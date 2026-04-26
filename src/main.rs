@@ -4,6 +4,7 @@ mod config;
 mod git;
 mod notify;
 mod routing;
+mod runner;
 mod task;
 
 use std::path::PathBuf;
@@ -34,7 +35,8 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -48,13 +50,19 @@ fn main() -> Result<()> {
         Command::Run { task } => {
             let config = config::load_config(config::CONFIG_FILE)?;
             let route = routing::match_route(&config, &task)?;
-            let task_document = task::load_task(&task)?;
+            let agent_config = config
+                .agents
+                .get(&route.agent)
+                .expect("routing ensures the selected agent exists");
+            let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
+            let outcome = runner::run_task(&config, &route.agent, &task, &client).await?;
             println!(
-                "varda run is not implemented yet; task={} status={:?} agent={} glob={}",
+                "processed task={} agent={} glob={} status={:?} recap={}",
                 task.display(),
-                task_document.frontmatter.status,
                 route.agent,
-                route.glob
+                route.glob,
+                outcome.status,
+                outcome.recap_path.display()
             );
         }
     }

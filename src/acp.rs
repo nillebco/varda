@@ -36,6 +36,7 @@ impl AgentClient for AcpSubprocessClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| {
                 format!(
