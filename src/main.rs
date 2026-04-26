@@ -48,9 +48,11 @@ fn main() -> Result<()> {
         Command::Run { task } => {
             let config = config::load_config(config::CONFIG_FILE)?;
             let route = routing::match_route(&config, &task)?;
+            let task_document = task::load_task(&task)?;
             println!(
-                "varda run is not implemented yet; task={} agent={} glob={}",
+                "varda run is not implemented yet; task={} status={:?} agent={} glob={}",
                 task.display(),
+                task_document.frontmatter.status,
                 route.agent,
                 route.glob
             );
