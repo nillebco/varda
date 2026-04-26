@@ -39,7 +39,11 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Init { force } => {
-            println!("varda init is not implemented yet; force={force}");
+            let result = config::init_workspace(force)?;
+            println!(
+                "initialized Varda config at {} and operations folder at {}",
+                result.config_path, result.operations_dir
+            );
         }
         Command::Run { task } => {
             println!("varda run is not implemented yet; task={}", task.display());

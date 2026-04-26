@@ -1,0 +1,15 @@
+[defaults]
+timeout_seconds = 600
+operations_dir = ".varda/operations"
+
+[[routes]]
+glob = ".varda/operations/tasks/codex/**/*.md"
+agent = "codex"
+
+[agents.codex]
+kind = "acp"
+command = "codex"
+args = ["--acp"]
+
+[git]
+auto_commit = true
