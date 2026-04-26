@@ -28,7 +28,7 @@ agent = "codex"
 [agents.codex]
 kind = "acp"
 command = "codex"
-args = ["--acp"]
+args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "--ask-for-approval", "never", "-"]
 
 [git]
 auto_commit = true
