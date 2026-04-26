@@ -64,6 +64,10 @@ async fn main() -> Result<()> {
                 outcome.status,
                 outcome.recap_path.display()
             );
+            if config.git.auto_commit {
+                git::commit_task_update(&task, &outcome.recap_path)?;
+                println!("committed task update");
+            }
         }
     }
 
