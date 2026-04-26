@@ -3,9 +3,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use gray_matter::{Matter, engine::YAML};
 use serde::{Deserialize, Serialize};
+
+use crate::config::Config;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskDocument {
@@ -64,6 +66,47 @@ pub fn write_task(task: &TaskDocument) -> Result<()> {
     Ok(())
 }
 
+pub fn default_assignee(config: &Config) -> Result<String> {
+    let route = config
+        .routes
+        .first()
+        .context("config has no routes; cannot choose a default assignee")?;
+
+    Ok(route.agent.clone())
+}
+
+pub fn create_task(config: &Config, taskname: &str, assignee: Option<&str>) -> Result<PathBuf> {
+    let route = config
+        .routes
+        .first()
+        .context("config has no routes; cannot choose a task directory")?;
+    let task_dir = task_dir_from_glob(&route.glob)?;
+    fs::create_dir_all(&task_dir)
+        .with_context(|| format!("failed to create task directory {}", task_dir.display()))?;
+
+    let filename = format!("{}.md", slugify_task_name(taskname)?);
+    let path = task_dir.join(filename);
+
+    if path.exists() {
+        bail!("task {} already exists", path.display());
+    }
+
+    let task = TaskDocument {
+        path: path.clone(),
+        frontmatter: TaskFrontmatter {
+            status: TaskStatus::Ready,
+            assignee: assignee.map(str::to_owned),
+            recap: None,
+            requires_user: false,
+        },
+        body: format!("# {taskname}\n\n"),
+    };
+
+    write_task(&task)?;
+
+    Ok(path)
+}
+
 fn parse_task(path: &Path, content: &str) -> Result<TaskDocument> {
     let matter = Matter::<YAML>::new();
     let parsed = matter
@@ -78,6 +121,60 @@ fn parse_task(path: &Path, content: &str) -> Result<TaskDocument> {
         frontmatter,
         body: parsed.content,
     })
+}
+
+fn task_dir_from_glob(glob: &str) -> Result<PathBuf> {
+    let prefix = glob
+        .split_once("**")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(glob);
+    let prefix = prefix.trim_end_matches('/');
+    let path = Path::new(prefix);
+
+    if prefix.contains(['*', '?', '[']) {
+        let stable_prefix = prefix
+            .split(['*', '?', '['])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
+        let stable_path = Path::new(stable_prefix);
+        return stable_path
+            .parent()
+            .map(Path::to_path_buf)
+            .context("route glob does not contain a usable task directory");
+    }
+
+    if path.extension().is_some() {
+        return path
+            .parent()
+            .map(Path::to_path_buf)
+            .context("route glob does not contain a usable task directory");
+    }
+
+    Ok(path.to_path_buf())
+}
+
+fn slugify_task_name(taskname: &str) -> Result<String> {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+
+    for character in taskname.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let slug = slug.trim_matches('-').to_owned();
+
+    if slug.is_empty() {
+        bail!("task name must contain at least one ASCII letter or digit");
+    }
+
+    Ok(slug)
 }
 
 #[cfg(test)]
@@ -152,5 +249,51 @@ Do the work.
         assert!(written.starts_with("---\n"));
         assert!(written.contains("status: pending"));
         assert!(written.contains("# Task"));
+    }
+
+    #[test]
+    fn creates_task_from_first_route() {
+        let root = std::env::temp_dir().join(format!("varda-task-add-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let task_glob = operations_dir
+            .join("tasks/codex/**/*.md")
+            .display()
+            .to_string();
+        let config = Config {
+            defaults: crate::config::Defaults {
+                timeout_seconds: 600,
+                operations_dir: operations_dir.display().to_string(),
+            },
+            routes: vec![crate::config::Route {
+                glob: task_glob,
+                agent: "codex".to_owned(),
+            }],
+            agents: std::collections::BTreeMap::new(),
+            git: crate::config::GitConfig { auto_commit: true },
+        };
+
+        let path = create_task(&config, "Write README Please", Some("codex"))
+            .expect("task should be created");
+        let content = fs::read_to_string(path).expect("task should be readable");
+
+        assert!(content.contains("status: ready"));
+        assert!(content.contains("assignee: codex"));
+        assert!(content.contains("# Write README Please"));
+    }
+
+    #[test]
+    fn derives_task_dir_from_glob() {
+        let dir = task_dir_from_glob(".varda/operations/tasks/codex/**/*.md")
+            .expect("glob should produce a task dir");
+
+        assert_eq!(dir, PathBuf::from(".varda/operations/tasks/codex"));
+    }
+
+    #[test]
+    fn slugifies_task_name() {
+        assert_eq!(
+            slugify_task_name("Write README Please").expect("name should slugify"),
+            "write-readme-please"
+        );
     }
 }

@@ -7,7 +7,9 @@ mod routing;
 mod runner;
 mod task;
 
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -32,6 +34,20 @@ enum Command {
     Run {
         /// Markdown task file to process.
         task: PathBuf,
+    },
+    /// Manage markdown tasks.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// Create a new markdown task and open it in $EDITOR.
+    Add {
+        /// Human-readable task name.
+        taskname: String,
     },
 }
 
@@ -80,6 +96,42 @@ async fn main() -> Result<()> {
                 println!("committed task update");
             }
         }
+        Command::Task { command } => match command {
+            TaskCommand::Add { taskname } => {
+                let config = config::load_config(config::CONFIG_FILE)?;
+                let default_assignee = task::default_assignee(&config)?;
+                let assignee = prompt_assignee(&default_assignee)?;
+                let task_path = task::create_task(&config, &taskname, assignee.as_deref())?;
+                println!("created task {}", task_path.display());
+                open_editor(&task_path)?;
+            }
+        },
+    }
+
+    Ok(())
+}
+
+fn prompt_assignee(default_assignee: &str) -> Result<Option<String>> {
+    print!("Assignee [{default_assignee}]: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let assignee = input.trim();
+
+    if assignee.is_empty() {
+        Ok(Some(default_assignee.to_owned()))
+    } else {
+        Ok(Some(assignee.to_owned()))
+    }
+}
+
+fn open_editor(path: &Path) -> Result<()> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
+    let status = ProcessCommand::new(&editor).arg(path).status()?;
+
+    if !status.success() {
+        anyhow::bail!("editor '{editor}' exited with status {status}");
     }
 
     Ok(())
