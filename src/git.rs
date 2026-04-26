@@ -5,12 +5,21 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-pub fn commit_task_update(task_path: &Path, recap_path: &Path) -> Result<()> {
+pub fn commit_task_update(
+    task_path: &Path,
+    recap_path: &Path,
+    notification_path: Option<&Path>,
+) -> Result<()> {
     let task_arg = path_arg(task_path);
     let recap_arg = path_arg(recap_path);
 
     run_git(["add", task_arg.as_str(), recap_arg.as_str()])
         .context("failed to stage task update")?;
+
+    if let Some(notification_path) = notification_path {
+        let notification_arg = path_arg(notification_path);
+        run_git(["add", notification_arg.as_str()]).context("failed to stage notification")?;
+    }
 
     let message = format!("Update task {}", task_path.display());
     run_git(["commit", "-m", message.as_str()]).context("failed to commit task update")?;

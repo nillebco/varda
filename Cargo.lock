@@ -646,6 +646,7 @@ dependencies = [
  "globset",
  "gray_matter",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "toml",
