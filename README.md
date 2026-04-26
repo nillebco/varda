@@ -8,8 +8,18 @@ The current proof of concept routes task files to Codex, runs Codex with a 10 mi
 
 You begin from a git repository that contains this project.
 
+Build and install the executable:
+
 ```sh
-cargo run -- init
+make install
+```
+
+By default this installs `varda` to `~/.local/bin/varda`. Make sure that directory is in your `PATH`.
+
+After that, the docs assume you can run `varda` directly.
+
+```sh
+varda init
 ```
 
 This creates the Varda operations folder:
@@ -32,27 +42,39 @@ The important files are:
 
 ## The Basic Flow
 
-1. Create a markdown task file under `.varda/operations/tasks/`.
-2. Give the task YAML frontmatter with `status: ready`.
-3. Run `varda run path/to/task.md`.
-4. Varda finds the matching route in `.varda/config.toml`.
-5. Varda marks the task as `running`.
-6. Varda starts the configured agent.
-7. The agent has at most 10 minutes to work.
-8. The agent must produce a recap before it finishes.
-9. Varda writes the recap under `.varda/operations/recaps/`.
-10. Varda updates the original task to `pending`, `needs_user`, or `failed`.
-11. Varda commits the task update and recap with git.
+1. Create a markdown task with `varda task add`.
+2. Varda asks for an assignee, defaulting to the configured agent.
+3. Varda creates the task file and opens it in `$EDITOR`.
+4. Write the task details and save the file.
+5. Run `varda run path/to/task.md`.
+6. Varda finds the matching route in `.varda/config.toml`.
+7. Varda marks the task as `running`.
+8. Varda starts the configured agent.
+9. The agent has at most 10 minutes to work.
+10. The agent must produce a recap before it finishes.
+11. Varda writes the recap under `.varda/operations/recaps/`.
+12. Varda updates the original task to `pending`, `needs_user`, or `failed`.
+13. Varda commits the task update and recap with git.
 
 ## Create Your First Task
 
-Create this file:
+Run:
 
-```text
-.varda/operations/tasks/codex/example.md
+```sh
+varda task add "Summarize Varda"
 ```
 
-With this content:
+Varda prompts for the assignee:
+
+```text
+Assignee [codex]:
+```
+
+Press Enter to accept the default from `.varda/config.toml`, or type another agent name.
+
+Varda then creates a markdown task file and opens it in `$EDITOR`. If `EDITOR` is not set, Varda falls back to `vi`.
+
+The generated task starts like this:
 
 ```markdown
 ---
@@ -61,15 +83,27 @@ assignee: codex
 requires_user: false
 ---
 
-# Task
+# Summarize Varda
+```
 
-Read the repository and write a short summary of what Varda currently does.
+Add the task details under the heading, then save and quit your editor.
+
+The default config stores Codex tasks under:
+
+```text
+.varda/operations/tasks/codex/
+```
+
+For the example above, the file is:
+
+```text
+.varda/operations/tasks/codex/summarize-varda.md
 ```
 
 Then run:
 
 ```sh
-cargo run -- run .varda/operations/tasks/codex/example.md
+varda run .varda/operations/tasks/codex/summarize-varda.md
 ```
 
 The default config routes files matching this pattern to Codex:
@@ -158,19 +192,31 @@ For a task that needs user input, the commit also includes:
 Run tests:
 
 ```sh
-cargo test
+make test
 ```
 
 Check formatting:
 
 ```sh
-cargo fmt --check
+make fmt
 ```
 
 Build the CLI:
 
 ```sh
-cargo build
+make build
+```
+
+Build the release executable:
+
+```sh
+make release
+```
+
+Install it to `~/.local/bin`:
+
+```sh
+make install
 ```
 
 ## Current Limitations
