@@ -11,9 +11,14 @@ use crate::config::{Config, Route};
 pub struct RouteMatch {
     pub agent: String,
     pub glob: String,
+    pub allowed_agents: Vec<String>,
 }
 
-pub fn match_route(config: &Config, task_path: &Path) -> Result<RouteMatch> {
+pub fn match_route(
+    config: &Config,
+    project_path: &Path,
+    requested_agent: Option<&str>,
+) -> Result<RouteMatch> {
     let mut builder = GlobSetBuilder::new();
 
     for route in &config.routes {
@@ -23,30 +28,59 @@ pub fn match_route(config: &Config, task_path: &Path) -> Result<RouteMatch> {
     }
 
     let set = builder.build().context("failed to build route matcher")?;
-    let matches = set.matches(task_path);
+    let matches = set.matches(project_path);
     let route = matches
         .first()
         .and_then(|index| config.routes.get(*index))
-        .with_context(|| format!("no route matched {}", task_path.display()))?;
+        .with_context(|| format!("no project route matched {}", project_path.display()))?;
 
-    ensure_agent_exists(config, route)?;
+    ensure_agents_exist(config, route)?;
+    let agent = select_agent(route, requested_agent)?;
 
     Ok(RouteMatch {
-        agent: route.agent.clone(),
+        agent,
         glob: route.glob.clone(),
+        allowed_agents: route.agents.clone(),
     })
 }
 
-fn ensure_agent_exists(config: &Config, route: &Route) -> Result<()> {
-    if !config.agents.contains_key(&route.agent) {
-        bail!(
-            "route '{}' references unknown agent '{}'",
-            route.glob,
-            route.agent
-        );
+fn ensure_agents_exist(config: &Config, route: &Route) -> Result<()> {
+    if route.agents.is_empty() {
+        bail!("route '{}' does not allow any agents", route.glob);
+    }
+
+    for agent in &route.agents {
+        if !config.agents.contains_key(agent) {
+            bail!(
+                "route '{}' references unknown agent '{}'",
+                route.glob,
+                agent
+            );
+        }
     }
 
     Ok(())
+}
+
+fn select_agent(route: &Route, requested_agent: Option<&str>) -> Result<String> {
+    if let Some(agent) = requested_agent {
+        if route.agents.iter().any(|allowed| allowed == agent) {
+            return Ok(agent.to_owned());
+        }
+
+        bail!(
+            "agent '{}' is not allowed for project route '{}'; allowed agents: {}",
+            agent,
+            route.glob,
+            route.agents.join(", ")
+        );
+    }
+
+    route
+        .agents
+        .first()
+        .cloned()
+        .with_context(|| format!("route '{}' does not allow any agents", route.glob))
 }
 
 #[cfg(test)]
@@ -66,12 +100,12 @@ mod tests {
             },
             routes: vec![
                 Route {
-                    glob: ".varda/operations/tasks/codex/**/*.md".to_owned(),
-                    agent: "codex".to_owned(),
+                    glob: "/work/special/**".to_owned(),
+                    agents: vec!["codex".to_owned()],
                 },
                 Route {
-                    glob: ".varda/operations/tasks/**/*.md".to_owned(),
-                    agent: "fallback".to_owned(),
+                    glob: "**".to_owned(),
+                    agents: vec!["fallback".to_owned()],
                 },
             ],
             agents: BTreeMap::from([
@@ -95,12 +129,37 @@ mod tests {
             git: GitConfig { auto_commit: true },
         };
 
-        let route = match_route(
-            &config,
-            Path::new(".varda/operations/tasks/codex/example.md"),
-        )
-        .expect("route should match");
+        let route = match_route(&config, Path::new("/work/special/project"), None)
+            .expect("route should match");
 
         assert_eq!(route.agent, "codex");
+    }
+
+    #[test]
+    fn rejects_requested_agent_that_is_not_allowed() {
+        let config = Config {
+            defaults: Defaults {
+                timeout_seconds: 600,
+                operations_dir: ".varda/operations".to_owned(),
+            },
+            routes: vec![Route {
+                glob: "**".to_owned(),
+                agents: vec!["codex".to_owned()],
+            }],
+            agents: BTreeMap::from([(
+                "codex".to_owned(),
+                AgentConfig {
+                    kind: AgentKind::Acp,
+                    command: "codex".to_owned(),
+                    args: vec![],
+                },
+            )]),
+            git: GitConfig { auto_commit: true },
+        };
+
+        let error = match_route(&config, Path::new("/work/project"), Some("claude"))
+            .expect_err("agent should be rejected");
+
+        assert!(error.to_string().contains("not allowed"));
     }
 }

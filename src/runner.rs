@@ -120,6 +120,7 @@ mod tests {
             &task_path,
             r#"---
 status: ready
+project: /work/project
 assignee: codex
 requires_user: false
 ---
@@ -158,8 +159,8 @@ Do it.
                 operations_dir,
             },
             routes: vec![Route {
-                glob: ".varda/operations/tasks/codex/**/*.md".to_owned(),
-                agent: "codex".to_owned(),
+                glob: "**".to_owned(),
+                agents: vec!["codex".to_owned()],
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),

@@ -3,8 +3,8 @@ timeout_seconds = 600
 operations_dir = ".varda/operations"
 
 [[routes]]
-glob = ".varda/operations/tasks/codex/**/*.md"
-agent = "codex"
+glob = "**"
+agents = ["codex"]
 
 [agents.codex]
 kind = "acp"

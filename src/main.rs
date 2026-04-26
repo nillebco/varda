@@ -35,6 +35,11 @@ enum Command {
         /// Markdown task file to process.
         task: PathBuf,
     },
+    /// Manage project routes.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
     /// Manage markdown tasks.
     Task {
         #[command(subcommand)]
@@ -48,6 +53,21 @@ enum TaskCommand {
     Add {
         /// Human-readable task name.
         taskname: String,
+        /// Project path this task belongs to. Defaults to the current directory.
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    /// Add a project/path route and its allowed agents.
+    Add {
+        /// Project path or glob pattern.
+        glob: String,
+        /// Allowed agents for this project route. Accepts comma-separated values.
+        #[arg(long, value_delimiter = ',', required = true)]
+        agents: Vec<String>,
     },
 }
 
@@ -65,7 +85,13 @@ async fn main() -> Result<()> {
         }
         Command::Run { task } => {
             let config = config::load_config(config::CONFIG_FILE)?;
-            let route = routing::match_route(&config, &task)?;
+            let task_document = task::load_task(&task)?;
+            let project_path = task::task_project_path(&task_document)?;
+            let route = routing::match_route(
+                &config,
+                &project_path,
+                task_document.frontmatter.assignee.as_deref(),
+            )?;
             let agent_config = config
                 .agents
                 .get(&route.agent)
@@ -97,13 +123,29 @@ async fn main() -> Result<()> {
             }
         }
         Command::Task { command } => match command {
-            TaskCommand::Add { taskname } => {
+            TaskCommand::Add { taskname, project } => {
                 let config = config::load_config(config::CONFIG_FILE)?;
-                let default_assignee = task::default_assignee(&config)?;
+                let project_path = task::resolve_project_path(project.as_deref())?;
+                let default_route = routing::match_route(&config, &project_path, None)?;
+                let default_assignee = default_route.agent;
                 let assignee = prompt_assignee(&default_assignee)?;
-                let task_path = task::create_task(&config, &taskname, assignee.as_deref())?;
+                if let Some(assignee) = assignee.as_deref() {
+                    routing::match_route(&config, &project_path, Some(assignee))?;
+                }
+                let task_path =
+                    task::create_task(&config, &taskname, &project_path, assignee.as_deref())?;
                 println!("created task {}", task_path.display());
                 open_editor(&task_path)?;
+            }
+        },
+        Command::Project { command } => match command {
+            ProjectCommand::Add { glob, agents } => {
+                config::add_project_route(config::CONFIG_FILE, glob.clone(), agents.clone())?;
+                println!(
+                    "added project route glob={} allowed_agents={}",
+                    glob,
+                    agents.join(",")
+                );
             }
         },
     }

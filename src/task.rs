@@ -20,6 +20,8 @@ pub struct TaskDocument {
 pub struct TaskFrontmatter {
     pub status: TaskStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recap: Option<String>,
@@ -66,21 +68,13 @@ pub fn write_task(task: &TaskDocument) -> Result<()> {
     Ok(())
 }
 
-pub fn default_assignee(config: &Config) -> Result<String> {
-    let route = config
-        .routes
-        .first()
-        .context("config has no routes; cannot choose a default assignee")?;
-
-    Ok(route.agent.clone())
-}
-
-pub fn create_task(config: &Config, taskname: &str, assignee: Option<&str>) -> Result<PathBuf> {
-    let route = config
-        .routes
-        .first()
-        .context("config has no routes; cannot choose a task directory")?;
-    let task_dir = task_dir_from_glob(&route.glob)?;
+pub fn create_task(
+    config: &Config,
+    taskname: &str,
+    project_path: &Path,
+    assignee: Option<&str>,
+) -> Result<PathBuf> {
+    let task_dir = Path::new(&config.defaults.operations_dir).join("tasks");
     fs::create_dir_all(&task_dir)
         .with_context(|| format!("failed to create task directory {}", task_dir.display()))?;
 
@@ -95,6 +89,7 @@ pub fn create_task(config: &Config, taskname: &str, assignee: Option<&str>) -> R
         path: path.clone(),
         frontmatter: TaskFrontmatter {
             status: TaskStatus::Ready,
+            project: Some(project_path.display().to_string()),
             assignee: assignee.map(str::to_owned),
             recap: None,
             requires_user: false,
@@ -103,6 +98,29 @@ pub fn create_task(config: &Config, taskname: &str, assignee: Option<&str>) -> R
     };
 
     write_task(&task)?;
+
+    Ok(path)
+}
+
+pub fn task_project_path(task: &TaskDocument) -> Result<PathBuf> {
+    task.frontmatter
+        .project
+        .as_ref()
+        .map(PathBuf::from)
+        .context("task frontmatter is missing project")
+}
+
+pub fn resolve_project_path(project_path: Option<&Path>) -> Result<PathBuf> {
+    let path = match project_path {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().context("failed to determine current project directory")?,
+    };
+
+    if path.exists() {
+        return path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize project path {}", path.display()));
+    }
 
     Ok(path)
 }
@@ -121,37 +139,6 @@ fn parse_task(path: &Path, content: &str) -> Result<TaskDocument> {
         frontmatter,
         body: parsed.content,
     })
-}
-
-fn task_dir_from_glob(glob: &str) -> Result<PathBuf> {
-    let prefix = glob
-        .split_once("**")
-        .map(|(prefix, _)| prefix)
-        .unwrap_or(glob);
-    let prefix = prefix.trim_end_matches('/');
-    let path = Path::new(prefix);
-
-    if prefix.contains(['*', '?', '[']) {
-        let stable_prefix = prefix
-            .split(['*', '?', '['])
-            .next()
-            .unwrap_or("")
-            .trim_end_matches('/');
-        let stable_path = Path::new(stable_prefix);
-        return stable_path
-            .parent()
-            .map(Path::to_path_buf)
-            .context("route glob does not contain a usable task directory");
-    }
-
-    if path.extension().is_some() {
-        return path
-            .parent()
-            .map(Path::to_path_buf)
-            .context("route glob does not contain a usable task directory");
-    }
-
-    Ok(path.to_path_buf())
 }
 
 fn slugify_task_name(taskname: &str) -> Result<String> {
@@ -211,6 +198,7 @@ Do the work.
             path: PathBuf::from("task.md"),
             frontmatter: TaskFrontmatter {
                 status: TaskStatus::Running,
+                project: None,
                 assignee: Some("codex".to_owned()),
                 recap: None,
                 requires_user: false,
@@ -235,6 +223,7 @@ Do the work.
             path: path.clone(),
             frontmatter: TaskFrontmatter {
                 status: TaskStatus::Pending,
+                project: None,
                 assignee: Some("codex".to_owned()),
                 recap: Some(".varda/operations/recaps/run.md".to_owned()),
                 requires_user: false,
@@ -255,38 +244,28 @@ Do the work.
     fn creates_task_from_first_route() {
         let root = std::env::temp_dir().join(format!("varda-task-add-{}", std::process::id()));
         let operations_dir = root.join("operations");
-        let task_glob = operations_dir
-            .join("tasks/codex/**/*.md")
-            .display()
-            .to_string();
         let config = Config {
             defaults: crate::config::Defaults {
                 timeout_seconds: 600,
                 operations_dir: operations_dir.display().to_string(),
             },
             routes: vec![crate::config::Route {
-                glob: task_glob,
-                agent: "codex".to_owned(),
+                glob: "**".to_owned(),
+                agents: vec!["codex".to_owned()],
             }],
             agents: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
         };
 
-        let path = create_task(&config, "Write README Please", Some("codex"))
+        let project_path = Path::new("/work/project");
+        let path = create_task(&config, "Write README Please", project_path, Some("codex"))
             .expect("task should be created");
         let content = fs::read_to_string(path).expect("task should be readable");
 
         assert!(content.contains("status: ready"));
+        assert!(content.contains("project: /work/project"));
         assert!(content.contains("assignee: codex"));
         assert!(content.contains("# Write README Please"));
-    }
-
-    #[test]
-    fn derives_task_dir_from_glob() {
-        let dir = task_dir_from_glob(".varda/operations/tasks/codex/**/*.md")
-            .expect("glob should produce a task dir");
-
-        assert_eq!(dir, PathBuf::from(".varda/operations/tasks/codex"));
     }
 
     #[test]

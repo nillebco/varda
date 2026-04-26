@@ -101,6 +101,7 @@ mod tests {
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
                     status: TaskStatus::Ready,
+                    project: Some("/work/project".to_owned()),
                     assignee: Some("codex".to_owned()),
                     recap: None,
                     requires_user: false,
