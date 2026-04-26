@@ -1,0 +1,1 @@
+//! Varda configuration loading.
