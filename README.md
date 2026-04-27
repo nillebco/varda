@@ -216,6 +216,14 @@ varda task dashboard
 
 The dashboard groups tasks by status and then prompts for a task ID or path. Selecting a task displays the full task markdown and every associated recap.
 
+Serve a browser-based Trello-like dashboard with project and status filters:
+
+```sh
+varda task dashboard --web
+```
+
+The web dashboard is available at `http://127.0.0.1:8787/` by default. It loads tasks across all projects, pre-selects the current folder in the project filter when that project has tasks, refreshes task data every 30 seconds, and lets you select a task to inspect its markdown and associated recaps. Use `--port` to choose a different local port.
+
 Show all tasks across all projects:
 
 ```sh
@@ -473,7 +481,6 @@ make install
 
 ## Current Limitations
 
-- The dashboard is terminal-based.
 - The Codex integration is a subprocess POC, not a full ACP protocol client yet.
 - Notification is file-backed JSON plus terminal output.
 - Task handoff to another agent is represented by `pending` plus recap metadata, but automatic reassignment is not implemented yet.

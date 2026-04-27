@@ -8,7 +8,8 @@ mod runner;
 mod task;
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -126,6 +127,12 @@ enum TaskCommand {
         /// Show tasks across all projects instead of only one project.
         #[arg(long)]
         all: bool,
+        /// Serve a browser-based kanban dashboard.
+        #[arg(long)]
+        web: bool,
+        /// Local port for --web.
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
         /// Task file or task id to display after the board.
         #[arg(long)]
         task: Option<PathBuf>,
@@ -255,8 +262,14 @@ async fn main() -> Result<()> {
             TaskCommand::Show { task } => {
                 show_task_command(&task)?;
             }
-            TaskCommand::Dashboard { project, all, task } => {
-                dashboard_task_command(project.as_deref(), all, task.as_deref())?;
+            TaskCommand::Dashboard {
+                project,
+                all,
+                web,
+                port,
+                task,
+            } => {
+                dashboard_task_command(project.as_deref(), all, web, port, task.as_deref())?;
             }
             TaskCommand::Edit { task } => {
                 let config_path = config::config_file()?;
@@ -958,10 +971,18 @@ fn show_task_command(task_path: &Path) -> Result<()> {
 fn dashboard_task_command(
     project: Option<&Path>,
     all_projects: bool,
+    web: bool,
+    port: u16,
     selected_task: Option<&Path>,
 ) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
+
+    if web {
+        serve_task_dashboard(config, project.map(Path::to_path_buf), true, port)?;
+        return Ok(());
+    }
+
     let (scope, tasks) = if all_projects {
         ("all projects".to_owned(), task::list_all_tasks(&config)?)
     } else {
@@ -989,6 +1010,347 @@ fn dashboard_task_command(
 
     Ok(())
 }
+
+#[derive(Debug, Serialize)]
+struct DashboardPayload {
+    scope: String,
+    generated_at: u64,
+    default_project: Option<String>,
+    tasks: Vec<DashboardTask>,
+    projects: Vec<String>,
+    statuses: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardTask {
+    id: Option<u64>,
+    status: &'static str,
+    project: Option<String>,
+    assignee: Option<String>,
+    title: String,
+    path: String,
+    markdown: String,
+    recaps: Vec<DashboardRecap>,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardRecap {
+    path: String,
+    markdown: String,
+}
+
+fn serve_task_dashboard(
+    config: config::Config,
+    project: Option<PathBuf>,
+    all_projects: bool,
+    port: u16,
+) -> Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .with_context(|| format!("failed to bind dashboard server to 127.0.0.1:{port}"))?;
+    println!("serving task dashboard at http://127.0.0.1:{port}/");
+    println!("press Ctrl-C to stop");
+
+    for stream in listener.incoming() {
+        let mut stream = stream.context("failed to accept dashboard connection")?;
+        if let Err(error) =
+            handle_dashboard_connection(&mut stream, &config, project.as_deref(), all_projects)
+        {
+            eprintln!("dashboard request failed: {error:#}");
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_dashboard_connection(
+    stream: &mut TcpStream,
+    config: &config::Config,
+    project: Option<&Path>,
+    all_projects: bool,
+) -> Result<()> {
+    let mut buffer = [0; 4096];
+    let read = stream
+        .read(&mut buffer)
+        .context("failed to read dashboard request")?;
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+
+    match target.split('?').next().unwrap_or("/") {
+        "/" | "/index.html" => write_http_response(stream, "200 OK", "text/html", DASHBOARD_HTML),
+        "/api/tasks" => {
+            let payload = load_dashboard_payload(config, project, all_projects)?;
+            let json =
+                serde_json::to_string(&payload).context("failed to encode dashboard JSON")?;
+            write_http_response(stream, "200 OK", "application/json", &json)
+        }
+        "/healthz" => write_http_response(stream, "200 OK", "text/plain", "ok\n"),
+        _ => write_http_response(stream, "404 Not Found", "text/plain", "not found\n"),
+    }
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .context("failed to write dashboard response")
+}
+
+fn load_dashboard_payload(
+    config: &config::Config,
+    project: Option<&Path>,
+    all_projects: bool,
+) -> Result<DashboardPayload> {
+    let default_project = task::resolve_project_path(project)?;
+    let default_project = default_project.display().to_string();
+    let (scope, summaries) = if all_projects {
+        ("all projects".to_owned(), task::list_all_tasks(config)?)
+    } else {
+        (
+            default_project.clone(),
+            task::list_tasks(config, Path::new(&default_project))?,
+        )
+    };
+
+    let mut projects = Vec::new();
+    let mut tasks = Vec::new();
+    for summary in summaries {
+        if let Some(project) = summary.project.as_ref() {
+            if !projects.contains(project) {
+                projects.push(project.clone());
+            }
+        }
+
+        let document = task::load_task(&summary.path)?;
+        let markdown = fs::read_to_string(&summary.path)
+            .with_context(|| format!("failed to read task at {}", summary.path.display()))?;
+        let mut recaps = Vec::new();
+        for recap_path in &document.frontmatter.recaps {
+            let resolved = resolve_recap_path(recap_path, &summary.path);
+            let markdown = fs::read_to_string(&resolved).unwrap_or_else(|error| {
+                format!(
+                    "# Recap Unavailable\n\nFailed to read {}: {error}",
+                    resolved.display()
+                )
+            });
+            recaps.push(DashboardRecap {
+                path: resolved.display().to_string(),
+                markdown,
+            });
+        }
+
+        tasks.push(DashboardTask {
+            id: summary.id,
+            status: summary.status.as_str(),
+            project: summary.project,
+            assignee: summary.assignee,
+            title: summary.title,
+            path: summary.path.display().to_string(),
+            markdown,
+            recaps,
+        });
+    }
+    projects.sort();
+
+    Ok(DashboardPayload {
+        scope,
+        generated_at: unix_timestamp()?,
+        default_project: Some(default_project),
+        tasks,
+        projects,
+        statuses: vec!["ready", "running", "needs_user", "failed", "pending"],
+    })
+}
+
+const DASHBOARD_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Varda Tasks</title>
+  <style>
+    :root { color-scheme: light; --bg: #f6f7f9; --panel: #ffffff; --line: #d9dee7; --text: #1e2430; --muted: #687386; --accent: #1f7a5a; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 24px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    h1 { margin: 0; font-size: 20px; font-weight: 700; }
+    .meta { color: var(--muted); font-size: 13px; }
+    .filters { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 12px 24px; border-bottom: 1px solid var(--line); background: #eef1f5; }
+    label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+    select { min-width: 160px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 8px 10px; color: var(--text); }
+    main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 34vw); gap: 0; min-height: calc(100vh - 113px); }
+    .board { display: grid; grid-template-columns: repeat(5, minmax(220px, 1fr)); gap: 12px; overflow-x: auto; padding: 16px; }
+    .column { min-width: 220px; }
+    .column h2 { display: flex; justify-content: space-between; align-items: center; margin: 0 0 10px; font-size: 13px; text-transform: uppercase; color: var(--muted); letter-spacing: 0; }
+    .count { border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; background: var(--panel); color: var(--muted); }
+    .task { width: 100%; text-align: left; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 10px; margin-bottom: 10px; cursor: pointer; box-shadow: 0 1px 2px rgba(25, 32, 44, 0.05); }
+    .task:hover, .task.selected { border-color: var(--accent); }
+    .task-title { font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; }
+    .task-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .badge { border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px; background: #f9fafb; max-width: 100%; overflow-wrap: anywhere; }
+    aside { border-left: 1px solid var(--line); background: var(--panel); padding: 18px; overflow: auto; }
+    .empty { color: var(--muted); padding: 20px; }
+    .details h2 { margin: 0 0 6px; font-size: 18px; overflow-wrap: anywhere; }
+    .details .path { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f6f7f9; border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.45; }
+    h3 { margin: 18px 0 8px; font-size: 14px; }
+    @media (max-width: 980px) { main { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid var(--line); } .board { grid-template-columns: repeat(5, 240px); } }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Varda Tasks</h1>
+      <div id="scope" class="meta"></div>
+    </div>
+    <div id="updated" class="meta"></div>
+  </header>
+  <section class="filters">
+    <label>Project <select id="projectFilter"><option value="">All projects</option></select></label>
+    <label>Status <select id="statusFilter"><option value="">All statuses</option></select></label>
+  </section>
+  <main>
+    <section id="board" class="board"></section>
+    <aside id="details" class="empty">Select a task to inspect its markdown and recaps.</aside>
+  </main>
+  <script>
+    const statuses = ["ready", "running", "needs_user", "failed", "pending"];
+    let payload = { tasks: [], projects: [], statuses };
+    let selectedPath = "";
+    let initializedFilters = false;
+
+    function label(value) {
+      return value.replaceAll("_", " ");
+    }
+
+    function optionList(select, values, emptyLabel) {
+      const current = select.value;
+      select.innerHTML = "";
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = emptyLabel;
+      select.appendChild(empty);
+      for (const value of values) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label(value);
+        select.appendChild(option);
+      }
+      select.value = values.includes(current) ? current : "";
+    }
+
+    function taskMatches(task) {
+      const project = document.getElementById("projectFilter").value;
+      const status = document.getElementById("statusFilter").value;
+      return (!project || task.project === project) && (!status || task.status === status);
+    }
+
+    function renderBoard() {
+      optionList(document.getElementById("projectFilter"), payload.projects, "All projects");
+      optionList(document.getElementById("statusFilter"), payload.statuses || statuses, "All statuses");
+      if (!initializedFilters) {
+        const defaultProject = payload.default_project || "";
+        if (payload.projects.includes(defaultProject)) {
+          document.getElementById("projectFilter").value = defaultProject;
+        }
+        initializedFilters = true;
+      }
+      document.getElementById("scope").textContent = `Scope: ${payload.scope || "unknown"} | Tasks: ${payload.tasks.length}`;
+      document.getElementById("updated").textContent = payload.generated_at ? `Updated ${new Date(payload.generated_at * 1000).toLocaleTimeString()}` : "";
+
+      const board = document.getElementById("board");
+      board.innerHTML = "";
+      for (const status of statuses) {
+        const column = document.createElement("section");
+        column.className = "column";
+        const tasks = payload.tasks.filter(task => task.status === status && taskMatches(task));
+        const heading = document.createElement("h2");
+        heading.innerHTML = `<span>${label(status)}</span><span class="count">${tasks.length}</span>`;
+        column.appendChild(heading);
+        for (const task of tasks) {
+          const button = document.createElement("button");
+          button.className = `task${task.path === selectedPath ? " selected" : ""}`;
+          button.type = "button";
+          button.onclick = () => { selectedPath = task.path; renderBoard(); renderDetails(task); };
+          const id = task.id === null || task.id === undefined ? "unversioned" : `#${task.id}`;
+          button.innerHTML = `<div class="task-title"></div><div class="task-row"><span class="badge"></span><span class="badge"></span></div>`;
+          button.querySelector(".task-title").textContent = task.title;
+          const badges = button.querySelectorAll(".badge");
+          badges[0].textContent = id;
+          badges[1].textContent = task.assignee || "-";
+          column.appendChild(button);
+        }
+        board.appendChild(column);
+      }
+      const selected = payload.tasks.find(task => task.path === selectedPath);
+      if (selected) renderDetails(selected);
+    }
+
+    function renderDetails(task) {
+      const details = document.getElementById("details");
+      details.className = "details";
+      details.innerHTML = "";
+      const title = document.createElement("h2");
+      title.textContent = task.title;
+      details.appendChild(title);
+      const path = document.createElement("div");
+      path.className = "path";
+      path.textContent = task.path;
+      details.appendChild(path);
+      const taskHeading = document.createElement("h3");
+      taskHeading.textContent = "Task";
+      details.appendChild(taskHeading);
+      const taskPre = document.createElement("pre");
+      taskPre.textContent = task.markdown;
+      details.appendChild(taskPre);
+      const recapHeading = document.createElement("h3");
+      recapHeading.textContent = "Recaps";
+      details.appendChild(recapHeading);
+      if (!task.recaps.length) {
+        const empty = document.createElement("p");
+        empty.className = "meta";
+        empty.textContent = "No recaps are associated with this task.";
+        details.appendChild(empty);
+      }
+      for (const recap of task.recaps) {
+        const recapPath = document.createElement("div");
+        recapPath.className = "path";
+        recapPath.textContent = recap.path;
+        details.appendChild(recapPath);
+        const recapPre = document.createElement("pre");
+        recapPre.textContent = recap.markdown;
+        details.appendChild(recapPre);
+      }
+    }
+
+    async function refresh() {
+      const response = await fetch("/api/tasks", { cache: "no-store" });
+      payload = await response.json();
+      if (!selectedPath && payload.tasks.length) selectedPath = payload.tasks[0].path;
+      renderBoard();
+    }
+
+    document.getElementById("projectFilter").addEventListener("change", renderBoard);
+    document.getElementById("statusFilter").addEventListener("change", renderBoard);
+    refresh().catch(error => {
+      document.getElementById("details").textContent = `Failed to load dashboard: ${error}`;
+    });
+    setInterval(refresh, 30000);
+  </script>
+</body>
+</html>
+"##;
 
 fn print_task_dashboard(scope: &str, tasks: &[task::TaskSummary]) {
     println!("# Tasks Dashboard");
