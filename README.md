@@ -339,13 +339,20 @@ The agent is instructed to finish with a recap that includes:
 - a suggested next agent, if useful
 - a `Files touched` section with one absolute file path per created, modified, or deleted file, or `(none)` when no files changed
 
-If the agent needs user input, it should include this exact marker in its recap:
+The agent must end every recap with exactly one machine-readable marker:
 
 ```text
 requires_user: true
 ```
 
+or
+
+```text
+requires_user: false
+```
+
 Varda uses that marker to set the task status to `needs_user` and write a notification file.
+As a fallback, Varda also treats recap text such as `User interaction required: yes` or a `User Interaction Required` heading followed by `Yes: ...` as requiring user input.
 
 Each task run also records the latest agent session in task frontmatter:
 

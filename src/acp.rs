@@ -12,7 +12,7 @@ use tokio::time;
 
 use crate::agent::{
     AgentClient, AgentRunRequest, AgentRunResult, build_agent_instructions,
-    build_planning_instructions,
+    build_planning_instructions, recap_requires_user_interaction,
 };
 use crate::config::AgentConfig;
 
@@ -130,7 +130,7 @@ impl AcpSubprocessClient {
         }
 
         Ok(AgentRunResult {
-            requires_user: recap_contains_user_request(&recap),
+            requires_user: recap_requires_user_interaction(&recap),
             suggested_agent: None,
             recap,
         })
@@ -408,12 +408,6 @@ fn append_session_log(path: &str, content: &str) -> Result<()> {
     Ok(())
 }
 
-fn recap_contains_user_request(recap: &str) -> bool {
-    recap
-        .lines()
-        .any(|line| line.trim().eq_ignore_ascii_case("requires_user: true"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -504,14 +498,6 @@ mod tests {
         assert!(log.contains("stdout:\nrecap line"));
         assert!(log.contains("stderr:\ndiagnostic line"));
         assert!(log.contains("status=exit status: 0"));
-    }
-
-    #[test]
-    fn detects_requires_user_marker() {
-        assert!(recap_contains_user_request(
-            "Completed nothing.\nrequires_user: true"
-        ));
-        assert!(!recap_contains_user_request("requires_user: false"));
     }
 
     #[test]

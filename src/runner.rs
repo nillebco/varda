@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use tokio::time;
 use uuid::Uuid;
 
-use crate::agent::{AgentClient, AgentRunRequest, AgentRunResult};
+use crate::agent::{AgentClient, AgentRunRequest, AgentRunResult, recap_requires_user_interaction};
 use crate::config::Config;
 use crate::task::{TaskStatus, load_task, write_task};
 
@@ -102,11 +102,12 @@ pub async fn run_task(
         }
     };
 
+    let requires_user = result.requires_user || recap_requires_user_interaction(&result.recap);
     let recap_path = write_recap(config, task_path, &result.recap)?;
     task.set_recap(recap_path.display().to_string());
-    task.frontmatter.requires_user = result.requires_user;
+    task.frontmatter.requires_user = requires_user;
 
-    let status = if result.requires_user {
+    let status = if requires_user {
         TaskStatus::NeedsUser
     } else if result.recap.starts_with("# Agent Run Failed")
         || result.recap.starts_with("# Agent Run Timed Out")
@@ -285,6 +286,48 @@ Do it.
         assert!(updated.contains("agent_session_log:"));
         assert!(outcome.session_log_path.exists());
         assert!(recap.contains("Completed."));
+    }
+
+    #[tokio::test]
+    async fn run_task_marks_needs_user_from_recap_wording() {
+        let root =
+            std::env::temp_dir().join(format!("varda-run-needs-user-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: codex
+requires_user: false
+---
+
+# Task
+
+Do it.
+"#,
+        )
+        .expect("task should be written");
+
+        let config = test_config(operations_dir.display().to_string());
+        let client = FakeAgentClient::new(AgentRunResult {
+            recap: "# Recap\n\n**User Interaction Required**\nYes: run this locally.".to_owned(),
+            requires_user: false,
+            suggested_agent: None,
+        });
+
+        let outcome = run_task(&config, "codex", &task_path, &client)
+            .await
+            .expect("task should run");
+
+        let updated = fs::read_to_string(&task_path).expect("task should be readable");
+
+        assert_eq!(outcome.status, TaskStatus::NeedsUser);
+        assert!(updated.contains("status: needs_user"));
+        assert!(updated.contains("requires_user: true"));
     }
 
     fn test_config(operations_dir: String) -> Config {

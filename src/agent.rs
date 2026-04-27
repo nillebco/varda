@@ -76,8 +76,66 @@ In your recap, include a section listing every file you created, modified, or de
 Add a markdown heading called Files touched and list one absolute file path per line below it.
 If no files were changed, write (none) under that heading.
 
-If you need user input, stop and mark the result as requires_user."#
+At the end of the recap, include exactly one bare machine-readable marker line whose content is either `requires_user: true` or `requires_user: false`.
+
+If you need user input, stop and use the true marker."#
     )
+}
+
+pub fn recap_requires_user_interaction(recap: &str) -> bool {
+    let mut previous_line_was_user_interaction_heading = false;
+
+    for line in recap.lines() {
+        let normalized = normalize_recap_line(line);
+
+        if normalized.eq_ignore_ascii_case("requires_user: true") {
+            return true;
+        }
+
+        if let Some(answer) = normalized
+            .strip_prefix("user interaction required:")
+            .or_else(|| normalized.strip_prefix("user interaction required -"))
+        {
+            if answer_starts_yes(answer) {
+                return true;
+            }
+            continue;
+        }
+
+        if previous_line_was_user_interaction_heading {
+            if normalized.is_empty() {
+                continue;
+            }
+            if answer_starts_yes(&normalized) {
+                return true;
+            }
+        }
+
+        previous_line_was_user_interaction_heading =
+            normalized.eq_ignore_ascii_case("user interaction required");
+    }
+
+    false
+}
+
+fn normalize_recap_line(line: &str) -> String {
+    line.trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches('*')
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn answer_starts_yes(answer: &str) -> bool {
+    let answer = answer.trim_start();
+    answer == "yes"
+        || answer.strip_prefix("yes").is_some_and(|rest| {
+            rest.starts_with(':')
+                || rest.starts_with('.')
+                || rest.starts_with('-')
+                || rest.starts_with(',')
+        })
 }
 
 #[cfg(test)]
@@ -120,6 +178,23 @@ mod tests {
         assert!(instructions.contains("Files touched"));
         assert!(instructions.contains("absolute file path"));
         assert!(instructions.contains("requires_user"));
+    }
+
+    #[test]
+    fn detects_requires_user_recap_markers() {
+        assert!(recap_requires_user_interaction(
+            "Completed nothing.\nrequires_user: true"
+        ));
+        assert!(recap_requires_user_interaction(
+            "**User Interaction Required**\nYes: run the smoke suite locally."
+        ));
+        assert!(recap_requires_user_interaction(
+            "User interaction required: yes, provide credentials."
+        ));
+        assert!(!recap_requires_user_interaction("requires_user: false"));
+        assert!(!recap_requires_user_interaction(
+            "User interaction required: no.\nContinue with codex."
+        ));
     }
 
     #[tokio::test]
