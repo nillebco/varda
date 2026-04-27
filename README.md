@@ -49,7 +49,7 @@ The important files are:
 - `$VARDA_HOME/operations/recaps/`: where agent recaps are written.
 - `$VARDA_HOME/operations/runs/`: where notification records are written.
 
-`varda init` also runs `git init` in the control-plane folder. This matters because `varda run` commits task updates, recaps, and notifications into that repository.
+`varda init` also runs `git init` in the control-plane folder. This matters because `varda task run` commits task updates, recaps, and notifications into that repository.
 
 ## The Basic Flow
 
@@ -59,7 +59,7 @@ The important files are:
 4. Varda asks for an assignee, defaulting to the first allowed agent for that project.
 5. Varda creates the task file and opens it in `$EDITOR`.
 6. Write the task details and save the file.
-7. Run `varda run path/to/task.md`.
+7. Run `varda task run path/to/task.md`.
 8. Varda finds the matching project route in the global config.
 9. Varda verifies the assignee is allowed for that project.
 10. Varda marks the task as `running`.
@@ -146,12 +146,14 @@ $VARDA_HOME/operations/tasks/summarize-this-project.md
 Then run:
 
 ```sh
-varda run "$HOME/.varda/operations/tasks/summarize-this-project.md"
+varda task run "$HOME/.varda/operations/tasks/summarize-this-project.md"
 ```
 
 If you set `VARDA_HOME`, use that path instead.
 
-When `varda run` starts, it reads the task's `project` field and uses that path to select the route and allowed agents.
+When `varda task run` starts, it reads the task's `project` field and uses that path to select the route and allowed agents.
+
+The old top-level `varda run <task>` command is still available as a compatibility alias, but new usage should prefer `varda task run <task>`.
 
 ## Task Statuses
 
@@ -170,6 +172,32 @@ Status meanings:
 - `pending`: the agent produced a recap and the task is ready for a later follow-up.
 - `needs_user`: the agent needs human input before work can continue.
 - `failed`: the agent failed, timed out, or returned unusable output.
+
+## Resume A Task
+
+When an agent needs user input, the task is left in this state:
+
+```yaml
+status: needs_user
+requires_user: true
+```
+
+Resume it with:
+
+```sh
+varda task resume "$HOME/.varda/operations/tasks/summarize-this-project.md"
+```
+
+`varda task resume` does this:
+
+1. Requires the task to be in `needs_user`.
+2. Sets `status: ready`.
+3. Sets `requires_user: false`.
+4. Offers to open `$EDITOR` so you can add the missing user input.
+5. Commits that resume edit to the Varda home git repo.
+6. Runs the task immediately with `varda task run`.
+
+If you set `VARDA_HOME`, use that path instead of `$HOME/.varda`.
 
 ## What The Agent Is Told
 
