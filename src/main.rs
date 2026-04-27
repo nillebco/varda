@@ -180,19 +180,13 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
 
 async fn resume_task_command(task_path: &Path) -> Result<()> {
     let mut task_document = task::load_task(task_path)?;
-    if task_document.frontmatter.status != task::TaskStatus::NeedsUser {
-        anyhow::bail!(
-            "task {} is not waiting for user input; current status is {:?}",
-            task_path.display(),
-            task_document.frontmatter.status
-        );
-    }
+    let was_needs_user = task_document.frontmatter.status == task::TaskStatus::NeedsUser;
 
     task_document.set_status(task::TaskStatus::Ready);
     task_document.frontmatter.requires_user = false;
     task::write_task(&task_document)?;
 
-    if prompt_yes_no("Open editor to complete the task update?", true)? {
+    if was_needs_user && prompt_yes_no("Open editor to complete the task update?", true)? {
         open_editor(task_path)?;
     }
 

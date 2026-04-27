@@ -190,10 +190,10 @@ varda task resume "$HOME/.varda/operations/tasks/summarize-this-project.md"
 
 `varda task resume` does this:
 
-1. Requires the task to be in `needs_user`.
-2. Sets `status: ready`.
-3. Sets `requires_user: false`.
-4. Offers to open `$EDITOR` so you can add the missing user input.
+1. Sets `status: ready`.
+2. Sets `requires_user: false`.
+3. If the task was in `needs_user`, offers to open `$EDITOR` so you can add the missing user input.
+4. If the task was not in `needs_user`, skips the editor prompt.
 5. Commits that resume edit to the Varda home git repo.
 6. Runs the task immediately with `varda task run`.
 
