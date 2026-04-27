@@ -113,6 +113,7 @@ Start with a small explicit state model:
 ready -> running -> pending
 ready -> running -> needs_user
 ready -> running -> failed
+pending -> done
 ```
 
 State meanings:
@@ -122,6 +123,7 @@ State meanings:
 - `pending`: the agent produced a recap and the task should continue with another agent or a later run.
 - `needs_user`: the agent cannot proceed without user interaction.
 - `failed`: the runner or agent failed, timed out, or returned invalid output.
+- `done`: the task has been reviewed or archived after completion.
 
 The POC should update markdown frontmatter after each transition.
 

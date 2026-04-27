@@ -282,6 +282,7 @@ Tasks move through a small state machine:
 ready -> running -> pending
 ready -> running -> needs_user
 ready -> running -> failed
+pending -> done
 ```
 
 Status meanings:
@@ -291,6 +292,7 @@ Status meanings:
 - `pending`: the agent produced a recap and the task is ready for a later follow-up.
 - `needs_user`: the agent needs human input before work can continue.
 - `failed`: the agent failed, timed out, or returned unusable output.
+- `done`: the task has been reviewed or archived after completion.
 
 ## Resume A Task
 

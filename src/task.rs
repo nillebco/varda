@@ -59,6 +59,7 @@ pub enum TaskStatus {
     Pending,
     NeedsUser,
     Failed,
+    Done,
 }
 
 impl TaskStatus {
@@ -69,6 +70,7 @@ impl TaskStatus {
             Self::Pending => "pending",
             Self::NeedsUser => "needs_user",
             Self::Failed => "failed",
+            Self::Done => "done",
         }
     }
 }

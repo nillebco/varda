@@ -1169,7 +1169,14 @@ fn load_dashboard_payload(
         default_project: Some(default_project),
         tasks,
         projects,
-        statuses: vec!["ready", "running", "needs_user", "failed", "pending"],
+        statuses: vec![
+            "ready",
+            "running",
+            "needs_user",
+            "failed",
+            "pending",
+            "done",
+        ],
     })
 }
 
@@ -1191,7 +1198,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     select { min-width: 160px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 8px 10px; color: var(--text); }
     main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; min-height: calc(100vh - 113px); }
     main.details-open { grid-template-columns: minmax(0, 1fr) minmax(360px, 34vw); }
-    .board { display: grid; grid-template-columns: repeat(5, minmax(220px, 1fr)); gap: 12px; overflow-x: auto; padding: 16px; }
+    .board { display: grid; grid-template-columns: repeat(6, minmax(220px, 1fr)); gap: 12px; overflow-x: auto; padding: 16px; }
     .column { min-width: 220px; }
     .column h2 { display: flex; justify-content: space-between; align-items: center; margin: 0 0 10px; font-size: 13px; text-transform: uppercase; color: var(--muted); letter-spacing: 0; }
     .count { border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; background: var(--panel); color: var(--muted); }
@@ -1210,7 +1217,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     .details .path { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f6f7f9; border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.45; }
     h3 { margin: 18px 0 8px; font-size: 14px; }
-    @media (max-width: 980px) { main.details-open { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid var(--line); } .board { grid-template-columns: repeat(5, 240px); } }
+    @media (max-width: 980px) { main.details-open { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid var(--line); } .board { grid-template-columns: repeat(6, 240px); } }
   </style>
 </head>
 <body>
@@ -1230,7 +1237,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <aside id="details" class="empty"></aside>
   </main>
   <script>
-    const statuses = ["ready", "running", "needs_user", "failed", "pending"];
+    const statuses = ["ready", "running", "needs_user", "failed", "pending", "done"];
     let payload = { tasks: [], projects: [], statuses };
     let selectedPath = "";
     let initializedFilters = false;
@@ -1394,6 +1401,7 @@ fn print_task_dashboard(scope: &str, tasks: &[task::TaskSummary]) {
         task::TaskStatus::NeedsUser,
         task::TaskStatus::Failed,
         task::TaskStatus::Pending,
+        task::TaskStatus::Done,
     ] {
         println!("## {}", status.as_str());
         let mut found = false;
