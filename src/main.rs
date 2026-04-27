@@ -608,6 +608,13 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
+    if config.git.auto_commit {
+        git::commit_task_file(
+            &task_path,
+            &format!("Snapshot task {} before run", task_path.display()),
+        )?;
+        println!("committed task snapshot");
+    }
     let outcome = runner::run_task(&config, &route.agent, &task_path, &client).await?;
     println!(
         "processed task={} agent={} glob={} status={:?} recap={}",
@@ -629,7 +636,11 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
         None
     };
     if config.git.auto_commit {
-        git::commit_task_update(&task_path, &outcome.recap_path, notification.as_deref())?;
+        git::commit_task_update(
+            &task_path,
+            &outcome.recap_path,
+            notification.as_deref(),
+        )?;
         println!("committed task update");
     }
 

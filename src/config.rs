@@ -33,6 +33,11 @@ kind = "acp"
 command = "claude"
 args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
 
+[agents.copilot]
+kind = "acp"
+command = "gh"
+args = ["copilot", "suggest", "-t", "shell", "-"]
+
 [git]
 auto_commit = true
 "#;
@@ -302,6 +307,11 @@ mod tests {
                 "--add-dir",
                 "{project}"
             ]
+        );
+        assert_eq!(config.agents["copilot"].command, "gh");
+        assert_eq!(
+            config.agents["copilot"].args,
+            vec!["copilot", "suggest", "-t", "shell", "-"]
         );
         assert!(
             !config.agents["codex"]

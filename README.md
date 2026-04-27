@@ -312,6 +312,11 @@ kind = "acp"
 command = "claude"
 args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
 
+[agents.copilot]
+kind = "acp"
+command = "gh"
+args = ["copilot", "suggest", "-t", "shell", "-"]
+
 [git]
 auto_commit = true
 ```
@@ -321,6 +326,8 @@ For now, `kind = "acp"` means Varda uses its ACP-facing agent abstraction. The c
 When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder.
 
 The generated Claude Code args use `-p` for non-interactive output through stdin/stdout. Varda expands `{project}` in `--add-dir "{project}"` so Claude can access the tracked project while the task file remains in the global Varda control-plane folder.
+
+The generated GitHub Copilot args use `gh copilot suggest -t shell -` to drive the GitHub CLI copilot extension through stdin/stdout. The `-` at the end signals stdin input mode. You must have the `gh` CLI installed with the copilot extension (`gh extension install github/gh-copilot`).
 
 ## Git Behavior
 
