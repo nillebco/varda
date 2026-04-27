@@ -71,6 +71,9 @@ enum TaskCommand {
         /// Treat the task name as a complete one-line task and run it immediately.
         #[arg(long)]
         exec: bool,
+        /// Open the task in $EDITOR before running (only meaningful with --exec).
+        #[arg(long)]
+        edit: bool,
     },
     /// List markdown tasks for a project.
     List {
@@ -140,6 +143,7 @@ async fn main() -> Result<()> {
                 project,
                 agent,
                 exec,
+                edit,
             } => {
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
@@ -165,6 +169,9 @@ async fn main() -> Result<()> {
                     println!("created task {}", task_path.display());
                 }
                 if exec {
+                    if edit {
+                        open_editor(&task_path)?;
+                    }
                     run_task_command(&task_path).await?;
                 } else {
                     open_editor(&task_path)?;
