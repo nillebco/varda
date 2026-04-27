@@ -38,6 +38,11 @@ pub fn commit_task_file(task_path: &Path, message: &str) -> Result<()> {
     let task_arg = repo_relative_path(&repo, task_path)?;
 
     run_git_in(&repo, ["add", task_arg.as_str()]).context("failed to stage task file")?;
+
+    if !has_staged_changes(&repo)? {
+        return Ok(());
+    }
+
     run_git_in(&repo, ["commit", "-m", message]).context("failed to commit task file")?;
 
     Ok(())
@@ -102,6 +107,17 @@ fn repo_relative_path(repo: &Path, path: &Path) -> Result<String> {
         })?;
 
     Ok(relative.display().to_string())
+}
+
+fn has_staged_changes(repo: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--cached", "--quiet"])
+        .output()
+        .context("failed to check staged changes")?;
+    // exit 0 = no diff, exit 1 = has diff
+    Ok(!output.status.success())
 }
 
 fn run_git_in<const N: usize>(repo: &Path, args: [&str; N]) -> Result<()> {
