@@ -1,11 +1,14 @@
 //! ACP transport support.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::time;
 
 use crate::agent::{
     AgentClient, AgentRunRequest, AgentRunResult, build_agent_instructions,
@@ -52,6 +55,7 @@ impl AcpSubprocessClient {
         args: Vec<String>,
         request: &AgentRunRequest,
     ) -> Result<AgentRunResult> {
+        let started_at = SystemTime::now();
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(
                 log_path,
@@ -83,34 +87,40 @@ impl AcpSubprocessClient {
             .context("failed to write task prompt to agent stdin")?;
         drop(stdin);
 
-        let output = child
-            .wait_with_output()
-            .await
-            .context("failed to wait for agent subprocess")?;
+        self.record_external_session(request, started_at);
+
+        let stdout = child.stdout.take().context("failed to open agent stdout")?;
+        let stderr = child.stderr.take().context("failed to open agent stderr")?;
+        let log_path = request.session_log_path.clone();
+        let stdout_log_path = log_path.clone();
+        let stderr_log_path = log_path.clone();
+
+        let stdout_task = collect_stream(stdout, stdout_log_path, "stdout");
+        let stderr_task = collect_stream(stderr, stderr_log_path, "stderr");
+        let wait_task = async {
+            child
+                .wait()
+                .await
+                .context("failed to wait for agent subprocess")
+        };
+        let (stdout, stderr, status) = tokio::try_join!(stdout_task, stderr_task, wait_task)
+            .context("failed while waiting for agent subprocess")?;
 
         if let Some(log_path) = request.session_log_path.as_deref() {
-            let _ = append_session_log(
-                log_path,
-                &format!(
-                    "\nstatus={}\n\nstdout:\n{}\n\nstderr:\n{}\n",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            );
+            let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
         }
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr);
             bail!(
                 "agent '{}' exited with status {}; stderr: {}",
                 self.agent_name,
-                output.status,
+                status,
                 stderr.trim()
             );
         }
 
-        let recap = String::from_utf8(output.stdout)
+        let recap = String::from_utf8(stdout)
             .context("agent stdout was not valid UTF-8")?
             .trim()
             .to_owned();
@@ -125,6 +135,86 @@ impl AcpSubprocessClient {
             recap,
         })
     }
+
+    fn record_external_session(&self, request: &AgentRunRequest, started_at: SystemTime) {
+        if self.command != "claude" {
+            return;
+        }
+
+        let Some(log_path) = request.session_log_path.as_deref() else {
+            return;
+        };
+        let Some(project) = request.frontmatter.project.as_deref() else {
+            return;
+        };
+
+        let log_path = log_path.to_owned();
+        let project = project.to_owned();
+        let varda_session_id = request.session_id.clone();
+
+        tokio::spawn(async move {
+            record_claude_external_session(log_path, project, varda_session_id, started_at).await;
+        });
+    }
+}
+
+async fn record_claude_external_session(
+    log_path: String,
+    project: String,
+    varda_session_id: String,
+    started_at: SystemTime,
+) {
+    for _ in 0..20 {
+        if let Some(transcript) = find_claude_transcript(&project, &varda_session_id, started_at) {
+            let session_id = transcript
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("unknown");
+            let _ = append_session_log(
+                &log_path,
+                &format!(
+                    "external_session_id={session_id}\nexternal_session_log={}\n",
+                    transcript.display()
+                ),
+            );
+            return;
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn collect_stream<R>(
+    mut stream: R,
+    log_path: Option<String>,
+    label: &'static str,
+) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut wrote_header = false;
+
+    loop {
+        let bytes_read = stream
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("failed to read agent {label}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        output.extend_from_slice(&buffer[..bytes_read]);
+        if let Some(log_path) = log_path.as_deref() {
+            if !wrote_header {
+                let _ = append_session_log(log_path, &format!("\n{label}:\n"));
+                wrote_header = true;
+            }
+            let _ = append_session_log(log_path, &String::from_utf8_lossy(&buffer[..bytes_read]));
+        }
+    }
+
+    Ok(output)
 }
 
 fn load_project_instructions(project: &str) -> String {
@@ -252,6 +342,49 @@ fn expand_arg(arg: &str, request: &AgentRunRequest, project: &str) -> String {
         .replace("{task}", &request.task_path)
 }
 
+fn find_claude_transcript(
+    project: &str,
+    varda_session_id: &str,
+    started_at: SystemTime,
+) -> Option<PathBuf> {
+    let project_dir = claude_project_dir(project)?;
+    let entries = std::fs::read_dir(project_dir).ok()?;
+    let mut matches = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified < started_at {
+            continue;
+        }
+
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if content.contains(varda_session_id) {
+            matches.push((modified, path));
+        }
+    }
+
+    matches.sort_by(|left, right| right.0.cmp(&left.0));
+    matches.into_iter().map(|(_, path)| path).next()
+}
+
+fn claude_project_dir(project: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let slug = project.replace('/', "-");
+    Some(Path::new(&home).join(".claude/projects").join(slug))
+}
+
 fn append_session_log(path: &str, content: &str) -> Result<()> {
     use std::io::Write;
 
@@ -325,6 +458,52 @@ mod tests {
         assert!(result.recap.contains("You have at most 10 minutes"));
         assert!(result.recap.contains("Do it."));
         assert!(!result.requires_user);
+    }
+
+    #[tokio::test]
+    async fn subprocess_client_streams_stdout_and_stderr_to_session_log() {
+        let root = std::env::temp_dir().join(format!("varda-acp-log-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp directory should be created");
+        let log_path = root.join("session.log");
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf 'recap line\\n'; printf 'diagnostic line\\n' >&2".to_owned(),
+            ],
+        };
+        let client = AcpSubprocessClient::new("shell", &config);
+
+        let result = client
+            .run_task(AgentRunRequest {
+                agent_name: "shell".to_owned(),
+                task_path: "task.md".to_owned(),
+                frontmatter: TaskFrontmatter {
+                    id: None,
+                    status: TaskStatus::Ready,
+                    project: Some("/work/project".to_owned()),
+                    assignee: Some("shell".to_owned()),
+                    recap: None,
+                    recaps: vec![],
+                    plan: None,
+                    agent_session_id: None,
+                    agent_session_log: None,
+                    requires_user: false,
+                },
+                body: "# Task\n\nDo it.".to_owned(),
+                timeout: Duration::from_secs(600),
+                session_id: "session-1".to_owned(),
+                session_log_path: Some(log_path.display().to_string()),
+            })
+            .await
+            .expect("subprocess should run");
+
+        let log = std::fs::read_to_string(&log_path).expect("session log should be readable");
+        assert_eq!(result.recap, "recap line");
+        assert!(log.contains("stdout:\nrecap line"));
+        assert!(log.contains("stderr:\ndiagnostic line"));
+        assert!(log.contains("status=exit status: 0"));
     }
 
     #[test]

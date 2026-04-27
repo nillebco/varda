@@ -40,12 +40,14 @@ pub async fn run_task(
         );
     }
 
-    task.set_status(TaskStatus::Running);
-    write_task(&task)?;
-
     let timeout = Duration::from_secs(config.defaults.timeout_seconds);
     let session_id = Uuid::new_v4().to_string();
     let session_log_path = session_log_path(config, &session_id);
+    task.set_status(TaskStatus::Running);
+    task.frontmatter.agent_session_id = Some(session_id.clone());
+    task.frontmatter.agent_session_log = Some(session_log_path.display().to_string());
+    write_task(&task)?;
+
     write_session_log(
         &session_log_path,
         &format!(
@@ -102,8 +104,6 @@ pub async fn run_task(
 
     let recap_path = write_recap(config, task_path, &result.recap)?;
     task.set_recap(recap_path.display().to_string());
-    task.frontmatter.agent_session_id = Some(session_id);
-    task.frontmatter.agent_session_log = Some(session_log_path.display().to_string());
     task.frontmatter.requires_user = result.requires_user;
 
     let status = if result.requires_user {

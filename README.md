@@ -354,7 +354,7 @@ agent_session_id: 2f6f0f2c-7ad9-4d78-b5b6-66a9eddfce54
 agent_session_log: /home/user/.varda/operations/runs/2f6f0f2c-7ad9-4d78-b5b6-66a9eddfce54.log
 ```
 
-If the agent process fails or times out, the synthetic failure recap includes the session ID and a link to that log file.
+Varda writes these fields before launching the agent, so an interrupted runner still leaves a resumable run pointer on the task. For Claude Code runs, Varda also records the discovered Claude transcript as `external_session_id` and `external_session_log` inside the session log when it can match the generated Claude JSONL file. While the agent runs, stdout and stderr are streamed into the session log instead of being buffered until process exit. If the agent process fails or times out, the synthetic failure recap includes the session ID and a link to that log file.
 
 ## Configuration
 
