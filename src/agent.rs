@@ -62,7 +62,7 @@ pub fn build_agent_instructions(timeout: Duration) -> String {
 
 You have at most {minutes} minutes.
 
-Follow any instructions in CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder.
+Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder. When those files are present, Varda includes their contents below as Project instructions; treat them as mandatory task requirements.
 
 Before the time limit expires, produce a concise recap for the end user.
 The recap must include:
@@ -116,6 +116,9 @@ mod tests {
 
         assert!(instructions.contains("at most 10 minutes"));
         assert!(instructions.contains("produce a concise recap"));
+        assert!(instructions.contains("Project instructions"));
+        assert!(instructions.contains("Files touched"));
+        assert!(instructions.contains("absolute file path"));
         assert!(instructions.contains("requires_user"));
     }
 

@@ -69,10 +69,11 @@ The important files are:
 13. Varda marks the task as `running`.
 14. Varda starts the configured agent.
 15. The agent has at most 10 minutes to work.
-16. The agent must produce a recap before it finishes.
-17. Varda writes the recap under the global operations folder.
-18. Varda updates the original task to `pending`, `needs_user`, or `failed`.
-19. Varda commits the task update and recap with git.
+16. The agent must follow project instructions from `CLAUDE.md`, `AGENTS.md`, and `copilot-instructions.md` when those files exist.
+17. The agent must produce a recap before it finishes, including a `Files touched` section that lists every created, modified, or deleted file as an absolute path.
+18. Varda writes the recap under the global operations folder.
+19. Varda updates the original task to `pending`, `needs_user`, or `failed`.
+20. Varda commits the task update and recap with git.
 
 ## Add Project Routes
 
@@ -303,6 +304,7 @@ The agent is instructed to finish with a recap that includes:
 - blockers
 - whether user interaction is required
 - a suggested next agent, if useful
+- a `Files touched` section with one absolute file path per created, modified, or deleted file, or `(none)` when no files changed
 
 If the agent needs user input, it should include this exact marker in its recap:
 
