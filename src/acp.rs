@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::agent::{AgentClient, AgentRunRequest, AgentRunResult, build_agent_instructions, build_planning_instructions};
+use crate::agent::{
+    AgentClient, AgentRunRequest, AgentRunResult, build_agent_instructions,
+    build_planning_instructions,
+};
 use crate::config::AgentConfig;
 
 #[derive(Debug, Clone)]

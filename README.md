@@ -342,6 +342,28 @@ For a task that needs user input, the commit also includes:
 
 - a notification JSON file under the global `operations/runs/` folder
 
+## Install The Claude Code Skill
+
+Varda ships a Claude Code skill that lets any agent session manage tasks with natural language. Install it from the varda project directory:
+
+```sh
+varda skill install
+```
+
+This copies `skills/varda/SKILL.md` to `~/.claude/skills/varda/SKILL.md`. Pass `--link` to create a symlink instead so the skill stays in sync with the repository:
+
+```sh
+varda skill install --link
+```
+
+You can also point to a specific source file:
+
+```sh
+varda skill install /path/to/SKILL.md
+```
+
+Once installed, start any Claude Code session and use `/varda` to trigger the skill. The skill exposes all Varda commands (`task add`, `task list`, `task run`, `task show`, `task resume`, `plan`, `project add`).
+
 ## Development
 
 Run tests:

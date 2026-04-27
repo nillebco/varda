@@ -54,6 +54,11 @@ enum Command {
         #[command(subcommand)]
         command: ShowCommand,
     },
+    /// Manage Claude Code skills.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -121,6 +126,18 @@ enum ProjectCommand {
         /// Allowed agents for this project route. Accepts comma-separated values.
         #[arg(long, value_delimiter = ',', required = true)]
         agents: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// Install the Varda skill into the user-level Claude Code skills directory.
+    Install {
+        /// Path to the SKILL.md file. Defaults to skills/varda/SKILL.md in the current directory.
+        source: Option<PathBuf>,
+        /// Create a symbolic link instead of copying the skill file.
+        #[arg(long)]
+        link: bool,
     },
 }
 
@@ -216,6 +233,11 @@ async fn main() -> Result<()> {
                     glob,
                     agents.join(",")
                 );
+            }
+        },
+        Command::Skill { command } => match command {
+            SkillCommand::Install { source, link } => {
+                skill_install_command(source.as_deref(), link)?;
             }
         },
     }
@@ -661,11 +683,7 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
         None
     };
     if config.git.auto_commit {
-        git::commit_task_update(
-            &task_path,
-            &outcome.recap_path,
-            notification.as_deref(),
-        )?;
+        git::commit_task_update(&task_path, &outcome.recap_path, notification.as_deref())?;
         println!("committed task update");
     }
 
@@ -758,6 +776,54 @@ fn open_editor(path: &Path) -> Result<()> {
 
     if !status.success() {
         anyhow::bail!("editor '{editor}' exited with status {status}");
+    }
+
+    Ok(())
+}
+
+fn skill_install_command(source: Option<&Path>, link: bool) -> Result<()> {
+    let source = if let Some(s) = source {
+        s.to_path_buf()
+    } else {
+        std::env::current_dir()?.join("skills/varda/SKILL.md")
+    };
+
+    if !source.exists() {
+        anyhow::bail!(
+            "skill source not found at {}; run this command from the varda project directory or pass the path explicitly",
+            source.display()
+        );
+    }
+
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    let dest_dir = PathBuf::from(format!("{home}/.claude/skills/varda"));
+    let dest = dest_dir.join("SKILL.md");
+
+    fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("failed to create skills directory {}", dest_dir.display()))?;
+
+    if dest.symlink_metadata().is_ok() {
+        fs::remove_file(&dest)
+            .with_context(|| format!("failed to remove existing skill at {}", dest.display()))?;
+    }
+
+    if link {
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", source.display()))?;
+        std::os::unix::fs::symlink(&source, &dest).with_context(|| {
+            format!(
+                "failed to create symlink {} -> {}",
+                dest.display(),
+                source.display()
+            )
+        })?;
+        println!("linked {} -> {}", dest.display(), source.display());
+    } else {
+        fs::copy(&source, &dest).with_context(|| {
+            format!("failed to copy {} to {}", source.display(), dest.display())
+        })?;
+        println!("installed {} -> {}", source.display(), dest.display());
     }
 
     Ok(())

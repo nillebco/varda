@@ -124,16 +124,14 @@ The glob pattern matches the project path during task routing.
 
 ## Installation
 
-To make this skill available from any Claude Code session, install it to the user-level skills directory:
+To make this skill available from any Claude Code session, run from the varda project directory:
 
 ```bash
-mkdir -p ~/.claude/skills/varda
-cp /Users/nilleb/dev/nillebco/varda/skills/varda/SKILL.md ~/.claude/skills/varda/SKILL.md
+varda skill install
 ```
 
-Or create a symlink so it stays in sync automatically:
+Pass `--link` to symlink instead of copy so the skill stays in sync with the repository:
 
 ```bash
-mkdir -p ~/.claude/skills/varda
-ln -sf /Users/nilleb/dev/nillebco/varda/skills/varda/SKILL.md ~/.claude/skills/varda/SKILL.md
+varda skill install --link
 ```

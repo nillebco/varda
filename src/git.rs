@@ -44,8 +44,7 @@ pub fn commit_task_plan(task_path: &Path, plan_path: &Path) -> Result<()> {
         .context("failed to stage task plan")?;
 
     let message = format!("Plan task {}", task_path.display());
-    run_git_in(&repo, ["commit", "-m", message.as_str()])
-        .context("failed to commit task plan")?;
+    run_git_in(&repo, ["commit", "-m", message.as_str()]).context("failed to commit task plan")?;
 
     Ok(())
 }
