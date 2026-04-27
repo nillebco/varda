@@ -26,6 +26,30 @@ pub struct AgentRunResult {
 #[async_trait]
 pub trait AgentClient {
     async fn run_task(&self, request: AgentRunRequest) -> Result<AgentRunResult>;
+
+    async fn plan_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
+        self.run_task(request).await
+    }
+}
+
+pub fn build_planning_instructions(timeout: Duration) -> String {
+    let minutes = timeout.as_secs() / 60;
+
+    format!(
+        r#"You are producing an execution plan for a task managed by Varda.
+
+You have at most {minutes} minutes.
+
+Analyze the task and produce a structured plan. Do NOT execute the task.
+
+Your plan must include:
+- A brief summary of what the task requires
+- Numbered implementation steps in execution order
+- Potential blockers or risks for each step
+- Any open questions or ambiguities that should be resolved before starting
+
+Format the plan as markdown starting with a `# Plan` heading."#
+    )
 }
 
 pub fn build_agent_instructions(timeout: Duration) -> String {
@@ -111,6 +135,7 @@ mod tests {
                     project: Some("/work/project".to_owned()),
                     assignee: Some("codex".to_owned()),
                     recap: None,
+                    plan: None,
                     requires_user: false,
                 },
                 body: "# Task".to_owned(),

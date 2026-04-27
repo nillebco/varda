@@ -33,6 +33,23 @@ pub fn commit_task_update(
     Ok(())
 }
 
+pub fn commit_task_plan(task_path: &Path, plan_path: &Path) -> Result<()> {
+    let repo = repo_root_for_path(task_path)?;
+    ensure_same_repo(&repo, plan_path)?;
+
+    let task_arg = repo_relative_path(&repo, task_path)?;
+    let plan_arg = repo_relative_path(&repo, plan_path)?;
+
+    run_git_in(&repo, ["add", task_arg.as_str(), plan_arg.as_str()])
+        .context("failed to stage task plan")?;
+
+    let message = format!("Plan task {}", task_path.display());
+    run_git_in(&repo, ["commit", "-m", message.as_str()])
+        .context("failed to commit task plan")?;
+
+    Ok(())
+}
+
 pub fn commit_task_file(task_path: &Path, message: &str) -> Result<()> {
     let repo = repo_root_for_path(task_path)?;
     let task_arg = repo_relative_path(&repo, task_path)?;

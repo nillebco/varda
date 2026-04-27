@@ -86,6 +86,11 @@ enum TaskCommand {
         /// Markdown task file or task id to process.
         task: PathBuf,
     },
+    /// Generate an agent-driven plan for a task and open it in $EDITOR.
+    Plan {
+        /// Markdown task file or task id to plan.
+        task: PathBuf,
+    },
     /// Resume a task that is waiting for user input, then run it.
     Resume {
         /// Markdown task file or task id to resume.
@@ -186,6 +191,9 @@ async fn main() -> Result<()> {
             }
             TaskCommand::Run { task } => {
                 run_task_command(&task).await?;
+            }
+            TaskCommand::Plan { task } => {
+                plan_task_command(&task).await?;
             }
             TaskCommand::Resume { task } => {
                 resume_task_command(&task).await?;
@@ -661,6 +669,37 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
         println!("committed task update");
     }
 
+    Ok(())
+}
+
+async fn plan_task_command(task_path: &Path) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let task_path = task::resolve_task_reference(&config, task_path)?;
+    let task_document = task::load_task(&task_path)?;
+    let project_path = task::task_project_path(&task_document)?;
+    let route = routing::match_route(
+        &config,
+        &project_path,
+        task_document.frontmatter.assignee.as_deref(),
+    )?;
+    let agent_config = config
+        .agents
+        .get(&route.agent)
+        .expect("routing ensures the selected agent exists");
+    let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
+    let outcome = runner::plan_task(&config, &route.agent, &task_path, &client).await?;
+    println!(
+        "plan generated task={} agent={} plan={}",
+        task_path.display(),
+        route.agent,
+        outcome.plan_path.display()
+    );
+    open_editor(&outcome.plan_path)?;
+    if config.git.auto_commit {
+        git::commit_task_plan(&task_path, &outcome.plan_path)?;
+        println!("committed task plan");
+    }
     Ok(())
 }
 

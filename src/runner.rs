@@ -18,6 +18,11 @@ pub struct RunOutcome {
     pub recap_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanOutcome {
+    pub plan_path: PathBuf,
+}
+
 pub async fn run_task(
     config: &Config,
     agent_name: &str,
@@ -85,6 +90,65 @@ pub async fn run_task(
     write_task(&task)?;
 
     Ok(RunOutcome { status, recap_path })
+}
+
+pub async fn plan_task(
+    config: &Config,
+    agent_name: &str,
+    task_path: &Path,
+    client: &(impl AgentClient + Sync),
+) -> Result<PlanOutcome> {
+    let mut task = load_task(task_path)?;
+
+    let timeout = Duration::from_secs(config.defaults.timeout_seconds);
+    let request = AgentRunRequest {
+        agent_name: agent_name.to_owned(),
+        task_path: task_path.display().to_string(),
+        frontmatter: task.frontmatter.clone(),
+        body: task.body.clone(),
+        timeout,
+    };
+
+    let result = match time::timeout(timeout, client.plan_task(request)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => AgentRunResult {
+            recap: format!(
+                "# Planning Failed\n\nThe agent failed while planning `{}`.\n\nError: {error}",
+                task_path.display()
+            ),
+            requires_user: false,
+            suggested_agent: None,
+        },
+        Err(_) => AgentRunResult {
+            recap: format!(
+                "# Planning Timed Out\n\nThe agent exceeded the configured {} second limit while planning `{}`.",
+                config.defaults.timeout_seconds,
+                task_path.display()
+            ),
+            requires_user: false,
+            suggested_agent: None,
+        },
+    };
+
+    let plan_path = write_plan(config, task_path, &result.recap)?;
+    task.set_plan(plan_path.display().to_string());
+    write_task(&task)?;
+
+    Ok(PlanOutcome { plan_path })
+}
+
+fn write_plan(config: &Config, task_path: &Path, plan: &str) -> Result<PathBuf> {
+    let plan_dir = Path::new(&config.defaults.operations_dir).join("plans");
+    fs::create_dir_all(&plan_dir)
+        .with_context(|| format!("failed to create plan directory {}", plan_dir.display()))?;
+    let stem = task_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("task");
+    let plan_path = plan_dir.join(format!("{stem}-plan.md"));
+    fs::write(&plan_path, plan)
+        .with_context(|| format!("failed to write plan at {}", plan_path.display()))?;
+    Ok(plan_path)
 }
 
 fn write_recap(config: &Config, recap: &str) -> Result<PathBuf> {

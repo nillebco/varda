@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::agent::{AgentClient, AgentRunRequest, AgentRunResult, build_agent_instructions};
+use crate::agent::{AgentClient, AgentRunRequest, AgentRunResult, build_agent_instructions, build_planning_instructions};
 use crate::config::AgentConfig;
 
 #[derive(Debug, Clone)]
@@ -32,6 +32,18 @@ impl AgentClient for AcpSubprocessClient {
     async fn run_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
         let prompt = build_prompt(&request);
         let args = args_for_request(&self.args, &request);
+        self.execute(prompt, args).await
+    }
+
+    async fn plan_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
+        let prompt = build_planning_prompt(&request);
+        let args = args_for_request(&self.args, &request);
+        self.execute(prompt, args).await
+    }
+}
+
+impl AcpSubprocessClient {
+    async fn execute(&self, prompt: String, args: Vec<String>) -> Result<AgentRunResult> {
         let mut child = Command::new(&self.command)
             .args(&args)
             .stdin(Stdio::piped())
@@ -115,6 +127,47 @@ fn build_prompt(request: &AgentRunRequest) -> String {
         format!("\n## Project instructions\n\n{project_instructions}\n")
     };
 
+    let plan_section = request
+        .frontmatter
+        .plan
+        .as_deref()
+        .and_then(|plan_path| std::fs::read_to_string(plan_path).ok())
+        .map(|content| format!("\n## Task plan\n\n{content}\n"))
+        .unwrap_or_default();
+
+    format!(
+        r#"{instructions}{instructions_section}{plan_section}
+Agent: {agent}
+Task path: {task_path}
+Task frontmatter:
+{frontmatter}
+
+Task markdown:
+{body}
+"#,
+        instructions = build_agent_instructions(request.timeout),
+        agent = request.agent_name,
+        task_path = request.task_path,
+        frontmatter = serde_yaml::to_string(&request.frontmatter)
+            .unwrap_or_else(|_| "<frontmatter serialization failed>".to_owned()),
+        body = request.body,
+    )
+}
+
+fn build_planning_prompt(request: &AgentRunRequest) -> String {
+    let project_instructions = request
+        .frontmatter
+        .project
+        .as_deref()
+        .map(load_project_instructions)
+        .unwrap_or_default();
+
+    let instructions_section = if project_instructions.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Project instructions\n\n{project_instructions}\n")
+    };
+
     format!(
         r#"{instructions}{instructions_section}
 Agent: {agent}
@@ -125,7 +178,7 @@ Task frontmatter:
 Task markdown:
 {body}
 "#,
-        instructions = build_agent_instructions(request.timeout),
+        instructions = build_planning_instructions(request.timeout),
         agent = request.agent_name,
         task_path = request.task_path,
         frontmatter = serde_yaml::to_string(&request.frontmatter)
@@ -202,6 +255,7 @@ mod tests {
                     project: Some("/work/project".to_owned()),
                     assignee: Some("echo".to_owned()),
                     recap: None,
+                    plan: None,
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
@@ -234,6 +288,7 @@ mod tests {
                 project: Some("/work/project".to_owned()),
                 assignee: Some("codex".to_owned()),
                 recap: None,
+                plan: None,
                 requires_user: false,
             },
             body: "# Task".to_owned(),
@@ -276,6 +331,7 @@ mod tests {
                 project: Some("/work/project".to_owned()),
                 assignee: Some("claude".to_owned()),
                 recap: None,
+                plan: None,
                 requires_user: false,
             },
             body: "# Task".to_owned(),

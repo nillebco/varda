@@ -37,6 +37,8 @@ pub struct TaskFrontmatter {
     pub assignee: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recap: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
     #[serde(default)]
     pub requires_user: bool,
 }
@@ -70,6 +72,10 @@ impl TaskDocument {
 
     pub fn set_recap(&mut self, recap: impl Into<String>) {
         self.frontmatter.recap = Some(recap.into());
+    }
+
+    pub fn set_plan(&mut self, plan: impl Into<String>) {
+        self.frontmatter.plan = Some(plan.into());
     }
 }
 
@@ -118,6 +124,7 @@ pub fn create_task(
             project: Some(project_path.display().to_string()),
             assignee: assignee.map(str::to_owned),
             recap: None,
+            plan: None,
             requires_user: false,
         },
         body: format!("# {taskname}\n\n"),
@@ -492,6 +499,7 @@ Do the work.
                 project: None,
                 assignee: Some("codex".to_owned()),
                 recap: None,
+                plan: None,
                 requires_user: false,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
@@ -518,6 +526,7 @@ Do the work.
                 project: None,
                 assignee: Some("codex".to_owned()),
                 recap: Some(".varda/operations/recaps/run.md".to_owned()),
+                plan: None,
                 requires_user: false,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
