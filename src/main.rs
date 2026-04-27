@@ -679,9 +679,6 @@ async fn resume_task_command(task_path: &Path) -> Result<()> {
         open_editor(&task_path)?;
     }
 
-    git::commit_task_file(&task_path, &format!("Resume task {}", task_path.display()))?;
-    println!("committed resume update");
-
     run_task_command(&task_path).await
 }
 
