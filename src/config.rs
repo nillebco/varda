@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -116,6 +117,7 @@ pub fn init_workspace(force: bool) -> Result<InitResult> {
 
     fs::create_dir_all(&home)
         .with_context(|| format!("failed to create Varda home {}", home.display()))?;
+    ensure_git_repo(&home)?;
     fs::create_dir_all(&tasks_dir).context("failed to create tasks directory")?;
     fs::create_dir_all(&recaps_dir).context("failed to create recaps directory")?;
     fs::create_dir_all(&runs_dir).context("failed to create runs directory")?;
@@ -134,6 +136,29 @@ pub fn init_workspace(force: bool) -> Result<InitResult> {
         config_path: config_path.display().to_string(),
         operations_dir: operations_dir.display().to_string(),
     })
+}
+
+fn ensure_git_repo(path: &Path) -> Result<()> {
+    if path.join(".git").exists() {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .arg("init")
+        .arg(path)
+        .output()
+        .with_context(|| format!("failed to start git init for {}", path.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "git init {} failed with status {}; stderr: {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
 }
 
 pub fn varda_home() -> Result<PathBuf> {
@@ -271,5 +296,19 @@ mod tests {
             config.defaults.operations_dir,
             root.join("operations").display().to_string()
         );
+    }
+
+    #[test]
+    fn initializes_git_repo_when_needed() {
+        let root = std::env::temp_dir().join(format!("varda-git-init-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("old test directory should be removed");
+        }
+        fs::create_dir_all(&root).expect("test directory should be created");
+
+        ensure_git_repo(&root).expect("git repo should initialize");
+
+        assert!(root.join(".git").exists());
+        fs::remove_dir_all(root).expect("test directory should be removed");
     }
 }

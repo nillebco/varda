@@ -34,6 +34,7 @@ The folder looks like this:
 
 ```text
 $HOME/.varda/
+  .git/
   config.toml
   operations/
     tasks/
@@ -47,6 +48,8 @@ The important files are:
 - `$VARDA_HOME/operations/tasks/`: where Varda stores markdown task files.
 - `$VARDA_HOME/operations/recaps/`: where agent recaps are written.
 - `$VARDA_HOME/operations/runs/`: where notification records are written.
+
+`varda init` also runs `git init` in the control-plane folder. This matters because `varda run` commits task updates, recaps, and notifications into that repository.
 
 ## The Basic Flow
 
