@@ -65,6 +65,9 @@ enum TaskCommand {
         /// Project path this task belongs to. Defaults to the current directory.
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Agent to assign the task to. Skips the interactive assignee prompt.
+        #[arg(long)]
+        agent: Option<String>,
         /// Treat the task name as a complete one-line task and run it immediately.
         #[arg(long)]
         exec: bool,
@@ -135,17 +138,24 @@ async fn main() -> Result<()> {
             TaskCommand::Add {
                 taskname,
                 project,
+                agent,
                 exec,
             } => {
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
-                let default_route = routing::match_route(&config, &project_path, None)?;
-                let default_assignee = default_route.agent;
-                let assignee = prompt_assignee(&default_assignee)?;
-                if let Some(assignee) = assignee.as_deref() {
-                    routing::match_route(&config, &project_path, Some(assignee))?;
-                }
+                let assignee = if let Some(ref agent_name) = agent {
+                    routing::match_route(&config, &project_path, Some(agent_name))?;
+                    Some(agent_name.clone())
+                } else {
+                    let default_route = routing::match_route(&config, &project_path, None)?;
+                    let default_assignee = default_route.agent;
+                    let assignee = prompt_assignee(&default_assignee)?;
+                    if let Some(assignee) = assignee.as_deref() {
+                        routing::match_route(&config, &project_path, Some(assignee))?;
+                    }
+                    assignee
+                };
                 let task_path =
                     task::create_task(&config, &taskname, &project_path, assignee.as_deref())?;
                 let task_id = task::load_task(&task_path)?.frontmatter.id;
