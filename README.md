@@ -22,10 +22,18 @@ After that, the docs assume you can run `varda` directly.
 varda init
 ```
 
-This creates the Varda operations folder:
+This creates the global Varda control-plane folder.
+
+Varda uses `$VARDA_HOME` when it is set. Otherwise it uses:
 
 ```text
-.varda/
+$HOME/.varda
+```
+
+The folder looks like this:
+
+```text
+$HOME/.varda/
   config.toml
   operations/
     tasks/
@@ -35,10 +43,10 @@ This creates the Varda operations folder:
 
 The important files are:
 
-- `.varda/config.toml`: tells Varda which agents are allowed for which project paths.
-- `.varda/operations/tasks/`: where you put markdown task files.
-- `.varda/operations/recaps/`: where agent recaps are written.
-- `.varda/operations/runs/`: where notification records are written.
+- `$VARDA_HOME/config.toml` or `$HOME/.varda/config.toml`: tells Varda which agents are allowed for which project paths.
+- `$VARDA_HOME/operations/tasks/`: where Varda stores markdown task files.
+- `$VARDA_HOME/operations/recaps/`: where agent recaps are written.
+- `$VARDA_HOME/operations/runs/`: where notification records are written.
 
 ## The Basic Flow
 
@@ -49,13 +57,13 @@ The important files are:
 5. Varda creates the task file and opens it in `$EDITOR`.
 6. Write the task details and save the file.
 7. Run `varda run path/to/task.md`.
-8. Varda finds the matching project route in `.varda/config.toml`.
+8. Varda finds the matching project route in the global config.
 9. Varda verifies the assignee is allowed for that project.
 10. Varda marks the task as `running`.
 11. Varda starts the configured agent.
 12. The agent has at most 10 minutes to work.
 13. The agent must produce a recap before it finishes.
-14. Varda writes the recap under `.varda/operations/recaps/`.
+14. Varda writes the recap under the global operations folder.
 15. Varda updates the original task to `pending`, `needs_user`, or `failed`.
 16. Varda commits the task update and recap with git.
 
@@ -77,7 +85,7 @@ Add another project route with:
 varda project add "/some/project/path/**" --agents codex,claude
 ```
 
-The agents listed in `--agents` must already exist in `.varda/config.toml`.
+The agents listed in `--agents` must already exist in the global config.
 
 Routes are checked in order. Put more specific project routes before broad catch-all routes when you edit the config manually.
 
@@ -123,20 +131,22 @@ Add the task details under the heading, then save and quit your editor.
 Tasks are stored in the Varda operations folder:
 
 ```text
-.varda/operations/tasks/
+$VARDA_HOME/operations/tasks/
 ```
 
 For the example above, the file is:
 
 ```text
-.varda/operations/tasks/summarize-this-project.md
+$VARDA_HOME/operations/tasks/summarize-this-project.md
 ```
 
 Then run:
 
 ```sh
-varda run .varda/operations/tasks/summarize-this-project.md
+varda run "$HOME/.varda/operations/tasks/summarize-this-project.md"
 ```
+
+If you set `VARDA_HOME`, use that path instead.
 
 When `varda run` starts, it reads the task's `project` field and uses that path to select the route and allowed agents.
 
@@ -180,12 +190,12 @@ Varda uses that marker to set the task status to `needs_user` and write a notifi
 
 ## Configuration
 
-The default `.varda/config.toml` looks like this:
+The default global config looks like this:
 
 ```toml
 [defaults]
 timeout_seconds = 600
-operations_dir = ".varda/operations"
+operations_dir = "operations"
 
 [[routes]]
 glob = "**"
@@ -213,7 +223,7 @@ For a normal task, the commit includes:
 
 For a task that needs user input, the commit also includes:
 
-- a notification JSON file under `.varda/operations/runs/`
+- a notification JSON file under the global `operations/runs/` folder
 
 ## Development
 

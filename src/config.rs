@@ -1,25 +1,22 @@
 //! Varda configuration loading and initialization.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub const VARDA_DIR: &str = ".varda";
-pub const CONFIG_FILE: &str = ".varda/config.toml";
-pub const OPERATIONS_DIR: &str = ".varda/operations";
-pub const TASKS_DIR: &str = ".varda/operations/tasks";
-pub const RECAPS_DIR: &str = ".varda/operations/recaps";
-pub const RUNS_DIR: &str = ".varda/operations/runs";
-pub const OPERATIONS_README: &str = ".varda/operations/README.md";
-const TASKS_KEEP: &str = ".varda/operations/tasks/.gitkeep";
-const RECAPS_KEEP: &str = ".varda/operations/recaps/.gitkeep";
-const RUNS_KEEP: &str = ".varda/operations/runs/.gitkeep";
+pub const VARDA_HOME_ENV: &str = "VARDA_HOME";
+pub const CONFIG_FILENAME: &str = "config.toml";
+pub const OPERATIONS_DIRNAME: &str = "operations";
+pub const TASKS_DIRNAME: &str = "tasks";
+pub const RECAPS_DIRNAME: &str = "recaps";
+pub const RUNS_DIRNAME: &str = "runs";
+pub const OPERATIONS_README: &str = "README.md";
 
 const DEFAULT_CONFIG: &str = r#"[defaults]
 timeout_seconds = 600
-operations_dir = ".varda/operations"
+operations_dir = "operations"
 
 [[routes]]
 glob = "**"
@@ -102,39 +99,65 @@ pub struct InitResult {
 }
 
 pub fn init_workspace(force: bool) -> Result<InitResult> {
-    let config_path = Path::new(CONFIG_FILE);
+    let home = varda_home()?;
+    let config_path = home.join(CONFIG_FILENAME);
+    let operations_dir = home.join(OPERATIONS_DIRNAME);
+    let tasks_dir = operations_dir.join(TASKS_DIRNAME);
+    let recaps_dir = operations_dir.join(RECAPS_DIRNAME);
+    let runs_dir = operations_dir.join(RUNS_DIRNAME);
+    let operations_readme = operations_dir.join(OPERATIONS_README);
 
     if config_path.exists() && !force {
-        bail!("{CONFIG_FILE} already exists; pass --force to overwrite it");
+        bail!(
+            "{} already exists; pass --force to overwrite it",
+            config_path.display()
+        );
     }
 
-    fs::create_dir_all(VARDA_DIR).context("failed to create .varda directory")?;
-    fs::create_dir_all(TASKS_DIR).context("failed to create tasks directory")?;
-    fs::create_dir_all(RECAPS_DIR).context("failed to create recaps directory")?;
-    fs::create_dir_all(RUNS_DIR).context("failed to create runs directory")?;
+    fs::create_dir_all(&home)
+        .with_context(|| format!("failed to create Varda home {}", home.display()))?;
+    fs::create_dir_all(&tasks_dir).context("failed to create tasks directory")?;
+    fs::create_dir_all(&recaps_dir).context("failed to create recaps directory")?;
+    fs::create_dir_all(&runs_dir).context("failed to create runs directory")?;
 
-    fs::write(CONFIG_FILE, DEFAULT_CONFIG).context("failed to write default config")?;
-    ensure_keep_file(TASKS_KEEP)?;
-    ensure_keep_file(RECAPS_KEEP)?;
-    ensure_keep_file(RUNS_KEEP)?;
+    fs::write(&config_path, DEFAULT_CONFIG).context("failed to write default config")?;
+    ensure_keep_file(&tasks_dir.join(".gitkeep"))?;
+    ensure_keep_file(&recaps_dir.join(".gitkeep"))?;
+    ensure_keep_file(&runs_dir.join(".gitkeep"))?;
 
-    if !Path::new(OPERATIONS_README).exists() || force {
-        fs::write(OPERATIONS_README, OPERATIONS_README_CONTENT)
+    if !operations_readme.exists() || force {
+        fs::write(&operations_readme, OPERATIONS_README_CONTENT)
             .context("failed to write operations README")?;
     }
 
     Ok(InitResult {
-        config_path: CONFIG_FILE.to_owned(),
-        operations_dir: OPERATIONS_DIR.to_owned(),
+        config_path: config_path.display().to_string(),
+        operations_dir: operations_dir.display().to_string(),
     })
+}
+
+pub fn varda_home() -> Result<PathBuf> {
+    if let Ok(home) = std::env::var(VARDA_HOME_ENV) {
+        if !home.trim().is_empty() {
+            return Ok(PathBuf::from(home));
+        }
+    }
+
+    let home = std::env::var("HOME").context("HOME is not set and VARDA_HOME was not provided")?;
+    Ok(PathBuf::from(home).join(".varda"))
+}
+
+pub fn config_file() -> Result<PathBuf> {
+    Ok(varda_home()?.join(CONFIG_FILENAME))
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
     let path = path.as_ref();
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
-    let config = toml::from_str(&content)
+    let mut config: Config = toml::from_str(&content)
         .with_context(|| format!("failed to parse config at {}", path.display()))?;
+    resolve_config_paths(path, &mut config)?;
 
     Ok(config)
 }
@@ -153,7 +176,7 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
         bail!("project route must allow at least one agent");
     }
 
-    let mut config = load_config(&path)?;
+    let mut config = load_config_raw(&path)?;
 
     for agent in &agents {
         if !config.agents.contains_key(agent) {
@@ -165,9 +188,33 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
     save_config(path, &config)
 }
 
-fn ensure_keep_file(path: &str) -> Result<()> {
-    if !Path::new(path).exists() {
-        fs::write(path, "").with_context(|| format!("failed to write {path}"))?;
+fn load_config_raw(path: impl AsRef<Path>) -> Result<Config> {
+    let path = path.as_ref();
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config at {}", path.display()))?;
+    let config = toml::from_str(&content)
+        .with_context(|| format!("failed to parse config at {}", path.display()))?;
+
+    Ok(config)
+}
+
+fn resolve_config_paths(path: &Path, config: &mut Config) -> Result<()> {
+    let operations_dir = Path::new(&config.defaults.operations_dir);
+    if operations_dir.is_absolute() {
+        return Ok(());
+    }
+
+    let config_dir = path
+        .parent()
+        .with_context(|| format!("config path {} has no parent", path.display()))?;
+    config.defaults.operations_dir = config_dir.join(operations_dir).display().to_string();
+
+    Ok(())
+}
+
+fn ensure_keep_file(path: &Path) -> Result<()> {
+    if !path.exists() {
+        fs::write(path, "").with_context(|| format!("failed to write {}", path.display()))?;
     }
 
     Ok(())
@@ -209,5 +256,20 @@ mod tests {
         assert_eq!(config.routes.len(), 2);
         assert_eq!(config.routes[1].glob, "/work/project/**");
         assert_eq!(config.routes[1].agents, vec!["codex"]);
+    }
+
+    #[test]
+    fn resolves_relative_operations_dir_against_config_dir() {
+        let root = std::env::temp_dir().join(format!("varda-home-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("config directory should be created");
+        let path = root.join("config.toml");
+        fs::write(&path, DEFAULT_CONFIG).expect("config should be written");
+
+        let config = load_config(&path).expect("config should load");
+
+        assert_eq!(
+            config.defaults.operations_dir,
+            root.join("operations").display().to_string()
+        );
     }
 }

@@ -84,7 +84,8 @@ async fn main() -> Result<()> {
             );
         }
         Command::Run { task } => {
-            let config = config::load_config(config::CONFIG_FILE)?;
+            let config_path = config::config_file()?;
+            let config = config::load_config(&config_path)?;
             let task_document = task::load_task(&task)?;
             let project_path = task::task_project_path(&task_document)?;
             let route = routing::match_route(
@@ -124,7 +125,8 @@ async fn main() -> Result<()> {
         }
         Command::Task { command } => match command {
             TaskCommand::Add { taskname, project } => {
-                let config = config::load_config(config::CONFIG_FILE)?;
+                let config_path = config::config_file()?;
+                let config = config::load_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
                 let default_route = routing::match_route(&config, &project_path, None)?;
                 let default_assignee = default_route.agent;
@@ -140,7 +142,8 @@ async fn main() -> Result<()> {
         },
         Command::Project { command } => match command {
             ProjectCommand::Add { glob, agents } => {
-                config::add_project_route(config::CONFIG_FILE, glob.clone(), agents.clone())?;
+                let config_path = config::config_file()?;
+                config::add_project_route(&config_path, glob.clone(), agents.clone())?;
                 println!(
                     "added project route glob={} allowed_agents={}",
                     glob,
