@@ -203,36 +203,181 @@ fn plan_command() -> Result<()> {
     let config = config::load_config(&config_path)?;
     let project_path = task::resolve_project_path(None)?;
     let project_tasks = task::list_tasks(&config, &project_path)?;
-    let (scope, considered_tasks) = if project_tasks.is_empty() {
-        ("global", task::list_all_tasks(&config)?)
+    let (scope, considered_tasks, selection_reason) = if project_tasks.is_empty() {
+        (
+            "global",
+            task::list_all_tasks(&config)?,
+            format!(
+                "the current folder is not known as a Varda project because no tasks reference {}; all tasks across all projects were considered",
+                project_path.display()
+            ),
+        )
     } else {
-        ("project", project_tasks)
+        (
+            "project",
+            project_tasks,
+            format!(
+                "the current folder is known as a Varda project because tasks in the Varda task store reference {}; only this project's tasks were considered",
+                project_path.display()
+            ),
+        )
     };
     let ready_tasks: Vec<_> = considered_tasks
         .iter()
         .filter(|task| task.status == task::TaskStatus::Ready)
         .cloned()
         .collect();
-    let plan_path = write_execution_plan(&config, scope, &project_path, &ready_tasks)?;
+    let plan_tasks = plan_tasks(&config, &ready_tasks)?;
+    let plan_path = write_execution_plan(
+        &config,
+        scope,
+        &project_path,
+        &selection_reason,
+        &plan_tasks,
+    )?;
 
     println!("scope: {scope}");
+    println!("selection: {selection_reason}");
     if scope == "project" {
         println!("project: {}", project_path.display());
     } else {
-        println!("project: none detected for current directory; considered all tasks");
+        println!("project: none detected for current directory");
     }
-    println!("ready_tasks: {}", ready_tasks.len());
+    println!("considered_tasks: {}", considered_tasks.len());
+    println!("ready_tasks: {}", plan_tasks.len());
     println!("plan: {}", plan_path.display());
     println!("review the plan, edit if needed, then confirm before running tasks");
 
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanTask {
+    summary: task::TaskSummary,
+    agent: String,
+    route_glob: String,
+    dependency_hint: DependencyHint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DependencyHint {
+    Identity,
+    Planning,
+    Execution,
+    Sessions,
+    Visibility,
+    AgentSupport,
+    General,
+}
+
+impl DependencyHint {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Identity => "identity/versioning",
+            Self::Planning => "planning",
+            Self::Execution => "execution",
+            Self::Sessions => "sessions/resume",
+            Self::Visibility => "visibility/dashboard",
+            Self::AgentSupport => "agent support",
+            Self::General => "general",
+        }
+    }
+
+    fn stage(self) -> &'static str {
+        match self {
+            Self::Identity => "Stage 1, sequential",
+            Self::Planning => "Stage 2, sequential",
+            Self::Execution => "Stage 3, sequential",
+            Self::Sessions => "Stage 4, parallel candidate",
+            Self::Visibility => "Stage 4, parallel candidate",
+            Self::AgentSupport => "Stage 5, optional parallel candidate",
+            Self::General => "Stage 6, sequential validation",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Identity => {
+                "stable task IDs and captured task state reduce ambiguity for later runs"
+            }
+            Self::Planning => "planning semantics should be reviewed before automated execution",
+            Self::Execution => {
+                "run command behavior depends on task selection and routing semantics"
+            }
+            Self::Sessions => "session resume behavior depends on run metadata and task lifecycle",
+            Self::Visibility => {
+                "dashboards and task views depend on stable task and recap metadata"
+            }
+            Self::AgentSupport => {
+                "additional agent support can be isolated after routing assumptions are clear"
+            }
+            Self::General => "work should run after the higher-level command semantics are stable",
+        }
+    }
+}
+
+fn plan_tasks(config: &config::Config, ready_tasks: &[task::TaskSummary]) -> Result<Vec<PlanTask>> {
+    let mut plan_tasks = Vec::new();
+    for summary in ready_tasks {
+        let project_path = summary
+            .project
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let route = routing::match_route(config, &project_path, summary.assignee.as_deref())?;
+        plan_tasks.push(PlanTask {
+            summary: summary.clone(),
+            agent: route.agent,
+            route_glob: route.glob,
+            dependency_hint: dependency_hint(summary),
+        });
+    }
+
+    plan_tasks.sort_by(|left, right| {
+        left.dependency_hint
+            .cmp(&right.dependency_hint)
+            .then_with(|| {
+                left.summary
+                    .id
+                    .unwrap_or(u64::MAX)
+                    .cmp(&right.summary.id.unwrap_or(u64::MAX))
+            })
+            .then_with(|| left.summary.path.cmp(&right.summary.path))
+    });
+
+    Ok(plan_tasks)
+}
+
+fn dependency_hint(summary: &task::TaskSummary) -> DependencyHint {
+    let text = format!(
+        "{} {}",
+        summary.title.to_ascii_lowercase(),
+        summary.path.display()
+    );
+
+    if text.contains("version") || text.contains(" id") || text.contains("-id") {
+        DependencyHint::Identity
+    } else if text.contains("plan") || text.contains("planner") {
+        DependencyHint::Planning
+    } else if text.contains("run") || text.contains("exec") {
+        DependencyHint::Execution
+    } else if text.contains("session") || text.contains("resume") {
+        DependencyHint::Sessions
+    } else if text.contains("dashboard") || text.contains("show") || text.contains("list") {
+        DependencyHint::Visibility
+    } else if text.contains("claude") || text.contains("agent") {
+        DependencyHint::AgentSupport
+    } else {
+        DependencyHint::General
+    }
+}
+
 fn write_execution_plan(
     config: &config::Config,
     scope: &str,
     project_path: &Path,
-    ready_tasks: &[task::TaskSummary],
+    selection_reason: &str,
+    ready_tasks: &[PlanTask],
 ) -> Result<PathBuf> {
     let timestamp = unix_timestamp()?;
     let plan_dir = Path::new(&config.defaults.operations_dir).join("plans");
@@ -245,7 +390,13 @@ fn write_execution_plan(
     let plan_path = plan_dir.join(format!(
         "{scope}-{project_name}-ready-task-plan-{timestamp}.md"
     ));
-    let content = render_execution_plan(scope, project_path, timestamp, ready_tasks);
+    let content = render_execution_plan(
+        scope,
+        project_path,
+        timestamp,
+        selection_reason,
+        ready_tasks,
+    );
 
     fs::write(&plan_path, content)
         .with_context(|| format!("failed to write plan at {}", plan_path.display()))?;
@@ -257,7 +408,8 @@ fn render_execution_plan(
     scope: &str,
     project_path: &Path,
     timestamp: u64,
-    ready_tasks: &[task::TaskSummary],
+    selection_reason: &str,
+    ready_tasks: &[PlanTask],
 ) -> String {
     let title_scope = if scope == "project" {
         "Project"
@@ -265,7 +417,7 @@ fn render_execution_plan(
         "Global"
     };
     let mut content = format!(
-        "# {title_scope} Ready Task Execution Plan\n\n- Scope: {scope}\n- Generated timestamp: {timestamp}\n- Project: {}\n- Ready tasks considered: {}\n- Planner agent: codex\n\n",
+        "# {title_scope} Ready Task Execution Plan\n\n- Scope: {scope}\n- Generated timestamp: {timestamp}\n- Project: `{}`\n- Selection rule: {selection_reason}.\n- Ready tasks considered: {}\n- Planner agent: codex\n- Execution should wait for explicit user confirmation.\n\n",
         project_path.display(),
         ready_tasks.len()
     );
@@ -276,35 +428,60 @@ fn render_execution_plan(
     } else {
         for task in ready_tasks {
             let id = task
+                .summary
                 .id
                 .map(|id| format!("#{id}"))
                 .unwrap_or_else(|| "unversioned".to_owned());
-            let assignee = task.assignee.as_deref().unwrap_or("route default");
+            let project = task.summary.project.as_deref().unwrap_or("no project");
             content.push_str(&format!(
-                "- {id} `{}`: {} (agent: {assignee})\n",
-                task.path.display(),
-                task.title
+                "- {id} `{}`: {} (project: `{project}`, agent: {}, route: `{}`, category: {})\n",
+                task.summary.path.display(),
+                task.summary.title,
+                task.agent,
+                task.route_glob,
+                task.dependency_hint.label()
             ));
         }
         content.push('\n');
     }
 
     content.push_str("## Priority And Dependencies\n\n");
-    content.push_str("- First: `version-the-task`, because stable task IDs and captured starting state reduce ambiguity for every later run.\n");
-    content.push_str("- Next: `assign-a-task-ID` if still not complete, because several ready tasks do not have IDs and task references are easier to review and run when numbered.\n");
-    content.push_str("- Then: command surface fixes (`run-a-specific-task`, `global-run`, `global-runner`, `planner-agent`) because they define how work is selected and executed.\n");
-    content.push_str("- Then: session support (`support-sessions`, `resume-session-interactively`) because resume behavior depends on run/session metadata.\n");
-    content.push_str("- Then: visibility work (`tasks-dashboard-cli`, `tasks-dashboard`, `show-task`) after task identity and run semantics are stable.\n");
-    content.push_str("- Optional/independent: `support-claude` can run after routing/session assumptions are clear; it may be parallel with dashboard work if agent configuration is isolated.\n\n");
+    if ready_tasks.is_empty() {
+        content.push_str("- No ready work is available to prioritize.\n\n");
+    } else {
+        for task in ready_tasks {
+            content.push_str(&format!(
+                "- `{}`: {}.\n",
+                task.summary.title,
+                task.dependency_hint.reason()
+            ));
+        }
+        content.push('\n');
+    }
 
     content.push_str("## Execution Stages\n\n");
-    content.push_str("1. Stage 1, sequential: complete task identity/versioning work.\n");
-    content.push_str("2. Stage 2, sequential: implement planning and run command semantics.\n");
-    content.push_str("3. Stage 3, parallel candidates: session tracking/resume work and dashboard/listing work, provided they touch disjoint modules.\n");
-    content.push_str("4. Stage 4, sequential validation: run the CLI against representative tasks, update docs, and confirm the plan before executing the ready set.\n\n");
+    if ready_tasks.is_empty() {
+        content.push_str("No execution stages are needed until a task is ready.\n\n");
+    } else {
+        let mut last_stage = "";
+        for task in ready_tasks {
+            let stage = task.dependency_hint.stage();
+            if stage != last_stage {
+                content.push_str(&format!("- {stage}: "));
+                last_stage = stage;
+            } else {
+                content.push_str("- Same stage: ");
+            }
+            content.push_str(&format!(
+                "`{}` assigned to `{}`.\n",
+                task.summary.title, task.agent
+            ));
+        }
+        content.push_str("- Final gate: review this plan, edit it if needed, and confirm before executing the ready set.\n\n");
+    }
 
-    content.push_str("## User Review\n\n");
-    content.push_str("Review and edit this plan before executing it. Execution should wait for explicit user confirmation.\n");
+    content.push_str("## Review Gate\n\n");
+    content.push_str("The next step is user review. The plan should be confirmed or edited before Varda executes the ready tasks.\n");
 
     content
 }

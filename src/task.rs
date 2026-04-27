@@ -21,6 +21,7 @@ pub struct TaskSummary {
     pub path: PathBuf,
     pub id: Option<u64>,
     pub status: TaskStatus,
+    pub project: Option<String>,
     pub assignee: Option<String>,
     pub title: String,
 }
@@ -275,6 +276,7 @@ fn collect_tasks(path: &Path, project_path: &Path, tasks: &mut Vec<TaskSummary>)
             path: task.path,
             id: task.frontmatter.id,
             status: task.frontmatter.status,
+            project: task.frontmatter.project,
             assignee: task.frontmatter.assignee,
             title: task_title(&task.body),
         });
@@ -318,6 +320,7 @@ fn collect_all_tasks(path: &Path, tasks: &mut Vec<TaskSummary>) -> Result<()> {
             path: task.path,
             id: task.frontmatter.id,
             status: task.frontmatter.status,
+            project: task.frontmatter.project,
             assignee: task.frontmatter.assignee,
             title: task_title(&task.body),
         });

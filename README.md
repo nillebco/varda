@@ -60,17 +60,18 @@ The important files are:
 5. Varda creates the task file and opens it in `$EDITOR`.
 6. Write the task details and save the file.
 7. List project tasks with `varda task list`.
-8. Run `varda task run path/to/task.md`.
-9. Show a task and its recap with `varda task show path/to/task.md`.
-10. Varda finds the matching project route in the global config.
-11. Varda verifies the assignee is allowed for that project.
-12. Varda marks the task as `running`.
-13. Varda starts the configured agent.
-14. The agent has at most 10 minutes to work.
-15. The agent must produce a recap before it finishes.
-16. Varda writes the recap under the global operations folder.
-17. Varda updates the original task to `pending`, `needs_user`, or `failed`.
-18. Varda commits the task update and recap with git.
+8. Create a reviewable ready-task plan with `varda plan`.
+9. Run `varda task run path/to/task.md`.
+10. Show a task and its recap with `varda task show path/to/task.md`.
+11. Varda finds the matching project route in the global config.
+12. Varda verifies the assignee is allowed for that project.
+13. Varda marks the task as `running`.
+14. Varda starts the configured agent.
+15. The agent has at most 10 minutes to work.
+16. The agent must produce a recap before it finishes.
+17. Varda writes the recap under the global operations folder.
+18. Varda updates the original task to `pending`, `needs_user`, or `failed`.
+19. Varda commits the task update and recap with git.
 
 ## Add Project Routes
 
@@ -201,6 +202,22 @@ When `varda task run` starts, it reads the task's `project` field and uses that 
 The old top-level `varda run <task>` command is still available as a compatibility alias, but new usage should prefer `varda task run <task>`.
 
 The old top-level `varda show task <task>` command is still available as a compatibility alias, but new usage should prefer `varda task show <task>`.
+
+## Plan Ready Work
+
+Create a reviewable execution plan with:
+
+```sh
+varda plan
+```
+
+When the current folder already has tasks in Varda's task store, the command plans ready tasks for that project. Otherwise, it plans ready tasks across all projects. Plans are written under the global operations folder:
+
+```text
+$VARDA_HOME/operations/plans/
+```
+
+The generated markdown assigns each ready task to the routed agent, explains the project/global selection, groups tasks into sequential and parallel candidate stages, and leaves execution behind an explicit user review gate.
 
 ## Task Statuses
 
