@@ -31,8 +31,9 @@ impl AcpSubprocessClient {
 impl AgentClient for AcpSubprocessClient {
     async fn run_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
         let prompt = build_prompt(&request);
+        let args = args_for_request(&self.args, &request);
         let mut child = Command::new(&self.command)
-            .args(&self.args)
+            .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -105,6 +106,41 @@ Task markdown:
     )
 }
 
+fn args_for_request(args: &[String], request: &AgentRunRequest) -> Vec<String> {
+    let Some(project) = request.frontmatter.project.as_deref() else {
+        return args.to_vec();
+    };
+
+    let mut resolved = Vec::with_capacity(args.len());
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        resolved.push(expand_arg(arg, request, project));
+
+        if arg == "--cd" {
+            if let Some(value) = args.get(index + 1) {
+                resolved.push(if value == "." {
+                    project.to_owned()
+                } else {
+                    expand_arg(value, request, project)
+                });
+                index += 2;
+                continue;
+            }
+        }
+
+        index += 1;
+    }
+
+    resolved
+}
+
+fn expand_arg(arg: &str, request: &AgentRunRequest, project: &str) -> String {
+    arg.replace("{project}", project)
+        .replace("{task}", &request.task_path)
+}
+
 fn recap_contains_user_request(recap: &str) -> bool {
     recap
         .lines()
@@ -156,5 +192,46 @@ mod tests {
             "Completed nothing.\nrequires_user: true"
         ));
         assert!(!recap_contains_user_request("requires_user: false"));
+    }
+
+    #[test]
+    fn replaces_dot_cd_with_task_project_path() {
+        let request = AgentRunRequest {
+            agent_name: "codex".to_owned(),
+            task_path: "/home/user/.varda/operations/tasks/task.md".to_owned(),
+            frontmatter: TaskFrontmatter {
+                status: TaskStatus::Ready,
+                project: Some("/work/project".to_owned()),
+                assignee: Some("codex".to_owned()),
+                recap: None,
+                requires_user: false,
+            },
+            body: "# Task".to_owned(),
+            timeout: Duration::from_secs(600),
+        };
+
+        let args = args_for_request(
+            &[
+                "exec".to_owned(),
+                "--cd".to_owned(),
+                ".".to_owned(),
+                "--sandbox".to_owned(),
+                "workspace-write".to_owned(),
+                "-".to_owned(),
+            ],
+            &request,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--cd",
+                "/work/project",
+                "--sandbox",
+                "workspace-write",
+                "-"
+            ]
+        );
     }
 }
