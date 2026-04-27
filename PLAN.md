@@ -71,6 +71,7 @@ Example task:
 
 ```markdown
 ---
+id: 1
 status: ready
 assignee: codex
 recap: null

@@ -100,6 +100,7 @@ mod tests {
                 agent_name: "codex".to_owned(),
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
+                    id: None,
                     status: TaskStatus::Ready,
                     project: Some("/work/project".to_owned()),
                     assignee: Some("codex".to_owned()),

@@ -7,11 +7,12 @@ mod routing;
 mod runner;
 mod task;
 
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -32,7 +33,7 @@ enum Command {
     },
     /// Run a markdown task through the configured agent.
     Run {
-        /// Markdown task file to process.
+        /// Markdown task file or task id to process.
         task: PathBuf,
     },
     /// Manage project routes.
@@ -44,6 +45,11 @@ enum Command {
     Task {
         #[command(subcommand)]
         command: TaskCommand,
+    },
+    /// Show stored operation records.
+    Show {
+        #[command(subcommand)]
+        command: ShowCommand,
     },
 }
 
@@ -57,14 +63,29 @@ enum TaskCommand {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+    /// List markdown tasks for a project.
+    List {
+        /// Project path to list tasks for. Defaults to the current directory.
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
     /// Run a markdown task through the configured agent.
     Run {
-        /// Markdown task file to process.
+        /// Markdown task file or task id to process.
         task: PathBuf,
     },
     /// Resume a task that is waiting for user input, then run it.
     Resume {
         /// Markdown task file to resume.
+        task: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ShowCommand {
+    /// Display a markdown task and its associated recap.
+    Task {
+        /// Markdown task file to display.
         task: PathBuf,
     },
 }
@@ -109,14 +130,31 @@ async fn main() -> Result<()> {
                 }
                 let task_path =
                     task::create_task(&config, &taskname, &project_path, assignee.as_deref())?;
-                println!("created task {}", task_path.display());
+                let task_id = task::load_task(&task_path)?.frontmatter.id;
+                if let Some(task_id) = task_id {
+                    println!("created task #{task_id} {}", task_path.display());
+                } else {
+                    println!("created task {}", task_path.display());
+                }
                 open_editor(&task_path)?;
+            }
+            TaskCommand::List { project } => {
+                let config_path = config::config_file()?;
+                let config = config::load_config(&config_path)?;
+                let project_path = task::resolve_project_path(project.as_deref())?;
+                let tasks = task::list_tasks(&config, &project_path)?;
+                print_task_list(&project_path, &tasks);
             }
             TaskCommand::Run { task } => {
                 run_task_command(&task).await?;
             }
             TaskCommand::Resume { task } => {
                 resume_task_command(&task).await?;
+            }
+        },
+        Command::Show { command } => match command {
+            ShowCommand::Task { task } => {
+                show_task_command(&task)?;
             }
         },
         Command::Project { command } => match command {
@@ -135,10 +173,99 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn show_task_command(task_path: &Path) -> Result<()> {
+    let task_content = fs::read_to_string(task_path)
+        .with_context(|| format!("failed to read task at {}", task_path.display()))?;
+    let task_document = task::load_task(&task_path)?;
+
+    println!("# Task {}", task_path.display());
+    println!();
+    print!("{task_content}");
+    if !task_content.ends_with('\n') {
+        println!();
+    }
+
+    println!();
+    println!("---");
+    println!();
+
+    let Some(recap_path) = task_document.frontmatter.recap.as_deref() else {
+        println!("# Recap");
+        println!();
+        println!("No recap is associated with this task.");
+        return Ok(());
+    };
+
+    let recap_path = resolve_recap_path(recap_path, task_path);
+    let recap_content = fs::read_to_string(&recap_path)
+        .with_context(|| format!("failed to read recap at {}", recap_path.display()))?;
+
+    println!("# Recap {}", recap_path.display());
+    println!();
+    print!("{recap_content}");
+    if !recap_content.ends_with('\n') {
+        println!();
+    }
+
+    Ok(())
+}
+
+fn resolve_recap_path(recap_path: &str, task_path: &Path) -> PathBuf {
+    let path = PathBuf::from(recap_path);
+    if path.is_absolute() || path.exists() {
+        return path;
+    }
+
+    task_path
+        .parent()
+        .map(|parent| parent.join(&path))
+        .unwrap_or(path)
+}
+
+fn print_task_list(project_path: &Path, tasks: &[task::TaskSummary]) {
+    println!("project: {}", project_path.display());
+
+    if tasks.is_empty() {
+        println!("no tasks found");
+        return;
+    }
+
+    println!(
+        "{:<5} {:<10} {:<12} {:<32} PATH",
+        "ID", "STATUS", "ASSIGNEE", "TITLE"
+    );
+    for task in tasks {
+        let id = task
+            .id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        let assignee = task.assignee.as_deref().unwrap_or("-");
+        println!(
+            "{:<5} {:<10} {:<12} {:<32} {}",
+            id,
+            task.status.as_str(),
+            assignee,
+            truncate_for_table(&task.title, 32),
+            task.path.display()
+        );
+    }
+}
+
+fn truncate_for_table(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+
+    let mut truncated: String = value.chars().take(width.saturating_sub(1)).collect();
+    truncated.push('.');
+    truncated
+}
+
 async fn run_task_command(task_path: &Path) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
-    let task_document = task::load_task(task_path)?;
+    let task_path = task::resolve_task_reference(&config, task_path)?;
+    let task_document = task::load_task(&task_path)?;
     let project_path = task::task_project_path(&task_document)?;
     let route = routing::match_route(
         &config,
@@ -150,7 +277,7 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
-    let outcome = runner::run_task(&config, &route.agent, task_path, &client).await?;
+    let outcome = runner::run_task(&config, &route.agent, &task_path, &client).await?;
     println!(
         "processed task={} agent={} glob={} status={:?} recap={}",
         task_path.display(),
@@ -161,7 +288,7 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
     );
     let notification = if outcome.status == task::TaskStatus::NeedsUser {
         let notification =
-            notify::notify_user_interaction(&config, task_path, &outcome.recap_path)?;
+            notify::notify_user_interaction(&config, &task_path, &outcome.recap_path)?;
         println!(
             "user interaction required; notification={}",
             notification.display()
@@ -171,7 +298,7 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
         None
     };
     if config.git.auto_commit {
-        git::commit_task_update(task_path, &outcome.recap_path, notification.as_deref())?;
+        git::commit_task_update(&task_path, &outcome.recap_path, notification.as_deref())?;
         println!("committed task update");
     }
 

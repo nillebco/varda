@@ -59,16 +59,17 @@ The important files are:
 4. Varda asks for an assignee, defaulting to the first allowed agent for that project.
 5. Varda creates the task file and opens it in `$EDITOR`.
 6. Write the task details and save the file.
-7. Run `varda task run path/to/task.md`.
-8. Varda finds the matching project route in the global config.
-9. Varda verifies the assignee is allowed for that project.
-10. Varda marks the task as `running`.
-11. Varda starts the configured agent.
-12. The agent has at most 10 minutes to work.
-13. The agent must produce a recap before it finishes.
-14. Varda writes the recap under the global operations folder.
-15. Varda updates the original task to `pending`, `needs_user`, or `failed`.
-16. Varda commits the task update and recap with git.
+7. List project tasks with `varda task list`.
+8. Run `varda task run path/to/task.md`.
+9. Varda finds the matching project route in the global config.
+10. Varda verifies the assignee is allowed for that project.
+11. Varda marks the task as `running`.
+12. Varda starts the configured agent.
+13. The agent has at most 10 minutes to work.
+14. The agent must produce a recap before it finishes.
+15. Varda writes the recap under the global operations folder.
+16. Varda updates the original task to `pending`, `needs_user`, or `failed`.
+17. Varda commits the task update and recap with git.
 
 ## Add Project Routes
 
@@ -120,6 +121,7 @@ The generated task starts like this:
 
 ```markdown
 ---
+id: 1
 status: ready
 project: /some/project/path
 assignee: codex
@@ -128,6 +130,8 @@ requires_user: false
 
 # Summarize this project
 ```
+
+Varda assigns the next available numeric task ID and prints it with the task path.
 
 Add the task details under the heading, then save and quit your editor.
 
@@ -143,6 +147,18 @@ For the example above, the file is:
 $VARDA_HOME/operations/tasks/summarize-this-project.md
 ```
 
+List tasks for the current project with:
+
+```sh
+varda task list
+```
+
+Or list tasks for another project path:
+
+```sh
+varda task list --project /some/project/path
+```
+
 Then run:
 
 ```sh
@@ -150,6 +166,12 @@ varda task run "$HOME/.varda/operations/tasks/summarize-this-project.md"
 ```
 
 If you set `VARDA_HOME`, use that path instead.
+
+You can also run by numeric task ID:
+
+```sh
+varda task run 1
+```
 
 When `varda task run` starts, it reads the task's `project` field and uses that path to select the route and allowed agents.
 
