@@ -135,6 +135,7 @@ mod tests {
                     project: Some("/work/project".to_owned()),
                     assignee: Some("codex".to_owned()),
                     recap: None,
+                    recaps: vec![],
                     plan: None,
                     requires_user: false,
                 },

@@ -35,8 +35,12 @@ pub struct TaskFrontmatter {
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Legacy single-recap field; kept for backward-compat deserialization only.
+    // Migrated to `recaps` on load. Not serialized.
+    #[serde(default, skip_serializing)]
     pub recap: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recaps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
     #[serde(default)]
@@ -71,7 +75,7 @@ impl TaskDocument {
     }
 
     pub fn set_recap(&mut self, recap: impl Into<String>) {
-        self.frontmatter.recap = Some(recap.into());
+        self.frontmatter.recaps.push(recap.into());
     }
 
     pub fn set_plan(&mut self, plan: impl Into<String>) {
@@ -124,6 +128,7 @@ pub fn create_task(
             project: Some(project_path.display().to_string()),
             assignee: assignee.map(str::to_owned),
             recap: None,
+            recaps: vec![],
             plan: None,
             requires_user: false,
         },
@@ -425,9 +430,16 @@ fn parse_task(path: &Path, content: &str) -> Result<TaskDocument> {
     let parsed = matter
         .parse::<TaskFrontmatter>(content)
         .context("failed to parse markdown frontmatter")?;
-    let frontmatter = parsed
+    let mut frontmatter = parsed
         .data
         .with_context(|| format!("missing or invalid frontmatter in {}", path.display()))?;
+
+    // Migrate legacy single-recap field to the recaps list.
+    if let Some(recap) = frontmatter.recap.take() {
+        if frontmatter.recaps.is_empty() {
+            frontmatter.recaps.push(recap);
+        }
+    }
 
     Ok(TaskDocument {
         path: path.to_path_buf(),
@@ -499,6 +511,7 @@ Do the work.
                 project: None,
                 assignee: Some("codex".to_owned()),
                 recap: None,
+                recaps: vec![],
                 plan: None,
                 requires_user: false,
             },
@@ -512,7 +525,8 @@ Do the work.
             serde_yaml::to_string(&task.frontmatter).expect("frontmatter should serialize");
 
         assert!(frontmatter.contains("status: pending"));
-        assert!(frontmatter.contains("recap: .varda/operations/recaps/run.md"));
+        assert!(frontmatter.contains("recaps:"));
+        assert!(frontmatter.contains(".varda/operations/recaps/run.md"));
     }
 
     #[test]
@@ -525,7 +539,8 @@ Do the work.
                 status: TaskStatus::Pending,
                 project: None,
                 assignee: Some("codex".to_owned()),
-                recap: Some(".varda/operations/recaps/run.md".to_owned()),
+                recap: None,
+                recaps: vec![".varda/operations/recaps/run.md".to_owned()],
                 plan: None,
                 requires_user: false,
             },

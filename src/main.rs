@@ -590,21 +590,26 @@ fn show_task_command(task_path: &Path) -> Result<()> {
     println!("---");
     println!();
 
-    let Some(recap_path) = task_document.frontmatter.recap.as_deref() else {
+    if task_document.frontmatter.recaps.is_empty() {
         println!("# Recap");
         println!();
         println!("No recap is associated with this task.");
         return Ok(());
-    };
+    }
 
-    let recap_path = resolve_recap_path(recap_path, &task_path);
-    let recap_content = fs::read_to_string(&recap_path)
-        .with_context(|| format!("failed to read recap at {}", recap_path.display()))?;
+    for recap_path_str in &task_document.frontmatter.recaps {
+        let recap_path = resolve_recap_path(recap_path_str, &task_path);
+        let recap_content = fs::read_to_string(&recap_path)
+            .with_context(|| format!("failed to read recap at {}", recap_path.display()))?;
 
-    println!("# Recap {}", recap_path.display());
-    println!();
-    print!("{recap_content}");
-    if !recap_content.ends_with('\n') {
+        println!("# Recap {}", recap_path.display());
+        println!();
+        print!("{recap_content}");
+        if !recap_content.ends_with('\n') {
+            println!();
+        }
+        println!();
+        println!("---");
         println!();
     }
 

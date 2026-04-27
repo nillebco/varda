@@ -72,7 +72,7 @@ pub async fn run_task(
         },
     };
 
-    let recap_path = write_recap(config, &result.recap)?;
+    let recap_path = write_recap(config, task_path, &result.recap)?;
     task.set_recap(recap_path.display().to_string());
     task.frontmatter.requires_user = result.requires_user;
 
@@ -151,13 +151,14 @@ fn write_plan(config: &Config, task_path: &Path, plan: &str) -> Result<PathBuf> 
     Ok(plan_path)
 }
 
-fn write_recap(config: &Config, recap: &str) -> Result<PathBuf> {
+fn write_recap(config: &Config, task_path: &Path, recap: &str) -> Result<PathBuf> {
     let recap_dir = Path::new(&config.defaults.operations_dir).join("recaps");
     fs::create_dir_all(&recap_dir)
         .with_context(|| format!("failed to create recap directory {}", recap_dir.display()))?;
 
     let recap_path = recap_dir.join(format!("{}.md", Uuid::new_v4()));
-    fs::write(&recap_path, recap)
+    let content = format!("---\ntask: {}\n---\n\n{}", task_path.display(), recap);
+    fs::write(&recap_path, &content)
         .with_context(|| format!("failed to write recap at {}", recap_path.display()))?;
 
     Ok(recap_path)
@@ -212,7 +213,7 @@ Do it.
 
         assert_eq!(outcome.status, TaskStatus::Pending);
         assert!(updated.contains("status: pending"));
-        assert!(updated.contains("recap:"));
+        assert!(updated.contains("recaps:"));
         assert!(recap.contains("Completed."));
     }
 
