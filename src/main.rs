@@ -57,6 +57,16 @@ enum TaskCommand {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+    /// Run a markdown task through the configured agent.
+    Run {
+        /// Markdown task file to process.
+        task: PathBuf,
+    },
+    /// Resume a task that is waiting for user input, then run it.
+    Resume {
+        /// Markdown task file to resume.
+        task: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -84,44 +94,7 @@ async fn main() -> Result<()> {
             );
         }
         Command::Run { task } => {
-            let config_path = config::config_file()?;
-            let config = config::load_config(&config_path)?;
-            let task_document = task::load_task(&task)?;
-            let project_path = task::task_project_path(&task_document)?;
-            let route = routing::match_route(
-                &config,
-                &project_path,
-                task_document.frontmatter.assignee.as_deref(),
-            )?;
-            let agent_config = config
-                .agents
-                .get(&route.agent)
-                .expect("routing ensures the selected agent exists");
-            let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
-            let outcome = runner::run_task(&config, &route.agent, &task, &client).await?;
-            println!(
-                "processed task={} agent={} glob={} status={:?} recap={}",
-                task.display(),
-                route.agent,
-                route.glob,
-                outcome.status,
-                outcome.recap_path.display()
-            );
-            let notification = if outcome.status == task::TaskStatus::NeedsUser {
-                let notification =
-                    notify::notify_user_interaction(&config, &task, &outcome.recap_path)?;
-                println!(
-                    "user interaction required; notification={}",
-                    notification.display()
-                );
-                Some(notification)
-            } else {
-                None
-            };
-            if config.git.auto_commit {
-                git::commit_task_update(&task, &outcome.recap_path, notification.as_deref())?;
-                println!("committed task update");
-            }
+            run_task_command(&task).await?;
         }
         Command::Task { command } => match command {
             TaskCommand::Add { taskname, project } => {
@@ -138,6 +111,12 @@ async fn main() -> Result<()> {
                     task::create_task(&config, &taskname, &project_path, assignee.as_deref())?;
                 println!("created task {}", task_path.display());
                 open_editor(&task_path)?;
+            }
+            TaskCommand::Run { task } => {
+                run_task_command(&task).await?;
+            }
+            TaskCommand::Resume { task } => {
+                resume_task_command(&task).await?;
             }
         },
         Command::Project { command } => match command {
@@ -156,6 +135,73 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_task_command(task_path: &Path) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let task_document = task::load_task(task_path)?;
+    let project_path = task::task_project_path(&task_document)?;
+    let route = routing::match_route(
+        &config,
+        &project_path,
+        task_document.frontmatter.assignee.as_deref(),
+    )?;
+    let agent_config = config
+        .agents
+        .get(&route.agent)
+        .expect("routing ensures the selected agent exists");
+    let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
+    let outcome = runner::run_task(&config, &route.agent, task_path, &client).await?;
+    println!(
+        "processed task={} agent={} glob={} status={:?} recap={}",
+        task_path.display(),
+        route.agent,
+        route.glob,
+        outcome.status,
+        outcome.recap_path.display()
+    );
+    let notification = if outcome.status == task::TaskStatus::NeedsUser {
+        let notification =
+            notify::notify_user_interaction(&config, task_path, &outcome.recap_path)?;
+        println!(
+            "user interaction required; notification={}",
+            notification.display()
+        );
+        Some(notification)
+    } else {
+        None
+    };
+    if config.git.auto_commit {
+        git::commit_task_update(task_path, &outcome.recap_path, notification.as_deref())?;
+        println!("committed task update");
+    }
+
+    Ok(())
+}
+
+async fn resume_task_command(task_path: &Path) -> Result<()> {
+    let mut task_document = task::load_task(task_path)?;
+    if task_document.frontmatter.status != task::TaskStatus::NeedsUser {
+        anyhow::bail!(
+            "task {} is not waiting for user input; current status is {:?}",
+            task_path.display(),
+            task_document.frontmatter.status
+        );
+    }
+
+    task_document.set_status(task::TaskStatus::Ready);
+    task_document.frontmatter.requires_user = false;
+    task::write_task(&task_document)?;
+
+    if prompt_yes_no("Open editor to complete the task update?", true)? {
+        open_editor(task_path)?;
+    }
+
+    git::commit_task_file(task_path, &format!("Resume task {}", task_path.display()))?;
+    println!("committed resume update");
+
+    run_task_command(task_path).await
+}
+
 fn prompt_assignee(default_assignee: &str) -> Result<Option<String>> {
     print!("Assignee [{default_assignee}]: ");
     io::stdout().flush()?;
@@ -169,6 +215,22 @@ fn prompt_assignee(default_assignee: &str) -> Result<Option<String>> {
     } else {
         Ok(Some(assignee.to_owned()))
     }
+}
+
+fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
+    let suffix = if default { "Y/n" } else { "y/N" };
+    print!("{prompt} [{suffix}]: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let answer = input.trim().to_ascii_lowercase();
+
+    if answer.is_empty() {
+        return Ok(default);
+    }
+
+    Ok(matches!(answer.as_str(), "y" | "yes"))
 }
 
 fn open_editor(path: &Path) -> Result<()> {

@@ -33,6 +33,16 @@ pub fn commit_task_update(
     Ok(())
 }
 
+pub fn commit_task_file(task_path: &Path, message: &str) -> Result<()> {
+    let repo = repo_root_for_path(task_path)?;
+    let task_arg = repo_relative_path(&repo, task_path)?;
+
+    run_git_in(&repo, ["add", task_arg.as_str()]).context("failed to stage task file")?;
+    run_git_in(&repo, ["commit", "-m", message]).context("failed to commit task file")?;
+
+    Ok(())
+}
+
 fn repo_root_for_path(path: &Path) -> Result<PathBuf> {
     let git_dir = if path.is_dir() {
         path
