@@ -671,6 +671,17 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
         outcome.status,
         outcome.recap_path.display()
     );
+
+    let recap_content = fs::read_to_string(&outcome.recap_path)
+        .with_context(|| format!("failed to read recap at {}", outcome.recap_path.display()))?;
+    println!();
+    println!("---");
+    println!();
+    print!("{recap_content}");
+    if !recap_content.ends_with('\n') {
+        println!();
+    }
+
     let notification = if outcome.status == task::TaskStatus::NeedsUser {
         let notification =
             notify::notify_user_interaction(&config, &task_path, &outcome.recap_path)?;
