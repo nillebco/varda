@@ -16,6 +16,7 @@ use crate::task::{TaskStatus, load_task, write_task};
 pub struct RunOutcome {
     pub status: TaskStatus,
     pub recap_path: PathBuf,
+    pub session_log_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,37 +44,66 @@ pub async fn run_task(
     write_task(&task)?;
 
     let timeout = Duration::from_secs(config.defaults.timeout_seconds);
+    let session_id = Uuid::new_v4().to_string();
+    let session_log_path = session_log_path(config, &session_id);
+    write_session_log(
+        &session_log_path,
+        &format!(
+            "session_id={session_id}\nagent={agent_name}\ntask={}\n",
+            task_path.display()
+        ),
+    )?;
     let request = AgentRunRequest {
         agent_name: agent_name.to_owned(),
         task_path: task_path.display().to_string(),
         frontmatter: task.frontmatter.clone(),
         body: task.body.clone(),
         timeout,
+        session_id: session_id.clone(),
+        session_log_path: Some(session_log_path.display().to_string()),
     };
 
     let result = match time::timeout(timeout, client.run_task(request)).await {
         Ok(Ok(result)) => result,
-        Ok(Err(error)) => AgentRunResult {
-            recap: format!(
-                "# Agent Run Failed\n\nThe agent failed while processing `{}`.\n\nError: {error}",
-                task_path.display()
-            ),
-            requires_user: false,
-            suggested_agent: None,
-        },
-        Err(_) => AgentRunResult {
-            recap: format!(
-                "# Agent Run Timed Out\n\nThe agent exceeded the configured {} second limit while processing `{}`.",
-                config.defaults.timeout_seconds,
-                task_path.display()
-            ),
-            requires_user: false,
-            suggested_agent: None,
-        },
+        Ok(Err(error)) => {
+            append_session_log(&session_log_path, &format!("\nerror:\n{error:#}\n"))?;
+            AgentRunResult {
+                recap: format!(
+                    "# Agent Run Failed\n\nThe agent failed while processing `{}`.\n\nError: {error}\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
+                    task_path.display(),
+                    session_log_path.display(),
+                    session_log_path.display()
+                ),
+                requires_user: false,
+                suggested_agent: None,
+            }
+        }
+        Err(_) => {
+            append_session_log(
+                &session_log_path,
+                &format!(
+                    "\ntimeout:\nexceeded {} second limit\n",
+                    config.defaults.timeout_seconds
+                ),
+            )?;
+            AgentRunResult {
+                recap: format!(
+                    "# Agent Run Timed Out\n\nThe agent exceeded the configured {} second limit while processing `{}`.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
+                    config.defaults.timeout_seconds,
+                    task_path.display(),
+                    session_log_path.display(),
+                    session_log_path.display()
+                ),
+                requires_user: false,
+                suggested_agent: None,
+            }
+        }
     };
 
     let recap_path = write_recap(config, task_path, &result.recap)?;
     task.set_recap(recap_path.display().to_string());
+    task.frontmatter.agent_session_id = Some(session_id);
+    task.frontmatter.agent_session_log = Some(session_log_path.display().to_string());
     task.frontmatter.requires_user = result.requires_user;
 
     let status = if result.requires_user {
@@ -89,7 +119,11 @@ pub async fn run_task(
     task.set_status(status);
     write_task(&task)?;
 
-    Ok(RunOutcome { status, recap_path })
+    Ok(RunOutcome {
+        status,
+        recap_path,
+        session_log_path,
+    })
 }
 
 pub async fn plan_task(
@@ -107,6 +141,8 @@ pub async fn plan_task(
         frontmatter: task.frontmatter.clone(),
         body: task.body.clone(),
         timeout,
+        session_id: Uuid::new_v4().to_string(),
+        session_log_path: None,
     };
 
     let result = match time::timeout(timeout, client.plan_task(request)).await {
@@ -164,6 +200,37 @@ fn write_recap(config: &Config, task_path: &Path, recap: &str) -> Result<PathBuf
     Ok(recap_path)
 }
 
+fn session_log_path(config: &Config, session_id: &str) -> PathBuf {
+    Path::new(&config.defaults.operations_dir)
+        .join("runs")
+        .join(format!("{session_id}.log"))
+}
+
+fn write_session_log(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create session log directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(path, content)
+        .with_context(|| format!("failed to write session log at {}", path.display()))
+}
+
+fn append_session_log(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open session log at {}", path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("failed to append session log at {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -214,6 +281,9 @@ Do it.
         assert_eq!(outcome.status, TaskStatus::Pending);
         assert!(updated.contains("status: pending"));
         assert!(updated.contains("recaps:"));
+        assert!(updated.contains("agent_session_id:"));
+        assert!(updated.contains("agent_session_log:"));
+        assert!(outcome.session_log_path.exists());
         assert!(recap.contains("Completed."));
     }
 

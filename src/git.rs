@@ -8,16 +8,27 @@ use anyhow::{Context, Result, bail};
 pub fn commit_task_update(
     task_path: &Path,
     recap_path: &Path,
+    session_log_path: &Path,
     notification_path: Option<&Path>,
 ) -> Result<()> {
     let repo = repo_root_for_path(task_path)?;
     ensure_same_repo(&repo, recap_path)?;
+    ensure_same_repo(&repo, session_log_path)?;
 
     let task_arg = repo_relative_path(&repo, task_path)?;
     let recap_arg = repo_relative_path(&repo, recap_path)?;
+    let session_log_arg = repo_relative_path(&repo, session_log_path)?;
 
-    run_git_in(&repo, ["add", task_arg.as_str(), recap_arg.as_str()])
-        .context("failed to stage task update")?;
+    run_git_in(
+        &repo,
+        [
+            "add",
+            task_arg.as_str(),
+            recap_arg.as_str(),
+            session_log_arg.as_str(),
+        ],
+    )
+    .context("failed to stage task update")?;
 
     if let Some(notification_path) = notification_path {
         ensure_same_repo(&repo, notification_path)?;

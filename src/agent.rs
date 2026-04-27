@@ -14,6 +14,8 @@ pub struct AgentRunRequest {
     pub frontmatter: TaskFrontmatter,
     pub body: String,
     pub timeout: Duration,
+    pub session_id: String,
+    pub session_log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,10 +139,14 @@ mod tests {
                     recap: None,
                     recaps: vec![],
                     plan: None,
+                    agent_session_id: None,
+                    agent_session_log: None,
                     requires_user: false,
                 },
                 body: "# Task".to_owned(),
                 timeout: Duration::from_secs(600),
+                session_id: "session-1".to_owned(),
+                session_log_path: None,
             })
             .await
             .expect("fake agent should return a result");

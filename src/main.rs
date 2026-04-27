@@ -700,6 +700,8 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
             recap: None,
             recaps: vec![],
             plan: None,
+            agent_session_id: None,
+            agent_session_log: None,
             requires_user: false,
         },
         body: format!(
@@ -708,6 +710,8 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
             content
         ),
         timeout,
+        session_id: uuid::Uuid::new_v4().to_string(),
+        session_log_path: None,
     };
     let result = client.run_task(request).await?;
     let json = extract_json_object(&result.recap)?;
@@ -830,6 +834,7 @@ async fn run_task_paths_in_parallel(
                     git::commit_task_update(
                         &report.task_path,
                         &report.outcome.recap_path,
+                        &report.outcome.session_log_path,
                         notification.as_deref(),
                     )?;
                 }
@@ -1043,7 +1048,12 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
         None
     };
     if config.git.auto_commit {
-        git::commit_task_update(&task_path, &outcome.recap_path, notification.as_deref())?;
+        git::commit_task_update(
+            &task_path,
+            &outcome.recap_path,
+            &outcome.session_log_path,
+            notification.as_deref(),
+        )?;
         println!("committed task update");
     }
 

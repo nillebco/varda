@@ -43,6 +43,10 @@ pub struct TaskFrontmatter {
     pub recaps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_log: Option<String>,
     #[serde(default)]
     pub requires_user: bool,
 }
@@ -130,6 +134,8 @@ pub fn create_task(
             recap: None,
             recaps: vec![],
             plan: None,
+            agent_session_id: None,
+            agent_session_log: None,
             requires_user: false,
         },
         body: format!("# {taskname}\n\n"),
@@ -497,6 +503,7 @@ Do the work.
         assert_eq!(task.frontmatter.status, TaskStatus::Ready);
         assert_eq!(task.frontmatter.id, Some(42));
         assert_eq!(task.frontmatter.assignee.as_deref(), Some("codex"));
+        assert_eq!(task.frontmatter.agent_session_id, None);
         assert!(!task.frontmatter.requires_user);
         assert!(task.body.contains("Do the work."));
     }
@@ -513,6 +520,8 @@ Do the work.
                 recap: None,
                 recaps: vec![],
                 plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
                 requires_user: false,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
@@ -520,6 +529,9 @@ Do the work.
 
         task.set_status(TaskStatus::Pending);
         task.set_recap(".varda/operations/recaps/run.md");
+        task.frontmatter.agent_session_id = Some("session-123".to_owned());
+        task.frontmatter.agent_session_log =
+            Some(".varda/operations/runs/session-123.log".to_owned());
 
         let frontmatter =
             serde_yaml::to_string(&task.frontmatter).expect("frontmatter should serialize");
@@ -527,6 +539,8 @@ Do the work.
         assert!(frontmatter.contains("status: pending"));
         assert!(frontmatter.contains("recaps:"));
         assert!(frontmatter.contains(".varda/operations/recaps/run.md"));
+        assert!(frontmatter.contains("agent_session_id: session-123"));
+        assert!(frontmatter.contains(".varda/operations/runs/session-123.log"));
     }
 
     #[test]
@@ -542,6 +556,8 @@ Do the work.
                 recap: None,
                 recaps: vec![".varda/operations/recaps/run.md".to_owned()],
                 plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
                 requires_user: false,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),

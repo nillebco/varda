@@ -47,6 +47,7 @@ The important files are:
 - `$VARDA_HOME/config.toml` or `$HOME/.varda/config.toml`: tells Varda which agents are allowed for which project paths.
 - `$VARDA_HOME/operations/tasks/`: where Varda stores markdown task files.
 - `$VARDA_HOME/operations/recaps/`: where agent recaps are written.
+- `$VARDA_HOME/operations/runs/`: where agent session logs and notifications are written.
 - `$VARDA_HOME/operations/runs/`: where notification records are written.
 
 `varda init` also runs `git init` in the control-plane folder. This matters because `varda task run` commits task updates, recaps, and notifications into that repository.
@@ -311,6 +312,15 @@ requires_user: true
 
 Varda uses that marker to set the task status to `needs_user` and write a notification file.
 
+Each task run also records the latest agent session in task frontmatter:
+
+```yaml
+agent_session_id: 2f6f0f2c-7ad9-4d78-b5b6-66a9eddfce54
+agent_session_log: /home/user/.varda/operations/runs/2f6f0f2c-7ad9-4d78-b5b6-66a9eddfce54.log
+```
+
+If the agent process fails or times out, the synthetic failure recap includes the session ID and a link to that log file.
+
 ## Configuration
 
 The default global config looks like this:
@@ -359,6 +369,7 @@ For a normal task, the commit includes:
 
 - the updated task markdown file
 - the generated recap file
+- the generated agent session log
 
 For a task that needs user input, the commit also includes:
 

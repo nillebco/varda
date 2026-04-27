@@ -35,18 +35,33 @@ impl AgentClient for AcpSubprocessClient {
     async fn run_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
         let prompt = build_prompt(&request);
         let args = args_for_request(&self.args, &request);
-        self.execute(prompt, args).await
+        self.execute(prompt, args, &request).await
     }
 
     async fn plan_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
         let prompt = build_planning_prompt(&request);
         let args = args_for_request(&self.args, &request);
-        self.execute(prompt, args).await
+        self.execute(prompt, args, &request).await
     }
 }
 
 impl AcpSubprocessClient {
-    async fn execute(&self, prompt: String, args: Vec<String>) -> Result<AgentRunResult> {
+    async fn execute(
+        &self,
+        prompt: String,
+        args: Vec<String>,
+        request: &AgentRunRequest,
+    ) -> Result<AgentRunResult> {
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let _ = append_session_log(
+                log_path,
+                &format!(
+                    "session_id={}\nagent={}\ntask={}\ncommand={} args={:?}\n",
+                    request.session_id, self.agent_name, request.task_path, self.command, args
+                ),
+            );
+        }
+
         let mut child = Command::new(&self.command)
             .args(&args)
             .stdin(Stdio::piped())
@@ -72,6 +87,18 @@ impl AcpSubprocessClient {
             .wait_with_output()
             .await
             .context("failed to wait for agent subprocess")?;
+
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let _ = append_session_log(
+                log_path,
+                &format!(
+                    "\nstatus={}\n\nstdout:\n{}\n\nstderr:\n{}\n",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            );
+        }
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -225,6 +252,29 @@ fn expand_arg(arg: &str, request: &AgentRunRequest, project: &str) -> String {
         .replace("{task}", &request.task_path)
 }
 
+fn append_session_log(path: &str, content: &str) -> Result<()> {
+    use std::io::Write;
+
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create session log directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open session log {}", path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("failed to write session log {}", path.display()))?;
+    Ok(())
+}
+
 fn recap_contains_user_request(recap: &str) -> bool {
     recap
         .lines()
@@ -260,10 +310,14 @@ mod tests {
                     recap: None,
                     recaps: vec![],
                     plan: None,
+                    agent_session_id: None,
+                    agent_session_log: None,
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
                 timeout: Duration::from_secs(600),
+                session_id: "session-1".to_owned(),
+                session_log_path: None,
             })
             .await
             .expect("subprocess should echo prompt");
@@ -294,10 +348,14 @@ mod tests {
                 recap: None,
                 recaps: vec![],
                 plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
                 requires_user: false,
             },
             body: "# Task".to_owned(),
             timeout: Duration::from_secs(600),
+            session_id: "session-1".to_owned(),
+            session_log_path: None,
         };
 
         let args = args_for_request(
@@ -338,10 +396,14 @@ mod tests {
                 recap: None,
                 recaps: vec![],
                 plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
                 requires_user: false,
             },
             body: "# Task".to_owned(),
             timeout: Duration::from_secs(600),
+            session_id: "session-1".to_owned(),
+            session_log_path: None,
         };
 
         let args = args_for_request(
