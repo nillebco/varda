@@ -28,6 +28,11 @@ kind = "acp"
 command = "codex"
 args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
 
+[agents.claude]
+kind = "acp"
+command = "claude"
+args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
+
 [git]
 auto_commit = true
 "#;
@@ -287,6 +292,17 @@ mod tests {
         assert_eq!(config.defaults.timeout_seconds, 600);
         assert_eq!(config.routes[0].agents, vec!["codex"]);
         assert_eq!(config.agents["codex"].command, "codex");
+        assert_eq!(config.agents["claude"].command, "claude");
+        assert_eq!(
+            config.agents["claude"].args,
+            vec![
+                "-p",
+                "--permission-mode",
+                "acceptEdits",
+                "--add-dir",
+                "{project}"
+            ]
+        );
         assert!(
             !config.agents["codex"]
                 .args

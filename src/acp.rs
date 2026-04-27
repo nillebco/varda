@@ -236,4 +236,44 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn expands_task_project_placeholders_in_args() {
+        let request = AgentRunRequest {
+            agent_name: "claude".to_owned(),
+            task_path: "/home/user/.varda/operations/tasks/task.md".to_owned(),
+            frontmatter: TaskFrontmatter {
+                id: None,
+                status: TaskStatus::Ready,
+                project: Some("/work/project".to_owned()),
+                assignee: Some("claude".to_owned()),
+                recap: None,
+                requires_user: false,
+            },
+            body: "# Task".to_owned(),
+            timeout: Duration::from_secs(600),
+        };
+
+        let args = args_for_request(
+            &[
+                "-p".to_owned(),
+                "--permission-mode".to_owned(),
+                "acceptEdits".to_owned(),
+                "--add-dir".to_owned(),
+                "{project}".to_owned(),
+            ],
+            &request,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "--permission-mode",
+                "acceptEdits",
+                "--add-dir",
+                "/work/project",
+            ]
+        );
+    }
 }
