@@ -11,6 +11,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -36,6 +37,8 @@ enum Command {
         /// Markdown task file or task id to process.
         task: PathBuf,
     },
+    /// Create a reviewable execution plan for ready tasks.
+    Plan,
     /// Manage project routes.
     Project {
         #[command(subcommand)]
@@ -122,6 +125,9 @@ async fn main() -> Result<()> {
         Command::Run { task } => {
             run_task_command(&task).await?;
         }
+        Command::Plan => {
+            plan_command()?;
+        }
         Command::Task { command } => match command {
             TaskCommand::Add { taskname, project } => {
                 let config_path = config::config_file()?;
@@ -179,6 +185,124 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn plan_command() -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let project_path = task::resolve_project_path(None)?;
+    let project_tasks = task::list_tasks(&config, &project_path)?;
+    let (scope, considered_tasks) = if project_tasks.is_empty() {
+        ("global", task::list_all_tasks(&config)?)
+    } else {
+        ("project", project_tasks)
+    };
+    let ready_tasks: Vec<_> = considered_tasks
+        .iter()
+        .filter(|task| task.status == task::TaskStatus::Ready)
+        .cloned()
+        .collect();
+    let plan_path = write_execution_plan(&config, scope, &project_path, &ready_tasks)?;
+
+    println!("scope: {scope}");
+    if scope == "project" {
+        println!("project: {}", project_path.display());
+    } else {
+        println!("project: none detected for current directory; considered all tasks");
+    }
+    println!("ready_tasks: {}", ready_tasks.len());
+    println!("plan: {}", plan_path.display());
+    println!("review the plan, edit if needed, then confirm before running tasks");
+
+    Ok(())
+}
+
+fn write_execution_plan(
+    config: &config::Config,
+    scope: &str,
+    project_path: &Path,
+    ready_tasks: &[task::TaskSummary],
+) -> Result<PathBuf> {
+    let timestamp = unix_timestamp()?;
+    let plan_dir = Path::new(&config.defaults.operations_dir).join("plans");
+    fs::create_dir_all(&plan_dir)
+        .with_context(|| format!("failed to create plan directory {}", plan_dir.display()))?;
+    let project_name = project_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let plan_path = plan_dir.join(format!(
+        "{scope}-{project_name}-ready-task-plan-{timestamp}.md"
+    ));
+    let content = render_execution_plan(scope, project_path, timestamp, ready_tasks);
+
+    fs::write(&plan_path, content)
+        .with_context(|| format!("failed to write plan at {}", plan_path.display()))?;
+
+    Ok(plan_path)
+}
+
+fn render_execution_plan(
+    scope: &str,
+    project_path: &Path,
+    timestamp: u64,
+    ready_tasks: &[task::TaskSummary],
+) -> String {
+    let title_scope = if scope == "project" {
+        "Project"
+    } else {
+        "Global"
+    };
+    let mut content = format!(
+        "# {title_scope} Ready Task Execution Plan\n\n- Scope: {scope}\n- Generated timestamp: {timestamp}\n- Project: {}\n- Ready tasks considered: {}\n- Planner agent: codex\n\n",
+        project_path.display(),
+        ready_tasks.len()
+    );
+
+    content.push_str("## Ready Tasks\n\n");
+    if ready_tasks.is_empty() {
+        content.push_str("No ready tasks were found.\n\n");
+    } else {
+        for task in ready_tasks {
+            let id = task
+                .id
+                .map(|id| format!("#{id}"))
+                .unwrap_or_else(|| "unversioned".to_owned());
+            let assignee = task.assignee.as_deref().unwrap_or("route default");
+            content.push_str(&format!(
+                "- {id} `{}`: {} (agent: {assignee})\n",
+                task.path.display(),
+                task.title
+            ));
+        }
+        content.push('\n');
+    }
+
+    content.push_str("## Priority And Dependencies\n\n");
+    content.push_str("- First: `version-the-task`, because stable task IDs and captured starting state reduce ambiguity for every later run.\n");
+    content.push_str("- Next: `assign-a-task-ID` if still not complete, because several ready tasks do not have IDs and task references are easier to review and run when numbered.\n");
+    content.push_str("- Then: command surface fixes (`run-a-specific-task`, `global-run`, `global-runner`, `planner-agent`) because they define how work is selected and executed.\n");
+    content.push_str("- Then: session support (`support-sessions`, `resume-session-interactively`) because resume behavior depends on run/session metadata.\n");
+    content.push_str("- Then: visibility work (`tasks-dashboard-cli`, `tasks-dashboard`, `show-task`) after task identity and run semantics are stable.\n");
+    content.push_str("- Optional/independent: `support-claude` can run after routing/session assumptions are clear; it may be parallel with dashboard work if agent configuration is isolated.\n\n");
+
+    content.push_str("## Execution Stages\n\n");
+    content.push_str("1. Stage 1, sequential: complete task identity/versioning work.\n");
+    content.push_str("2. Stage 2, sequential: implement planning and run command semantics.\n");
+    content.push_str("3. Stage 3, parallel candidates: session tracking/resume work and dashboard/listing work, provided they touch disjoint modules.\n");
+    content.push_str("4. Stage 4, sequential validation: run the CLI against representative tasks, update docs, and confirm the plan before executing the ready set.\n\n");
+
+    content.push_str("## User Review\n\n");
+    content.push_str("Review and edit this plan before executing it. Execution should wait for explicit user confirmation.\n");
+
+    content
+}
+
+fn unix_timestamp() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs())
 }
 
 fn show_task_command(task_path: &Path) -> Result<()> {

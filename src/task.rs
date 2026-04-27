@@ -146,6 +146,24 @@ pub fn list_tasks(config: &Config, project_path: &Path) -> Result<Vec<TaskSummar
     Ok(tasks)
 }
 
+pub fn list_all_tasks(config: &Config) -> Result<Vec<TaskSummary>> {
+    let task_dir = Path::new(&config.defaults.operations_dir).join("tasks");
+    if !task_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut tasks = Vec::new();
+    collect_all_tasks(&task_dir, &mut tasks)?;
+    tasks.sort_by(|left, right| {
+        left.id
+            .unwrap_or(u64::MAX)
+            .cmp(&right.id.unwrap_or(u64::MAX))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    Ok(tasks)
+}
+
 pub fn resolve_task_reference(config: &Config, task_ref: &Path) -> Result<PathBuf> {
     if task_ref.exists() {
         return Ok(task_ref.to_path_buf());
@@ -252,6 +270,49 @@ fn collect_tasks(path: &Path, project_path: &Path, tasks: &mut Vec<TaskSummary>)
         if normalize_project_path(Path::new(task_project))? != project_path {
             continue;
         }
+
+        tasks.push(TaskSummary {
+            path: task.path,
+            id: task.frontmatter.id,
+            status: task.frontmatter.status,
+            assignee: task.frontmatter.assignee,
+            title: task_title(&task.body),
+        });
+    }
+
+    Ok(())
+}
+
+fn collect_all_tasks(path: &Path, tasks: &mut Vec<TaskSummary>) -> Result<()> {
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("failed to read task directory {}", path.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read task directory {}", path.display()))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry_path.display()))?;
+
+        if file_type.is_dir() {
+            collect_all_tasks(&entry_path, tasks)?;
+            continue;
+        }
+
+        if !entry_path
+            .extension()
+            .is_some_and(|extension| extension == "md")
+        {
+            continue;
+        }
+
+        let task = match load_task(&entry_path) {
+            Ok(task) => task,
+            Err(error) => {
+                eprintln!("warning: skipped {}: {error:#}", entry_path.display());
+                continue;
+            }
+        };
 
         tasks.push(TaskSummary {
             path: task.path,
