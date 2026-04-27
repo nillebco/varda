@@ -365,7 +365,13 @@ fn max_task_id(path: &Path) -> Result<Option<u64>> {
             .extension()
             .is_some_and(|extension| extension == "md")
         {
-            Some(load_task(&entry_path)?.frontmatter.id.unwrap_or(0))
+            match load_task(&entry_path) {
+                Ok(task) => Some(task.frontmatter.id.unwrap_or(0)),
+                Err(error) => {
+                    eprintln!("warning: skipped {}: {error:#}", entry_path.display());
+                    None
+                }
+            }
         } else {
             None
         };
