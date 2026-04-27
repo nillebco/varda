@@ -1039,6 +1039,12 @@ struct DashboardRecap {
     markdown: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DashboardStatusUpdate {
+    path: String,
+    status: task::TaskStatus,
+}
+
 fn serve_task_dashboard(
     config: config::Config,
     project: Option<PathBuf>,
@@ -1073,23 +1079,61 @@ fn handle_dashboard_connection(
         .read(&mut buffer)
         .context("failed to read dashboard request")?;
     let request = String::from_utf8_lossy(&buffer[..read]);
-    let target = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
+    let request_line = request.lines().next().unwrap_or("");
+    let method = request_line.split_whitespace().next().unwrap_or("");
+    let target = request_line.split_whitespace().nth(1).unwrap_or("/");
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("");
 
-    match target.split('?').next().unwrap_or("/") {
-        "/" | "/index.html" => write_http_response(stream, "200 OK", "text/html", DASHBOARD_HTML),
-        "/api/tasks" => {
+    match (method, target.split('?').next().unwrap_or("/")) {
+        ("GET", "/" | "/index.html") => {
+            write_http_response(stream, "200 OK", "text/html", DASHBOARD_HTML)
+        }
+        ("GET", "/api/tasks") => {
             let payload = load_dashboard_payload(config, project, all_projects)?;
             let json =
                 serde_json::to_string(&payload).context("failed to encode dashboard JSON")?;
             write_http_response(stream, "200 OK", "application/json", &json)
         }
-        "/healthz" => write_http_response(stream, "200 OK", "text/plain", "ok\n"),
+        ("POST", "/api/tasks/status") => {
+            let update: DashboardStatusUpdate =
+                serde_json::from_str(body).context("failed to decode dashboard status update")?;
+            update_dashboard_task_status(config, update)?;
+            write_http_response(stream, "200 OK", "application/json", "{\"ok\":true}")
+        }
+        ("GET", "/healthz") => write_http_response(stream, "200 OK", "text/plain", "ok\n"),
         _ => write_http_response(stream, "404 Not Found", "text/plain", "not found\n"),
     }
+}
+
+fn update_dashboard_task_status(
+    config: &config::Config,
+    update: DashboardStatusUpdate,
+) -> Result<()> {
+    if update.status != task::TaskStatus::Done {
+        anyhow::bail!("dashboard status updates currently support only done");
+    }
+
+    let task_path = task::resolve_task_reference(config, Path::new(&update.path))?;
+    let mut task_document = task::load_task(&task_path)?;
+    if task_document.frontmatter.status == task::TaskStatus::Done {
+        return Ok(());
+    }
+
+    task_document.set_status(task::TaskStatus::Done);
+    task_document.frontmatter.requires_user = false;
+    task::write_task(&task_document)?;
+
+    if config.git.auto_commit {
+        git::commit_task_file(
+            &task_path,
+            &format!("Mark task {} done", task_path.display()),
+        )?;
+    }
+
+    Ok(())
 }
 
 fn write_http_response(
@@ -1199,10 +1243,13 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; min-height: calc(100vh - 113px); }
     main.details-open { grid-template-columns: minmax(0, 1fr) minmax(360px, 34vw); }
     .board { display: grid; grid-template-columns: repeat(6, minmax(220px, 1fr)); gap: 12px; overflow-x: auto; padding: 16px; }
-    .column { min-width: 220px; }
+    .column { min-width: 220px; border: 1px solid transparent; border-radius: 8px; padding: 4px; }
+    .column.drop-target { border-color: var(--accent); background: #edf7f2; }
     .column h2 { display: flex; justify-content: space-between; align-items: center; margin: 0 0 10px; font-size: 13px; text-transform: uppercase; color: var(--muted); letter-spacing: 0; }
     .count { border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; background: var(--panel); color: var(--muted); }
     .task { width: 100%; text-align: left; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 10px; margin-bottom: 10px; cursor: pointer; box-shadow: 0 1px 2px rgba(25, 32, 44, 0.05); }
+    .task[draggable="true"] { cursor: grab; }
+    .task.dragging { opacity: 0.55; }
     .task:hover, .task.selected { border-color: var(--accent); }
     .task-title { font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; }
     .task-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
@@ -1294,6 +1341,28 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       for (const status of statuses) {
         const column = document.createElement("section");
         column.className = "column";
+        column.dataset.status = status;
+        if (status === "done") {
+          column.ondragover = event => {
+            if (Array.from(event.dataTransfer.types).includes("text/plain")) {
+              event.preventDefault();
+              column.classList.add("drop-target");
+            }
+          };
+          column.ondragleave = () => column.classList.remove("drop-target");
+          column.ondrop = async event => {
+            event.preventDefault();
+            column.classList.remove("drop-target");
+            const path = event.dataTransfer.getData("text/plain");
+            if (path) {
+              try {
+                await markTaskDone(path);
+              } catch (error) {
+                document.getElementById("details").textContent = `Failed to update task: ${error}`;
+              }
+            }
+          };
+        }
         const tasks = payload.tasks.filter(task => task.status === status && taskMatches(task));
         const heading = document.createElement("h2");
         heading.innerHTML = `<span>${label(status)}</span><span class="count">${tasks.length}</span>`;
@@ -1302,6 +1371,13 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           const button = document.createElement("button");
           button.className = `task${task.path === selectedPath ? " selected" : ""}`;
           button.type = "button";
+          button.draggable = task.status !== "done";
+          button.ondragstart = event => {
+            event.dataTransfer.setData("text/plain", task.path);
+            event.dataTransfer.effectAllowed = "move";
+            button.classList.add("dragging");
+          };
+          button.ondragend = () => button.classList.remove("dragging");
           button.onclick = () => { selectedPath = task.path; renderBoard(); renderDetails(task); };
           const id = task.id === null || task.id === undefined ? "unversioned" : `#${task.id}`;
           button.innerHTML = `<div class="task-title"></div><div class="task-row"><span class="badge"></span><span class="badge"></span></div>`;
@@ -1319,6 +1395,23 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       } else if (selectedPath) {
         closeDetails();
       }
+    }
+
+    async function markTaskDone(path) {
+      const response = await fetch("/api/tasks/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path, status: "done" })
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const task = payload.tasks.find(task => task.path === path);
+      if (task) {
+        task.status = "done";
+      }
+      renderBoard();
+      await refresh();
     }
 
     function renderDetails(task) {
