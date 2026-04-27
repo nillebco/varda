@@ -36,6 +36,8 @@ pub fn build_agent_instructions(timeout: Duration) -> String {
 
 You have at most {minutes} minutes.
 
+Follow any instructions in CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder.
+
 Before the time limit expires, produce a concise recap for the end user.
 The recap must include:
 - what you completed
@@ -43,6 +45,10 @@ The recap must include:
 - any blockers
 - whether user interaction is required
 - suggested next agent, if applicable
+
+In your recap, include a section listing every file you created, modified, or deleted during this session.
+Add a markdown heading called Files touched and list one absolute file path per line below it.
+If no files were changed, write (none) under that heading.
 
 If you need user input, stop and mark the result as requires_user."#
     )

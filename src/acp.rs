@@ -85,10 +85,38 @@ impl AgentClient for AcpSubprocessClient {
     }
 }
 
-fn build_prompt(request: &AgentRunRequest) -> String {
-    format!(
-        r#"{instructions}
+fn load_project_instructions(project: &str) -> String {
+    let files = ["CLAUDE.md", "AGENTS.md", "copilot-instructions.md"];
+    let sections: Vec<String> = files
+        .iter()
+        .filter_map(|name| {
+            let path = std::path::Path::new(project).join(name);
+            let content = std::fs::read_to_string(&path).ok()?;
+            if content.trim().is_empty() {
+                return None;
+            }
+            Some(format!("### {name}\n{content}"))
+        })
+        .collect();
+    sections.join("\n\n")
+}
 
+fn build_prompt(request: &AgentRunRequest) -> String {
+    let project_instructions = request
+        .frontmatter
+        .project
+        .as_deref()
+        .map(load_project_instructions)
+        .unwrap_or_default();
+
+    let instructions_section = if project_instructions.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Project instructions\n\n{project_instructions}\n")
+    };
+
+    format!(
+        r#"{instructions}{instructions_section}
 Agent: {agent}
 Task path: {task_path}
 Task frontmatter:
