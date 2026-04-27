@@ -186,6 +186,8 @@ You can also show by numeric task ID:
 varda task show 1
 ```
 
+Any command that accepts a `<TASK>` argument accepts either an existing task file path or a numeric task ID from `varda task list`.
+
 When `varda task run` starts, it reads the task's `project` field and uses that path to select the route and allowed agents.
 
 The old top-level `varda run <task>` command is still available as a compatibility alias, but new usage should prefer `varda task run <task>`.
@@ -223,6 +225,12 @@ Resume it with:
 
 ```sh
 varda task resume "$HOME/.varda/operations/tasks/summarize-this-project.md"
+```
+
+Or resume it by numeric task ID:
+
+```sh
+varda task resume 1
 ```
 
 `varda task resume` does this:

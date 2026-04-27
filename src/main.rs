@@ -79,7 +79,7 @@ enum TaskCommand {
     },
     /// Resume a task that is waiting for user input, then run it.
     Resume {
-        /// Markdown task file to resume.
+        /// Markdown task file or task id to resume.
         task: PathBuf,
     },
     /// Display a markdown task and its associated recap.
@@ -93,7 +93,7 @@ enum TaskCommand {
 enum ShowCommand {
     /// Display a markdown task and its associated recap.
     Task {
-        /// Markdown task file to display.
+        /// Markdown task file or task id to display.
         task: PathBuf,
     },
 }
@@ -449,7 +449,10 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
 }
 
 async fn resume_task_command(task_path: &Path) -> Result<()> {
-    let mut task_document = task::load_task(task_path)?;
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let task_path = task::resolve_task_reference(&config, task_path)?;
+    let mut task_document = task::load_task(&task_path)?;
     let was_needs_user = task_document.frontmatter.status == task::TaskStatus::NeedsUser;
 
     task_document.set_status(task::TaskStatus::Ready);
@@ -457,13 +460,13 @@ async fn resume_task_command(task_path: &Path) -> Result<()> {
     task::write_task(&task_document)?;
 
     if was_needs_user && prompt_yes_no("Open editor to complete the task update?", true)? {
-        open_editor(task_path)?;
+        open_editor(&task_path)?;
     }
 
-    git::commit_task_file(task_path, &format!("Resume task {}", task_path.display()))?;
+    git::commit_task_file(&task_path, &format!("Resume task {}", task_path.display()))?;
     println!("committed resume update");
 
-    run_task_command(task_path).await
+    run_task_command(&task_path).await
 }
 
 fn prompt_assignee(default_assignee: &str) -> Result<Option<String>> {
