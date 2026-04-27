@@ -79,6 +79,11 @@ enum TaskCommand {
         /// Markdown task file to resume.
         task: PathBuf,
     },
+    /// Display a markdown task and its associated recap.
+    Show {
+        /// Markdown task file or task id to display.
+        task: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -151,6 +156,9 @@ async fn main() -> Result<()> {
             TaskCommand::Resume { task } => {
                 resume_task_command(&task).await?;
             }
+            TaskCommand::Show { task } => {
+                show_task_command(&task)?;
+            }
         },
         Command::Show { command } => match command {
             ShowCommand::Task { task } => {
@@ -174,7 +182,8 @@ async fn main() -> Result<()> {
 }
 
 fn show_task_command(task_path: &Path) -> Result<()> {
-    let task_content = fs::read_to_string(task_path)
+    let task_path = resolve_task_for_show(task_path)?;
+    let task_content = fs::read_to_string(&task_path)
         .with_context(|| format!("failed to read task at {}", task_path.display()))?;
     let task_document = task::load_task(&task_path)?;
 
@@ -196,7 +205,7 @@ fn show_task_command(task_path: &Path) -> Result<()> {
         return Ok(());
     };
 
-    let recap_path = resolve_recap_path(recap_path, task_path);
+    let recap_path = resolve_recap_path(recap_path, &task_path);
     let recap_content = fs::read_to_string(&recap_path)
         .with_context(|| format!("failed to read recap at {}", recap_path.display()))?;
 
@@ -208,6 +217,16 @@ fn show_task_command(task_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_task_for_show(task_path: &Path) -> Result<PathBuf> {
+    if task_path.exists() {
+        return Ok(task_path.to_path_buf());
+    }
+
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    task::resolve_task_reference(&config, task_path)
 }
 
 fn resolve_recap_path(recap_path: &str, task_path: &Path) -> PathBuf {

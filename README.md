@@ -61,15 +61,16 @@ The important files are:
 6. Write the task details and save the file.
 7. List project tasks with `varda task list`.
 8. Run `varda task run path/to/task.md`.
-9. Varda finds the matching project route in the global config.
-10. Varda verifies the assignee is allowed for that project.
-11. Varda marks the task as `running`.
-12. Varda starts the configured agent.
-13. The agent has at most 10 minutes to work.
-14. The agent must produce a recap before it finishes.
-15. Varda writes the recap under the global operations folder.
-16. Varda updates the original task to `pending`, `needs_user`, or `failed`.
-17. Varda commits the task update and recap with git.
+9. Show a task and its recap with `varda task show path/to/task.md`.
+10. Varda finds the matching project route in the global config.
+11. Varda verifies the assignee is allowed for that project.
+12. Varda marks the task as `running`.
+13. Varda starts the configured agent.
+14. The agent has at most 10 minutes to work.
+15. The agent must produce a recap before it finishes.
+16. Varda writes the recap under the global operations folder.
+17. Varda updates the original task to `pending`, `needs_user`, or `failed`.
+18. Varda commits the task update and recap with git.
 
 ## Add Project Routes
 
@@ -173,9 +174,23 @@ You can also run by numeric task ID:
 varda task run 1
 ```
 
+Show a task and its associated recap with:
+
+```sh
+varda task show "$HOME/.varda/operations/tasks/summarize-this-project.md"
+```
+
+You can also show by numeric task ID:
+
+```sh
+varda task show 1
+```
+
 When `varda task run` starts, it reads the task's `project` field and uses that path to select the route and allowed agents.
 
 The old top-level `varda run <task>` command is still available as a compatibility alias, but new usage should prefer `varda task run <task>`.
+
+The old top-level `varda show task <task>` command is still available as a compatibility alias, but new usage should prefer `varda task show <task>`.
 
 ## Task Statuses
 
