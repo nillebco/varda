@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(name = "varda")]
@@ -280,6 +281,7 @@ fn plan_command() -> Result<()> {
         scope,
         &project_path,
         &selection_reason,
+        considered_tasks.len(),
         &plan_tasks,
     )?;
 
@@ -424,6 +426,7 @@ fn write_execution_plan(
     scope: &str,
     project_path: &Path,
     selection_reason: &str,
+    considered_tasks_count: usize,
     ready_tasks: &[PlanTask],
 ) -> Result<PathBuf> {
     let timestamp = unix_timestamp()?;
@@ -442,6 +445,7 @@ fn write_execution_plan(
         project_path,
         timestamp,
         selection_reason,
+        considered_tasks_count,
         ready_tasks,
     );
 
@@ -456,6 +460,7 @@ fn render_execution_plan(
     project_path: &Path,
     timestamp: u64,
     selection_reason: &str,
+    considered_tasks_count: usize,
     ready_tasks: &[PlanTask],
 ) -> String {
     let title_scope = if scope == "project" {
@@ -463,8 +468,23 @@ fn render_execution_plan(
     } else {
         "Global"
     };
+    let project = project_path.display().to_string();
+    let frontmatter = PlanFrontmatter {
+        plan_type: "ready_task_execution_plan",
+        scope,
+        project: &project,
+        generated_timestamp: timestamp,
+        tasks_evaluated: considered_tasks_count,
+        ready_tasks: ready_tasks.len(),
+        planner_agent: "codex",
+        selection_reason,
+        requires_user_confirmation: true,
+    };
+    let frontmatter =
+        serde_yaml::to_string(&frontmatter).expect("plan frontmatter should serialize");
+    let frontmatter = frontmatter.trim_start_matches("---\n").trim_end();
     let mut content = format!(
-        "# {title_scope} Ready Task Execution Plan\n\n- Scope: {scope}\n- Generated timestamp: {timestamp}\n- Project: `{}`\n- Selection rule: {selection_reason}.\n- Ready tasks considered: {}\n- Planner agent: codex\n- Execution should wait for explicit user confirmation.\n\n",
+        "---\n{frontmatter}\n---\n\n# {title_scope} Ready Task Execution Plan\n\n- Scope: {scope}\n- Generated timestamp: {timestamp}\n- Project: `{}`\n- Selection rule: {selection_reason}.\n- Tasks evaluated: {considered_tasks_count}\n- Ready tasks: {}\n- Planner agent: codex\n- Execution should wait for explicit user confirmation.\n\n",
         project_path.display(),
         ready_tasks.len()
     );
@@ -531,6 +551,19 @@ fn render_execution_plan(
     content.push_str("The next step is user review. The plan should be confirmed or edited before Varda executes the ready tasks.\n");
 
     content
+}
+
+#[derive(Debug, Serialize)]
+struct PlanFrontmatter<'a> {
+    plan_type: &'a str,
+    scope: &'a str,
+    project: &'a str,
+    generated_timestamp: u64,
+    tasks_evaluated: usize,
+    ready_tasks: usize,
+    planner_agent: &'a str,
+    selection_reason: &'a str,
+    requires_user_confirmation: bool,
 }
 
 fn unix_timestamp() -> Result<u64> {
@@ -838,4 +871,62 @@ fn skill_install_command(source: Option<&Path>, link: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gray_matter::{Matter, engine::YAML};
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct PlanMetadata {
+        plan_type: String,
+        scope: String,
+        project: String,
+        generated_timestamp: u64,
+        tasks_evaluated: usize,
+        ready_tasks: usize,
+        planner_agent: String,
+        selection_reason: String,
+        requires_user_confirmation: bool,
+    }
+
+    #[test]
+    fn rendered_execution_plan_includes_review_frontmatter() {
+        let content = render_execution_plan(
+            "project",
+            Path::new("/tmp/example"),
+            1_775_000_000,
+            "the current folder is known as a Varda project",
+            3,
+            &[],
+        );
+
+        let matter = Matter::<YAML>::new();
+        let parsed = matter
+            .parse::<PlanMetadata>(&content)
+            .expect("plan should parse");
+        let metadata = parsed.data.expect("plan should include valid frontmatter");
+
+        assert_eq!(metadata.plan_type, "ready_task_execution_plan");
+        assert_eq!(metadata.scope, "project");
+        assert_eq!(metadata.project, "/tmp/example");
+        assert_eq!(metadata.generated_timestamp, 1_775_000_000);
+        assert_eq!(metadata.tasks_evaluated, 3);
+        assert_eq!(metadata.ready_tasks, 0);
+        assert_eq!(metadata.planner_agent, "codex");
+        assert_eq!(
+            metadata.selection_reason,
+            "the current folder is known as a Varda project"
+        );
+        assert!(metadata.requires_user_confirmation);
+        assert!(
+            parsed
+                .content
+                .starts_with("# Project Ready Task Execution Plan")
+        );
+        assert!(parsed.content.contains("- Tasks evaluated: 3"));
+        assert!(parsed.content.contains("- Ready tasks: 0"));
+    }
 }

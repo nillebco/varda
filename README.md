@@ -217,7 +217,7 @@ When the current folder already has tasks in Varda's task store, the command pla
 $VARDA_HOME/operations/plans/
 ```
 
-The generated markdown assigns each ready task to the routed agent, explains the project/global selection, groups tasks into sequential and parallel candidate stages, and leaves execution behind an explicit user review gate.
+The generated markdown includes YAML frontmatter with the scope, project, task counts, planner agent, and review-gate metadata. It assigns each ready task to the routed agent, explains the project/global selection, groups tasks into sequential and parallel candidate stages, and leaves execution behind an explicit user review gate.
 
 ## Task Statuses
 
