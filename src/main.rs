@@ -15,7 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinSet;
+
+use crate::agent::AgentClient;
 
 #[derive(Debug, Parser)]
 #[command(name = "varda")]
@@ -33,10 +36,13 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Run a markdown task through the configured agent.
+    /// Run tasks through configured agents.
     Run {
         /// Markdown task file or task id to process.
-        task: PathBuf,
+        #[arg(long)]
+        task: Option<PathBuf>,
+        /// Execution plan to transform to JSON and run. For compatibility, a positional task still runs as a task.
+        plan: Option<PathBuf>,
     },
     /// Create a reviewable execution plan for ready tasks.
     Plan,
@@ -164,8 +170,8 @@ async fn main() -> Result<()> {
                 result.config_path, result.operations_dir
             );
         }
-        Command::Run { task } => {
-            run_task_command(&task).await?;
+        Command::Run { task, plan } => {
+            run_command(task.as_deref(), plan.as_deref()).await?;
         }
         Command::Plan => {
             plan_command()?;
@@ -588,11 +594,294 @@ struct PlanFrontmatter<'a> {
     requires_user_confirmation: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct OwnedPlanFrontmatter {
+    #[serde(default)]
+    planner_agent: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JsonExecutionPlan {
+    schema: String,
+    source_plan: String,
+    tasks: Vec<JsonExecutionTask>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JsonExecutionTask {
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parallel_group: Option<String>,
+}
+
 fn unix_timestamp() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
         .as_secs())
+}
+
+async fn run_command(task_arg: Option<&Path>, plan_arg: Option<&Path>) -> Result<()> {
+    match (task_arg, plan_arg) {
+        (Some(task), None) => run_task_command(task).await,
+        (Some(_), Some(_)) => {
+            anyhow::bail!("pass either --task <TASK> or a plan path, not both")
+        }
+        (None, Some(path)) => {
+            let config_path = config::config_file()?;
+            let config = config::load_config(&config_path)?;
+            if looks_like_task(&config, path) {
+                run_task_command(path).await
+            } else {
+                run_plan_command(path).await
+            }
+        }
+        (None, None) => run_ready_tasks_command().await,
+    }
+}
+
+fn looks_like_task(config: &config::Config, path: &Path) -> bool {
+    task::resolve_task_reference(config, path)
+        .ok()
+        .and_then(|resolved| task::load_task(resolved).ok())
+        .is_some()
+}
+
+async fn run_plan_command(plan_path: &Path) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let plan_path = if plan_path.exists() {
+        plan_path.to_path_buf()
+    } else {
+        anyhow::bail!("plan does not exist: {}", plan_path.display());
+    };
+    let json_path = transform_plan_to_json(&config, &plan_path).await?;
+    let json_plan = load_json_execution_plan(&json_path)?;
+    let task_paths: Vec<PathBuf> = json_plan
+        .tasks
+        .iter()
+        .map(|task| PathBuf::from(&task.path))
+        .collect();
+
+    println!("plan_json: {}", json_path.display());
+    run_task_paths_in_parallel(config, task_paths).await
+}
+
+async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Result<PathBuf> {
+    let content = fs::read_to_string(plan_path)
+        .with_context(|| format!("failed to read plan at {}", plan_path.display()))?;
+    let planner_agent = plan_planner_agent(&content)
+        .or_else(|| config.agents.keys().next().cloned())
+        .context("no configured agent is available to transform the plan")?;
+    let agent_config = config
+        .agents
+        .get(&planner_agent)
+        .with_context(|| format!("plan transformer agent '{planner_agent}' is not configured"))?;
+    let client = acp::AcpSubprocessClient::new(&planner_agent, agent_config);
+    let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
+    let request = agent::AgentRunRequest {
+        agent_name: planner_agent.clone(),
+        task_path: plan_path.display().to_string(),
+        frontmatter: task::TaskFrontmatter {
+            id: None,
+            status: task::TaskStatus::Ready,
+            project: None,
+            assignee: Some(planner_agent),
+            recap: None,
+            recaps: vec![],
+            plan: None,
+            requires_user: false,
+        },
+        body: format!(
+            "# Transform Execution Plan To JSON\n\nReturn only JSON using schema `varda.execution_plan.v1`.\n\nThe JSON shape is:\n\n```json\n{{\"schema\":\"varda.execution_plan.v1\",\"source_plan\":\"{}\",\"tasks\":[{{\"path\":\"/absolute/or/resolvable/task.md\",\"id\":1,\"title\":\"Task title\",\"agent\":\"codex\",\"project\":\"/project\",\"stage\":\"Stage 1\",\"parallel_group\":\"group-1\"}}]}}\n```\n\nInclude every task that should be executed from this plan. Omit optional fields when unknown.\n\nPlan markdown:\n\n{}",
+            plan_path.display(),
+            content
+        ),
+        timeout,
+    };
+    let result = client.run_task(request).await?;
+    let json = extract_json_object(&result.recap)?;
+    let mut json_plan: JsonExecutionPlan =
+        serde_json::from_str(json).context("agent did not return a valid execution plan JSON")?;
+    if json_plan.schema != "varda.execution_plan.v1" {
+        anyhow::bail!(
+            "unsupported execution plan JSON schema '{}'",
+            json_plan.schema
+        );
+    }
+    json_plan.source_plan = plan_path.display().to_string();
+    let rendered = serde_json::to_string_pretty(&json_plan)?;
+    let json_path = plan_path.with_extension("json");
+    fs::write(&json_path, format!("{rendered}\n"))
+        .with_context(|| format!("failed to write plan JSON at {}", json_path.display()))?;
+
+    Ok(json_path)
+}
+
+fn plan_planner_agent(content: &str) -> Option<String> {
+    let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
+    matter
+        .parse::<OwnedPlanFrontmatter>(content)
+        .ok()
+        .and_then(|parsed| parsed.data)
+        .and_then(|frontmatter| frontmatter.planner_agent)
+}
+
+fn extract_json_object(output: &str) -> Result<&str> {
+    let start = output
+        .find('{')
+        .context("agent output did not contain JSON")?;
+    let end = output
+        .rfind('}')
+        .context("agent output did not contain a complete JSON object")?;
+    if end < start {
+        anyhow::bail!("agent output did not contain a complete JSON object");
+    }
+    Ok(&output[start..=end])
+}
+
+fn load_json_execution_plan(path: &Path) -> Result<JsonExecutionPlan> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read plan JSON at {}", path.display()))?;
+    let plan: JsonExecutionPlan =
+        serde_json::from_str(&content).context("failed to parse execution plan JSON")?;
+    if plan.schema != "varda.execution_plan.v1" {
+        anyhow::bail!("unsupported execution plan JSON schema '{}'", plan.schema);
+    }
+    Ok(plan)
+}
+
+async fn run_ready_tasks_command() -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let ready_tasks: Vec<PathBuf> = task::list_all_tasks(&config)?
+        .into_iter()
+        .filter(|summary| summary.status == task::TaskStatus::Ready)
+        .map(|summary| summary.path)
+        .collect();
+
+    if ready_tasks.is_empty() {
+        println!("ready_tasks: 0");
+        return Ok(());
+    }
+
+    println!("ready_tasks: {}", ready_tasks.len());
+    run_task_paths_in_parallel(config, ready_tasks).await
+}
+
+async fn run_task_paths_in_parallel(
+    config: config::Config,
+    task_paths: Vec<PathBuf>,
+) -> Result<()> {
+    if config.git.auto_commit {
+        for task_path in &task_paths {
+            git::commit_task_file(
+                task_path,
+                &format!("Snapshot task {} before run", task_path.display()),
+            )?;
+        }
+        println!("committed task snapshots");
+    }
+
+    let mut runs = JoinSet::new();
+    for task_path in task_paths {
+        let config = config.clone();
+        runs.spawn(async move { run_task_path_for_parallel(config, task_path).await });
+    }
+
+    let mut failures = 0usize;
+    while let Some(joined) = runs.join_next().await {
+        match joined.context("task runner join failed")? {
+            Ok(report) => {
+                println!(
+                    "processed task={} agent={} glob={} status={:?} recap={}",
+                    report.task_path.display(),
+                    report.agent,
+                    report.glob,
+                    report.outcome.status,
+                    report.outcome.recap_path.display()
+                );
+                let notification = if report.outcome.status == task::TaskStatus::NeedsUser {
+                    let notification = notify::notify_user_interaction(
+                        &config,
+                        &report.task_path,
+                        &report.outcome.recap_path,
+                    )?;
+                    println!(
+                        "user interaction required for {}; notification={}",
+                        report.task_path.display(),
+                        notification.display()
+                    );
+                    Some(notification)
+                } else {
+                    None
+                };
+                if config.git.auto_commit {
+                    git::commit_task_update(
+                        &report.task_path,
+                        &report.outcome.recap_path,
+                        notification.as_deref(),
+                    )?;
+                }
+            }
+            Err(error) => {
+                failures += 1;
+                eprintln!("task failed: {error:#}");
+            }
+        }
+    }
+
+    if config.git.auto_commit {
+        println!("committed task updates");
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} task(s) failed");
+    }
+    Ok(())
+}
+
+struct ParallelRunReport {
+    task_path: PathBuf,
+    agent: String,
+    glob: String,
+    outcome: runner::RunOutcome,
+}
+
+async fn run_task_path_for_parallel(
+    config: config::Config,
+    task_path: PathBuf,
+) -> Result<ParallelRunReport> {
+    let task_path = task::resolve_task_reference(&config, &task_path)?;
+    let task_document = task::load_task(&task_path)?;
+    let project_path = task::task_project_path(&task_document)?;
+    let route = routing::match_route(
+        &config,
+        &project_path,
+        task_document.frontmatter.assignee.as_deref(),
+    )?;
+    let agent_config = config
+        .agents
+        .get(&route.agent)
+        .expect("routing ensures the selected agent exists");
+    let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
+    let outcome = runner::run_task(&config, &route.agent, &task_path, &client).await?;
+
+    Ok(ParallelRunReport {
+        task_path,
+        agent: route.agent,
+        glob: route.glob,
+        outcome,
+    })
 }
 
 fn show_task_command(task_path: &Path) -> Result<()> {
@@ -955,5 +1244,29 @@ mod tests {
         );
         assert!(parsed.content.contains("- Tasks evaluated: 3"));
         assert!(parsed.content.contains("- Ready tasks: 0"));
+    }
+
+    #[test]
+    fn extracts_json_object_from_agent_output() {
+        let output = "```json\n{\"schema\":\"varda.execution_plan.v1\",\"source_plan\":\"plan.md\",\"tasks\":[]}\n```";
+
+        let json = extract_json_object(output).expect("json object should be extracted");
+
+        assert_eq!(
+            json,
+            "{\"schema\":\"varda.execution_plan.v1\",\"source_plan\":\"plan.md\",\"tasks\":[]}"
+        );
+    }
+
+    #[test]
+    fn reads_planner_agent_from_plan_frontmatter() {
+        let content = r#"---
+planner_agent: codex
+---
+
+# Plan
+"#;
+
+        assert_eq!(plan_planner_agent(content).as_deref(), Some("codex"));
     }
 }

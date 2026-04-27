@@ -61,7 +61,7 @@ The important files are:
 6. Write the task details and save the file.
 7. List project tasks with `varda task list`.
 8. Create a reviewable ready-task plan with `varda plan`.
-9. Run `varda task run path/to/task.md`.
+9. Run a task with `varda task run path/to/task.md`, run a reviewed plan with `varda run path/to/plan.md`, or run all ready tasks with `varda run`.
 10. Show a task and its recap with `varda task show path/to/task.md`.
 11. Varda finds the matching project route in the global config.
 12. Varda verifies the assignee is allowed for that project.
@@ -199,7 +199,7 @@ Any command that accepts a `<TASK>` argument accepts either an existing task fil
 
 When `varda task run` starts, it reads the task's `project` field and uses that path to select the route and allowed agents.
 
-The old top-level `varda run <task>` command is still available as a compatibility alias, but new usage should prefer `varda task run <task>`.
+The old top-level `varda run <task>` command is still available as a compatibility alias when the positional path is a task document. New single-task usage should prefer `varda task run <task>` or `varda run --task <task>`.
 
 The old top-level `varda show task <task>` command is still available as a compatibility alias, but new usage should prefer `varda task show <task>`.
 
@@ -218,6 +218,28 @@ $VARDA_HOME/operations/plans/
 ```
 
 The generated markdown includes YAML frontmatter with the scope, project, task counts, planner agent, and review-gate metadata. It assigns each ready task to the routed agent, explains the project/global selection, groups tasks into sequential and parallel candidate stages, and leaves execution behind an explicit user review gate.
+
+Execute ready work with:
+
+```sh
+varda run
+```
+
+With no arguments, `varda run` finds every `ready` task in the operations task store and starts them in parallel through their routed agents.
+
+Execute a reviewed plan with:
+
+```sh
+varda run "$HOME/.varda/operations/plans/global-workspace-ready-task-plan-1775000000.md"
+```
+
+Before running a plan, Varda asks the configured planner agent to convert the markdown plan to a lightweight JSON document using schema `varda.execution_plan.v1`, writes that JSON beside the markdown plan, then runs the listed tasks in parallel. The JSON contains a `tasks` array with task paths and optional metadata such as `id`, `title`, `agent`, `project`, `stage`, and `parallel_group`.
+
+Run one task through the top-level command with:
+
+```sh
+varda run --task 1
+```
 
 ## Task Statuses
 
