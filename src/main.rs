@@ -107,6 +107,16 @@ enum TaskCommand {
         /// Markdown task file or task id to display.
         task: PathBuf,
     },
+    /// Open a markdown task in $EDITOR.
+    Edit {
+        /// Markdown task file or task id to open.
+        task: PathBuf,
+    },
+    /// Print the resolved file path for a task ID or path.
+    Resolve {
+        /// Markdown task file or task id to resolve.
+        task: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -218,6 +228,18 @@ async fn main() -> Result<()> {
             }
             TaskCommand::Show { task } => {
                 show_task_command(&task)?;
+            }
+            TaskCommand::Edit { task } => {
+                let config_path = config::config_file()?;
+                let config = config::load_config(&config_path)?;
+                let resolved = task::resolve_task_reference(&config, &task)?;
+                open_editor(&resolved)?;
+            }
+            TaskCommand::Resolve { task } => {
+                let config_path = config::config_file()?;
+                let config = config::load_config(&config_path)?;
+                let resolved = task::resolve_task_reference(&config, &task)?;
+                println!("{}", resolved.display());
             }
         },
         Command::Show { command } => match command {
