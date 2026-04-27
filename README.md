@@ -61,19 +61,20 @@ The important files are:
 5. Varda creates the task file and opens it in `$EDITOR`.
 6. Write the task details and save the file.
 7. List project tasks with `varda task list`.
-8. Create a reviewable ready-task plan with `varda plan`.
-9. Run a task with `varda task run path/to/task.md`, run a reviewed plan with `varda run path/to/plan.md`, or run all ready tasks with `varda run`.
-10. Show a task and its recap with `varda task show path/to/task.md`.
-11. Varda finds the matching project route in the global config.
-12. Varda verifies the assignee is allowed for that project.
-13. Varda marks the task as `running`.
-14. Varda starts the configured agent.
-15. The agent has at most 10 minutes to work.
-16. The agent must follow project instructions from `CLAUDE.md`, `AGENTS.md`, and `copilot-instructions.md` when those files exist.
-17. The agent must produce a recap before it finishes, including a `Files touched` section that lists every created, modified, or deleted file as an absolute path.
-18. Varda writes the recap under the global operations folder.
-19. Varda updates the original task to `pending`, `needs_user`, or `failed`.
-20. Varda commits the task update and recap with git.
+8. Review the task kanban board with `varda task dashboard`.
+9. Create a reviewable ready-task plan with `varda plan`.
+10. Run a task with `varda task run path/to/task.md`, run a reviewed plan with `varda run path/to/plan.md`, or run all ready tasks with `varda run`.
+11. Show a task and its recap with `varda task show path/to/task.md`.
+12. Varda finds the matching project route in the global config.
+13. Varda verifies the assignee is allowed for that project.
+14. Varda marks the task as `running`.
+15. Varda starts the configured agent.
+16. The agent has at most 10 minutes to work.
+17. The agent must follow project instructions from `CLAUDE.md`, `AGENTS.md`, and `copilot-instructions.md` when those files exist.
+18. The agent must produce a recap before it finishes, including a `Files touched` section that lists every created, modified, or deleted file as an absolute path.
+19. Varda writes the recap under the global operations folder.
+20. Varda updates the original task to `pending`, `needs_user`, or `failed`.
+21. Varda commits the task update and recap with git.
 
 ## Add Project Routes
 
@@ -204,6 +205,28 @@ When `varda task run` starts, it reads the task's `project` field and uses that 
 The old top-level `varda run <task>` command is still available as a compatibility alias when the positional path is a task document. New single-task usage should prefer `varda task run <task>` or `varda run --task <task>`.
 
 The old top-level `varda show task <task>` command is still available as a compatibility alias, but new usage should prefer `varda task show <task>`.
+
+## Tasks Dashboard
+
+Show a kanban board for the current project's tasks with:
+
+```sh
+varda task dashboard
+```
+
+The dashboard groups tasks by status and then prompts for a task ID or path. Selecting a task displays the full task markdown and every associated recap.
+
+Show all tasks across all projects:
+
+```sh
+varda task dashboard --all
+```
+
+Open a specific task from the dashboard without the prompt:
+
+```sh
+varda task dashboard --task 1
+```
 
 ## Plan Ready Work
 
@@ -443,7 +466,7 @@ make install
 
 ## Current Limitations
 
-- The dashboard is currently a folder structure, not a UI.
+- The dashboard is terminal-based.
 - The Codex integration is a subprocess POC, not a full ACP protocol client yet.
 - Notification is file-backed JSON plus terminal output.
 - Task handoff to another agent is represented by `pending` plus recap metadata, but automatic reassignment is not implemented yet.

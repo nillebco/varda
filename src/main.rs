@@ -118,6 +118,18 @@ enum TaskCommand {
         /// Markdown task file or task id to display.
         task: PathBuf,
     },
+    /// Show a kanban dashboard and optionally open task details.
+    Dashboard {
+        /// Project path to show tasks for. Defaults to the current directory.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Show tasks across all projects instead of only one project.
+        #[arg(long)]
+        all: bool,
+        /// Task file or task id to display after the board.
+        #[arg(long)]
+        task: Option<PathBuf>,
+    },
     /// Open a markdown task in $EDITOR.
     Edit {
         /// Markdown task file or task id to open.
@@ -242,6 +254,9 @@ async fn main() -> Result<()> {
             }
             TaskCommand::Show { task } => {
                 show_task_command(&task)?;
+            }
+            TaskCommand::Dashboard { project, all, task } => {
+                dashboard_task_command(project.as_deref(), all, task.as_deref())?;
             }
             TaskCommand::Edit { task } => {
                 let config_path = config::config_file()?;
@@ -938,6 +953,93 @@ fn show_task_command(task_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn dashboard_task_command(
+    project: Option<&Path>,
+    all_projects: bool,
+    selected_task: Option<&Path>,
+) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let (scope, tasks) = if all_projects {
+        ("all projects".to_owned(), task::list_all_tasks(&config)?)
+    } else {
+        let project_path = task::resolve_project_path(project)?;
+        (
+            project_path.display().to_string(),
+            task::list_tasks(&config, &project_path)?,
+        )
+    };
+
+    print_task_dashboard(&scope, &tasks);
+
+    let selected = if let Some(selected_task) = selected_task {
+        Some(selected_task.to_path_buf())
+    } else {
+        prompt_task_selection()?
+    };
+
+    if let Some(selected) = selected {
+        println!();
+        println!("---");
+        println!();
+        show_task_command(&selected)?;
+    }
+
+    Ok(())
+}
+
+fn print_task_dashboard(scope: &str, tasks: &[task::TaskSummary]) {
+    println!("# Tasks Dashboard");
+    println!();
+    println!("scope: {scope}");
+    println!("tasks: {}", tasks.len());
+    println!();
+
+    for status in [
+        task::TaskStatus::Ready,
+        task::TaskStatus::Running,
+        task::TaskStatus::NeedsUser,
+        task::TaskStatus::Failed,
+        task::TaskStatus::Pending,
+    ] {
+        println!("## {}", status.as_str());
+        let mut found = false;
+        for task in tasks.iter().filter(|task| task.status == status) {
+            found = true;
+            let id = task
+                .id
+                .map(|id| format!("#{id}"))
+                .unwrap_or_else(|| "unversioned".to_owned());
+            let assignee = task.assignee.as_deref().unwrap_or("-");
+            let project = task.project.as_deref().unwrap_or("-");
+            println!(
+                "- {id} {} (assignee: {assignee}, project: `{project}`, path: {})",
+                task.title,
+                task.path.display()
+            );
+        }
+        if !found {
+            println!("- none");
+        }
+        println!();
+    }
+}
+
+fn prompt_task_selection() -> Result<Option<PathBuf>> {
+    print!("Task to inspect [id/path, blank to skip]: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    if input.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PathBuf::from(input.trim_start_matches('#'))))
+    }
 }
 
 fn resolve_task_for_show(task_path: &Path) -> Result<PathBuf> {
