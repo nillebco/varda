@@ -75,6 +75,25 @@ impl TaskStatus {
     }
 }
 
+impl std::str::FromStr for TaskStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "ready" => Ok(Self::Ready),
+            "running" => Ok(Self::Running),
+            "pending" => Ok(Self::Pending),
+            "needs_user" => Ok(Self::NeedsUser),
+            "failed" => Ok(Self::Failed),
+            "done" => Ok(Self::Done),
+            _ => anyhow::bail!(
+                "unknown status '{}'; expected one of: ready, running, pending, needs_user, failed, done",
+                s
+            ),
+        }
+    }
+}
+
 impl TaskDocument {
     pub fn set_status(&mut self, status: TaskStatus) {
         self.frontmatter.status = status;
@@ -86,6 +105,10 @@ impl TaskDocument {
 
     pub fn set_plan(&mut self, plan: impl Into<String>) {
         self.frontmatter.plan = Some(plan.into());
+    }
+
+    pub fn set_assignee(&mut self, assignee: impl Into<String>) {
+        self.frontmatter.assignee = Some(assignee.into());
     }
 }
 

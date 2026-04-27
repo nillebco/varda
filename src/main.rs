@@ -147,6 +147,32 @@ enum TaskCommand {
         /// Markdown task file or task id to resolve.
         task: PathBuf,
     },
+    /// Update task properties for a single task or in bulk.
+    Update {
+        /// Task file or task id to update. Omit to use filter flags for bulk selection.
+        task: Option<PathBuf>,
+        /// Set the task status (ready, running, pending, needs_user, failed, done).
+        #[arg(long, value_name = "STATUS")]
+        set_status: Option<String>,
+        /// Set the task assignee.
+        #[arg(long, value_name = "AGENT")]
+        set_agent: Option<String>,
+        /// Only update tasks with this status (repeatable for OR logic).
+        #[arg(long, value_name = "STATUS")]
+        filter_status: Vec<String>,
+        /// Only update tasks assigned to this agent.
+        #[arg(long, value_name = "AGENT")]
+        filter_agent: Option<String>,
+        /// Project path to scope task selection. Defaults to the current directory.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Operate across all projects instead of only one project.
+        #[arg(long)]
+        all: bool,
+        /// Apply changes without prompting for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -282,6 +308,27 @@ async fn main() -> Result<()> {
                 let config = config::load_config(&config_path)?;
                 let resolved = task::resolve_task_reference(&config, &task)?;
                 println!("{}", resolved.display());
+            }
+            TaskCommand::Update {
+                task,
+                set_status,
+                set_agent,
+                filter_status,
+                filter_agent,
+                project,
+                all,
+                yes,
+            } => {
+                update_tasks_command(
+                    task.as_deref(),
+                    set_status.as_deref(),
+                    set_agent.as_deref(),
+                    &filter_status,
+                    filter_agent.as_deref(),
+                    project.as_deref(),
+                    all,
+                    yes,
+                )?;
             }
         },
         Command::Show { command } => match command {
@@ -1709,6 +1756,101 @@ async fn resume_task_command(task_path: &Path) -> Result<()> {
     }
 
     run_task_command(&task_path).await
+}
+
+fn update_tasks_command(
+    task_ref: Option<&Path>,
+    set_status: Option<&str>,
+    set_agent: Option<&str>,
+    filter_status: &[String],
+    filter_agent: Option<&str>,
+    project: Option<&Path>,
+    all: bool,
+    yes: bool,
+) -> Result<()> {
+    if set_status.is_none() && set_agent.is_none() {
+        anyhow::bail!("nothing to update: specify --set-status and/or --set-agent");
+    }
+
+    let new_status: Option<task::TaskStatus> =
+        set_status.map(|s| s.parse()).transpose()?;
+    let filter_statuses: Vec<task::TaskStatus> = filter_status
+        .iter()
+        .map(|s| s.parse())
+        .collect::<Result<Vec<_>>>()?;
+
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+
+    let task_paths: Vec<PathBuf> = if let Some(task_ref) = task_ref {
+        vec![task::resolve_task_reference(&config, task_ref)?]
+    } else {
+        let summaries: Vec<task::TaskSummary> = if all {
+            task::list_all_tasks(&config)?
+        } else {
+            let project_path = task::resolve_project_path(project)?;
+            task::list_tasks(&config, &project_path)?
+        };
+        summaries
+            .into_iter()
+            .filter(|t| {
+                if !filter_statuses.is_empty() && !filter_statuses.contains(&t.status) {
+                    return false;
+                }
+                if let Some(agent) = filter_agent {
+                    if t.assignee.as_deref() != Some(agent) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|t| t.path)
+            .collect()
+    };
+
+    if task_paths.is_empty() {
+        println!("no matching tasks");
+        return Ok(());
+    }
+
+    if !yes {
+        println!("will update {} task(s):", task_paths.len());
+        for path in &task_paths {
+            println!("  {}", path.display());
+        }
+        if let Some(s) = set_status {
+            println!("  set status → {s}");
+        }
+        if let Some(a) = set_agent {
+            println!("  set agent  → {a}");
+        }
+        if !prompt_yes_no("Proceed?", true)? {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
+    for path in &task_paths {
+        let mut doc = task::load_task(path)?;
+        if let Some(status) = new_status {
+            doc.set_status(status);
+        }
+        if let Some(agent) = set_agent {
+            doc.set_assignee(agent);
+        }
+        task::write_task(&doc)?;
+        println!("updated {}", path.display());
+    }
+
+    println!("updated {} task(s)", task_paths.len());
+
+    if config.git.auto_commit {
+        let paths_ref: Vec<&Path> = task_paths.iter().map(|p| p.as_path()).collect();
+        git::commit_task_files(&paths_ref, "Update tasks")?;
+        println!("committed changes");
+    }
+
+    Ok(())
 }
 
 fn resume_task_session_command(task_path: &Path) -> Result<()> {

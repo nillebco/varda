@@ -75,6 +75,53 @@ pub fn commit_task_file(task_path: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn commit_task_files(task_paths: &[&Path], message: &str) -> Result<()> {
+    if task_paths.is_empty() {
+        return Ok(());
+    }
+    let repo = repo_root_for_path(task_paths[0])?;
+
+    let rel_paths: Vec<String> = task_paths
+        .iter()
+        .map(|p| repo_relative_path(&repo, p))
+        .collect::<Result<_>>()?;
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .arg("add")
+        .args(&rel_paths)
+        .output()
+        .context("failed to stage task files")?;
+
+    if !output.status.success() {
+        bail!(
+            "git add failed; stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    if !has_staged_changes(&repo)? {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["commit", "-m", message])
+        .output()
+        .context("failed to commit task files")?;
+
+    if !output.status.success() {
+        bail!(
+            "git commit failed; stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
 fn repo_root_for_path(path: &Path) -> Result<PathBuf> {
     let git_dir = if path.is_dir() {
         path
