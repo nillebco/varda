@@ -293,6 +293,16 @@ varda task resume 1
 
 If you set `VARDA_HOME`, use that path instead of `$HOME/.varda`.
 
+## Resume A Past Session
+
+To move a past task back to `ready` without running it immediately, choose one of its recorded sessions:
+
+```sh
+varda task resume-session 1
+```
+
+Varda scans `operations/runs/*.log` for sessions tied to that task, prompts for the session to resume, stores the selected `agent_session_id` and `agent_session_log` in task frontmatter, sets `status: ready`, and clears `requires_user`.
+
 ## What The Agent Is Told
 
 Varda tells the agent that it has a fixed time limit. The default is 600 seconds, or 10 minutes.

@@ -108,6 +108,11 @@ enum TaskCommand {
         /// Markdown task file or task id to resume.
         task: PathBuf,
     },
+    /// Choose a past run session for a task and move it back to ready.
+    ResumeSession {
+        /// Markdown task file or task id whose session should be resumed.
+        task: PathBuf,
+    },
     /// Display a markdown task and its associated recap.
     Show {
         /// Markdown task file or task id to display.
@@ -231,6 +236,9 @@ async fn main() -> Result<()> {
             }
             TaskCommand::Resume { task } => {
                 resume_task_command(&task).await?;
+            }
+            TaskCommand::ResumeSession { task } => {
+                resume_task_session_command(&task)?;
             }
             TaskCommand::Show { task } => {
                 show_task_command(&task)?;
@@ -1109,6 +1117,153 @@ async fn resume_task_command(task_path: &Path) -> Result<()> {
     run_task_command(&task_path).await
 }
 
+fn resume_task_session_command(task_path: &Path) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let task_path = task::resolve_task_reference(&config, task_path)?;
+    let mut task_document = task::load_task(&task_path)?;
+    let sessions = task_sessions(&config, &task_path)?;
+
+    if sessions.is_empty() {
+        anyhow::bail!("no previous sessions found for {}", task_path.display());
+    }
+
+    let selected = prompt_task_session(&sessions)?.context("session resume cancelled")?;
+    task_document.set_status(task::TaskStatus::Ready);
+    task_document.frontmatter.requires_user = false;
+    task_document.frontmatter.agent_session_id = Some(selected.session_id.clone());
+    task_document.frontmatter.agent_session_log = Some(selected.log_path.display().to_string());
+    task::write_task(&task_document)?;
+
+    if config.git.auto_commit {
+        git::commit_task_file(
+            &task_path,
+            &format!("Resume task session {}", task_path.display()),
+        )?;
+        println!("committed task session resume");
+    }
+
+    println!(
+        "task ready; selected session={} log={}",
+        selected.session_id,
+        selected.log_path.display()
+    );
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskSession {
+    session_id: String,
+    log_path: PathBuf,
+    modified: Option<SystemTime>,
+}
+
+fn task_sessions(config: &config::Config, task_path: &Path) -> Result<Vec<TaskSession>> {
+    let runs_dir = Path::new(&config.defaults.operations_dir).join(config::RUNS_DIRNAME);
+    if !runs_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut sessions = Vec::new();
+    for entry in fs::read_dir(&runs_dir)
+        .with_context(|| format!("failed to read runs directory {}", runs_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", runs_dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
+            continue;
+        }
+
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read session log {}", path.display()))?;
+        let Some(log_task) = session_log_value(&content, "task") else {
+            continue;
+        };
+        if !same_task_path(Path::new(&log_task), task_path) {
+            continue;
+        }
+
+        let session_id = session_log_value(&content, "session_id").unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("unknown")
+                .to_owned()
+        });
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        sessions.push(TaskSession {
+            session_id,
+            log_path: path,
+            modified,
+        });
+    }
+
+    sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
+    Ok(sessions)
+}
+
+fn session_log_value(content: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    content.lines().find_map(|line| {
+        line.strip_prefix(&prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn same_task_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn prompt_task_session(sessions: &[TaskSession]) -> Result<Option<TaskSession>> {
+    println!("Past sessions:");
+    for (index, session) in sessions.iter().enumerate() {
+        println!(
+            "{}. {} {}",
+            index + 1,
+            session.session_id,
+            session.log_path.display()
+        );
+    }
+    print!("Session to resume [1, q to cancel]: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let answer = input.trim();
+    if answer.eq_ignore_ascii_case("q") || answer.eq_ignore_ascii_case("quit") {
+        return Ok(None);
+    }
+
+    let index = if answer.is_empty() {
+        0
+    } else {
+        answer
+            .parse::<usize>()
+            .with_context(|| format!("invalid session selection '{answer}'"))?
+            .checked_sub(1)
+            .context("session selection must be at least 1")?
+    };
+
+    sessions
+        .get(index)
+        .cloned()
+        .with_context(|| format!("session selection {} is out of range", index + 1))
+        .map(Some)
+}
+
 fn prompt_assignee(default_assignee: &str) -> Result<Option<String>> {
     print!("Assignee [{default_assignee}]: ");
     io::stdout().flush()?;
@@ -1278,5 +1433,63 @@ planner_agent: codex
 "#;
 
         assert_eq!(plan_planner_agent(content).as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn extracts_values_from_session_log() {
+        let content = "session_id=session-1\nagent=codex\ntask=/tmp/task.md\n";
+
+        assert_eq!(
+            session_log_value(content, "session_id").as_deref(),
+            Some("session-1")
+        );
+        assert_eq!(
+            session_log_value(content, "task").as_deref(),
+            Some("/tmp/task.md")
+        );
+        assert_eq!(session_log_value(content, "missing"), None);
+    }
+
+    #[test]
+    fn finds_sessions_for_task() {
+        let root = std::env::temp_dir().join(format!("varda-task-sessions-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let runs_dir = operations_dir.join(config::RUNS_DIRNAME);
+        let tasks_dir = operations_dir.join("tasks");
+        fs::create_dir_all(&runs_dir).expect("runs directory should be created");
+        fs::create_dir_all(&tasks_dir).expect("tasks directory should be created");
+        let task_path = tasks_dir.join("mine.md");
+        fs::write(&task_path, "# Mine\n").expect("task should be written");
+        fs::write(
+            runs_dir.join("session-1.log"),
+            format!(
+                "session_id=session-1\nagent=codex\ntask={}\n",
+                task_path.display()
+            ),
+        )
+        .expect("matching session should be written");
+        fs::write(
+            runs_dir.join("session-2.log"),
+            "session_id=session-2\nagent=codex\ntask=/tmp/other.md\n",
+        )
+        .expect("other session should be written");
+
+        let config = config::Config {
+            defaults: config::Defaults {
+                timeout_seconds: 600,
+                operations_dir: operations_dir.display().to_string(),
+            },
+            routes: vec![],
+            agents: std::collections::BTreeMap::new(),
+            git: config::GitConfig { auto_commit: true },
+        };
+
+        let sessions = task_sessions(&config, &task_path).expect("sessions should be found");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "session-1");
+        assert_eq!(sessions[0].log_path, runs_dir.join("session-1.log"));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
     }
 }
