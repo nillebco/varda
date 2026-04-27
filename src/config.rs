@@ -26,7 +26,7 @@ agents = ["codex"]
 [agents.codex]
 kind = "acp"
 command = "codex"
-args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "--ask-for-approval", "never", "-"]
+args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
 
 [git]
 auto_commit = true
@@ -183,6 +183,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
     let mut config: Config = toml::from_str(&content)
         .with_context(|| format!("failed to parse config at {}", path.display()))?;
     resolve_config_paths(path, &mut config)?;
+    remove_legacy_codex_exec_args(&mut config);
 
     Ok(config)
 }
@@ -237,6 +238,32 @@ fn resolve_config_paths(path: &Path, config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+fn remove_legacy_codex_exec_args(config: &mut Config) {
+    for agent in config.agents.values_mut() {
+        if agent.command != "codex" || !agent.args.iter().any(|arg| arg == "exec") {
+            continue;
+        }
+
+        let mut cleaned = Vec::with_capacity(agent.args.len());
+        let mut index = 0;
+
+        while index < agent.args.len() {
+            if agent.args[index] == "--ask-for-approval" {
+                index += 1;
+                if agent.args.get(index).is_some_and(|value| value == "never") {
+                    index += 1;
+                }
+                continue;
+            }
+
+            cleaned.push(agent.args[index].clone());
+            index += 1;
+        }
+
+        agent.args = cleaned;
+    }
+}
+
 fn ensure_keep_file(path: &Path) -> Result<()> {
     if !path.exists() {
         fs::write(path, "").with_context(|| format!("failed to write {}", path.display()))?;
@@ -260,7 +287,32 @@ mod tests {
         assert_eq!(config.defaults.timeout_seconds, 600);
         assert_eq!(config.routes[0].agents, vec!["codex"]);
         assert_eq!(config.agents["codex"].command, "codex");
+        assert!(
+            !config.agents["codex"]
+                .args
+                .iter()
+                .any(|arg| arg == "--ask-for-approval")
+        );
         assert!(config.git.auto_commit);
+    }
+
+    #[test]
+    fn strips_legacy_codex_exec_approval_args_on_load() {
+        let path =
+            std::env::temp_dir().join(format!("varda-legacy-codex-{}.toml", std::process::id()));
+        let config = DEFAULT_CONFIG.replace(
+            r#"args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]"#,
+            r#"args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "--ask-for-approval", "never", "-"]"#,
+        );
+        fs::write(&path, config).expect("config should be written");
+
+        let config = load_config(&path).expect("legacy config should load");
+        fs::remove_file(path).expect("config should be removed");
+
+        assert_eq!(
+            config.agents["codex"].args,
+            vec!["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
+        );
     }
 
     #[test]
