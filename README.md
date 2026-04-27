@@ -136,6 +136,14 @@ Varda assigns the next available numeric task ID and prints it with the task pat
 
 Add the task details under the heading, then save and quit your editor.
 
+For a one-line task that should run immediately, pass `--exec`:
+
+```sh
+varda task add "Summarize this project" --exec
+```
+
+Varda still prompts for the assignee, creates the task, skips the editor, and processes the new task through the selected agent.
+
 Tasks are stored in the Varda operations folder:
 
 ```text

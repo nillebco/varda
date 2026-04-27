@@ -65,6 +65,9 @@ enum TaskCommand {
         /// Project path this task belongs to. Defaults to the current directory.
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Treat the task name as a complete one-line task and run it immediately.
+        #[arg(long)]
+        exec: bool,
     },
     /// List markdown tasks for a project.
     List {
@@ -129,7 +132,11 @@ async fn main() -> Result<()> {
             plan_command()?;
         }
         Command::Task { command } => match command {
-            TaskCommand::Add { taskname, project } => {
+            TaskCommand::Add {
+                taskname,
+                project,
+                exec,
+            } => {
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
@@ -147,7 +154,11 @@ async fn main() -> Result<()> {
                 } else {
                     println!("created task {}", task_path.display());
                 }
-                open_editor(&task_path)?;
+                if exec {
+                    run_task_command(&task_path).await?;
+                } else {
+                    open_editor(&task_path)?;
+                }
             }
             TaskCommand::List { project } => {
                 let config_path = config::config_file()?;
