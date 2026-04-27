@@ -1189,7 +1189,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     .filters { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 12px 24px; border-bottom: 1px solid var(--line); background: #eef1f5; }
     label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
     select { min-width: 160px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 8px 10px; color: var(--text); }
-    main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 34vw); gap: 0; min-height: calc(100vh - 113px); }
+    main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; min-height: calc(100vh - 113px); }
+    main.details-open { grid-template-columns: minmax(0, 1fr) minmax(360px, 34vw); }
     .board { display: grid; grid-template-columns: repeat(5, minmax(220px, 1fr)); gap: 12px; overflow-x: auto; padding: 16px; }
     .column { min-width: 220px; }
     .column h2 { display: flex; justify-content: space-between; align-items: center; margin: 0 0 10px; font-size: 13px; text-transform: uppercase; color: var(--muted); letter-spacing: 0; }
@@ -1199,13 +1200,17 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     .task-title { font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; }
     .task-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
     .badge { border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px; background: #f9fafb; max-width: 100%; overflow-wrap: anywhere; }
-    aside { border-left: 1px solid var(--line); background: var(--panel); padding: 18px; overflow: auto; }
+    aside { display: none; border-left: 1px solid var(--line); background: var(--panel); padding: 18px; overflow: auto; }
+    main.details-open aside { display: block; }
     .empty { color: var(--muted); padding: 20px; }
+    .details-header { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
     .details h2 { margin: 0 0 6px; font-size: 18px; overflow-wrap: anywhere; }
+    .close { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1; padding: 4px 8px; }
+    .close:hover { border-color: var(--accent); color: var(--text); }
     .details .path { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f6f7f9; border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.45; }
     h3 { margin: 18px 0 8px; font-size: 14px; }
-    @media (max-width: 980px) { main { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid var(--line); } .board { grid-template-columns: repeat(5, 240px); } }
+    @media (max-width: 980px) { main.details-open { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid var(--line); } .board { grid-template-columns: repeat(5, 240px); } }
   </style>
 </head>
 <body>
@@ -1222,7 +1227,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   </section>
   <main>
     <section id="board" class="board"></section>
-    <aside id="details" class="empty">Select a task to inspect its markdown and recaps.</aside>
+    <aside id="details" class="empty"></aside>
   </main>
   <script>
     const statuses = ["ready", "running", "needs_user", "failed", "pending"];
@@ -1254,6 +1259,14 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const project = document.getElementById("projectFilter").value;
       const status = document.getElementById("statusFilter").value;
       return (!project || task.project === project) && (!status || task.status === status);
+    }
+
+    function closeDetails() {
+      selectedPath = "";
+      document.querySelector("main").classList.remove("details-open");
+      document.getElementById("details").className = "empty";
+      document.getElementById("details").innerHTML = "";
+      renderBoard();
     }
 
     function renderBoard() {
@@ -1293,21 +1306,38 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         }
         board.appendChild(column);
       }
-      const selected = payload.tasks.find(task => task.path === selectedPath);
-      if (selected) renderDetails(selected);
+      const selected = payload.tasks.find(task => task.path === selectedPath && taskMatches(task));
+      if (selected) {
+        renderDetails(selected);
+      } else if (selectedPath) {
+        closeDetails();
+      }
     }
 
     function renderDetails(task) {
       const details = document.getElementById("details");
+      document.querySelector("main").classList.add("details-open");
       details.className = "details";
       details.innerHTML = "";
+      const header = document.createElement("div");
+      header.className = "details-header";
+      const headingGroup = document.createElement("div");
       const title = document.createElement("h2");
       title.textContent = task.title;
-      details.appendChild(title);
+      headingGroup.appendChild(title);
       const path = document.createElement("div");
       path.className = "path";
       path.textContent = task.path;
-      details.appendChild(path);
+      headingGroup.appendChild(path);
+      const close = document.createElement("button");
+      close.type = "button";
+      close.className = "close";
+      close.title = "Close";
+      close.textContent = "x";
+      close.onclick = closeDetails;
+      header.appendChild(headingGroup);
+      header.appendChild(close);
+      details.appendChild(header);
       const taskHeading = document.createElement("h3");
       taskHeading.textContent = "Task";
       details.appendChild(taskHeading);
@@ -1337,7 +1367,6 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     async function refresh() {
       const response = await fetch("/api/tasks", { cache: "no-store" });
       payload = await response.json();
-      if (!selectedPath && payload.tasks.length) selectedPath = payload.tasks[0].path;
       renderBoard();
     }
 
