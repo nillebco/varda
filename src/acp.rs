@@ -635,6 +635,12 @@ fn build_prompt(request: &AgentRunRequest) -> String {
         .map(load_project_instructions)
         .unwrap_or_default();
 
+    let role_section = request
+        .role_instructions
+        .as_deref()
+        .map(|instr| format!("\n## Role\n\n{instr}\n"))
+        .unwrap_or_default();
+
     let instructions_section = if project_instructions.is_empty() {
         String::new()
     } else {
@@ -650,7 +656,7 @@ fn build_prompt(request: &AgentRunRequest) -> String {
         .unwrap_or_default();
 
     format!(
-        r#"{instructions}{instructions_section}{plan_section}
+        r#"{instructions}{role_section}{instructions_section}{plan_section}
 Agent: {agent}
 Task path: {task_path}
 Task frontmatter:
@@ -846,6 +852,7 @@ mod tests {
         let result = client
             .run_task(AgentRunRequest {
                 agent_name: "echo".to_owned(),
+                role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
                     id: None,
@@ -898,6 +905,7 @@ mod tests {
         let result = client
             .run_task(AgentRunRequest {
                 agent_name: "shell".to_owned(),
+                role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
                     id: None,
@@ -952,6 +960,7 @@ mod tests {
         let result = client
             .run_task(AgentRunRequest {
                 agent_name: "shell".to_owned(),
+                role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
                     id: None,
@@ -988,6 +997,7 @@ mod tests {
     fn replaces_dot_cd_with_task_project_path() {
         let request = AgentRunRequest {
             agent_name: "codex".to_owned(),
+            role_instructions: None,
             task_path: "/home/user/.varda/operations/tasks/task.md".to_owned(),
             frontmatter: TaskFrontmatter {
                 id: None,
@@ -1039,6 +1049,7 @@ mod tests {
     fn expands_task_project_placeholders_in_args() {
         let request = AgentRunRequest {
             agent_name: "claude".to_owned(),
+            role_instructions: None,
             task_path: "/home/user/.varda/operations/tasks/task.md".to_owned(),
             frontmatter: TaskFrontmatter {
                 id: None,

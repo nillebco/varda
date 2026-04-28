@@ -271,7 +271,7 @@ async fn main() -> Result<()> {
                     Some(agent_name.clone())
                 } else {
                     let default_route = routing::match_route(&config, &project_path, None)?;
-                    let default_assignee = default_route.agent;
+                    let default_assignee = default_route.display_name().to_owned();
                     let assignee = prompt_assignee(&default_assignee)?;
                     if let Some(assignee) = assignee.as_deref() {
                         routing::match_route(&config, &project_path, Some(assignee))?;
@@ -521,7 +521,7 @@ fn plan_tasks(config: &config::Config, ready_tasks: &[task::TaskSummary]) -> Res
         let route = routing::match_route_for_task(config, &task_document, false)?;
         plan_tasks.push(PlanTask {
             summary: summary.clone(),
-            agent: route.agent,
+            agent: route.display_name().to_owned(),
             route_glob: route.glob,
             dependency_hint: dependency_hint(summary),
         });
@@ -816,6 +816,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
     let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
     let request = agent::AgentRunRequest {
         agent_name: planner_agent.clone(),
+        role_instructions: None,
         task_path: plan_path.display().to_string(),
         frontmatter: task::TaskFrontmatter {
             id: None,
@@ -1021,17 +1022,18 @@ async fn run_task_path_for_parallel(
         .id
         .map(|id| format!("#{id}"))
         .unwrap_or_else(|| "unversioned".to_owned());
-    println!("dispatching {} {} → agent={}", id, task_document.title(), route.agent);
+    println!("dispatching {} {} → agent={}", id, task_document.title(), route.display_name());
     let agent_config = config
         .agents
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
-    let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
-    let outcome = runner::run_task(&config, &route.agent, &task_path, &client, false).await?;
+    let display_name = route.display_name().to_owned();
+    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    let outcome = runner::run_task(&config, &display_name, route.role_instructions.as_deref(), &task_path, &client, false).await?;
 
     Ok(ParallelRunReport {
         task_path,
-        agent: route.agent,
+        agent: route.display_name().to_owned(),
         glob: route.glob,
         outcome,
     })
@@ -1803,7 +1805,8 @@ async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
         .agents
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
-    let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
+    let display_name = route.display_name().to_owned();
+    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
     if config.git.auto_commit {
         git::commit_task_file(
             &task_path,
@@ -1811,11 +1814,11 @@ async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
         )?;
         println!("committed task snapshot");
     }
-    let outcome = runner::run_task(&config, &route.agent, &task_path, &client, interactive).await?;
+    let outcome = runner::run_task(&config, &display_name, route.role_instructions.as_deref(), &task_path, &client, interactive).await?;
     println!(
         "processed task={} agent={} glob={} status={:?} recap={}",
         task_path.display(),
-        route.agent,
+        display_name,
         route.glob,
         outcome.status,
         outcome.recap_path.display()
@@ -1865,12 +1868,13 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         .agents
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
-    let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
-    let outcome = runner::plan_task(&config, &route.agent, &task_path, &client).await?;
+    let display_name = route.display_name().to_owned();
+    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    let outcome = runner::plan_task(&config, &display_name, route.role_instructions.as_deref(), &task_path, &client).await?;
     println!(
         "plan generated task={} agent={} plan={}",
         task_path.display(),
-        route.agent,
+        display_name,
         outcome.plan_path.display()
     );
     open_editor(&outcome.plan_path)?;
@@ -2394,6 +2398,7 @@ planner_agent: codex
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
             git: config::GitConfig { auto_commit: true },
         };
 

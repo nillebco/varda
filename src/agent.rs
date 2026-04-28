@@ -10,6 +10,7 @@ use crate::task::TaskFrontmatter;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRunRequest {
     pub agent_name: String,
+    pub role_instructions: Option<String>,
     pub task_path: String,
     pub frontmatter: TaskFrontmatter,
     pub body: String,
@@ -80,18 +81,7 @@ If no files were changed, write (none) under that heading.
 
 At the end of the recap, include exactly one bare machine-readable marker line whose content is either `requires_user: true` or `requires_user: false`.
 
-If you need user input, stop and use the true marker.
-
-If the Agent field below is `tester`: You are the tester agent. Your role is to verify an implementation after the implementation agent has finished.
-
-Tester workflow:
-- Read the task, any attached plan, existing recaps, and the current project state before deciding what to test.
-- Define a concise test plan in your recap before or while executing it.
-- Execute the practical checks needed to verify the implementation, using the project's existing verification commands when available.
-- Decide explicitly whether the original task is complete.
-- If verification succeeds, state that the implementation is verified and what evidence supports that decision.
-- If verification fails, update the task with the failed checks and required follow-up when the task file is writable. In all cases, include the failed checks, exact follow-up work, and the suggested next agent to re-run the task.
-- Only request user interaction when verification is blocked by missing information, credentials, environment access, or a decision that an agent cannot make."#
+If you need user input, stop and use the true marker."#
     )
 }
 
@@ -191,10 +181,7 @@ mod tests {
         assert!(instructions.contains("Files touched"));
         assert!(instructions.contains("absolute file path"));
         assert!(instructions.contains("requires_user"));
-        assert!(instructions.contains("Agent field below is `tester`"));
-        assert!(instructions.contains("Define a concise test plan"));
-        assert!(instructions.contains("If verification fails"));
-        assert!(instructions.contains("suggested next agent"));
+        assert!(!instructions.contains("Agent field below is `tester`"));
     }
 
     #[test]
@@ -225,6 +212,7 @@ mod tests {
         let result = client
             .run_task(AgentRunRequest {
                 agent_name: "codex".to_owned(),
+                role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
                     id: None,

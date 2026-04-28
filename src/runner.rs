@@ -27,6 +27,7 @@ pub struct PlanOutcome {
 pub async fn run_task(
     config: &Config,
     agent_name: &str,
+    role_instructions: Option<&str>,
     task_path: &Path,
     client: &impl AgentClient,
     interactive: bool,
@@ -60,6 +61,7 @@ pub async fn run_task(
     )?;
     let request = AgentRunRequest {
         agent_name: agent_name.to_owned(),
+        role_instructions: role_instructions.map(str::to_owned),
         task_path: task_path.display().to_string(),
         frontmatter: task.frontmatter.clone(),
         body: task.body.clone(),
@@ -134,6 +136,7 @@ pub async fn run_task(
 pub async fn plan_task(
     config: &Config,
     agent_name: &str,
+    role_instructions: Option<&str>,
     task_path: &Path,
     client: &(impl AgentClient + Sync),
 ) -> Result<PlanOutcome> {
@@ -142,6 +145,7 @@ pub async fn plan_task(
     let timeout = Duration::from_secs(config.defaults.timeout_seconds);
     let request = AgentRunRequest {
         agent_name: agent_name.to_owned(),
+        role_instructions: role_instructions.map(str::to_owned),
         task_path: task_path.display().to_string(),
         frontmatter: task.frontmatter.clone(),
         body: task.body.clone(),
@@ -279,7 +283,7 @@ Do it.
             suggested_agent: None,
         });
 
-        let outcome = run_task(&config, "codex", &task_path, &client, false)
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false)
             .await
             .expect("task should run");
 
@@ -326,7 +330,7 @@ Do it.
             suggested_agent: None,
         });
 
-        let outcome = run_task(&config, "codex", &task_path, &client, false)
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false)
             .await
             .expect("task should run");
 
@@ -367,7 +371,7 @@ Do it.
         config.defaults.timeout_seconds = 0;
         let client = PendingAgentClient;
 
-        let outcome = run_task(&config, "codex", &task_path, &client, false)
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false)
             .await
             .expect("task should time out cleanly");
 
@@ -413,6 +417,7 @@ Do it.
                     interactive_args: None,
                 },
             )]),
+            roles: std::collections::BTreeMap::new(),
             git: GitConfig { auto_commit: true },
         }
     }

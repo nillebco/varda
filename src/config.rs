@@ -29,11 +29,6 @@ kind = "acp"
 command = "codex"
 args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
 
-[agents.tester]
-kind = "acp"
-command = "codex"
-args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
-
 [agents.claude]
 kind = "acp"
 command = "claude"
@@ -45,6 +40,20 @@ interactive_args = ["-c", "claude --append-system-prompt \"$(cat $VARDA_PROMPT_F
 kind = "acp"
 command = "sh"
 args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"]
+
+[roles.tester]
+backend = "codex"
+instructions = """
+You are the tester agent. Your role is to verify an implementation after the implementation agent has finished.
+
+Tester workflow:
+- Read the task, any attached plan, existing recaps, and the current project state before deciding what to test.
+- Define a concise test plan in your recap before or while executing it.
+- Execute the practical checks needed to verify the implementation, using the project's existing verification commands when available.
+- Decide explicitly whether the original task is complete.
+- If verification succeeds, state that the implementation is verified and what evidence supports that decision.
+- If verification fails, update the task with the failed checks and required follow-up when the task file is writable. In all cases, include the failed checks, exact follow-up work, and the suggested next agent to re-run the task.
+- Only request user interaction when verification is blocked by missing information, credentials, environment access, or a decision that an agent cannot make."""
 
 [git]
 auto_commit = true
@@ -67,7 +76,16 @@ pub struct Config {
     #[serde(default)]
     pub agents: BTreeMap<String, AgentConfig>,
     #[serde(default)]
+    pub roles: BTreeMap<String, RoleConfig>,
+    #[serde(default)]
     pub git: GitConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleConfig {
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,8 +254,8 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
     let mut config = load_config_raw(&path)?;
 
     for agent in &agents {
-        if !config.agents.contains_key(agent) {
-            bail!("unknown agent '{agent}'");
+        if !config.agents.contains_key(agent) && !config.roles.contains_key(agent) {
+            bail!("unknown agent or role '{agent}'");
         }
     }
 
@@ -318,11 +336,9 @@ mod tests {
         assert_eq!(config.defaults.timeout_seconds, 600);
         assert_eq!(config.routes[0].agents, vec!["codex"]);
         assert_eq!(config.agents["codex"].command, "codex");
-        assert_eq!(config.agents["tester"].command, "codex");
-        assert_eq!(
-            config.agents["tester"].args,
-            vec!["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
-        );
+        assert!(!config.agents.contains_key("tester"));
+        assert_eq!(config.roles["tester"].backend, "codex");
+        assert!(config.roles["tester"].instructions.is_some());
         assert_eq!(config.agents["claude"].command, "claude");
         assert_eq!(
             config.agents["claude"].args,

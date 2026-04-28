@@ -449,11 +449,6 @@ kind = "acp"
 command = "codex"
 args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
 
-[agents.tester]
-kind = "acp"
-command = "codex"
-args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
-
 [agents.claude]
 kind = "acp"
 command = "claude"
@@ -463,6 +458,12 @@ args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
 kind = "acp"
 command = "sh"
 args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"]
+
+[roles.tester]
+backend = "codex"
+instructions = """
+You are the tester agent. Your role is to verify an implementation...
+"""
 
 [git]
 auto_commit = true
@@ -474,11 +475,27 @@ For now, `kind = "acp"` means Varda uses its ACP-facing agent abstraction. The c
 
 When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder.
 
-The generated `tester` agent uses the same Codex launcher as `codex`, but Varda gives it a verification-focused prompt. Assign a task to `tester` after implementation when you want an agent to define and execute a test plan, decide whether the task is complete, and record failed checks plus suggested follow-up when verification does not pass. Add `tester` to a project route before assigning tasks to it:
+### Roles
+
+Roles are prompt personas that layer on top of an agent backend. They let you assign a different behavioral mode (e.g. verification, planning, review) without changing the underlying executable.
+
+The default config ships with a `tester` role that runs on the `codex` backend:
+
+```toml
+[roles.tester]
+backend = "codex"
+instructions = """..."""
+```
+
+Add a role to a project route to allow it as an assignee:
 
 ```sh
 varda project add "/some/project/path/**" --agents codex,tester
 ```
+
+Assign a task to `tester` after implementation when you want the agent to define and execute a test plan, decide whether the task is complete, and record failed checks plus suggested follow-up when verification does not pass.
+
+To define a custom role, add a `[roles.<name>]` entry to your config with a `backend` that names an existing agent and an optional `instructions` string. No code changes are needed — Varda injects the instructions as a `## Role` section in the agent prompt at run time.
 
 The generated Claude Code args use `-p` for non-interactive output through stdin/stdout. Varda expands `{project}` in `--add-dir "{project}"` so Claude can access the tracked project while the task file remains in the global Varda control-plane folder.
 

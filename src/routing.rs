@@ -14,9 +14,17 @@ use crate::task::TaskDocument;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteMatch {
     pub agent: String,
+    pub role: Option<String>,
+    pub role_instructions: Option<String>,
     pub glob: String,
     pub allowed_agents: Vec<String>,
     pub estimated_prompt_tokens: usize,
+}
+
+impl RouteMatch {
+    pub fn display_name(&self) -> &str {
+        self.role.as_deref().unwrap_or(&self.agent)
+    }
 }
 
 pub fn match_route(
@@ -40,10 +48,12 @@ pub fn match_route(
         .with_context(|| format!("no project route matched {}", project_path.display()))?;
 
     ensure_agents_exist(config, route)?;
-    let agent = select_agent(route, requested_agent)?;
+    let (agent, role, role_instructions) = select_agent(config, route, requested_agent)?;
 
     Ok(RouteMatch {
         agent,
+        role,
+        role_instructions,
         glob: route.glob.clone(),
         allowed_agents: route.agents.clone(),
         estimated_prompt_tokens: 0,
@@ -65,7 +75,7 @@ pub fn match_route_for_task(
     ensure_agents_exist(config, route)?;
 
     let estimated_prompt_tokens = estimate_task_prompt_tokens(config, task, planning);
-    let agent = select_agent_with_budget(
+    let (agent, role, role_instructions) = select_agent_with_budget(
         config,
         route,
         task.frontmatter.assignee.as_deref(),
@@ -74,6 +84,8 @@ pub fn match_route_for_task(
 
     Ok(RouteMatch {
         agent,
+        role,
+        role_instructions,
         glob: route.glob.clone(),
         allowed_agents: route.agents.clone(),
         estimated_prompt_tokens,
@@ -102,48 +114,40 @@ fn ensure_agents_exist(config: &Config, route: &Route) -> Result<()> {
         bail!("route '{}' does not allow any agents", route.glob);
     }
 
-    for agent in &route.agents {
-        if !config.agents.contains_key(agent) {
-            bail!(
-                "route '{}' references unknown agent '{}'",
-                route.glob,
-                agent
-            );
+    for name in &route.agents {
+        if config.agents.contains_key(name) {
+            continue;
         }
+        if let Some(role) = config.roles.get(name) {
+            if !config.agents.contains_key(&role.backend) {
+                bail!(
+                    "route '{}' role '{}' references unknown backend agent '{}'",
+                    route.glob,
+                    name,
+                    role.backend
+                );
+            }
+            continue;
+        }
+        bail!(
+            "route '{}' references unknown agent or role '{}'",
+            route.glob,
+            name
+        );
     }
 
     Ok(())
 }
 
-fn select_agent(route: &Route, requested_agent: Option<&str>) -> Result<String> {
-    if let Some(agent) = requested_agent {
-        if route.agents.iter().any(|allowed| allowed == agent) {
-            return Ok(agent.to_owned());
-        }
-
-        bail!(
-            "agent '{}' is not allowed for project route '{}'; allowed agents: {}",
-            agent,
-            route.glob,
-            route.agents.join(", ")
-        );
-    }
-
-    route
-        .agents
-        .first()
-        .cloned()
-        .with_context(|| format!("route '{}' does not allow any agents", route.glob))
-}
-
-fn select_agent_with_budget(
+fn select_agent(
     config: &Config,
     route: &Route,
     requested_agent: Option<&str>,
-    estimated_prompt_tokens: usize,
-) -> Result<String> {
-    if let Some(agent) = requested_agent {
-        if !route.agents.iter().any(|allowed| allowed == agent) {
+) -> Result<(String, Option<String>, Option<String>)> {
+    let name = if let Some(agent) = requested_agent {
+        if route.agents.iter().any(|allowed| allowed == agent) {
+            agent.to_owned()
+        } else {
             bail!(
                 "agent '{}' is not allowed for project route '{}'; allowed agents: {}",
                 agent,
@@ -151,48 +155,94 @@ fn select_agent_with_budget(
                 route.agents.join(", ")
             );
         }
+    } else {
+        route
+            .agents
+            .first()
+            .cloned()
+            .with_context(|| format!("route '{}' does not allow any agents", route.glob))?
+    };
 
-        if agent_fits_prompt_budget(config, agent, estimated_prompt_tokens) {
-            return Ok(agent.to_owned());
+    Ok(resolve_selection(config, &name))
+}
+
+fn select_agent_with_budget(
+    config: &Config,
+    route: &Route,
+    requested_agent: Option<&str>,
+    estimated_prompt_tokens: usize,
+) -> Result<(String, Option<String>, Option<String>)> {
+    if let Some(name) = requested_agent {
+        if !route.agents.iter().any(|allowed| allowed == name) {
+            bail!(
+                "agent '{}' is not allowed for project route '{}'; allowed agents: {}",
+                name,
+                route.glob,
+                route.agents.join(", ")
+            );
+        }
+
+        let backend = resolve_backend(config, name);
+        if agent_fits_prompt_budget(config, backend, estimated_prompt_tokens) {
+            return Ok(resolve_selection(config, name));
         }
 
         bail!(
             "agent '{}' prompt budget is too small for this task: estimated {} tokens, max_prompt_tokens {}; allowed agents with enough budget: {}",
-            agent,
+            name,
             estimated_prompt_tokens,
-            describe_agent_budget(config, agent),
+            describe_agent_budget(config, backend),
             agents_with_enough_budget(config, route, estimated_prompt_tokens).join(", ")
         );
     }
 
-    route
-        .agents
-        .iter()
-        .find(|agent| agent_fits_prompt_budget(config, agent, estimated_prompt_tokens))
-        .cloned()
-        .with_context(|| {
-            format!(
-                "no allowed agent has enough prompt budget for this task: estimated {} tokens; allowed agents: {}",
-                estimated_prompt_tokens,
-                describe_route_budgets(config, route)
-            )
-        })
+    for name in &route.agents {
+        let backend = resolve_backend(config, name);
+        if agent_fits_prompt_budget(config, backend, estimated_prompt_tokens) {
+            return Ok(resolve_selection(config, name));
+        }
+    }
+
+    bail!(
+        "no allowed agent has enough prompt budget for this task: estimated {} tokens; allowed agents: {}",
+        estimated_prompt_tokens,
+        describe_route_budgets(config, route)
+    )
 }
 
-fn agent_fits_prompt_budget(config: &Config, agent: &str, estimated_prompt_tokens: usize) -> bool {
+fn resolve_backend<'a>(config: &'a Config, name: &'a str) -> &'a str {
     config
-        .agents
-        .get(agent)
-        .and_then(|agent| agent.max_prompt_tokens)
-        .is_none_or(|max_prompt_tokens| estimated_prompt_tokens <= max_prompt_tokens)
+        .roles
+        .get(name)
+        .map(|r| r.backend.as_str())
+        .unwrap_or(name)
 }
 
-fn describe_agent_budget(config: &Config, agent: &str) -> String {
+fn resolve_selection(
+    config: &Config,
+    name: &str,
+) -> (String, Option<String>, Option<String>) {
+    if let Some(role) = config.roles.get(name) {
+        (role.backend.clone(), Some(name.to_owned()), role.instructions.clone())
+    } else {
+        (name.to_owned(), None, None)
+    }
+}
+
+fn agent_fits_prompt_budget(config: &Config, backend: &str, estimated_prompt_tokens: usize) -> bool {
     config
         .agents
-        .get(agent)
-        .and_then(|agent| agent.max_prompt_tokens)
-        .map(|budget| budget.to_string())
+        .get(backend)
+        .and_then(|a| a.max_prompt_tokens)
+        .is_none_or(|max| estimated_prompt_tokens <= max)
+}
+
+fn describe_agent_budget(config: &Config, backend: &str) -> String {
+    config
+        .agents
+        .get(backend)
+        .and_then(|a| a.max_prompt_tokens)
+        .map(|b| b.to_string())
         .unwrap_or_else(|| "unlimited".to_owned())
 }
 
@@ -204,7 +254,10 @@ fn agents_with_enough_budget(
     route
         .agents
         .iter()
-        .filter(|agent| agent_fits_prompt_budget(config, agent, estimated_prompt_tokens))
+        .filter(|name| {
+            let backend = resolve_backend(config, name);
+            agent_fits_prompt_budget(config, backend, estimated_prompt_tokens)
+        })
         .cloned()
         .collect()
 }
@@ -213,7 +266,10 @@ fn describe_route_budgets(config: &Config, route: &Route) -> String {
     route
         .agents
         .iter()
-        .map(|agent| format!("{agent}={}", describe_agent_budget(config, agent)))
+        .map(|name| {
+            let backend = resolve_backend(config, name);
+            format!("{name}={}", describe_agent_budget(config, backend))
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -225,6 +281,14 @@ fn estimate_task_prompt_tokens(config: &Config, task: &TaskDocument, planning: b
     } else {
         build_agent_instructions(timeout).len()
     };
+
+    if !planning {
+        if let Some(assignee) = task.frontmatter.assignee.as_deref() {
+            if let Some(role) = config.roles.get(assignee) {
+                characters += role.instructions.as_deref().map(str::len).unwrap_or(0);
+            }
+        }
+    }
 
     characters += task.path.display().to_string().len();
     characters += task.body.len();
@@ -308,6 +372,7 @@ mod tests {
                     },
                 ),
             ]),
+            roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
         };
 
@@ -375,6 +440,7 @@ mod tests {
                     },
                 ),
             ]),
+            roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
         };
 
@@ -415,6 +481,7 @@ mod tests {
                     interactive_args: None,
                 },
             )]),
+            roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
         };
 
@@ -463,6 +530,7 @@ mod tests {
                     },
                 ),
             ]),
+            roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
         };
         let task = TaskDocument {
@@ -530,6 +598,7 @@ mod tests {
                     },
                 ),
             ]),
+            roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
         };
         let task = TaskDocument {

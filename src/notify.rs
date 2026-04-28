@@ -126,6 +126,7 @@ mod tests {
             },
             routes: vec![],
             agents: BTreeMap::new(),
+            roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
         };
 

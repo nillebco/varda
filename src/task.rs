@@ -676,6 +676,7 @@ Do the work.
                 agents: vec!["codex".to_owned()],
             }],
             agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
         };
 
@@ -721,6 +722,7 @@ requires_user: false
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
         };
 
@@ -751,6 +753,7 @@ requires_user: false
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
         };
 
@@ -825,6 +828,7 @@ requires_user: false
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
         };
 
@@ -864,6 +868,7 @@ requires_user: false
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
         };
 
