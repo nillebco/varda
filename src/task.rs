@@ -43,10 +43,16 @@ pub struct TaskFrontmatter {
     pub recaps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Legacy single-value fields; kept for backward-compat deserialization only.
+    // Migrated to `agent_session_ids`/`agent_session_logs` on load. Not serialized.
+    #[serde(default, skip_serializing)]
     pub agent_session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub agent_session_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_session_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_session_logs: Vec<String>,
     #[serde(default)]
     pub requires_user: bool,
 }
@@ -165,6 +171,8 @@ pub fn create_task(
             plan: None,
             agent_session_id: None,
             agent_session_log: None,
+            agent_session_ids: vec![],
+            agent_session_logs: vec![],
             requires_user: false,
         },
         body: format!("# {taskname}\n\n"),
@@ -476,6 +484,18 @@ fn parse_task(path: &Path, content: &str) -> Result<TaskDocument> {
         }
     }
 
+    // Migrate legacy single agent_session fields to the list variants.
+    if let Some(id) = frontmatter.agent_session_id.take() {
+        if frontmatter.agent_session_ids.is_empty() {
+            frontmatter.agent_session_ids.push(id);
+        }
+    }
+    if let Some(log) = frontmatter.agent_session_log.take() {
+        if frontmatter.agent_session_logs.is_empty() {
+            frontmatter.agent_session_logs.push(log);
+        }
+    }
+
     Ok(TaskDocument {
         path: path.to_path_buf(),
         frontmatter,
@@ -532,7 +552,7 @@ Do the work.
         assert_eq!(task.frontmatter.status, TaskStatus::Ready);
         assert_eq!(task.frontmatter.id, Some(42));
         assert_eq!(task.frontmatter.assignee.as_deref(), Some("codex"));
-        assert_eq!(task.frontmatter.agent_session_id, None);
+        assert!(task.frontmatter.agent_session_ids.is_empty());
         assert!(!task.frontmatter.requires_user);
         assert!(task.body.contains("Do the work."));
     }
@@ -551,6 +571,8 @@ Do the work.
                 plan: None,
                 agent_session_id: None,
                 agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
@@ -558,9 +580,9 @@ Do the work.
 
         task.set_status(TaskStatus::Pending);
         task.set_recap(".varda/operations/recaps/run.md");
-        task.frontmatter.agent_session_id = Some("session-123".to_owned());
-        task.frontmatter.agent_session_log =
-            Some(".varda/operations/runs/session-123.log".to_owned());
+        task.frontmatter.agent_session_ids.push("session-123".to_owned());
+        task.frontmatter.agent_session_logs
+            .push(".varda/operations/runs/session-123.log".to_owned());
 
         let frontmatter =
             serde_yaml::to_string(&task.frontmatter).expect("frontmatter should serialize");
@@ -568,7 +590,8 @@ Do the work.
         assert!(frontmatter.contains("status: pending"));
         assert!(frontmatter.contains("recaps:"));
         assert!(frontmatter.contains(".varda/operations/recaps/run.md"));
-        assert!(frontmatter.contains("agent_session_id: session-123"));
+        assert!(frontmatter.contains("agent_session_ids:"));
+        assert!(frontmatter.contains("session-123"));
         assert!(frontmatter.contains(".varda/operations/runs/session-123.log"));
     }
 
@@ -587,6 +610,8 @@ Do the work.
                 plan: None,
                 agent_session_id: None,
                 agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),

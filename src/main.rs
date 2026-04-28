@@ -828,6 +828,8 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
             plan: None,
             agent_session_id: None,
             agent_session_log: None,
+            agent_session_ids: vec![],
+            agent_session_logs: vec![],
             requires_user: false,
         },
         body: format!(
@@ -1948,8 +1950,8 @@ fn resume_task_session_command(task_path: &Path) -> Result<()> {
     let selected = prompt_task_session(&sessions)?.context("session resume cancelled")?;
     task_document.set_status(task::TaskStatus::Ready);
     task_document.frontmatter.requires_user = false;
-    task_document.frontmatter.agent_session_id = Some(selected.session_id.clone());
-    task_document.frontmatter.agent_session_log = Some(selected.log_path.display().to_string());
+    task_document.frontmatter.agent_session_ids.push(selected.session_id.clone());
+    task_document.frontmatter.agent_session_logs.push(selected.log_path.display().to_string());
     task::write_task(&task_document)?;
 
     if config.git.auto_commit {

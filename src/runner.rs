@@ -45,8 +45,8 @@ pub async fn run_task(
     let session_id = Uuid::new_v4().to_string();
     let session_log_path = session_log_path(config, &session_id);
     task.set_status(TaskStatus::Running);
-    task.frontmatter.agent_session_id = Some(session_id.clone());
-    task.frontmatter.agent_session_log = Some(session_log_path.display().to_string());
+    task.frontmatter.agent_session_ids.push(session_id.clone());
+    task.frontmatter.agent_session_logs.push(session_log_path.display().to_string());
     write_task(&task)?;
 
     write_session_log(
@@ -285,8 +285,8 @@ Do it.
         assert_eq!(outcome.status, TaskStatus::Pending);
         assert!(updated.contains("status: pending"));
         assert!(updated.contains("recaps:"));
-        assert!(updated.contains("agent_session_id:"));
-        assert!(updated.contains("agent_session_log:"));
+        assert!(updated.contains("agent_session_ids:"));
+        assert!(updated.contains("agent_session_logs:"));
         assert!(outcome.session_log_path.exists());
         assert!(recap.contains("Completed."));
     }

@@ -221,6 +221,8 @@ mod tests {
                     plan: None,
                     agent_session_id: None,
                     agent_session_log: None,
+                    agent_session_ids: vec![],
+                    agent_session_logs: vec![],
                     requires_user: false,
                 },
                 body: "# Task".to_owned(),
