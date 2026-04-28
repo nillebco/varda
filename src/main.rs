@@ -1367,7 +1367,6 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     .task-title { font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; }
     .task-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
     .badge { border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px; background: #f9fafb; max-width: 100%; overflow-wrap: anywhere; }
-    .project-badge { background: #edf7f2; border-color: #a8d5c2; color: var(--accent); }
     aside { display: none; border-left: 1px solid var(--line); background: var(--panel); padding: 18px; overflow: auto; }
     main.details-open aside { display: block; }
     .empty { color: var(--muted); padding: 20px; }
@@ -1405,6 +1404,12 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function label(value) {
       return value.replaceAll("_", " ");
+    }
+
+    function projectHue(name) {
+      let h = 0;
+      for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) & 0xffff;
+      return h % 360;
     }
 
     function optionList(select, values, emptyLabel) {
@@ -1494,10 +1499,16 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           button.ondragend = () => button.classList.remove("dragging");
           button.onclick = () => { selectedPath = task.path; renderBoard(); renderDetails(task); };
           const id = task.id === null || task.id === undefined ? "unversioned" : `#${task.id}`;
-          const projectChip = (payload.projects.length > 1 && task.project)
+          const projectChip = (payload.scope === "all projects" && task.project)
             ? task.project.replace(/\\/g, "/").split("/").filter(Boolean).pop() || task.project
             : null;
-          button.innerHTML = `<div class="task-title"></div><div class="task-row"><span class="badge"></span><span class="badge"></span>${projectChip ? `<span class="badge project-badge"></span>` : ""}</div>`;
+          let projectBadgeHtml = "";
+          if (projectChip) {
+            const hue = projectHue(projectChip);
+            const style = `background:hsl(${hue},60%,92%);border-color:hsl(${hue},45%,68%);color:hsl(${hue},55%,28%)`;
+            projectBadgeHtml = `<span class="badge" style="${style}"></span>`;
+          }
+          button.innerHTML = `<div class="task-title"></div><div class="task-row"><span class="badge"></span><span class="badge"></span>${projectBadgeHtml}</div>`;
           button.querySelector(".task-title").textContent = task.title;
           const badges = button.querySelectorAll(".badge");
           badges[0].textContent = id;
