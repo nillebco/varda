@@ -1224,24 +1224,35 @@ fn update_dashboard_task_status(
     config: &config::Config,
     update: DashboardStatusUpdate,
 ) -> Result<()> {
-    if update.status != task::TaskStatus::Done {
-        anyhow::bail!("dashboard status updates currently support only done");
+    use task::TaskStatus;
+    match update.status {
+        TaskStatus::Done | TaskStatus::Backlog | TaskStatus::Ready => {}
+        other => anyhow::bail!(
+            "dashboard status updates do not support status '{}'",
+            other.as_str()
+        ),
     }
 
     let task_path = task::resolve_task_reference(config, Path::new(&update.path))?;
     let mut task_document = task::load_task(&task_path)?;
-    if task_document.frontmatter.status == task::TaskStatus::Done {
+    if task_document.frontmatter.status == update.status {
         return Ok(());
     }
 
-    task_document.set_status(task::TaskStatus::Done);
-    task_document.frontmatter.requires_user = false;
+    task_document.set_status(update.status);
+    if update.status == TaskStatus::Done {
+        task_document.frontmatter.requires_user = false;
+    }
     task::write_task(&task_document)?;
 
     if config.git.auto_commit {
         git::commit_task_file(
             &task_path,
-            &format!("Mark task {} done", task_path.display()),
+            &format!(
+                "Mark task {} {}",
+                task_path.display(),
+                update.status.as_str()
+            ),
         )?;
     }
 
@@ -1462,9 +1473,12 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         const column = document.createElement("section");
         column.className = "column";
         column.dataset.status = status;
-        if (status === "done") {
+        const droppable = status === "done" || status === "backlog" || status === "ready";
+        if (droppable) {
           column.ondragover = event => {
-            if (Array.from(event.dataTransfer.types).includes("text/plain")) {
+            const path = event.dataTransfer.getData("text/plain");
+            const task = payload.tasks.find(t => t.path === path);
+            if (Array.from(event.dataTransfer.types).includes("text/plain") && (!task || task.status !== status)) {
               event.preventDefault();
               column.classList.add("drop-target");
             }
@@ -1476,7 +1490,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             const path = event.dataTransfer.getData("text/plain");
             if (path) {
               try {
-                await markTaskDone(path);
+                await updateTaskStatus(path, status);
               } catch (error) {
                 document.getElementById("details").textContent = `Failed to update task: ${error}`;
               }
@@ -1527,18 +1541,18 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }
     }
 
-    async function markTaskDone(path) {
+    async function updateTaskStatus(path, status) {
       const response = await fetch("/api/tasks/status", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path, status: "done" })
+        body: JSON.stringify({ path, status })
       });
       if (!response.ok) {
         throw new Error(await response.text());
       }
       const task = payload.tasks.find(task => task.path === path);
       if (task) {
-        task.status = "done";
+        task.status = status;
       }
       renderBoard();
       await refresh();
