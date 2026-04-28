@@ -115,7 +115,7 @@ impl AcpSubprocessClient {
             .context("failed to write task prompt to agent stdin")?;
         drop(stdin);
 
-        self.record_external_session(request, started_at);
+        self.record_external_session(request, started_at, child.id());
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let stderr = child.stderr.take().context("failed to open agent stderr")?;
@@ -289,7 +289,7 @@ impl AcpSubprocessClient {
             let _ = tokio::io::copy(&mut terminal_stdin, &mut stdin).await;
         });
 
-        self.record_external_session(request, started_at);
+        self.record_external_session(request, started_at, child.id());
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let log_path = request.session_log_path.clone();
@@ -332,25 +332,43 @@ impl AcpSubprocessClient {
         })
     }
 
-    fn record_external_session(&self, request: &AgentRunRequest, started_at: SystemTime) {
-        if self.command != "claude" {
-            return;
-        }
+    fn uses_copilot(&self) -> bool {
+        self.command == "copilot"
+            || self
+                .args
+                .iter()
+                .any(|a| a == "copilot" || a.starts_with("copilot "))
+    }
 
+    fn record_external_session(
+        &self,
+        request: &AgentRunRequest,
+        started_at: SystemTime,
+        pid: Option<u32>,
+    ) {
         let Some(log_path) = request.session_log_path.as_deref() else {
             return;
         };
-        let Some(project) = request.frontmatter.project.as_deref() else {
-            return;
-        };
 
-        let log_path = log_path.to_owned();
-        let project = project.to_owned();
-        let varda_session_id = request.session_id.clone();
-
-        tokio::spawn(async move {
-            record_claude_external_session(log_path, project, varda_session_id, started_at).await;
-        });
+        if self.command == "claude" {
+            let Some(project) = request.frontmatter.project.as_deref() else {
+                return;
+            };
+            let log_path = log_path.to_owned();
+            let project = project.to_owned();
+            let varda_session_id = request.session_id.clone();
+            tokio::spawn(async move {
+                record_claude_external_session(log_path, project, varda_session_id, started_at)
+                    .await;
+            });
+        } else if self.uses_copilot() {
+            if let Some(pid) = pid {
+                let log_path = log_path.to_owned();
+                tokio::spawn(async move {
+                    record_copilot_external_session(log_path, pid).await;
+                });
+            }
+        }
     }
 }
 
@@ -376,6 +394,58 @@ async fn record_claude_external_session(
             return;
         }
         time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn find_copilot_process_log(pid: u32) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let logs_dir = Path::new(&home).join(".copilot/logs");
+    let suffix = format!("-{pid}.log");
+    std::fs::read_dir(logs_dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("process-") && n.ends_with(&suffix))
+                .unwrap_or(false)
+        })
+}
+
+fn extract_copilot_workspace_id(log_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(log_path).ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.split("Workspace initialized: ").nth(1) {
+            let id = rest.split_whitespace().next()?;
+            return Some(id.to_owned());
+        }
+    }
+    None
+}
+
+async fn record_copilot_external_session(log_path: String, pid: u32) {
+    for _ in 0..20 {
+        if let Some(process_log) = find_copilot_process_log(pid) {
+            if let Some(workspace_id) = extract_copilot_workspace_id(&process_log) {
+                let Some(home) = std::env::var_os("HOME") else {
+                    return;
+                };
+                let events_path = Path::new(&home)
+                    .join(".copilot/session-state")
+                    .join(&workspace_id)
+                    .join("events.jsonl");
+                let _ = append_session_log(
+                    &log_path,
+                    &format!(
+                        "external_session_id={workspace_id}\nexternal_session_log={}\n",
+                        events_path.display()
+                    ),
+                );
+                return;
+            }
+        }
+        time::sleep(Duration::from_millis(500)).await;
     }
 }
 
