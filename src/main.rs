@@ -131,6 +131,11 @@ enum TaskCommand {
         /// Markdown task file or task id whose session should be resumed.
         task: PathBuf,
     },
+    /// Display a markdown task and its associated recap.
+    Show {
+        /// Markdown task file or task id to display.
+        task: PathBuf,
+    },
     /// Show a kanban dashboard and optionally open task details.
     Dashboard {
         /// Project path to show tasks for. Defaults to the current directory.
@@ -330,6 +335,9 @@ async fn main() -> Result<()> {
             }
             TaskCommand::ResumeSession { task } => {
                 resume_task_session_command(&task)?;
+            }
+            TaskCommand::Show { task } => {
+                show_task_command(&task)?;
             }
             TaskCommand::Dashboard {
                 project,
