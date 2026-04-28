@@ -368,6 +368,12 @@ impl AcpSubprocessClient {
                     record_copilot_external_session(log_path, pid).await;
                 });
             }
+        } else if self.command == "codex" {
+            let log_path = log_path.to_owned();
+            let project = request.frontmatter.project.clone();
+            tokio::spawn(async move {
+                record_codex_external_session(log_path, started_at, project).await;
+            });
         }
     }
 }
@@ -444,6 +450,82 @@ async fn record_copilot_external_session(log_path: String, pid: u32) {
                 );
                 return;
             }
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn find_codex_session(started_at: SystemTime, project: Option<&str>) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let sessions_base = Path::new(&home).join(".codex/sessions");
+    let mut matches: Vec<(SystemTime, PathBuf)> = Vec::new();
+
+    let years = std::fs::read_dir(&sessions_base).ok()?;
+    for year in years.flatten() {
+        for month in std::fs::read_dir(year.path()).ok().into_iter().flatten().flatten() {
+            for day in std::fs::read_dir(month.path()).ok().into_iter().flatten().flatten() {
+                for file in std::fs::read_dir(day.path()).ok().into_iter().flatten().flatten() {
+                    let path = file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let Ok(meta) = file.metadata() else { continue };
+                    let Ok(modified) = meta.modified() else { continue };
+                    if modified < started_at {
+                        continue;
+                    }
+                    if let Some(project) = project {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if let Some(first_line) = content.lines().next() {
+                                if let Ok(event) =
+                                    serde_json::from_str::<serde_json::Value>(first_line)
+                                {
+                                    let cwd =
+                                        event["payload"]["cwd"].as_str().unwrap_or_default();
+                                    if !cwd.starts_with(project) && cwd != project {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    matches.push((modified, path));
+                }
+            }
+        }
+    }
+
+    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches.into_iter().map(|(_, p)| p).next()
+}
+
+fn extract_codex_session_id(path: &Path) -> Option<String> {
+    // Filename stem: "rollout-YYYY-MM-DDTHH-MM-SS-<uuid>" where uuid is 36 chars.
+    let stem = path.file_stem()?.to_str()?;
+    if stem.len() >= 36 {
+        Some(stem[stem.len() - 36..].to_owned())
+    } else {
+        None
+    }
+}
+
+async fn record_codex_external_session(
+    log_path: String,
+    started_at: SystemTime,
+    project: Option<String>,
+) {
+    for _ in 0..20 {
+        if let Some(session_path) = find_codex_session(started_at, project.as_deref()) {
+            let session_id = extract_codex_session_id(&session_path)
+                .unwrap_or_else(|| "unknown".to_owned());
+            let _ = append_session_log(
+                &log_path,
+                &format!(
+                    "external_session_id={session_id}\nexternal_session_log={}\n",
+                    session_path.display()
+                ),
+            );
+            return;
         }
         time::sleep(Duration::from_millis(500)).await;
     }
