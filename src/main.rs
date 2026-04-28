@@ -47,6 +47,11 @@ enum Command {
     },
     /// Create a reviewable execution plan for ready tasks.
     Plan,
+    /// Manage Varda configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Manage project routes.
     Project {
         #[command(subcommand)]
@@ -176,6 +181,12 @@ enum TaskCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Open the global Varda config in $EDITOR.
+    Edit,
+}
+
+#[derive(Debug, Subcommand)]
 enum ShowCommand {
     /// Display a markdown task and its associated recap.
     Task {
@@ -226,6 +237,12 @@ async fn main() -> Result<()> {
         Command::Plan => {
             plan_command()?;
         }
+        Command::Config { command } => match command {
+            ConfigCommand::Edit => {
+                let config_path = config::config_file()?;
+                open_editor(&config_path)?;
+            }
+        },
         Command::Task { command } => match command {
             TaskCommand::Add {
                 taskname,
@@ -1772,8 +1789,7 @@ fn update_tasks_command(
         anyhow::bail!("nothing to update: specify --set-status and/or --set-agent");
     }
 
-    let new_status: Option<task::TaskStatus> =
-        set_status.map(|s| s.parse()).transpose()?;
+    let new_status: Option<task::TaskStatus> = set_status.map(|s| s.parse()).transpose()?;
     let filter_statuses: Vec<task::TaskStatus> = filter_status
         .iter()
         .map(|s| s.parse())
