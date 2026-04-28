@@ -1593,7 +1593,17 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 </html>
 "##;
 
+fn project_chip(project: Option<&str>) -> String {
+    project
+        .and_then(|p| Path::new(p).file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| format!(" [{s}]"))
+        .unwrap_or_default()
+}
+
 fn print_task_dashboard(scope: &str, tasks: &[task::TaskSummary]) {
+    let show_project = scope == "all projects";
+
     println!("# Tasks Dashboard");
     println!();
     println!("scope: {scope}");
@@ -1617,9 +1627,13 @@ fn print_task_dashboard(scope: &str, tasks: &[task::TaskSummary]) {
                 .map(|id| format!("#{id}"))
                 .unwrap_or_else(|| "unversioned".to_owned());
             let assignee = task.assignee.as_deref().unwrap_or("-");
-            let project = task.project.as_deref().unwrap_or("-");
+            let chip = if show_project {
+                project_chip(task.project.as_deref())
+            } else {
+                String::new()
+            };
             println!(
-                "- {id} {} (assignee: {assignee}, project: `{project}`, path: {})",
+                "- {id}{chip} {} (assignee: {assignee}, path: {})",
                 task.title,
                 task.path.display()
             );
