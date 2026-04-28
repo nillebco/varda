@@ -1342,7 +1342,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Varda Tasks</title>
+  <title>✨ Varda Tasks</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✨</text></svg>">
   <style>
     :root { color-scheme: light; --bg: #f6f7f9; --panel: #ffffff; --line: #d9dee7; --text: #1e2430; --muted: #687386; --accent: #1f7a5a; }
     * { box-sizing: border-box; }
@@ -1383,7 +1384,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 <body>
   <header>
     <div>
-      <h1>Varda Tasks</h1>
+      <h1>✨ Varda Tasks</h1>
       <div id="scope" class="meta"></div>
     </div>
     <div id="updated" class="meta"></div>
