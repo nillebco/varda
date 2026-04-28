@@ -1024,6 +1024,12 @@ async fn run_task_path_for_parallel(
     let task_path = task::resolve_task_reference(&config, &task_path)?;
     let task_document = task::load_task(&task_path)?;
     let route = routing::match_route_for_task(&config, &task_document, false)?;
+    let id = task_document
+        .frontmatter
+        .id
+        .map(|id| format!("#{id}"))
+        .unwrap_or_else(|| "unversioned".to_owned());
+    println!("dispatching {} {} → agent={}", id, task_document.title(), route.agent);
     let agent_config = config
         .agents
         .get(&route.agent)
