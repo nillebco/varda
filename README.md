@@ -98,6 +98,25 @@ The agents listed in `--agents` must already exist in the global config.
 
 Routes are checked in order. Put more specific project routes before broad catch-all routes when you edit the config manually.
 
+To use a custom Copilot launcher for one folder, define a separate agent and route that folder to it:
+
+```toml
+[[routes]]
+glob = "/some/project/path/**"
+agents = ["project-copilot"]
+
+[agents.project-copilot]
+kind = "acp"
+command = "/path/to/copilot-wrapper"
+args = ["-"]
+working_dir = "{project}"
+
+[agents.project-copilot.env]
+COPILOT_CUSTOM_VALUE = "enabled"
+```
+
+`command`, `args`, `working_dir`, and environment variable values support `{project}` and `{task}` placeholders.
+
 ## Create Your First Task
 
 From inside the project you want to track, run:
@@ -414,6 +433,8 @@ When the generated Codex args contain `--cd "."`, Varda replaces that `.` at run
 The generated Claude Code args use `-p` for non-interactive output through stdin/stdout. Varda expands `{project}` in `--add-dir "{project}"` so Claude can access the tracked project while the task file remains in the global Varda control-plane folder.
 
 The generated GitHub Copilot args use `gh copilot suggest -t shell -` to drive the GitHub CLI copilot extension through stdin/stdout. The `-` at the end signals stdin input mode. You must have the `gh` CLI installed with the copilot extension (`gh extension install github/gh-copilot`).
+
+Agent configs may also set `working_dir = "{project}"` and an `[agents.<name>.env]` table. This is useful for per-project wrapper scripts, including Copilot launchers that need custom environment variables.
 
 ## Git Behavior
 

@@ -1,5 +1,6 @@
 //! Varda configuration loading and initialization.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -57,7 +58,7 @@ pub struct Config {
     #[serde(default)]
     pub routes: Vec<Route>,
     #[serde(default)]
-    pub agents: std::collections::BTreeMap<String, AgentConfig>,
+    pub agents: BTreeMap<String, AgentConfig>,
     #[serde(default)]
     pub git: GitConfig,
 }
@@ -81,6 +82,10 @@ pub struct AgentConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

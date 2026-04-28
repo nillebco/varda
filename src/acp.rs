@@ -1,5 +1,6 @@
 //! ACP transport support.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
@@ -21,6 +22,8 @@ pub struct AcpSubprocessClient {
     agent_name: String,
     command: String,
     args: Vec<String>,
+    working_dir: Option<String>,
+    env: BTreeMap<String, String>,
 }
 
 impl AcpSubprocessClient {
@@ -29,6 +32,8 @@ impl AcpSubprocessClient {
             agent_name: agent_name.into(),
             command: config.command.clone(),
             args: config.args.clone(),
+            working_dir: config.working_dir.clone(),
+            env: config.env.clone(),
         }
     }
 }
@@ -56,29 +61,45 @@ impl AcpSubprocessClient {
         request: &AgentRunRequest,
     ) -> Result<AgentRunResult> {
         let started_at = SystemTime::now();
+        let command = expand_request_value(&self.command, request);
+        let working_dir = self
+            .working_dir
+            .as_deref()
+            .map(|dir| expand_request_value(dir, request));
+        let env = env_for_request(&self.env, request);
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(
                 log_path,
                 &format!(
-                    "session_id={}\nagent={}\ntask={}\ncommand={} args={:?}\n",
-                    request.session_id, self.agent_name, request.task_path, self.command, args
+                    "session_id={}\nagent={}\ntask={}\ncommand={} args={:?}\nworking_dir={:?}\n",
+                    request.session_id,
+                    self.agent_name,
+                    request.task_path,
+                    command,
+                    args,
+                    working_dir
                 ),
             );
         }
 
-        let mut child = Command::new(&self.command)
+        let mut command_builder = Command::new(&command);
+        command_builder
             .args(&args)
+            .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to start agent '{}' with command '{}'",
-                    self.agent_name, self.command
-                )
-            })?;
+            .kill_on_drop(true);
+        if let Some(working_dir) = working_dir.as_deref() {
+            command_builder.current_dir(working_dir);
+        }
+
+        let mut child = command_builder.spawn().with_context(|| {
+            format!(
+                "failed to start agent '{}' with command '{}'",
+                self.agent_name, command
+            )
+        })?;
 
         let mut stdin = child.stdin.take().context("failed to open agent stdin")?;
         stdin
@@ -309,7 +330,10 @@ Task markdown:
 
 fn args_for_request(args: &[String], request: &AgentRunRequest) -> Vec<String> {
     let Some(project) = request.frontmatter.project.as_deref() else {
-        return args.to_vec();
+        return args
+            .iter()
+            .map(|arg| expand_request_value(arg, request))
+            .collect();
     };
 
     let mut resolved = Vec::with_capacity(args.len());
@@ -340,6 +364,22 @@ fn args_for_request(args: &[String], request: &AgentRunRequest) -> Vec<String> {
 fn expand_arg(arg: &str, request: &AgentRunRequest, project: &str) -> String {
     arg.replace("{project}", project)
         .replace("{task}", &request.task_path)
+}
+
+fn expand_request_value(value: &str, request: &AgentRunRequest) -> String {
+    let Some(project) = request.frontmatter.project.as_deref() else {
+        return value.replace("{task}", &request.task_path);
+    };
+    expand_arg(value, request, project)
+}
+
+fn env_for_request(
+    env: &BTreeMap<String, String>,
+    request: &AgentRunRequest,
+) -> BTreeMap<String, String> {
+    env.iter()
+        .map(|(key, value)| (key.clone(), expand_request_value(value, request)))
+        .collect()
 }
 
 fn find_claude_transcript(
@@ -422,6 +462,8 @@ mod tests {
             kind: crate::config::AgentKind::Acp,
             command: "cat".to_owned(),
             args: vec![],
+            working_dir: None,
+            env: BTreeMap::new(),
         };
         let client = AcpSubprocessClient::new("echo", &config);
 
@@ -466,6 +508,8 @@ mod tests {
                 "-c".to_owned(),
                 "printf 'recap line\\n'; printf 'diagnostic line\\n' >&2".to_owned(),
             ],
+            working_dir: None,
+            env: BTreeMap::new(),
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -498,6 +542,55 @@ mod tests {
         assert!(log.contains("stdout:\nrecap line"));
         assert!(log.contains("stderr:\ndiagnostic line"));
         assert!(log.contains("status=exit status: 0"));
+    }
+
+    #[tokio::test]
+    async fn subprocess_client_applies_agent_env_and_working_dir() {
+        let root = std::env::temp_dir().join(format!("varda-acp-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp directory should be created");
+        let root = std::fs::canonicalize(root).expect("temp directory should canonicalize");
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf '%s\\n%s\\n' \"$VARDA_TEST_PROJECT\" \"$PWD\"".to_owned(),
+            ],
+            working_dir: Some("{project}".to_owned()),
+            env: BTreeMap::from([("VARDA_TEST_PROJECT".to_owned(), "{project}".to_owned())]),
+        };
+        let client = AcpSubprocessClient::new("shell", &config);
+
+        let result = client
+            .run_task(AgentRunRequest {
+                agent_name: "shell".to_owned(),
+                task_path: "task.md".to_owned(),
+                frontmatter: TaskFrontmatter {
+                    id: None,
+                    status: TaskStatus::Ready,
+                    project: Some(root.display().to_string()),
+                    assignee: Some("shell".to_owned()),
+                    recap: None,
+                    recaps: vec![],
+                    plan: None,
+                    agent_session_id: None,
+                    agent_session_log: None,
+                    requires_user: false,
+                },
+                body: "# Task\n\nDo it.".to_owned(),
+                timeout: Duration::from_secs(600),
+                session_id: "session-1".to_owned(),
+                session_log_path: None,
+            })
+            .await
+            .expect("subprocess should run");
+
+        let expected_project = root.display().to_string();
+        assert_eq!(
+            result.recap,
+            format!("{expected_project}\n{expected_project}")
+        );
+        std::fs::remove_dir_all(root).expect("temp directory should be removed");
     }
 
     #[test]

@@ -346,6 +346,8 @@ Do it.
                     kind: AgentKind::Acp,
                     command: "codex".to_owned(),
                     args: vec![],
+                    working_dir: None,
+                    env: BTreeMap::new(),
                 },
             )]),
             git: GitConfig { auto_commit: true },
