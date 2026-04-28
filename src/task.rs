@@ -60,6 +60,7 @@ pub struct TaskFrontmatter {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    Backlog,
     Ready,
     Running,
     Pending,
@@ -71,6 +72,7 @@ pub enum TaskStatus {
 impl TaskStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Backlog => "backlog",
             Self::Ready => "ready",
             Self::Running => "running",
             Self::Pending => "pending",
@@ -86,6 +88,7 @@ impl std::str::FromStr for TaskStatus {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
+            "backlog" => Ok(Self::Backlog),
             "ready" => Ok(Self::Ready),
             "running" => Ok(Self::Running),
             "pending" => Ok(Self::Pending),
@@ -93,7 +96,7 @@ impl std::str::FromStr for TaskStatus {
             "failed" => Ok(Self::Failed),
             "done" => Ok(Self::Done),
             _ => anyhow::bail!(
-                "unknown status '{}'; expected one of: ready, running, pending, needs_user, failed, done",
+                "unknown status '{}'; expected one of: backlog, ready, running, pending, needs_user, failed, done",
                 s
             ),
         }
@@ -165,7 +168,7 @@ pub fn create_task(
         path: path.clone(),
         frontmatter: TaskFrontmatter {
             id: Some(id),
-            status: TaskStatus::Ready,
+            status: TaskStatus::Backlog,
             project: Some(project_path.display().to_string()),
             assignee: assignee.map(str::to_owned),
             recap: None,
@@ -686,7 +689,7 @@ Do the work.
             path.parent(),
             Some(operations_dir.join("tasks/work-project").as_path())
         );
-        assert!(content.contains("status: ready"));
+        assert!(content.contains("status: backlog"));
         assert!(content.contains("project: /work/project"));
         assert!(content.contains("assignee: codex"));
         assert!(content.contains("# Write README Please"));

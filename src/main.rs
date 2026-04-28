@@ -163,7 +163,7 @@ enum TaskCommand {
     Update {
         /// Task file or task id to update. Omit to use filter flags for bulk selection.
         task: Option<PathBuf>,
-        /// Set the task status (ready, running, pending, needs_user, failed, done).
+        /// Set the task status (backlog, ready, running, pending, needs_user, failed, done).
         #[arg(long, value_name = "STATUS")]
         set_status: Option<String>,
         /// Set the task assignee.
@@ -1326,6 +1326,7 @@ fn load_dashboard_payload(
         tasks,
         projects,
         statuses: vec![
+            "backlog",
             "ready",
             "running",
             "needs_user",
@@ -1396,7 +1397,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <aside id="details" class="empty"></aside>
   </main>
   <script>
-    const statuses = ["ready", "running", "needs_user", "failed", "pending", "done"];
+    const statuses = ["backlog", "ready", "running", "needs_user", "failed", "pending", "done"];
     let payload = { tasks: [], projects: [], statuses };
     let selectedPath = "";
     let initializedFilters = false;
@@ -1611,6 +1612,7 @@ fn print_task_dashboard(scope: &str, tasks: &[task::TaskSummary]) {
     println!();
 
     for status in [
+        task::TaskStatus::Backlog,
         task::TaskStatus::Ready,
         task::TaskStatus::Running,
         task::TaskStatus::NeedsUser,
