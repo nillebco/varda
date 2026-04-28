@@ -95,6 +95,9 @@ enum TaskCommand {
         /// Spawn the agent in the background and return immediately (only meaningful with --exec).
         #[arg(long)]
         background: bool,
+        /// Surface the agent output in the current shell and forward stdin for interaction (only meaningful with --exec).
+        #[arg(long)]
+        interactive: bool,
     },
     /// List markdown tasks for a project.
     List {
@@ -109,6 +112,9 @@ enum TaskCommand {
         /// Spawn the agent in the background and return immediately.
         #[arg(long)]
         background: bool,
+        /// Surface the agent output in the current shell and forward stdin for interaction.
+        #[arg(long)]
+        interactive: bool,
     },
     /// Generate an agent-driven plan for a task and open it in $EDITOR.
     Plan {
@@ -257,6 +263,7 @@ async fn main() -> Result<()> {
                 exec,
                 edit,
                 background,
+                interactive,
             } => {
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
@@ -288,7 +295,7 @@ async fn main() -> Result<()> {
                     if background {
                         spawn_task_in_background(&task_path)?;
                     } else {
-                        run_task_command(&task_path).await?;
+                        run_task_command(&task_path, interactive).await?;
                     }
                 } else {
                     open_editor(&task_path)?;
@@ -301,11 +308,15 @@ async fn main() -> Result<()> {
                 let tasks = task::list_tasks(&config, &project_path)?;
                 print_task_list(&project_path, &tasks);
             }
-            TaskCommand::Run { task, background } => {
+            TaskCommand::Run {
+                task,
+                background,
+                interactive,
+            } => {
                 if background {
                     spawn_task_in_background(&task)?;
                 } else {
-                    run_task_command(&task).await?;
+                    run_task_command(&task, interactive).await?;
                 }
             }
             TaskCommand::Plan { task } => {
@@ -748,7 +759,7 @@ fn unix_timestamp() -> Result<u64> {
 
 async fn run_command(task_arg: Option<&Path>, plan_arg: Option<&Path>) -> Result<()> {
     match (task_arg, plan_arg) {
-        (Some(task), None) => run_task_command(task).await,
+        (Some(task), None) => run_task_command(task, false).await,
         (Some(_), Some(_)) => {
             anyhow::bail!("pass either --task <TASK> or a plan path, not both")
         }
@@ -756,7 +767,7 @@ async fn run_command(task_arg: Option<&Path>, plan_arg: Option<&Path>) -> Result
             let config_path = config::config_file()?;
             let config = config::load_config(&config_path)?;
             if looks_like_task(&config, path) {
-                run_task_command(path).await
+                run_task_command(path, false).await
             } else {
                 run_plan_command(path).await
             }
@@ -827,6 +838,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         timeout,
         session_id: uuid::Uuid::new_v4().to_string(),
         session_log_path: None,
+        interactive: false,
     };
     let result = client.run_task(request).await?;
     let json = extract_json_object(&result.recap)?;
@@ -994,7 +1006,7 @@ async fn run_task_path_for_parallel(
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let client = acp::AcpSubprocessClient::new(&route.agent, agent_config);
-    let outcome = runner::run_task(&config, &route.agent, &task_path, &client).await?;
+    let outcome = runner::run_task(&config, &route.agent, &task_path, &client, false).await?;
 
     Ok(ParallelRunReport {
         task_path,
@@ -1700,7 +1712,7 @@ fn spawn_task_in_background(task_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_task_command(task_path: &Path) -> Result<()> {
+async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
@@ -1735,7 +1747,7 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
         )?;
         println!("committed task snapshot");
     }
-    let outcome = runner::run_task(&config, &route.agent, &task_path, &client).await?;
+    let outcome = runner::run_task(&config, &route.agent, &task_path, &client, interactive).await?;
     println!(
         "processed task={} agent={} glob={} status={:?} recap={}",
         task_path.display(),
@@ -1825,7 +1837,7 @@ async fn resume_task_command(task_path: &Path) -> Result<()> {
         open_editor(&task_path)?;
     }
 
-    run_task_command(&task_path).await
+    run_task_command(&task_path, false).await
 }
 
 fn update_tasks_command(

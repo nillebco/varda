@@ -24,6 +24,8 @@ pub struct AcpSubprocessClient {
     args: Vec<String>,
     working_dir: Option<String>,
     env: BTreeMap<String, String>,
+    interactive_command: Option<String>,
+    interactive_args: Option<Vec<String>>,
 }
 
 impl AcpSubprocessClient {
@@ -34,6 +36,8 @@ impl AcpSubprocessClient {
             args: config.args.clone(),
             working_dir: config.working_dir.clone(),
             env: config.env.clone(),
+            interactive_command: config.interactive_command.clone(),
+            interactive_args: config.interactive_args.clone(),
         }
     }
 }
@@ -60,6 +64,9 @@ impl AcpSubprocessClient {
         args: Vec<String>,
         request: &AgentRunRequest,
     ) -> Result<AgentRunResult> {
+        if request.interactive {
+            return self.execute_interactive(prompt, args, request).await;
+        }
         let started_at = SystemTime::now();
         let command = expand_request_value(&self.command, request);
         let working_dir = self
@@ -157,6 +164,174 @@ impl AcpSubprocessClient {
         })
     }
 
+    async fn execute_interactive(
+        &self,
+        prompt: String,
+        args: Vec<String>,
+        request: &AgentRunRequest,
+    ) -> Result<AgentRunResult> {
+        let command = expand_request_value(&self.command, request);
+        let working_dir = self
+            .working_dir
+            .as_deref()
+            .map(|dir| expand_request_value(dir, request));
+        let mut env = env_for_request(&self.env, request);
+
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let _ = append_session_log(
+                log_path,
+                &format!(
+                    "session_id={}\nagent={}\ntask={}\ncommand={} args={:?}\nworking_dir={:?}\n[interactive]\n",
+                    request.session_id,
+                    self.agent_name,
+                    request.task_path,
+                    command,
+                    args,
+                    working_dir
+                ),
+            );
+        }
+
+        // Write the task prompt to a temp file so truly-interactive agents can read it.
+        let prompt_file = std::env::temp_dir()
+            .join(format!("varda-prompt-{}.txt", request.session_id));
+        std::fs::write(&prompt_file, prompt.as_bytes())
+            .context("failed to write prompt to temp file")?;
+        env.insert(
+            "VARDA_PROMPT_FILE".to_owned(),
+            prompt_file.display().to_string(),
+        );
+
+        if let Some(interactive_cmd) = &self.interactive_command {
+            // Truly interactive: inherit all terminal streams so the user can interact directly.
+            let interactive_cmd = expand_request_value(interactive_cmd, request);
+            let interactive_args = args_for_request(
+                self.interactive_args.as_deref().unwrap_or(&[]),
+                request,
+            );
+
+            let mut command_builder = Command::new(&interactive_cmd);
+            command_builder
+                .args(&interactive_args)
+                .envs(env)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            if let Some(working_dir) = working_dir.as_deref() {
+                command_builder.current_dir(working_dir);
+            }
+
+            let mut child = command_builder.spawn().with_context(|| {
+                format!(
+                    "failed to start interactive agent '{}' with command '{}'",
+                    self.agent_name, interactive_cmd
+                )
+            })?;
+
+            let status = child
+                .wait()
+                .await
+                .context("failed to wait for interactive agent subprocess")?;
+            let _ = std::fs::remove_file(&prompt_file);
+
+            if let Some(log_path) = request.session_log_path.as_deref() {
+                let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
+            }
+
+            if !status.success() {
+                bail!(
+                    "agent '{}' exited with status {}",
+                    self.agent_name,
+                    status,
+                );
+            }
+
+            return Ok(AgentRunResult {
+                recap: "Interactive session completed.\n\nrequires_user: false".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+            });
+        }
+
+        // Fallback: pipe-based interactive mode (prompt written to stdin, terminal forwarded).
+        let started_at = SystemTime::now();
+        let prompt = std::fs::read_to_string(&prompt_file)
+            .context("failed to read prompt from temp file")?;
+        let _ = std::fs::remove_file(&prompt_file);
+
+        let mut command_builder = Command::new(&command);
+        command_builder
+            .args(&args)
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        if let Some(working_dir) = working_dir.as_deref() {
+            command_builder.current_dir(working_dir);
+        }
+
+        let mut child = command_builder.spawn().with_context(|| {
+            format!(
+                "failed to start agent '{}' with command '{}'",
+                self.agent_name, command
+            )
+        })?;
+
+        let mut stdin = child.stdin.take().context("failed to open agent stdin")?;
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .context("failed to write task prompt to agent stdin")?;
+        // Forward terminal stdin to the agent so the user can interact.
+        tokio::spawn(async move {
+            let mut terminal_stdin = tokio::io::stdin();
+            let _ = tokio::io::copy(&mut terminal_stdin, &mut stdin).await;
+        });
+
+        self.record_external_session(request, started_at);
+
+        let stdout = child.stdout.take().context("failed to open agent stdout")?;
+        let log_path = request.session_log_path.clone();
+        let tee_task = collect_stream_tee(stdout, log_path, "stdout");
+
+        let (stdout_bytes, status) =
+            tokio::try_join!(tee_task, async {
+                child
+                    .wait()
+                    .await
+                    .context("failed to wait for agent subprocess")
+            })
+            .context("failed while waiting for agent subprocess")?;
+
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
+        }
+
+        if !status.success() {
+            bail!(
+                "agent '{}' exited with status {}",
+                self.agent_name,
+                status,
+            );
+        }
+
+        let recap = String::from_utf8(stdout_bytes)
+            .context("agent stdout was not valid UTF-8")?
+            .trim()
+            .to_owned();
+
+        if recap.is_empty() {
+            bail!("agent '{}' produced an empty recap", self.agent_name);
+        }
+
+        Ok(AgentRunResult {
+            requires_user: recap_requires_user_interaction(&recap),
+            suggested_agent: None,
+            recap,
+        })
+    }
+
     fn record_external_session(&self, request: &AgentRunRequest, started_at: SystemTime) {
         if self.command != "claude" {
             return;
@@ -232,6 +407,47 @@ where
                 wrote_header = true;
             }
             let _ = append_session_log(log_path, &String::from_utf8_lossy(&buffer[..bytes_read]));
+        }
+    }
+
+    Ok(output)
+}
+
+async fn collect_stream_tee<R>(
+    mut stream: R,
+    log_path: Option<String>,
+    label: &'static str,
+) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    use std::io::Write as _;
+
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut wrote_header = false;
+
+    loop {
+        let bytes_read = stream
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("failed to read agent {label}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let chunk = &buffer[..bytes_read];
+        output.extend_from_slice(chunk);
+
+        let _ = std::io::stdout().write_all(chunk);
+        let _ = std::io::stdout().flush();
+
+        if let Some(log_path) = log_path.as_deref() {
+            if !wrote_header {
+                let _ = append_session_log(log_path, &format!("\n{label}:\n"));
+                wrote_header = true;
+            }
+            let _ = append_session_log(log_path, &String::from_utf8_lossy(chunk));
         }
     }
 
@@ -464,6 +680,8 @@ mod tests {
             args: vec![],
             working_dir: None,
             env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
         };
         let client = AcpSubprocessClient::new("echo", &config);
 
@@ -487,6 +705,7 @@ mod tests {
                 timeout: Duration::from_secs(600),
                 session_id: "session-1".to_owned(),
                 session_log_path: None,
+                interactive: false,
             })
             .await
             .expect("subprocess should echo prompt");
@@ -510,6 +729,8 @@ mod tests {
             ],
             working_dir: None,
             env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -533,6 +754,7 @@ mod tests {
                 timeout: Duration::from_secs(600),
                 session_id: "session-1".to_owned(),
                 session_log_path: Some(log_path.display().to_string()),
+                interactive: false,
             })
             .await
             .expect("subprocess should run");
@@ -558,6 +780,8 @@ mod tests {
             ],
             working_dir: Some("{project}".to_owned()),
             env: BTreeMap::from([("VARDA_TEST_PROJECT".to_owned(), "{project}".to_owned())]),
+            interactive_command: None,
+            interactive_args: None,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -581,6 +805,7 @@ mod tests {
                 timeout: Duration::from_secs(600),
                 session_id: "session-1".to_owned(),
                 session_log_path: None,
+                interactive: false,
             })
             .await
             .expect("subprocess should run");
@@ -614,6 +839,7 @@ mod tests {
             timeout: Duration::from_secs(600),
             session_id: "session-1".to_owned(),
             session_log_path: None,
+            interactive: false,
         };
 
         let args = args_for_request(
@@ -662,6 +888,7 @@ mod tests {
             timeout: Duration::from_secs(600),
             session_id: "session-1".to_owned(),
             session_log_path: None,
+            interactive: false,
         };
 
         let args = args_for_request(

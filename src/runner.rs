@@ -29,6 +29,7 @@ pub async fn run_task(
     agent_name: &str,
     task_path: &Path,
     client: &impl AgentClient,
+    interactive: bool,
 ) -> Result<RunOutcome> {
     let mut task = load_task(task_path)?;
 
@@ -63,6 +64,7 @@ pub async fn run_task(
         timeout,
         session_id: session_id.clone(),
         session_log_path: Some(session_log_path.display().to_string()),
+        interactive,
     };
 
     let result = match time::timeout(timeout, client.run_task(request)).await {
@@ -144,6 +146,7 @@ pub async fn plan_task(
         timeout,
         session_id: Uuid::new_v4().to_string(),
         session_log_path: None,
+        interactive: false,
     };
 
     let result = match time::timeout(timeout, client.plan_task(request)).await {
@@ -272,7 +275,7 @@ Do it.
             suggested_agent: None,
         });
 
-        let outcome = run_task(&config, "codex", &task_path, &client)
+        let outcome = run_task(&config, "codex", &task_path, &client, false)
             .await
             .expect("task should run");
 
@@ -319,7 +322,7 @@ Do it.
             suggested_agent: None,
         });
 
-        let outcome = run_task(&config, "codex", &task_path, &client)
+        let outcome = run_task(&config, "codex", &task_path, &client, false)
             .await
             .expect("task should run");
 
@@ -348,6 +351,8 @@ Do it.
                     args: vec![],
                     working_dir: None,
                     env: BTreeMap::new(),
+                    interactive_command: None,
+                    interactive_args: None,
                 },
             )]),
             git: GitConfig { auto_commit: true },

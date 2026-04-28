@@ -16,6 +16,8 @@ pub struct AgentRunRequest {
     pub timeout: Duration,
     pub session_id: String,
     pub session_log_path: Option<String>,
+    /// When true, tee stdout to the terminal and forward terminal stdin to the agent.
+    pub interactive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +227,7 @@ mod tests {
                 timeout: Duration::from_secs(600),
                 session_id: "session-1".to_owned(),
                 session_log_path: None,
+                interactive: false,
             })
             .await
             .expect("fake agent should return a result");

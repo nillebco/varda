@@ -167,6 +167,20 @@ varda task add "Summarize this project" --exec
 
 Varda still prompts for the assignee, creates the task, skips the editor, and processes the new task through the selected agent.
 
+To run a task in the background and return immediately, add `--background`:
+
+```sh
+varda task add "Summarize this project" --exec --background
+```
+
+To keep the agent's output visible in the current shell and forward your terminal's stdin to the agent, add `--interactive`:
+
+```sh
+varda task add "Summarize this project" --exec --interactive
+```
+
+In interactive mode the agent's stderr appears directly in the terminal (so you can see tool calls and progress in real time), stdout is streamed to the terminal and also captured for the recap, and your keyboard input is forwarded to the agent's stdin after the initial prompt is delivered.
+
 Tasks are stored in the Varda operations folder:
 
 ```text
@@ -195,6 +209,18 @@ Then run:
 
 ```sh
 varda task run "$HOME/.varda/operations/tasks/summarize-this-project.md"
+```
+
+Pass `--background` to detach immediately:
+
+```sh
+varda task run 1 --background
+```
+
+Pass `--interactive` to surface the agent in the current shell:
+
+```sh
+varda task run 1 --interactive
 ```
 
 If you set `VARDA_HOME`, use that path instead.

@@ -33,6 +33,8 @@ args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
 kind = "acp"
 command = "claude"
 args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
+interactive_command = "sh"
+interactive_args = ["-c", "claude --append-system-prompt \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --permission-mode acceptEdits"]
 
 [agents.copilot]
 kind = "acp"
@@ -86,6 +88,13 @@ pub struct AgentConfig {
     pub working_dir: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Command to use when running interactively (inherits terminal stdio).
+    /// When set, the agent is spawned with all streams inherited from the terminal
+    /// and $VARDA_PROMPT_FILE points to a file containing the task prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -313,6 +322,14 @@ mod tests {
                 "{project}"
             ]
         );
+        assert_eq!(
+            config.agents["claude"].interactive_command.as_deref(),
+            Some("sh")
+        );
+        assert!(config.agents["claude"]
+            .interactive_args
+            .as_ref()
+            .is_some_and(|a| a[0] == "-c"));
         assert_eq!(config.agents["copilot"].command, "sh");
         assert_eq!(
             config.agents["copilot"].args,
