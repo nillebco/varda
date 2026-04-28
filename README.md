@@ -38,6 +38,7 @@ $HOME/.varda/
   config.toml
   operations/
     tasks/
+      <project-folder>/
     recaps/
     runs/
 ```
@@ -45,7 +46,7 @@ $HOME/.varda/
 The important files are:
 
 - `$VARDA_HOME/config.toml` or `$HOME/.varda/config.toml`: tells Varda which agents are allowed for which project paths.
-- `$VARDA_HOME/operations/tasks/`: where Varda stores markdown task files.
+- `$VARDA_HOME/operations/tasks/`: where Varda stores markdown task files, grouped into one folder per project.
 - `$VARDA_HOME/operations/recaps/`: where agent recaps are written.
 - `$VARDA_HOME/operations/runs/`: where agent session logs and notifications are written.
 - `$VARDA_HOME/operations/runs/`: where notification records are written.
@@ -181,16 +182,16 @@ varda task add "Summarize this project" --exec --interactive
 
 In interactive mode the agent's stderr appears directly in the terminal (so you can see tool calls and progress in real time), stdout is streamed to the terminal and also captured for the recap, and your keyboard input is forwarded to the agent's stdin after the initial prompt is delivered.
 
-Tasks are stored in the Varda operations folder:
+Tasks are stored in the Varda operations folder, grouped into one folder per project:
 
 ```text
-$VARDA_HOME/operations/tasks/
+$VARDA_HOME/operations/tasks/<project-folder>/
 ```
 
 For the example above, the file is:
 
 ```text
-$VARDA_HOME/operations/tasks/summarize-this-project.md
+$VARDA_HOME/operations/tasks/some-project-path/summarize-this-project.md
 ```
 
 List tasks for the current project with:
@@ -416,7 +417,7 @@ agent_session_id: 2f6f0f2c-7ad9-4d78-b5b6-66a9eddfce54
 agent_session_log: /home/user/.varda/operations/runs/2f6f0f2c-7ad9-4d78-b5b6-66a9eddfce54.log
 ```
 
-Varda writes these fields before launching the agent, so an interrupted runner still leaves a resumable run pointer on the task. For Claude Code runs, Varda also records the discovered Claude transcript as `external_session_id` and `external_session_log` inside the session log when it can match the generated Claude JSONL file. While the agent runs, stdout and stderr are streamed into the session log instead of being buffered until process exit. If the agent process fails or times out, the synthetic failure recap includes the session ID and a link to that log file.
+Varda writes these fields before launching the agent, so an interrupted runner still leaves a resumable run pointer on the task. For Claude Code runs, Varda also records the discovered Claude transcript as `external_session_id` and `external_session_log` inside the session log when it can match the generated Claude JSONL file. While the agent runs, stdout and stderr are streamed into the session log instead of being buffered until process exit. If the agent process fails or times out, the synthetic failure recap includes the session ID and a link to that log file. Timeout recaps also ask for the unfinished work to be delegated to a Varda long-running runner task and record `long_running_task_requested=true` in the session log.
 
 ## Configuration
 
@@ -436,6 +437,11 @@ kind = "acp"
 command = "codex"
 args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
 
+[agents.tester]
+kind = "acp"
+command = "codex"
+args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
+
 [agents.claude]
 kind = "acp"
 command = "claude"
@@ -443,8 +449,8 @@ args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
 
 [agents.copilot]
 kind = "acp"
-command = "gh"
-args = ["copilot", "suggest", "-t", "shell", "-"]
+command = "sh"
+args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"]
 
 [git]
 auto_commit = true
@@ -455,6 +461,12 @@ Run `varda config edit` to open the global config in `$EDITOR`. If `EDITOR` is n
 For now, `kind = "acp"` means Varda uses its ACP-facing agent abstraction. The concrete POC adapter drives the local Codex CLI with `codex exec` through stdin/stdout because this machine's Codex CLI does not expose a direct `--acp` flag.
 
 When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder.
+
+The generated `tester` agent uses the same Codex launcher as `codex`, but Varda gives it a verification-focused prompt. Assign a task to `tester` after implementation when you want an agent to define and execute a test plan, decide whether the task is complete, and record failed checks plus suggested follow-up when verification does not pass. Add `tester` to a project route before assigning tasks to it:
+
+```sh
+varda project add "/some/project/path/**" --agents codex,tester
+```
 
 The generated Claude Code args use `-p` for non-interactive output through stdin/stdout. Varda expands `{project}` in `--add-dir "{project}"` so Claude can access the tracked project while the task file remains in the global Varda control-plane folder.
 
@@ -475,6 +487,8 @@ For a normal task, the commit includes:
 For a task that needs user input, the commit also includes:
 
 - a notification JSON file under the global `operations/runs/` folder
+
+When running on macOS, Varda also sends a best-effort native notification signal for tasks that need user input. Signal delivery failures are reported to stderr but do not prevent the notification JSON from being written.
 
 ## Install The Claude Code Skill
 
@@ -533,5 +547,5 @@ make install
 ## Current Limitations
 
 - The Codex integration is a subprocess POC, not a full ACP protocol client yet.
-- Notification is file-backed JSON plus terminal output.
+- Notification is file-backed JSON plus terminal output, with a best-effort macOS native signal for tasks that need user input.
 - Task handoff to another agent is represented by `pending` plus recap metadata, but automatic reassignment is not implemented yet.

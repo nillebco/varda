@@ -29,6 +29,11 @@ kind = "acp"
 command = "codex"
 args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
 
+[agents.tester]
+kind = "acp"
+command = "codex"
+args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
+
 [agents.claude]
 kind = "acp"
 command = "claude"
@@ -49,7 +54,7 @@ const OPERATIONS_README_CONTENT: &str = r#"# Varda Operations
 
 This folder contains task files, agent recaps, and run records managed by Varda.
 
-- `tasks/`: markdown tasks with YAML frontmatter.
+- `tasks/`: markdown tasks with YAML frontmatter, grouped by project folder.
 - `recaps/`: end-user recaps produced by agents.
 - `runs/`: run metadata and notification records.
 "#;
@@ -84,6 +89,8 @@ pub struct AgentConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_prompt_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -311,6 +318,11 @@ mod tests {
         assert_eq!(config.defaults.timeout_seconds, 600);
         assert_eq!(config.routes[0].agents, vec!["codex"]);
         assert_eq!(config.agents["codex"].command, "codex");
+        assert_eq!(config.agents["tester"].command, "codex");
+        assert_eq!(
+            config.agents["tester"].args,
+            vec!["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
+        );
         assert_eq!(config.agents["claude"].command, "claude");
         assert_eq!(
             config.agents["claude"].args,
@@ -326,15 +338,21 @@ mod tests {
             config.agents["claude"].interactive_command.as_deref(),
             Some("sh")
         );
-        assert!(config.agents["claude"]
-            .interactive_args
-            .as_ref()
-            .is_some_and(|a| a[0] == "-c"));
+        assert!(
+            config.agents["claude"]
+                .interactive_args
+                .as_ref()
+                .is_some_and(|a| a[0] == "-c")
+        );
         assert_eq!(config.agents["copilot"].command, "sh");
         assert_eq!(
             config.agents["copilot"].args,
-            vec!["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"]
+            vec![
+                "-c",
+                "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"
+            ]
         );
+        assert_eq!(config.agents["codex"].max_prompt_tokens, None);
         assert!(
             !config.agents["codex"]
                 .args
