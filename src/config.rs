@@ -36,8 +36,8 @@ args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
 
 [agents.copilot]
 kind = "acp"
-command = "gh"
-args = ["copilot", "suggest", "-t", "shell", "-"]
+command = "sh"
+args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"]
 
 [git]
 auto_commit = true
@@ -313,10 +313,10 @@ mod tests {
                 "{project}"
             ]
         );
-        assert_eq!(config.agents["copilot"].command, "gh");
+        assert_eq!(config.agents["copilot"].command, "sh");
         assert_eq!(
             config.agents["copilot"].args,
-            vec!["copilot", "suggest", "-t", "shell", "-"]
+            vec!["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"]
         );
         assert!(
             !config.agents["codex"]
