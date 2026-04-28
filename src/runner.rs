@@ -46,7 +46,9 @@ pub async fn run_task(
     let session_log_path = session_log_path(config, &session_id);
     task.set_status(TaskStatus::Running);
     task.frontmatter.agent_session_ids.push(session_id.clone());
-    task.frontmatter.agent_session_logs.push(session_log_path.display().to_string());
+    task.frontmatter
+        .agent_session_logs
+        .push(session_log_path.display().to_string());
     write_task(&task)?;
 
     write_session_log(
@@ -86,20 +88,20 @@ pub async fn run_task(
             append_session_log(
                 &session_log_path,
                 &format!(
-                    "\ntimeout:\nexceeded {} second limit\n",
+                    "\ntimeout:\nexceeded {} second limit\nlong_running_task_requested=true\n",
                     config.defaults.timeout_seconds
                 ),
             )?;
             AgentRunResult {
                 recap: format!(
-                    "# Agent Run Timed Out\n\nThe agent exceeded the configured {} second limit while processing `{}`.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
+                    "# Agent Run Timed Out\n\nThe agent exceeded the configured {} second limit while processing `{}`.\n\nWhat completed: the session log was preserved for inspection.\n\nWhat remains: delegate the unfinished work to a Varda long-running runner task, then resume the agent after the complete runner output is available.\n\nBlockers: the single-session time limit was reached.\n\nUser interaction required: no.\n\nSuggested next agent: runner.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
                     config.defaults.timeout_seconds,
                     task_path.display(),
                     session_log_path.display(),
                     session_log_path.display()
                 ),
                 requires_user: false,
-                suggested_agent: None,
+                suggested_agent: Some("runner".to_owned()),
             }
         }
     };
@@ -239,8 +241,10 @@ fn append_session_log(path: &Path, content: &str) -> Result<()> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::agent::AgentRunResult;
+    use async_trait::async_trait;
+
     use crate::agent::fake::FakeAgentClient;
+    use crate::agent::{AgentRunRequest, AgentRunResult};
     use crate::config::{AgentConfig, AgentKind, Defaults, GitConfig, Route};
 
     use super::*;
@@ -333,6 +337,59 @@ Do it.
         assert!(updated.contains("requires_user: true"));
     }
 
+    #[tokio::test]
+    async fn run_task_timeout_requests_long_running_runner_task() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-run-timeout-long-running-{}",
+            std::process::id()
+        ));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: codex
+requires_user: false
+---
+
+# Task
+
+Do it.
+"#,
+        )
+        .expect("task should be written");
+
+        let mut config = test_config(operations_dir.display().to_string());
+        config.defaults.timeout_seconds = 0;
+        let client = PendingAgentClient;
+
+        let outcome = run_task(&config, "codex", &task_path, &client, false)
+            .await
+            .expect("task should time out cleanly");
+
+        let recap = fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
+        let log = fs::read_to_string(&outcome.session_log_path).expect("log should be readable");
+
+        assert_eq!(outcome.status, TaskStatus::Failed);
+        assert!(recap.contains("Agent Run Timed Out"));
+        assert!(recap.contains("long-running runner task"));
+        assert!(recap.contains("Suggested next agent: runner"));
+        assert!(log.contains("long_running_task_requested=true"));
+    }
+
+    struct PendingAgentClient;
+
+    #[async_trait]
+    impl AgentClient for PendingAgentClient {
+        async fn run_task(&self, _request: AgentRunRequest) -> Result<AgentRunResult> {
+            std::future::pending::<Result<AgentRunResult>>().await
+        }
+    }
+
     fn test_config(operations_dir: String) -> Config {
         Config {
             defaults: Defaults {
@@ -349,6 +406,7 @@ Do it.
                     kind: AgentKind::Acp,
                     command: "codex".to_owned(),
                     args: vec![],
+                    max_prompt_tokens: None,
                     working_dir: None,
                     env: BTreeMap::new(),
                     interactive_command: None,

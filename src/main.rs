@@ -522,12 +522,8 @@ impl DependencyHint {
 fn plan_tasks(config: &config::Config, ready_tasks: &[task::TaskSummary]) -> Result<Vec<PlanTask>> {
     let mut plan_tasks = Vec::new();
     for summary in ready_tasks {
-        let project_path = summary
-            .project
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let route = routing::match_route(config, &project_path, summary.assignee.as_deref())?;
+        let task_document = task::load_task(&summary.path)?;
+        let route = routing::match_route_for_task(config, &task_document, false)?;
         plan_tasks.push(PlanTask {
             summary: summary.clone(),
             agent: route.agent,
@@ -997,12 +993,7 @@ async fn run_task_path_for_parallel(
 ) -> Result<ParallelRunReport> {
     let task_path = task::resolve_task_reference(&config, &task_path)?;
     let task_document = task::load_task(&task_path)?;
-    let project_path = task::task_project_path(&task_document)?;
-    let route = routing::match_route(
-        &config,
-        &project_path,
-        task_document.frontmatter.assignee.as_deref(),
-    )?;
+    let route = routing::match_route_for_task(&config, &task_document, false)?;
     let agent_config = config
         .agents
         .get(&route.agent)
@@ -1731,12 +1722,8 @@ async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
     println!();
     println!("---");
     println!();
-    let project_path = task::task_project_path(&task_document)?;
-    let route = routing::match_route(
-        &config,
-        &project_path,
-        task_document.frontmatter.assignee.as_deref(),
-    )?;
+    let route = routing::match_route_for_task(&config, &task_document, false)?;
+    println!("estimated_prompt_tokens: {}", route.estimated_prompt_tokens);
     let agent_config = config
         .agents
         .get(&route.agent)
@@ -1798,12 +1785,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
     let config = config::load_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
     let task_document = task::load_task(&task_path)?;
-    let project_path = task::task_project_path(&task_document)?;
-    let route = routing::match_route(
-        &config,
-        &project_path,
-        task_document.frontmatter.assignee.as_deref(),
-    )?;
+    let route = routing::match_route_for_task(&config, &task_document, true)?;
     let agent_config = config
         .agents
         .get(&route.agent)
@@ -1950,8 +1932,14 @@ fn resume_task_session_command(task_path: &Path) -> Result<()> {
     let selected = prompt_task_session(&sessions)?.context("session resume cancelled")?;
     task_document.set_status(task::TaskStatus::Ready);
     task_document.frontmatter.requires_user = false;
-    task_document.frontmatter.agent_session_ids.push(selected.session_id.clone());
-    task_document.frontmatter.agent_session_logs.push(selected.log_path.display().to_string());
+    task_document
+        .frontmatter
+        .agent_session_ids
+        .push(selected.session_id.clone());
+    task_document
+        .frontmatter
+        .agent_session_logs
+        .push(selected.log_path.display().to_string());
     task::write_task(&task_document)?;
 
     if config.git.auto_commit {

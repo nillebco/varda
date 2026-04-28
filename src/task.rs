@@ -147,10 +147,11 @@ pub fn create_task(
     project_path: &Path,
     assignee: Option<&str>,
 ) -> Result<PathBuf> {
-    let task_dir = Path::new(&config.defaults.operations_dir).join("tasks");
+    let task_root = Path::new(&config.defaults.operations_dir).join("tasks");
+    let task_dir = task_root.join(project_task_folder(project_path)?);
     fs::create_dir_all(&task_dir)
         .with_context(|| format!("failed to create task directory {}", task_dir.display()))?;
-    let id = next_task_id(&task_dir)?;
+    let id = next_task_id(&task_root)?;
 
     let filename = format!("{}.md", slugify_task_name(taskname)?);
     let path = task_dir.join(filename);
@@ -437,14 +438,6 @@ fn max_task_id(path: &Path) -> Result<Option<u64>> {
     Ok(max_id)
 }
 
-pub fn task_project_path(task: &TaskDocument) -> Result<PathBuf> {
-    task.frontmatter
-        .project
-        .as_ref()
-        .map(PathBuf::from)
-        .context("task frontmatter is missing project")
-}
-
 pub fn resolve_project_path(project_path: Option<&Path>) -> Result<PathBuf> {
     let path = match project_path {
         Some(path) => path.to_path_buf(),
@@ -526,6 +519,38 @@ fn slugify_task_name(taskname: &str) -> Result<String> {
     Ok(slug)
 }
 
+fn project_task_folder(project_path: &Path) -> Result<String> {
+    let normalized = normalize_project_path(project_path)?;
+    let project = normalized
+        .to_str()
+        .with_context(|| format!("project path is not valid UTF-8: {}", normalized.display()))?;
+
+    slugify_path(project)
+}
+
+fn slugify_path(path: &str) -> Result<String> {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+
+    for character in path.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let slug = slug.trim_matches('-').to_owned();
+
+    if slug.is_empty() {
+        bail!("project path must contain at least one ASCII letter or digit");
+    }
+
+    Ok(slug)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,8 +605,11 @@ Do the work.
 
         task.set_status(TaskStatus::Pending);
         task.set_recap(".varda/operations/recaps/run.md");
-        task.frontmatter.agent_session_ids.push("session-123".to_owned());
-        task.frontmatter.agent_session_logs
+        task.frontmatter
+            .agent_session_ids
+            .push("session-123".to_owned());
+        task.frontmatter
+            .agent_session_logs
             .push(".varda/operations/runs/session-123.log".to_owned());
 
         let frontmatter =
@@ -646,9 +674,13 @@ Do the work.
         let project_path = Path::new("/work/project");
         let path = create_task(&config, "Write README Please", project_path, Some("codex"))
             .expect("task should be created");
-        let content = fs::read_to_string(path).expect("task should be readable");
+        let content = fs::read_to_string(&path).expect("task should be readable");
 
         assert!(content.contains("id: 1"));
+        assert_eq!(
+            path.parent(),
+            Some(operations_dir.join("tasks/work-project").as_path())
+        );
         assert!(content.contains("status: ready"));
         assert!(content.contains("project: /work/project"));
         assert!(content.contains("assignee: codex"));
@@ -659,7 +691,7 @@ Do the work.
     fn creates_task_with_next_id() {
         let root =
             std::env::temp_dir().join(format!("varda-task-add-next-id-{}", std::process::id()));
-        let task_dir = root.join("operations/tasks");
+        let task_dir = root.join("operations/tasks/old-project");
         fs::create_dir_all(&task_dir).expect("task directory should be created");
         fs::write(
             task_dir.join("old.md"),
@@ -686,9 +718,43 @@ requires_user: false
 
         let path = create_task(&config, "Next Task", Path::new("/work/project"), None)
             .expect("task should be created");
-        let content = fs::read_to_string(path).expect("task should be readable");
+        let content = fs::read_to_string(&path).expect("task should be readable");
 
         assert!(content.contains("id: 42"));
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn creates_separate_task_folders_per_project() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-task-add-project-folders-{}",
+            std::process::id()
+        ));
+        let operations_dir = root.join("operations");
+        let first_project = root.join("first project");
+        let second_project = root.join("second/project");
+        fs::create_dir_all(&first_project).expect("first project should be created");
+        fs::create_dir_all(&second_project).expect("second project should be created");
+
+        let config = Config {
+            defaults: crate::config::Defaults {
+                timeout_seconds: 600,
+                operations_dir: operations_dir.display().to_string(),
+            },
+            routes: vec![],
+            agents: std::collections::BTreeMap::new(),
+            git: crate::config::GitConfig { auto_commit: true },
+        };
+
+        let first = create_task(&config, "Project Task", &first_project, None)
+            .expect("first task should be created");
+        let second = create_task(&config, "Project Task", &second_project, None)
+            .expect("second task should be created");
+
+        assert_ne!(first.parent(), second.parent());
+        assert_eq!(first.file_name(), second.file_name());
+        assert!(first.starts_with(operations_dir.join("tasks")));
+        assert!(second.starts_with(operations_dir.join("tasks")));
         fs::remove_dir_all(root).expect("test directory should be removable");
     }
 

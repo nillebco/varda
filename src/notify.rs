@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "macos", not(test)))]
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -15,6 +17,7 @@ pub struct NotificationRecord {
     pub task_path: String,
     pub recap_path: String,
     pub message: String,
+    pub signal: NotificationSignal,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -23,23 +26,37 @@ pub enum NotificationKind {
     NeedsUser,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NotificationSignal {
+    pub title: String,
+    pub body: String,
+}
+
 pub fn notify_user_interaction(
     config: &Config,
     task_path: &Path,
     recap_path: &Path,
 ) -> Result<PathBuf> {
-    let record = NotificationRecord {
-        kind: NotificationKind::NeedsUser,
-        task_path: task_path.display().to_string(),
-        recap_path: recap_path.display().to_string(),
-        message: format!(
+    let signal = NotificationSignal {
+        title: "Varda needs user input".to_string(),
+        body: format!(
             "Task {} requires user interaction. See recap {}.",
             task_path.display(),
             recap_path.display()
         ),
     };
+    let record = NotificationRecord {
+        kind: NotificationKind::NeedsUser,
+        task_path: task_path.display().to_string(),
+        recap_path: recap_path.display().to_string(),
+        message: signal.body.clone(),
+        signal,
+    };
 
-    write_notification(config, &record)
+    let path = write_notification(config, &record)?;
+    emit_signal(&record.signal);
+
+    Ok(path)
 }
 
 fn write_notification(config: &Config, record: &NotificationRecord) -> Result<PathBuf> {
@@ -53,6 +70,42 @@ fn write_notification(config: &Config, record: &NotificationRecord) -> Result<Pa
         .with_context(|| format!("failed to write notification at {}", path.display()))?;
 
     Ok(path)
+}
+
+fn emit_signal(signal: &NotificationSignal) {
+    if let Err(error) = emit_platform_signal(signal) {
+        eprintln!("failed to send notification signal: {error:#}");
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn emit_platform_signal(signal: &NotificationSignal) -> Result<()> {
+    let script = format!(
+        "display notification {} with title {}",
+        applescript_string(&signal.body),
+        applescript_string(&signal.title)
+    );
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status()
+        .context("failed to run osascript")?;
+
+    if !status.success() {
+        anyhow::bail!("osascript exited with status {status}");
+    }
+
+    Ok(())
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn emit_platform_signal(_signal: &NotificationSignal) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn applescript_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(test)]
@@ -87,5 +140,6 @@ mod tests {
 
         assert!(content.contains("\"kind\": \"needs_user\""));
         assert!(content.contains("requires user interaction"));
+        assert!(content.contains("\"title\": \"Varda needs user input\""));
     }
 }

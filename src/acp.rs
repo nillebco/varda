@@ -193,8 +193,8 @@ impl AcpSubprocessClient {
         }
 
         // Write the task prompt to a temp file so truly-interactive agents can read it.
-        let prompt_file = std::env::temp_dir()
-            .join(format!("varda-prompt-{}.txt", request.session_id));
+        let prompt_file =
+            std::env::temp_dir().join(format!("varda-prompt-{}.txt", request.session_id));
         std::fs::write(&prompt_file, prompt.as_bytes())
             .context("failed to write prompt to temp file")?;
         env.insert(
@@ -205,10 +205,8 @@ impl AcpSubprocessClient {
         if let Some(interactive_cmd) = &self.interactive_command {
             // Truly interactive: inherit all terminal streams so the user can interact directly.
             let interactive_cmd = expand_request_value(interactive_cmd, request);
-            let interactive_args = args_for_request(
-                self.interactive_args.as_deref().unwrap_or(&[]),
-                request,
-            );
+            let interactive_args =
+                args_for_request(self.interactive_args.as_deref().unwrap_or(&[]), request);
 
             let mut command_builder = Command::new(&interactive_cmd);
             command_builder
@@ -239,11 +237,7 @@ impl AcpSubprocessClient {
             }
 
             if !status.success() {
-                bail!(
-                    "agent '{}' exited with status {}",
-                    self.agent_name,
-                    status,
-                );
+                bail!("agent '{}' exited with status {}", self.agent_name, status,);
             }
 
             return Ok(AgentRunResult {
@@ -295,25 +289,20 @@ impl AcpSubprocessClient {
         let log_path = request.session_log_path.clone();
         let tee_task = collect_stream_tee(stdout, log_path, "stdout");
 
-        let (stdout_bytes, status) =
-            tokio::try_join!(tee_task, async {
-                child
-                    .wait()
-                    .await
-                    .context("failed to wait for agent subprocess")
-            })
-            .context("failed while waiting for agent subprocess")?;
+        let (stdout_bytes, status) = tokio::try_join!(tee_task, async {
+            child
+                .wait()
+                .await
+                .context("failed to wait for agent subprocess")
+        })
+        .context("failed while waiting for agent subprocess")?;
 
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
         }
 
         if !status.success() {
-            bail!(
-                "agent '{}' exited with status {}",
-                self.agent_name,
-                status,
-            );
+            bail!("agent '{}' exited with status {}", self.agent_name, status,);
         }
 
         let recap = String::from_utf8(stdout_bytes)
@@ -462,15 +451,32 @@ fn find_codex_session(started_at: SystemTime, project: Option<&str>) -> Option<P
 
     let years = std::fs::read_dir(&sessions_base).ok()?;
     for year in years.flatten() {
-        for month in std::fs::read_dir(year.path()).ok().into_iter().flatten().flatten() {
-            for day in std::fs::read_dir(month.path()).ok().into_iter().flatten().flatten() {
-                for file in std::fs::read_dir(day.path()).ok().into_iter().flatten().flatten() {
+        for month in std::fs::read_dir(year.path())
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            for day in std::fs::read_dir(month.path())
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                for file in std::fs::read_dir(day.path())
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
                     let path = file.path();
                     if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                         continue;
                     }
                     let Ok(meta) = file.metadata() else { continue };
-                    let Ok(modified) = meta.modified() else { continue };
+                    let Ok(modified) = meta.modified() else {
+                        continue;
+                    };
                     if modified < started_at {
                         continue;
                     }
@@ -480,8 +486,7 @@ fn find_codex_session(started_at: SystemTime, project: Option<&str>) -> Option<P
                                 if let Ok(event) =
                                     serde_json::from_str::<serde_json::Value>(first_line)
                                 {
-                                    let cwd =
-                                        event["payload"]["cwd"].as_str().unwrap_or_default();
+                                    let cwd = event["payload"]["cwd"].as_str().unwrap_or_default();
                                     if !cwd.starts_with(project) && cwd != project {
                                         continue;
                                     }
@@ -516,8 +521,8 @@ async fn record_codex_external_session(
 ) {
     for _ in 0..20 {
         if let Some(session_path) = find_codex_session(started_at, project.as_deref()) {
-            let session_id = extract_codex_session_id(&session_path)
-                .unwrap_or_else(|| "unknown".to_owned());
+            let session_id =
+                extract_codex_session_id(&session_path).unwrap_or_else(|| "unknown".to_owned());
             let _ = append_session_log(
                 &log_path,
                 &format!(
@@ -830,6 +835,7 @@ mod tests {
             kind: crate::config::AgentKind::Acp,
             command: "cat".to_owned(),
             args: vec![],
+            max_prompt_tokens: None,
             working_dir: None,
             env: BTreeMap::new(),
             interactive_command: None,
@@ -881,6 +887,7 @@ mod tests {
                 "-c".to_owned(),
                 "printf 'recap line\\n'; printf 'diagnostic line\\n' >&2".to_owned(),
             ],
+            max_prompt_tokens: None,
             working_dir: None,
             env: BTreeMap::new(),
             interactive_command: None,
@@ -934,6 +941,7 @@ mod tests {
                 "-c".to_owned(),
                 "printf '%s\\n%s\\n' \"$VARDA_TEST_PROJECT\" \"$PWD\"".to_owned(),
             ],
+            max_prompt_tokens: None,
             working_dir: Some("{project}".to_owned()),
             env: BTreeMap::from([("VARDA_TEST_PROJECT".to_owned(), "{project}".to_owned())]),
             interactive_command: None,
