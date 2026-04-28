@@ -44,6 +44,9 @@ enum Command {
         task: Option<PathBuf>,
         /// Execution plan to transform to JSON and run. For compatibility, a positional task still runs as a task.
         plan: Option<PathBuf>,
+        /// Skip the confirmation prompt and run immediately.
+        #[arg(long)]
+        yes: bool,
     },
     /// Create a reviewable execution plan for ready tasks.
     Plan,
@@ -243,8 +246,8 @@ async fn main() -> Result<()> {
                 result.config_path, result.operations_dir
             );
         }
-        Command::Run { task, plan } => {
-            run_command(task.as_deref(), plan.as_deref()).await?;
+        Command::Run { task, plan, yes } => {
+            run_command(task.as_deref(), plan.as_deref(), yes).await?;
         }
         Command::Plan => {
             plan_command()?;
@@ -753,7 +756,7 @@ fn unix_timestamp() -> Result<u64> {
         .as_secs())
 }
 
-async fn run_command(task_arg: Option<&Path>, plan_arg: Option<&Path>) -> Result<()> {
+async fn run_command(task_arg: Option<&Path>, plan_arg: Option<&Path>, yes: bool) -> Result<()> {
     match (task_arg, plan_arg) {
         (Some(task), None) => run_task_command(task, false).await,
         (Some(_), Some(_)) => {
@@ -765,10 +768,10 @@ async fn run_command(task_arg: Option<&Path>, plan_arg: Option<&Path>) -> Result
             if looks_like_task(&config, path) {
                 run_task_command(path, false).await
             } else {
-                run_plan_command(path).await
+                run_plan_command(path, yes).await
             }
         }
-        (None, None) => run_ready_tasks_command().await,
+        (None, None) => run_ready_tasks_command(yes).await,
     }
 }
 
@@ -779,7 +782,7 @@ fn looks_like_task(config: &config::Config, path: &Path) -> bool {
         .is_some()
 }
 
-async fn run_plan_command(plan_path: &Path) -> Result<()> {
+async fn run_plan_command(plan_path: &Path, yes: bool) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
     let plan_path = if plan_path.exists() {
@@ -796,6 +799,14 @@ async fn run_plan_command(plan_path: &Path) -> Result<()> {
         .collect();
 
     println!("plan_json: {}", json_path.display());
+    println!("tasks: {}", task_paths.len());
+    for path in &task_paths {
+        println!("  {}", path.display());
+    }
+    if !yes && !prompt_yes_no("Proceed with running these tasks?", true)? {
+        println!("aborted");
+        return Ok(());
+    }
     run_task_paths_in_parallel(config, task_paths).await
 }
 
@@ -890,22 +901,41 @@ fn load_json_execution_plan(path: &Path) -> Result<JsonExecutionPlan> {
     Ok(plan)
 }
 
-async fn run_ready_tasks_command() -> Result<()> {
+async fn run_ready_tasks_command(yes: bool) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
-    let ready_tasks: Vec<PathBuf> = task::list_all_tasks(&config)?
+    let ready_summaries: Vec<task::TaskSummary> = task::list_all_tasks(&config)?
         .into_iter()
         .filter(|summary| summary.status == task::TaskStatus::Ready)
-        .map(|summary| summary.path)
         .collect();
 
-    if ready_tasks.is_empty() {
+    if ready_summaries.is_empty() {
         println!("ready_tasks: 0");
         return Ok(());
     }
 
-    println!("ready_tasks: {}", ready_tasks.len());
-    run_task_paths_in_parallel(config, ready_tasks).await
+    let plan_tasks = plan_tasks(&config, &ready_summaries)?;
+    println!("ready_tasks: {}", plan_tasks.len());
+    for task in &plan_tasks {
+        let id = task
+            .summary
+            .id
+            .map(|id| format!("#{id}"))
+            .unwrap_or_else(|| "unversioned".to_owned());
+        println!(
+            "  {} {} (agent: {}, category: {})",
+            id,
+            task.summary.title,
+            task.agent,
+            task.dependency_hint.label()
+        );
+    }
+    if !yes && !prompt_yes_no("Proceed with running these tasks?", true)? {
+        println!("aborted");
+        return Ok(());
+    }
+    let task_paths: Vec<PathBuf> = plan_tasks.into_iter().map(|t| t.summary.path).collect();
+    run_task_paths_in_parallel(config, task_paths).await
 }
 
 async fn run_task_paths_in_parallel(
