@@ -140,6 +140,72 @@ mod tests {
     }
 
     #[test]
+    fn specific_route_beats_catch_all_when_listed_first() {
+        let config = Config {
+            defaults: Defaults {
+                timeout_seconds: 600,
+                operations_dir: ".varda/operations".to_owned(),
+            },
+            routes: vec![
+                Route {
+                    glob: "**/AsianDevBank/**".to_owned(),
+                    agents: vec!["copilot".to_owned()],
+                },
+                Route {
+                    glob: "**".to_owned(),
+                    agents: vec!["codex".to_owned(), "claude".to_owned()],
+                },
+            ],
+            agents: BTreeMap::from([
+                (
+                    "codex".to_owned(),
+                    AgentConfig {
+                        kind: AgentKind::Acp,
+                        command: "codex".to_owned(),
+                        args: vec![],
+                        working_dir: None,
+                        env: BTreeMap::new(),
+                    },
+                ),
+                (
+                    "claude".to_owned(),
+                    AgentConfig {
+                        kind: AgentKind::Acp,
+                        command: "claude".to_owned(),
+                        args: vec![],
+                        working_dir: None,
+                        env: BTreeMap::new(),
+                    },
+                ),
+                (
+                    "copilot".to_owned(),
+                    AgentConfig {
+                        kind: AgentKind::Acp,
+                        command: "gh".to_owned(),
+                        args: vec![],
+                        working_dir: None,
+                        env: BTreeMap::new(),
+                    },
+                ),
+            ]),
+            git: GitConfig { auto_commit: true },
+        };
+
+        let adb_route = match_route(
+            &config,
+            Path::new("/Users/nilleb/dev/AsianDevBank/dpt-activity-log"),
+            None,
+        )
+        .expect("ADB path should match");
+        assert_eq!(adb_route.agent, "copilot");
+
+        let other_route =
+            match_route(&config, Path::new("/Users/nilleb/dev/nillebco/varda"), None)
+                .expect("non-ADB path should match");
+        assert_eq!(other_route.agent, "codex");
+    }
+
+    #[test]
     fn rejects_requested_agent_that_is_not_allowed() {
         let config = Config {
             defaults: Defaults {

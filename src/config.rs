@@ -225,7 +225,7 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
         }
     }
 
-    config.routes.push(Route { glob, agents });
+    config.routes.insert(0, Route { glob, agents });
     save_config(path, &config)
 }
 
@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn appends_project_route() {
+    fn prepends_project_route_before_catch_all() {
         let path = std::env::temp_dir().join(format!("varda-config-{}.toml", std::process::id()));
         fs::write(&path, DEFAULT_CONFIG).expect("config should be written");
 
@@ -356,14 +356,15 @@ mod tests {
             "/work/project/**".to_owned(),
             vec!["codex".to_owned()],
         )
-        .expect("project route should be appended");
+        .expect("project route should be prepended");
 
         let config = load_config(&path).expect("config should reload");
         fs::remove_file(path).expect("config should be removed");
 
         assert_eq!(config.routes.len(), 2);
-        assert_eq!(config.routes[1].glob, "/work/project/**");
-        assert_eq!(config.routes[1].agents, vec!["codex"]);
+        assert_eq!(config.routes[0].glob, "/work/project/**");
+        assert_eq!(config.routes[0].agents, vec!["codex"]);
+        assert_eq!(config.routes[1].glob, "**");
     }
 
     #[test]
