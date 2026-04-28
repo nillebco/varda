@@ -1664,6 +1664,18 @@ async fn run_task_command(task_path: &Path) -> Result<()> {
     let config = config::load_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
     let task_document = task::load_task(&task_path)?;
+    let id_str = task_document
+        .frontmatter
+        .id
+        .map(|id| format!(" #{id}"))
+        .unwrap_or_default();
+    println!("Running task{}: {}", id_str, task_document.title());
+    println!();
+    print!("{}", task_document.body.trim());
+    println!();
+    println!();
+    println!("---");
+    println!();
     let project_path = task::task_project_path(&task_document)?;
     let route = routing::match_route(
         &config,

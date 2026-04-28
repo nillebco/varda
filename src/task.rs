@@ -110,6 +110,10 @@ impl TaskDocument {
     pub fn set_assignee(&mut self, assignee: impl Into<String>) {
         self.frontmatter.assignee = Some(assignee.into());
     }
+
+    pub fn title(&self) -> String {
+        task_title(&self.body)
+    }
 }
 
 pub fn load_task(path: impl AsRef<Path>) -> Result<TaskDocument> {
