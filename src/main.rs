@@ -92,6 +92,9 @@ enum TaskCommand {
         /// Open the task in $EDITOR before running (only meaningful with --exec).
         #[arg(long)]
         edit: bool,
+        /// Spawn the agent in the background and return immediately (only meaningful with --exec).
+        #[arg(long)]
+        background: bool,
     },
     /// List markdown tasks for a project.
     List {
@@ -103,6 +106,9 @@ enum TaskCommand {
     Run {
         /// Markdown task file or task id to process.
         task: PathBuf,
+        /// Spawn the agent in the background and return immediately.
+        #[arg(long)]
+        background: bool,
     },
     /// Generate an agent-driven plan for a task and open it in $EDITOR.
     Plan {
@@ -250,6 +256,7 @@ async fn main() -> Result<()> {
                 agent,
                 exec,
                 edit,
+                background,
             } => {
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
@@ -278,7 +285,11 @@ async fn main() -> Result<()> {
                     if edit {
                         open_editor(&task_path)?;
                     }
-                    run_task_command(&task_path).await?;
+                    if background {
+                        spawn_task_in_background(&task_path)?;
+                    } else {
+                        run_task_command(&task_path).await?;
+                    }
                 } else {
                     open_editor(&task_path)?;
                 }
@@ -290,8 +301,12 @@ async fn main() -> Result<()> {
                 let tasks = task::list_tasks(&config, &project_path)?;
                 print_task_list(&project_path, &tasks);
             }
-            TaskCommand::Run { task } => {
-                run_task_command(&task).await?;
+            TaskCommand::Run { task, background } => {
+                if background {
+                    spawn_task_in_background(&task)?;
+                } else {
+                    run_task_command(&task).await?;
+                }
             }
             TaskCommand::Plan { task } => {
                 plan_task_command(&task).await?;
@@ -1657,6 +1672,32 @@ fn truncate_for_table(value: &str, width: usize) -> String {
     let mut truncated: String = value.chars().take(width.saturating_sub(1)).collect();
     truncated.push('.');
     truncated
+}
+
+fn spawn_task_in_background(task_path: &Path) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let resolved = task::resolve_task_reference(&config, task_path)?;
+    let exe = std::env::current_exe().context("failed to locate the varda executable")?;
+    let child = ProcessCommand::new(&exe)
+        .args(["task", "run"])
+        .arg(&resolved)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to spawn background agent for {}",
+                resolved.display()
+            )
+        })?;
+    println!(
+        "task running in background: {} (pid: {})",
+        resolved.display(),
+        child.id()
+    );
+    Ok(())
 }
 
 async fn run_task_command(task_path: &Path) -> Result<()> {
