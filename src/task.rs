@@ -146,6 +146,7 @@ pub fn create_task(
     taskname: &str,
     project_path: &Path,
     assignee: Option<&str>,
+    description: Option<&str>,
 ) -> Result<PathBuf> {
     let task_root = Path::new(&config.defaults.operations_dir).join("tasks");
     let task_dir = task_root.join(project_task_folder(project_path)?);
@@ -176,7 +177,11 @@ pub fn create_task(
             agent_session_logs: vec![],
             requires_user: false,
         },
-        body: format!("# {taskname}\n\n"),
+        body: if let Some(desc) = description {
+            format!("# {taskname}\n\n{desc}\n")
+        } else {
+            format!("# {taskname}\n\n")
+        },
     };
 
     write_task(&task)?;
@@ -672,7 +677,7 @@ Do the work.
         };
 
         let project_path = Path::new("/work/project");
-        let path = create_task(&config, "Write README Please", project_path, Some("codex"))
+        let path = create_task(&config, "Write README Please", project_path, Some("codex"), None)
             .expect("task should be created");
         let content = fs::read_to_string(&path).expect("task should be readable");
 
@@ -716,7 +721,7 @@ requires_user: false
             git: crate::config::GitConfig { auto_commit: true },
         };
 
-        let path = create_task(&config, "Next Task", Path::new("/work/project"), None)
+        let path = create_task(&config, "Next Task", Path::new("/work/project"), None, None)
             .expect("task should be created");
         let content = fs::read_to_string(&path).expect("task should be readable");
 
@@ -746,9 +751,9 @@ requires_user: false
             git: crate::config::GitConfig { auto_commit: true },
         };
 
-        let first = create_task(&config, "Project Task", &first_project, None)
+        let first = create_task(&config, "Project Task", &first_project, None, None)
             .expect("first task should be created");
-        let second = create_task(&config, "Project Task", &second_project, None)
+        let second = create_task(&config, "Project Task", &second_project, None, None)
             .expect("second task should be created");
 
         assert_ne!(first.parent(), second.parent());

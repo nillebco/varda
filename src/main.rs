@@ -79,10 +79,12 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
-    /// Create a new markdown task and open it in $EDITOR.
+    /// Create a new markdown task.
     Add {
         /// Human-readable task name.
         taskname: String,
+        /// Optional task description (body text). Reads from stdin if stdin is not a terminal.
+        description: Option<String>,
         /// Project path this task belongs to. Defaults to the current directory.
         #[arg(long)]
         project: Option<PathBuf>,
@@ -92,7 +94,7 @@ enum TaskCommand {
         /// Treat the task name as a complete one-line task and run it immediately.
         #[arg(long)]
         exec: bool,
-        /// Open the task in $EDITOR before running (only meaningful with --exec).
+        /// Open the task in $EDITOR after creation (or before running with --exec).
         #[arg(long)]
         edit: bool,
         /// Spawn the agent in the background and return immediately (only meaningful with --exec).
@@ -261,6 +263,7 @@ async fn main() -> Result<()> {
         Command::Task { command } => match command {
             TaskCommand::Add {
                 taskname,
+                description,
                 project,
                 agent,
                 exec,
@@ -268,6 +271,17 @@ async fn main() -> Result<()> {
                 background,
                 interactive,
             } => {
+                use std::io::IsTerminal as _;
+                let description = if description.is_some() {
+                    description
+                } else if !std::io::stdin().is_terminal() {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    let trimmed = buf.trim_end().to_owned();
+                    if trimmed.is_empty() { None } else { Some(trimmed) }
+                } else {
+                    None
+                };
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
@@ -283,8 +297,13 @@ async fn main() -> Result<()> {
                     }
                     assignee
                 };
-                let task_path =
-                    task::create_task(&config, &taskname, &project_path, assignee.as_deref())?;
+                let task_path = task::create_task(
+                    &config,
+                    &taskname,
+                    &project_path,
+                    assignee.as_deref(),
+                    description.as_deref(),
+                )?;
                 let task_id = task::load_task(&task_path)?.frontmatter.id;
                 if let Some(task_id) = task_id {
                     println!("created task #{task_id} {}", task_path.display());
@@ -300,7 +319,7 @@ async fn main() -> Result<()> {
                     } else {
                         run_task_command(&task_path, interactive).await?;
                     }
-                } else {
+                } else if edit {
                     open_editor(&task_path)?;
                 }
             }
