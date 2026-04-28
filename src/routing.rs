@@ -423,4 +423,138 @@ mod tests {
 
         assert!(error.to_string().contains("not allowed"));
     }
+
+    #[test]
+    fn selects_first_allowed_agent_that_fits_prompt_budget() {
+        let config = Config {
+            defaults: Defaults {
+                timeout_seconds: 600,
+                operations_dir: ".varda/operations".to_owned(),
+            },
+            routes: vec![Route {
+                glob: "**".to_owned(),
+                agents: vec!["small".to_owned(), "large".to_owned()],
+            }],
+            agents: BTreeMap::from([
+                (
+                    "small".to_owned(),
+                    AgentConfig {
+                        kind: AgentKind::Acp,
+                        command: "small".to_owned(),
+                        args: vec![],
+                        max_prompt_tokens: Some(1),
+                        working_dir: None,
+                        env: BTreeMap::new(),
+                        interactive_command: None,
+                        interactive_args: None,
+                    },
+                ),
+                (
+                    "large".to_owned(),
+                    AgentConfig {
+                        kind: AgentKind::Acp,
+                        command: "large".to_owned(),
+                        args: vec![],
+                        max_prompt_tokens: Some(10_000),
+                        working_dir: None,
+                        env: BTreeMap::new(),
+                        interactive_command: None,
+                        interactive_args: None,
+                    },
+                ),
+            ]),
+            git: GitConfig { auto_commit: true },
+        };
+        let task = TaskDocument {
+            path: Path::new("/tmp/task.md").to_path_buf(),
+            frontmatter: crate::task::TaskFrontmatter {
+                id: Some(1),
+                status: crate::task::TaskStatus::Ready,
+                project: Some("/work/project".to_owned()),
+                assignee: None,
+                recap: None,
+                recaps: vec![],
+                plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
+                requires_user: false,
+            },
+            body: "# Task\n\nDo it.".to_owned(),
+        };
+
+        let route =
+            match_route_for_task(&config, &task, false).expect("large agent should be selected");
+
+        assert_eq!(route.agent, "large");
+        assert!(route.estimated_prompt_tokens > 1);
+    }
+
+    #[test]
+    fn rejects_requested_agent_that_exceeds_prompt_budget() {
+        let config = Config {
+            defaults: Defaults {
+                timeout_seconds: 600,
+                operations_dir: ".varda/operations".to_owned(),
+            },
+            routes: vec![Route {
+                glob: "**".to_owned(),
+                agents: vec!["small".to_owned(), "large".to_owned()],
+            }],
+            agents: BTreeMap::from([
+                (
+                    "small".to_owned(),
+                    AgentConfig {
+                        kind: AgentKind::Acp,
+                        command: "small".to_owned(),
+                        args: vec![],
+                        max_prompt_tokens: Some(1),
+                        working_dir: None,
+                        env: BTreeMap::new(),
+                        interactive_command: None,
+                        interactive_args: None,
+                    },
+                ),
+                (
+                    "large".to_owned(),
+                    AgentConfig {
+                        kind: AgentKind::Acp,
+                        command: "large".to_owned(),
+                        args: vec![],
+                        max_prompt_tokens: None,
+                        working_dir: None,
+                        env: BTreeMap::new(),
+                        interactive_command: None,
+                        interactive_args: None,
+                    },
+                ),
+            ]),
+            git: GitConfig { auto_commit: true },
+        };
+        let task = TaskDocument {
+            path: Path::new("/tmp/task.md").to_path_buf(),
+            frontmatter: crate::task::TaskFrontmatter {
+                id: Some(1),
+                status: crate::task::TaskStatus::Ready,
+                project: Some("/work/project".to_owned()),
+                assignee: Some("small".to_owned()),
+                recap: None,
+                recaps: vec![],
+                plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
+                requires_user: false,
+            },
+            body: "# Task\n\nDo it.".to_owned(),
+        };
+
+        let error = match_route_for_task(&config, &task, false)
+            .expect_err("small agent should be rejected");
+
+        assert!(error.to_string().contains("prompt budget is too small"));
+        assert!(error.to_string().contains("large"));
+    }
 }

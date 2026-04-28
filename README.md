@@ -118,6 +118,18 @@ COPILOT_CUSTOM_VALUE = "enabled"
 
 `command`, `args`, `working_dir`, and environment variable values support `{project}` and `{task}` placeholders.
 
+Agents can also declare an optional prompt budget:
+
+```toml
+[agents.small-context-agent]
+kind = "acp"
+command = "small-agent"
+args = ["-"]
+max_prompt_tokens = 32000
+```
+
+Before Varda allocates a task, it estimates the full agent prompt, including project instructions and task plan content. If the default agent is over budget, Varda uses the first allowed agent with enough budget. If an explicitly assigned agent is over budget, Varda stops and reports which allowed agents can fit the task.
+
 ## Create Your First Task
 
 From inside the project you want to track, run:
