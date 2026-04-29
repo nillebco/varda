@@ -34,7 +34,7 @@ kind = "acp"
 command = "claude"
 args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
 interactive_command = "sh"
-interactive_args = ["-c", "claude --append-system-prompt \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --permission-mode acceptEdits"]
+interactive_args = ["-c", "claude \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --permission-mode acceptEdits"]
 
 [agents.copilot]
 kind = "acp"
