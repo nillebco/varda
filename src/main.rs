@@ -98,6 +98,9 @@ enum TaskCommand {
         /// Surface the agent output in the current shell and forward stdin for interaction (only meaningful with --exec).
         #[arg(long)]
         interactive: bool,
+        /// Set the task status to ready after creation (skips backlog).
+        #[arg(long)]
+        ready: bool,
     },
     /// List markdown tasks for a project.
     List {
@@ -157,6 +160,18 @@ enum TaskCommand {
     /// Open a markdown task in $EDITOR.
     Edit {
         /// Markdown task file or task id to open.
+        task: PathBuf,
+    },
+    /// Show runtime diagnostics: agent config, route, session logs, and live processes.
+    Inspect {
+        /// Markdown task file or task id to inspect.
+        task: PathBuf,
+    },
+    /// Set the status of a task directly.
+    SetStatus {
+        /// New status (backlog, ready, running, pending, needs_user, failed, done).
+        status: String,
+        /// Markdown task file or task id to update.
         task: PathBuf,
     },
     /// Print the resolved file path for a task ID or path.
@@ -256,6 +271,7 @@ async fn main() -> Result<()> {
                 edit,
                 background,
                 interactive,
+                ready,
             } => {
                 use std::io::IsTerminal as _;
                 let description = if description.is_some() {
@@ -290,8 +306,12 @@ async fn main() -> Result<()> {
                     assignee.as_deref(),
                     description.as_deref(),
                 )?;
-                let task_id = task::load_task(&task_path)?.frontmatter.id;
-                if let Some(task_id) = task_id {
+                let mut task_doc = task::load_task(&task_path)?;
+                if ready && !exec {
+                    task_doc.set_status(task::TaskStatus::Ready);
+                    task::write_task(&task_doc)?;
+                }
+                if let Some(task_id) = task_doc.frontmatter.id {
                     println!("created task #{task_id} {}", task_path.display());
                 } else {
                     println!("created task {}", task_path.display());
@@ -353,6 +373,21 @@ async fn main() -> Result<()> {
                 let config = config::load_config(&config_path)?;
                 let resolved = task::resolve_task_reference(&config, &task)?;
                 open_editor(&resolved)?;
+            }
+            TaskCommand::Inspect { task } => {
+                inspect_task_command(&task)?;
+            }
+            TaskCommand::SetStatus { status, task } => {
+                update_tasks_command(
+                    Some(&task),
+                    Some(&status),
+                    None,
+                    &[],
+                    None,
+                    None,
+                    false,
+                    true,
+                )?;
             }
             TaskCommand::Resolve { task } => {
                 let config_path = config::config_file()?;
@@ -1085,6 +1120,106 @@ fn show_task_command(task_path: &Path) -> Result<()> {
         println!();
         println!("---");
         println!();
+    }
+
+    Ok(())
+}
+
+fn inspect_task_command(task_path: &Path) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let task_path = task::resolve_task_reference(&config, task_path)?;
+    let task = task::load_task(&task_path)?;
+    let fm = &task.frontmatter;
+
+    println!("# Task {}", task_path.display());
+    println!();
+    println!(
+        "status: {:?}  assignee: {}  project: {}",
+        fm.status,
+        fm.assignee.as_deref().unwrap_or("(none)"),
+        fm.project.as_deref().unwrap_or("(none)")
+    );
+    println!();
+
+    // Agent config
+    let assignee = fm.assignee.as_deref().unwrap_or("(none)");
+    if let Some(agent_cfg) = config.agents.get(assignee) {
+        println!("## Agent config: {assignee}");
+        println!("  command:     {} {:?}", agent_cfg.command, agent_cfg.args);
+        match &agent_cfg.interactive_command {
+            Some(cmd) => println!(
+                "  interactive: {} {:?}  [configured]",
+                cmd,
+                agent_cfg.interactive_args.as_deref().unwrap_or(&[])
+            ),
+            None => println!("  interactive: (not configured — will fall back to pipe mode)"),
+        }
+        println!();
+    }
+
+    // Route
+    match routing::match_route_for_task(&config, &task, false) {
+        Ok(route) => {
+            println!("## Route");
+            println!("  glob:   {}", route.glob);
+            println!("  agent:  {}", route.agent);
+            println!();
+        }
+        Err(e) => {
+            println!("## Route");
+            println!("  (could not resolve: {e})");
+            println!();
+        }
+    }
+
+    // Sessions
+    let n = fm.agent_session_ids.len();
+    println!("## Sessions ({n})");
+    if n == 0 {
+        println!("  none");
+    }
+    let ps_output = std::process::Command::new("ps")
+        .args(["aux"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    for (i, session_id) in fm.agent_session_ids.iter().enumerate() {
+        let log_path = fm.agent_session_logs.get(i).map(|s| s.as_str());
+
+        // Detect whether a process holding this session's working context is running.
+        // We match on the task path appearing in ps output as a heuristic.
+        let task_path_str = task_path.display().to_string();
+        let live_pids: Vec<&str> = ps_output
+            .lines()
+            .filter(|l| l.contains(&task_path_str))
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .collect();
+
+        let live = if live_pids.is_empty() {
+            "not running".to_owned()
+        } else {
+            format!("running (pid {})", live_pids.join(", "))
+        };
+
+        println!();
+        println!("### Session {} — {live}", &session_id[..8]);
+        if let Some(log) = log_path {
+            println!("  log: {log}");
+            match fs::read_to_string(log) {
+                Ok(content) => {
+                    println!("  ---");
+                    for line in content.lines() {
+                        println!("  {line}");
+                    }
+                    println!("  ---");
+                }
+                Err(e) => println!("  (could not read log: {e})"),
+            }
+        } else {
+            println!("  (no log path recorded)");
+        }
     }
 
     Ok(())
