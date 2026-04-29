@@ -307,7 +307,7 @@ async fn main() -> Result<()> {
                     description.as_deref(),
                 )?;
                 let mut task_doc = task::load_task(&task_path)?;
-                if ready && !exec {
+                if ready || exec {
                     task_doc.set_status(task::TaskStatus::Ready);
                     task::write_task(&task_doc)?;
                 }
