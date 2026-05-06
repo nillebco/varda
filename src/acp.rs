@@ -13,6 +13,7 @@ use tokio::time;
 
 use crate::agent::{
     AgentClient, AgentRunRequest, AgentRunResult, build_agent_instructions,
+    build_interactive_instructions, build_interpretation_instructions,
     build_planning_instructions, recap_requires_user_interaction,
 };
 use crate::config::AgentConfig;
@@ -305,19 +306,15 @@ impl AcpSubprocessClient {
             bail!("agent '{}' exited with status {}", self.agent_name, status,);
         }
 
-        let recap = String::from_utf8(stdout_bytes)
-            .context("agent stdout was not valid UTF-8")?
-            .trim()
-            .to_owned();
-
-        if recap.is_empty() {
-            bail!("agent '{}' produced an empty recap", self.agent_name);
-        }
+        // Interactive sessions don't produce a structured Varda recap on stdout;
+        // the runner runs a separate interpretation pass over the session log.
+        // We still consume stdout above so it gets logged via the tee.
+        drop(stdout_bytes);
 
         Ok(AgentRunResult {
-            requires_user: recap_requires_user_interaction(&recap),
+            recap: "Interactive session completed.".to_owned(),
+            requires_user: false,
             suggested_agent: None,
-            recap,
         })
     }
 
@@ -665,11 +662,13 @@ Task frontmatter:
 Task markdown:
 {body}
 "#,
-        instructions = build_agent_instructions(if request.interactive {
-            None
+        instructions = if request.interactive {
+            build_interactive_instructions()
+        } else if request.interpret {
+            build_interpretation_instructions()
         } else {
-            Some(request.timeout)
-        }),
+            build_agent_instructions(request.timeout)
+        },
         agent = request.agent_name,
         task_path = request.task_path,
         frontmatter = serde_yaml::to_string(&request.frontmatter)
@@ -702,7 +701,7 @@ Task frontmatter:
 Task markdown:
 {body}
 "#,
-        instructions = build_planning_instructions(Some(request.timeout)),
+        instructions = build_planning_instructions(request.timeout),
         agent = request.agent_name,
         task_path = request.task_path,
         frontmatter = serde_yaml::to_string(&request.frontmatter)
@@ -877,6 +876,7 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 session_log_path: None,
                 interactive: false,
+                interpret: false,
             })
             .await
             .expect("subprocess should echo prompt");
@@ -930,6 +930,7 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 session_log_path: Some(log_path.display().to_string()),
                 interactive: false,
+                interpret: false,
             })
             .await
             .expect("subprocess should run");
@@ -985,6 +986,7 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 session_log_path: None,
                 interactive: false,
+                interpret: false,
             })
             .await
             .expect("subprocess should run");
@@ -1022,6 +1024,7 @@ mod tests {
             session_id: "session-1".to_owned(),
             session_log_path: None,
             interactive: false,
+            interpret: false,
         };
 
         let args = args_for_request(
@@ -1074,6 +1077,7 @@ mod tests {
             session_id: "session-1".to_owned(),
             session_log_path: None,
             interactive: false,
+            interpret: false,
         };
 
         let args = args_for_request(

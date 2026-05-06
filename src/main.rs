@@ -884,6 +884,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         session_id: uuid::Uuid::new_v4().to_string(),
         session_log_path: None,
         interactive: false,
+        interpret: false,
     };
     let result = client.run_task(request).await?;
     let json = extract_json_object(&result.recap)?;

@@ -275,7 +275,7 @@ fn describe_route_budgets(config: &Config, route: &Route) -> String {
 }
 
 fn estimate_task_prompt_tokens(config: &Config, task: &TaskDocument, planning: bool) -> usize {
-    let timeout = Some(Duration::from_secs(config.defaults.timeout_seconds));
+    let timeout = Duration::from_secs(config.defaults.timeout_seconds);
     let mut characters = if planning {
         build_planning_instructions(timeout).len()
     } else {

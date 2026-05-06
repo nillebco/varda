@@ -10,7 +10,11 @@ use uuid::Uuid;
 
 use crate::agent::{AgentClient, AgentRunRequest, AgentRunResult, recap_requires_user_interaction};
 use crate::config::Config;
-use crate::task::{TaskStatus, load_task, write_task};
+use crate::task::{TaskDocument, TaskStatus, load_task, write_task};
+
+/// Maximum bytes of session log content embedded in the interpretation prompt body.
+/// Larger logs are truncated, keeping the tail (most recent activity).
+const INTERPRETATION_LOG_BUDGET: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
@@ -69,6 +73,7 @@ pub async fn run_task(
         session_id: session_id.clone(),
         session_log_path: Some(session_log_path.display().to_string()),
         interactive,
+        interpret: false,
     };
 
     let agent_result = if interactive {
@@ -77,11 +82,11 @@ pub async fn run_task(
         time::timeout(timeout, client.run_task(request)).await
     };
 
-    let result = match agent_result {
-        Ok(Ok(result)) => result,
+    let session_outcome = match agent_result {
+        Ok(Ok(result)) => Ok(result),
         Ok(Err(error)) => {
             append_session_log(&session_log_path, &format!("\nerror:\n{error:#}\n"))?;
-            AgentRunResult {
+            Err(AgentRunResult {
                 recap: format!(
                     "# Agent Run Failed\n\nThe agent failed while processing `{}`.\n\nError: {error}\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
                     task_path.display(),
@@ -90,7 +95,7 @@ pub async fn run_task(
                 ),
                 requires_user: false,
                 suggested_agent: None,
-            }
+            })
         }
         Err(_) => {
             append_session_log(
@@ -100,7 +105,7 @@ pub async fn run_task(
                     config.defaults.timeout_seconds
                 ),
             )?;
-            AgentRunResult {
+            Err(AgentRunResult {
                 recap: format!(
                     "# Agent Run Timed Out\n\nThe agent exceeded the configured {} second limit while processing `{}`.\n\nWhat completed: the session log was preserved for inspection.\n\nWhat remains: delegate the unfinished work to a Varda long-running runner task, then resume the agent after the complete runner output is available.\n\nBlockers: the single-session time limit was reached.\n\nUser interaction required: no.\n\nSuggested next agent: runner.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
                     config.defaults.timeout_seconds,
@@ -110,8 +115,46 @@ pub async fn run_task(
                 ),
                 requires_user: false,
                 suggested_agent: Some("runner".to_owned()),
+            })
+        }
+    };
+
+    let result = match session_outcome {
+        Err(failure) => failure,
+        Ok(session_result) if interactive => {
+            match interpret_interactive_session(
+                config,
+                client,
+                agent_name,
+                role_instructions,
+                task_path,
+                &task,
+                &session_id,
+                &session_log_path,
+                timeout,
+            )
+            .await
+            {
+                Ok(interpreted) => interpreted,
+                Err(error) => {
+                    append_session_log(
+                        &session_log_path,
+                        &format!("\ninterpretation_error:\n{error:#}\n"),
+                    )?;
+                    AgentRunResult {
+                        recap: format!(
+                            "# Interactive Session Completed\n\nThe interactive session ended successfully but Varda's interpreter pass failed: {error}\n\nFalling back to the agent's session-end output.\n\n{}\n\nSession log: [{}]({})\n\nrequires_user: false",
+                            session_result.recap,
+                            session_log_path.display(),
+                            session_log_path.display()
+                        ),
+                        requires_user: false,
+                        suggested_agent: None,
+                    }
+                }
             }
         }
+        Ok(session_result) => session_result,
     };
 
     let requires_user = result.requires_user || recap_requires_user_interaction(&result.recap);
@@ -159,6 +202,7 @@ pub async fn plan_task(
         session_id: Uuid::new_v4().to_string(),
         session_log_path: None,
         interactive: false,
+        interpret: false,
     };
 
     let result = match time::timeout(timeout, client.plan_task(request)).await {
@@ -245,6 +289,77 @@ fn append_session_log(path: &Path, content: &str) -> Result<()> {
         .with_context(|| format!("failed to open session log at {}", path.display()))?;
     file.write_all(content.as_bytes())
         .with_context(|| format!("failed to append session log at {}", path.display()))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn interpret_interactive_session(
+    _config: &Config,
+    client: &impl AgentClient,
+    agent_name: &str,
+    role_instructions: Option<&str>,
+    task_path: &Path,
+    task: &TaskDocument,
+    parent_session_id: &str,
+    session_log_path: &Path,
+    timeout: Duration,
+) -> Result<AgentRunResult> {
+    let log_excerpt = read_session_log_excerpt(session_log_path)?;
+    let body = format!(
+        "An interactive Varda session for this task just finished. Read the session log content below \
+        (and any referenced external transcripts at the listed paths if your tools allow you to open them) \
+        and produce the Varda recap. Do not perform any new work.\n\n\
+        ## Original task body\n\n{task_body}\n\n\
+        ## Session log\n\nPath: {log_path}\n\n```\n{log_excerpt}\n```\n",
+        task_body = task.body,
+        log_path = session_log_path.display(),
+        log_excerpt = log_excerpt,
+    );
+
+    let request = AgentRunRequest {
+        agent_name: agent_name.to_owned(),
+        role_instructions: role_instructions.map(str::to_owned),
+        task_path: task_path.display().to_string(),
+        frontmatter: task.frontmatter.clone(),
+        body,
+        timeout,
+        session_id: format!("{parent_session_id}-interpret"),
+        session_log_path: Some(session_log_path.display().to_string()),
+        interactive: false,
+        interpret: true,
+    };
+
+    append_session_log(
+        session_log_path,
+        "\ninterpretation_pass: starting\n",
+    )?;
+
+    let result = time::timeout(timeout, client.run_task(request))
+        .await
+        .map_err(|_| anyhow::anyhow!("interpretation pass exceeded {} second limit", timeout.as_secs()))?
+        .context("interpretation pass failed")?;
+
+    append_session_log(session_log_path, "\ninterpretation_pass: completed\n")?;
+
+    Ok(result)
+}
+
+fn read_session_log_excerpt(path: &Path) -> Result<String> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read session log at {}", path.display()))?;
+    if content.len() <= INTERPRETATION_LOG_BUDGET {
+        return Ok(content);
+    }
+    let truncated_at = content.len() - INTERPRETATION_LOG_BUDGET;
+    let mut start = truncated_at;
+    while start < content.len() && !content.is_char_boundary(start) {
+        start += 1;
+    }
+    Ok(format!(
+        "[truncated: showing last {} bytes of {} byte log]\n\n{}",
+        content.len() - start,
+        content.len(),
+        &content[start..]
+    ))
 }
 
 #[cfg(test)]
@@ -398,6 +513,87 @@ Do it.
         async fn run_task(&self, _request: AgentRunRequest) -> Result<AgentRunResult> {
             std::future::pending::<Result<AgentRunResult>>().await
         }
+    }
+
+    #[derive(Clone)]
+    struct RecordingAgentClient {
+        requests: std::sync::Arc<std::sync::Mutex<Vec<AgentRunRequest>>>,
+        session_response: AgentRunResult,
+        interpretation_response: AgentRunResult,
+    }
+
+    #[async_trait]
+    impl AgentClient for RecordingAgentClient {
+        async fn run_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
+            let interpret = request.interpret;
+            self.requests.lock().unwrap().push(request);
+            Ok(if interpret {
+                self.interpretation_response.clone()
+            } else {
+                self.session_response.clone()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_run_invokes_interpreter_pass() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-run-interactive-interpret-{}",
+            std::process::id()
+        ));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: codex
+requires_user: false
+---
+
+# Task
+
+Help interactively.
+"#,
+        )
+        .expect("task should be written");
+
+        let mut config = test_config(operations_dir.display().to_string());
+        config.git.auto_commit = false;
+        let client = RecordingAgentClient {
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            session_response: AgentRunResult {
+                recap: "Interactive session completed.".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+            },
+            interpretation_response: AgentRunResult {
+                recap: "# Interpreted Recap\n\nDid the work.\n\nrequires_user: false".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+            },
+        };
+
+        let outcome = run_task(&config, "codex", None, &task_path, &client, true)
+            .await
+            .expect("interactive task should run and be interpreted");
+
+        let recap = fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
+        let recorded = client.requests.lock().unwrap().clone();
+
+        assert_eq!(recorded.len(), 2, "expected one session call and one interpretation call");
+        assert!(recorded[0].interactive, "first call should be the interactive session");
+        assert!(!recorded[0].interpret);
+        assert!(!recorded[1].interactive, "second call should not be interactive");
+        assert!(recorded[1].interpret, "second call should be the interpretation pass");
+        assert!(recorded[1].body.contains("Session log"));
+        assert!(recorded[1].body.contains("interactive Varda session"));
+        assert_eq!(outcome.status, TaskStatus::Pending);
+        assert!(recap.contains("Interpreted Recap"));
+        assert!(recap.contains("Did the work."));
     }
 
     fn test_config(operations_dir: String) -> Config {

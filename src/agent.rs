@@ -19,6 +19,9 @@ pub struct AgentRunRequest {
     pub session_log_path: Option<String>,
     /// When true, tee stdout to the terminal and forward terminal stdin to the agent.
     pub interactive: bool,
+    /// When true, the agent should only interpret a prior session log into a Varda recap
+    /// without performing any new work. Mutually exclusive with `interactive`.
+    pub interpret: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,14 +40,13 @@ pub trait AgentClient {
     }
 }
 
-pub fn build_planning_instructions(timeout: Option<Duration>) -> String {
-    let time_limit_line = match timeout {
-        Some(timeout) => format!("\n\nYou have at most {} minutes.", timeout.as_secs() / 60),
-        None => String::new(),
-    };
+pub fn build_planning_instructions(timeout: Duration) -> String {
+    let minutes = timeout.as_secs() / 60;
 
     format!(
-        r#"You are producing an execution plan for a task managed by Varda.{time_limit_line}
+        r#"You are producing an execution plan for a task managed by Varda.
+
+You have at most {minutes} minutes.
 
 Analyze the task and produce a structured plan. Do NOT execute the task.
 
@@ -58,21 +60,17 @@ Format the plan as markdown starting with a `# Plan` heading."#
     )
 }
 
-pub fn build_agent_instructions(timeout: Option<Duration>) -> String {
-    let (time_limit_line, deadline_clause) = match timeout {
-        Some(timeout) => (
-            format!("\n\nYou have at most {} minutes.", timeout.as_secs() / 60),
-            "Before the time limit expires, produce",
-        ),
-        None => (String::new(), "When you are done, produce"),
-    };
+pub fn build_agent_instructions(timeout: Duration) -> String {
+    let minutes = timeout.as_secs() / 60;
 
     format!(
-        r#"You are processing a task managed by Varda.{time_limit_line}
+        r#"You are processing a task managed by Varda.
+
+You have at most {minutes} minutes.
 
 Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder. When those files are present, Varda includes their contents below as Project instructions; treat them as mandatory task requirements.
 
-{deadline_clause} a concise recap for the end user.
+Before the time limit expires, produce a concise recap for the end user.
 The recap must include:
 - what you completed
 - what remains
@@ -88,6 +86,37 @@ At the end of the recap, include exactly one bare machine-readable marker line w
 
 If you need user input, stop and use the true marker."#
     )
+}
+
+pub fn build_interactive_instructions() -> String {
+    r#"You are running an interactive task session managed by Varda.
+
+Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder. When those files are present, Varda includes their contents below as Project instructions; treat them as mandatory task requirements.
+
+Help the user accomplish the task. Collaborate with them as you normally would in an interactive shell session: ask clarifying questions when needed, take actions, and report results conversationally. There is no time limit.
+
+Do NOT produce a structured Varda recap, file list, or `requires_user` marker yourself. Once the session ends, Varda will pass the session log to a separate interpreter pass that produces those artifacts. Just focus on doing the work with the user."#.to_owned()
+}
+
+pub fn build_interpretation_instructions() -> String {
+    r#"You are interpreting a completed interactive Varda session and producing the post-session recap.
+
+A previous interactive session for this task has already ended. Your only job is to read the session log (and any referenced external transcripts you can access) and produce the recap that Varda needs.
+
+Do NOT perform any new work. Do not edit, create, or delete files. Do not run commands beyond what is needed to read the session log or transcripts. Only summarize what already happened.
+
+Produce a concise recap for the end user that includes:
+- what was completed during the session
+- what remains
+- any blockers encountered
+- whether user interaction is required to continue
+- suggested next agent, if applicable
+
+Include a section listing every file that was created, modified, or deleted during the session, based on what the session log shows.
+Add a markdown heading called Files touched and list one absolute file path per line below it.
+If no files were changed, write (none) under that heading.
+
+At the end of the recap, include exactly one bare machine-readable marker line whose content is either `requires_user: true` or `requires_user: false`."#.to_owned()
 }
 
 pub fn recap_requires_user_interaction(recap: &str) -> bool {
@@ -178,10 +207,10 @@ mod tests {
 
     #[test]
     fn builds_time_limited_agent_instructions() {
-        let instructions = build_agent_instructions(Some(Duration::from_secs(600)));
+        let instructions = build_agent_instructions(Duration::from_secs(600));
 
         assert!(instructions.contains("at most 10 minutes"));
-        assert!(instructions.contains("Before the time limit expires, produce a concise recap"));
+        assert!(instructions.contains("produce a concise recap"));
         assert!(instructions.contains("Project instructions"));
         assert!(instructions.contains("Files touched"));
         assert!(instructions.contains("absolute file path"));
@@ -190,13 +219,23 @@ mod tests {
     }
 
     #[test]
-    fn builds_unbounded_agent_instructions_when_no_timeout() {
-        let instructions = build_agent_instructions(None);
+    fn interactive_instructions_omit_recap_requirements() {
+        let instructions = build_interactive_instructions();
 
+        assert!(instructions.contains("interactive task session"));
         assert!(!instructions.contains("at most"));
         assert!(!instructions.contains("minutes."));
-        assert!(!instructions.contains("Before the time limit expires"));
-        assert!(instructions.contains("When you are done, produce a concise recap"));
+        assert!(!instructions.contains("Files touched"));
+        assert!(instructions.contains("Do NOT produce a structured Varda recap"));
+        assert!(instructions.contains("interpreter pass"));
+    }
+
+    #[test]
+    fn interpretation_instructions_request_recap_from_log() {
+        let instructions = build_interpretation_instructions();
+
+        assert!(instructions.contains("interpreting a completed interactive Varda session"));
+        assert!(instructions.contains("Do NOT perform any new work"));
         assert!(instructions.contains("Files touched"));
         assert!(instructions.contains("requires_user"));
     }
@@ -250,6 +289,7 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 session_log_path: None,
                 interactive: false,
+                interpret: false,
             })
             .await
             .expect("fake agent should return a result");
