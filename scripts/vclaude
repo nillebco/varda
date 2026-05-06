@@ -1,0 +1,2 @@
+#!/bin/sh
+exec varda task add --agent claude --exec --interactive "$@"

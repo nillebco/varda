@@ -196,6 +196,30 @@ In interactive mode the agent's stderr appears directly in the terminal (so you 
 
 The interactive prompt also drops the structured recap requirements (file lists, `requires_user` markers, etc.), since those don't fit a free-form conversation. Once the interactive session ends, Varda runs a non-interactive **interpretation pass**: the same agent backend re-reads the session log and produces the standard Varda recap. The interpretation pass is bounded by `timeout_seconds`.
 
+`make install` also installs three convenience wrappers next to the `varda` binary:
+
+```sh
+vclaude  "Task name" "Optional task description"
+vcodex   "Task name" "Optional task description"
+vcopilot "Task name" "Optional task description"
+```
+
+Each one is a thin shell alias for `varda task add --agent <agent> --exec --interactive`, so the call above is equivalent to:
+
+```sh
+varda task add --agent claude --exec --interactive "Task name" "Optional task description"
+```
+
+Use them when you want to start an interactive session with a specific agent without typing the full flag list.
+
+`taskname` and `description` are two separate positional arguments, so quote any multi-word values:
+
+```sh
+vclaude "fix flaky integration test" "use the new fixture from PR #42"
+```
+
+Without quotes, the shell splits the input into individual arguments and `varda task add` rejects the extras.
+
 Tasks are stored in the Varda operations folder, grouped into one folder per project:
 
 ```text
