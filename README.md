@@ -308,6 +308,14 @@ varda task dashboard --web
 
 The web dashboard is available at `http://127.0.0.1:8787/` by default. It loads tasks across all projects, pre-selects the current folder in the project filter when that project has tasks, refreshes task data every 30 seconds, and lets you select a task to inspect its markdown and associated recaps. Cards within each column are sorted by completion date (most recent recap or task update) descending. Drag a task card to the done column to mark it reviewed or archived. Use `--port` to choose a different local port.
 
+Run the web dashboard detached from the terminal so it survives shell exit:
+
+```sh
+varda task dashboard --web --daemon
+```
+
+The command prints the daemon's PID and exits immediately. Stop it later with `kill <pid>`. `--daemon` requires `--web` and is supported on Unix systems.
+
 Show all tasks across all projects:
 
 ```sh

@@ -153,6 +153,9 @@ enum TaskCommand {
         /// Local port for --web.
         #[arg(long, default_value_t = 8787)]
         port: u16,
+        /// Detach the --web server from the terminal so it survives shell exit.
+        #[arg(long)]
+        daemon: bool,
         /// Task file or task id to display after the board.
         #[arg(long)]
         task: Option<PathBuf>,
@@ -280,7 +283,11 @@ async fn main() -> Result<()> {
                     let mut buf = String::new();
                     std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
                     let trimmed = buf.trim_end().to_owned();
-                    if trimmed.is_empty() { None } else { Some(trimmed) }
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
                 } else {
                     None
                 };
@@ -364,9 +371,17 @@ async fn main() -> Result<()> {
                 all,
                 web,
                 port,
+                daemon,
                 task,
             } => {
-                dashboard_task_command(project.as_deref(), all, web, port, task.as_deref())?;
+                dashboard_task_command(
+                    project.as_deref(),
+                    all,
+                    web,
+                    port,
+                    daemon,
+                    task.as_deref(),
+                )?;
             }
             TaskCommand::Edit { task } => {
                 let config_path = config::config_file()?;
@@ -882,6 +897,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
             agent_session_log: None,
             agent_session_ids: vec![],
             agent_session_logs: vec![],
+            agent_resume_commands: vec![],
             requires_user: false,
         },
         body: format!(
@@ -1083,14 +1099,27 @@ async fn run_task_path_for_parallel(
         .id
         .map(|id| format!("#{id}"))
         .unwrap_or_else(|| "unversioned".to_owned());
-    println!("dispatching {} {} → agent={}", id, task_document.title(), route.display_name());
+    println!(
+        "dispatching {} {} → agent={}",
+        id,
+        task_document.title(),
+        route.display_name()
+    );
     let agent_config = config
         .agents
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
     let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
-    let outcome = runner::run_task(&config, &display_name, route.role_instructions.as_deref(), &task_path, &client, false).await?;
+    let outcome = runner::run_task(
+        &config,
+        &display_name,
+        route.role_instructions.as_deref(),
+        &task_path,
+        &client,
+        false,
+    )
+    .await?;
 
     Ok(ParallelRunReport {
         task_path,
@@ -1249,12 +1278,21 @@ fn dashboard_task_command(
     all_projects: bool,
     web: bool,
     port: u16,
+    daemon: bool,
     selected_task: Option<&Path>,
 ) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
 
+    if daemon && !web {
+        anyhow::bail!("--daemon requires --web");
+    }
+
     if web {
+        if daemon {
+            spawn_dashboard_daemon(project, all_projects, port)?;
+            return Ok(());
+        }
         serve_task_dashboard(config, project.map(Path::to_path_buf), true, port)?;
         return Ok(());
     }
@@ -1322,6 +1360,50 @@ struct DashboardStatusUpdate {
     path: String,
     status: task::TaskStatus,
 }
+
+fn spawn_dashboard_daemon(project: Option<&Path>, all_projects: bool, port: u16) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to locate the varda executable")?;
+    let mut command = ProcessCommand::new(&exe);
+    command.args(["task", "dashboard", "--web"]);
+    command.args(["--port", &port.to_string()]);
+    if all_projects {
+        command.arg("--all");
+    }
+    if let Some(project) = project {
+        command.arg("--project").arg(project);
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    detach_command(&mut command);
+
+    let child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn dashboard daemon on port {port}"))?;
+    println!(
+        "dashboard daemon started on http://127.0.0.1:{port}/ (pid: {})",
+        child.id()
+    );
+    println!("stop it with: kill {}", child.id());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn detach_command(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_command(_command: &mut ProcessCommand) {}
 
 fn serve_task_dashboard(
     config: config::Config,
@@ -1995,7 +2077,15 @@ async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
         )?;
         println!("committed task snapshot");
     }
-    let outcome = runner::run_task(&config, &display_name, route.role_instructions.as_deref(), &task_path, &client, interactive).await?;
+    let outcome = runner::run_task(
+        &config,
+        &display_name,
+        route.role_instructions.as_deref(),
+        &task_path,
+        &client,
+        interactive,
+    )
+    .await?;
     println!(
         "processed task={} agent={} glob={} status={:?} recap={}",
         task_path.display(),
@@ -2042,11 +2132,7 @@ async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
     Ok(())
 }
 
-fn commit_agent_files_for_task(
-    task_path: &Path,
-    project: &str,
-    files_touched: &[PathBuf],
-) {
+fn commit_agent_files_for_task(task_path: &Path, project: &str, files_touched: &[PathBuf]) {
     if files_touched.is_empty() {
         return;
     }
@@ -2082,7 +2168,14 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
     let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
-    let outcome = runner::plan_task(&config, &display_name, route.role_instructions.as_deref(), &task_path, &client).await?;
+    let outcome = runner::plan_task(
+        &config,
+        &display_name,
+        route.role_instructions.as_deref(),
+        &task_path,
+        &client,
+    )
+    .await?;
     println!(
         "plan generated task={} agent={} plan={}",
         task_path.display(),
@@ -2411,7 +2504,11 @@ fn open_editor(path: &Path) -> Result<()> {
         }
     } else if std::env::var("VSCODE_GIT_IPC_HANDLE").is_ok() {
         // VS Code or Cursor (a VS Code fork) — prefer Cursor if it's on PATH
-        let cli = if which_exists("cursor") { "cursor" } else { "code" };
+        let cli = if which_exists("cursor") {
+            "cursor"
+        } else {
+            "code"
+        };
         let status = ProcessCommand::new(cli)
             .args(["--reuse-window", path_str])
             .status()?;

@@ -645,6 +645,7 @@ dependencies = [
  "clap",
  "globset",
  "gray_matter",
+ "libc",
  "serde",
  "serde_json",
  "serde_yaml",
