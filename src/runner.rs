@@ -101,6 +101,7 @@ pub async fn run_task(
                 ),
                 requires_user: false,
                 suggested_agent: None,
+                resume_command: None,
             })
         }
         Err(_) => {
@@ -121,6 +122,7 @@ pub async fn run_task(
                 ),
                 requires_user: false,
                 suggested_agent: Some("runner".to_owned()),
+                resume_command: None,
             })
         }
     };
@@ -128,6 +130,16 @@ pub async fn run_task(
     let result = match session_outcome {
         Err(failure) => failure,
         Ok(session_result) if interactive => {
+            // The interactive session carries the resume command; persist it on the task
+            // before running the interpreter pass so it survives even if the interpreter
+            // pass fails or returns its own (None) resume_command.
+            if let Some(resume) = session_result.resume_command.as_deref() {
+                task.frontmatter
+                    .agent_resume_commands
+                    .push(resume.to_owned());
+                write_task(&task)?;
+                eprintln!("captured resume command: {resume}");
+            }
             match interpret_interactive_session(
                 config,
                 client,
@@ -156,6 +168,7 @@ pub async fn run_task(
                         ),
                         requires_user: false,
                         suggested_agent: None,
+                        resume_command: None,
                     }
                 }
             }
@@ -222,6 +235,7 @@ pub async fn plan_task(
             ),
             requires_user: false,
             suggested_agent: None,
+            resume_command: None,
         },
         Err(_) => AgentRunResult {
             recap: format!(
@@ -231,6 +245,7 @@ pub async fn plan_task(
             ),
             requires_user: false,
             suggested_agent: None,
+            resume_command: None,
         },
     };
 
@@ -336,17 +351,29 @@ async fn interpret_interactive_session(
         interpret: true,
     };
 
-    append_session_log(
-        session_log_path,
-        "\ninterpretation_pass: starting\n",
-    )?;
+    eprintln!();
+    eprintln!(
+        "Interactive session ended. Varda is now running the {agent_name} interpreter pass to produce the recap and Files touched list."
+    );
+    eprintln!(
+        "This non-interactive agent run may take up to {} seconds — please wait, do not kill the process.",
+        timeout.as_secs()
+    );
+
+    append_session_log(session_log_path, "\ninterpretation_pass: starting\n")?;
 
     let result = time::timeout(timeout, client.run_task(request))
         .await
-        .map_err(|_| anyhow::anyhow!("interpretation pass exceeded {} second limit", timeout.as_secs()))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "interpretation pass exceeded {} second limit",
+                timeout.as_secs()
+            )
+        })?
         .context("interpretation pass failed")?;
 
     append_session_log(session_log_path, "\ninterpretation_pass: completed\n")?;
+    eprintln!("Interpreter pass completed; writing recap.");
 
     Ok(result)
 }
@@ -410,6 +437,7 @@ Do it.
             recap: "# Recap\n\nCompleted.".to_owned(),
             requires_user: false,
             suggested_agent: None,
+            resume_command: None,
         });
 
         let outcome = run_task(&config, "codex", None, &task_path, &client, false)
@@ -457,6 +485,7 @@ Do it.
             recap: "# Recap\n\n**User Interaction Required**\nYes: run this locally.".to_owned(),
             requires_user: false,
             suggested_agent: None,
+            resume_command: None,
         });
 
         let outcome = run_task(&config, "codex", None, &task_path, &client, false)
@@ -577,11 +606,13 @@ Help interactively.
                 recap: "Interactive session completed.".to_owned(),
                 requires_user: false,
                 suggested_agent: None,
+                resume_command: None,
             },
             interpretation_response: AgentRunResult {
                 recap: "# Interpreted Recap\n\nDid the work.\n\nrequires_user: false".to_owned(),
                 requires_user: false,
                 suggested_agent: None,
+                resume_command: None,
             },
         };
 
@@ -592,16 +623,89 @@ Help interactively.
         let recap = fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
         let recorded = client.requests.lock().unwrap().clone();
 
-        assert_eq!(recorded.len(), 2, "expected one session call and one interpretation call");
-        assert!(recorded[0].interactive, "first call should be the interactive session");
+        assert_eq!(
+            recorded.len(),
+            2,
+            "expected one session call and one interpretation call"
+        );
+        assert!(
+            recorded[0].interactive,
+            "first call should be the interactive session"
+        );
         assert!(!recorded[0].interpret);
-        assert!(!recorded[1].interactive, "second call should not be interactive");
-        assert!(recorded[1].interpret, "second call should be the interpretation pass");
+        assert!(
+            !recorded[1].interactive,
+            "second call should not be interactive"
+        );
+        assert!(
+            recorded[1].interpret,
+            "second call should be the interpretation pass"
+        );
         assert!(recorded[1].body.contains("Session log"));
         assert!(recorded[1].body.contains("interactive Varda session"));
         assert_eq!(outcome.status, TaskStatus::Pending);
         assert!(recap.contains("Interpreted Recap"));
         assert!(recap.contains("Did the work."));
+    }
+
+    #[tokio::test]
+    async fn interactive_run_persists_resume_command_in_frontmatter() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-run-interactive-resume-{}",
+            std::process::id()
+        ));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: codex
+requires_user: false
+---
+
+# Task
+
+Help interactively.
+"#,
+        )
+        .expect("task should be written");
+
+        let mut config = test_config(operations_dir.display().to_string());
+        config.git.auto_commit = false;
+        let client = RecordingAgentClient {
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            session_response: AgentRunResult {
+                recap: "Interactive session completed.".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: Some("codex resume abc-123".to_owned()),
+            },
+            interpretation_response: AgentRunResult {
+                recap: "# Interpreted Recap\n\nDid the work.\n\nrequires_user: false".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+        };
+
+        run_task(&config, "codex", None, &task_path, &client, true)
+            .await
+            .expect("interactive task should run");
+
+        let task = crate::task::load_task(&task_path).expect("task should load");
+        assert_eq!(
+            task.frontmatter.agent_resume_commands,
+            vec!["codex resume abc-123".to_owned()],
+            "interactive resume command should be persisted in the task frontmatter"
+        );
+
+        let raw = fs::read_to_string(&task_path).expect("task file should be readable");
+        assert!(raw.contains("agent_resume_commands:"));
+        assert!(raw.contains("codex resume abc-123"));
     }
 
     fn test_config(operations_dir: String) -> Config {
@@ -625,6 +729,7 @@ Help interactively.
                     env: BTreeMap::new(),
                     interactive_command: None,
                     interactive_args: None,
+                    resume_command_template: None,
                 },
             )]),
             roles: std::collections::BTreeMap::new(),

@@ -28,6 +28,7 @@ agents = ["codex"]
 kind = "acp"
 command = "codex"
 args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
+resume_command_template = "codex resume {external_session_id}"
 
 [agents.claude]
 kind = "acp"
@@ -35,11 +36,13 @@ command = "claude"
 args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
 interactive_command = "sh"
 interactive_args = ["-c", "claude \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --permission-mode acceptEdits"]
+resume_command_template = "claude --resume {external_session_id} --add-dir {project} --permission-mode acceptEdits"
 
 [agents.copilot]
 kind = "acp"
 command = "sh"
 args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"]
+resume_command_template = "copilot --resume-session {external_session_id} --add-dir {project} --allow-all-tools"
 
 [roles.tester]
 backend = "codex"
@@ -120,6 +123,11 @@ pub struct AgentConfig {
     pub interactive_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive_args: Option<Vec<String>>,
+    /// Template used to build the resume command after an interactive session ends.
+    /// `{external_session_id}` is replaced with the agent's own session id (discovered
+    /// from the agent's session storage), and `{project}` with the task's project path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_command_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

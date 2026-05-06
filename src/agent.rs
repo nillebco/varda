@@ -30,6 +30,10 @@ pub struct AgentRunResult {
     pub recap: String,
     pub requires_user: bool,
     pub suggested_agent: Option<String>,
+    /// Command the user can run to resume the agent session, when one was discovered.
+    /// Populated for interactive runs from the per-agent `resume_command_template`
+    /// in the config, with the discovered external session id substituted in.
+    pub resume_command: Option<String>,
 }
 
 #[async_trait]
@@ -343,6 +347,7 @@ mod tests {
             recap: "done".to_owned(),
             requires_user: false,
             suggested_agent: Some("codex".to_owned()),
+            resume_command: None,
         });
 
         let result = client
@@ -362,6 +367,7 @@ mod tests {
                     agent_session_log: None,
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
+                    agent_resume_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task".to_owned(),

@@ -53,6 +53,11 @@ pub struct TaskFrontmatter {
     pub agent_session_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_session_logs: Vec<String>,
+    /// Resume commands captured from interactive runs, parallel to `agent_session_ids`.
+    /// Populated from the agent's `resume_command_template` after the interactive session
+    /// ends and the agent's own session id has been discovered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_resume_commands: Vec<String>,
     #[serde(default)]
     pub requires_user: bool,
 }
@@ -178,6 +183,7 @@ pub fn create_task(
             agent_session_log: None,
             agent_session_ids: vec![],
             agent_session_logs: vec![],
+            agent_resume_commands: vec![],
             requires_user: false,
         },
         body: if let Some(desc) = description {
@@ -606,6 +612,7 @@ Do the work.
                 agent_session_log: None,
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
+                agent_resume_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
@@ -648,6 +655,7 @@ Do the work.
                 agent_session_log: None,
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
+                agent_resume_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
@@ -681,8 +689,14 @@ Do the work.
         };
 
         let project_path = Path::new("/work/project");
-        let path = create_task(&config, "Write README Please", project_path, Some("codex"), None)
-            .expect("task should be created");
+        let path = create_task(
+            &config,
+            "Write README Please",
+            project_path,
+            Some("codex"),
+            None,
+        )
+        .expect("task should be created");
         let content = fs::read_to_string(&path).expect("task should be readable");
 
         assert!(content.contains("id: 1"));

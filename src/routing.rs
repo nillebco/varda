@@ -218,18 +218,23 @@ fn resolve_backend<'a>(config: &'a Config, name: &'a str) -> &'a str {
         .unwrap_or(name)
 }
 
-fn resolve_selection(
-    config: &Config,
-    name: &str,
-) -> (String, Option<String>, Option<String>) {
+fn resolve_selection(config: &Config, name: &str) -> (String, Option<String>, Option<String>) {
     if let Some(role) = config.roles.get(name) {
-        (role.backend.clone(), Some(name.to_owned()), role.instructions.clone())
+        (
+            role.backend.clone(),
+            Some(name.to_owned()),
+            role.instructions.clone(),
+        )
     } else {
         (name.to_owned(), None, None)
     }
 }
 
-fn agent_fits_prompt_budget(config: &Config, backend: &str, estimated_prompt_tokens: usize) -> bool {
+fn agent_fits_prompt_budget(
+    config: &Config,
+    backend: &str,
+    estimated_prompt_tokens: usize,
+) -> bool {
     config
         .agents
         .get(backend)
@@ -356,6 +361,7 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        resume_command_template: None,
                     },
                 ),
                 (
@@ -369,6 +375,7 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        resume_command_template: None,
                     },
                 ),
             ]),
@@ -411,6 +418,7 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        resume_command_template: None,
                     },
                 ),
                 (
@@ -424,6 +432,7 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        resume_command_template: None,
                     },
                 ),
                 (
@@ -437,6 +446,7 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        resume_command_template: None,
                     },
                 ),
             ]),
@@ -479,6 +489,7 @@ mod tests {
                     env: BTreeMap::new(),
                     interactive_command: None,
                     interactive_args: None,
+                    resume_command_template: None,
                 },
             )]),
             roles: BTreeMap::new(),
@@ -514,6 +525,7 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        resume_command_template: None,
                     },
                 ),
                 (
@@ -527,6 +539,7 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        resume_command_template: None,
                     },
                 ),
             ]),
@@ -547,6 +560,7 @@ mod tests {
                 agent_session_log: None,
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
+                agent_resume_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo it.".to_owned(),
@@ -582,6 +596,7 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        resume_command_template: None,
                     },
                 ),
                 (
@@ -595,6 +610,7 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        resume_command_template: None,
                     },
                 ),
             ]),
@@ -615,6 +631,7 @@ mod tests {
                 agent_session_log: None,
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
+                agent_resume_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo it.".to_owned(),

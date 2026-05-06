@@ -194,7 +194,11 @@ varda task add "Summarize this project" --exec --interactive
 
 In interactive mode the agent's stderr appears directly in the terminal (so you can see tool calls and progress in real time), stdout is streamed to the terminal and also captured for the session log, and your keyboard input is forwarded to the agent's stdin after the initial prompt is delivered. Interactive runs bypass the configured `timeout_seconds`: Varda will wait for the agent for as long as the session lasts, and the time-limit hint is omitted from the agent prompt.
 
-The interactive prompt also drops the structured recap requirements (file lists, `requires_user` markers, etc.), since those don't fit a free-form conversation. Once the interactive session ends, Varda runs a non-interactive **interpretation pass**: the same agent backend re-reads the session log and produces the standard Varda recap. The interpretation pass is bounded by `timeout_seconds`.
+The interactive prompt also drops the structured recap requirements (file lists, `requires_user` markers, etc.), since those don't fit a free-form conversation. Once the interactive session ends, Varda prints a status line and runs a non-interactive **interpretation pass**: the same agent backend re-reads the session log and produces the standard Varda recap. The interpretation pass is bounded by `timeout_seconds`.
+
+When the interpreter pass starts, Varda prints a notice on stderr so you don't mistake the wait for a hang and kill the process.
+
+If the agent the route resolves to has a `resume_command_template` set in `config.toml`, Varda also captures the agent's own session id from its on-disk session storage (claude → `~/.claude/projects/...`, codex → `~/.codex/sessions/...`, copilot → `~/.copilot/session-state/...`) and stores a ready-to-run resume command on the task in the `agent_resume_commands:` frontmatter list. Wiring that command back into a `varda task resume` flow is a follow-up.
 
 `make install` also installs three convenience wrappers next to the `varda` binary:
 

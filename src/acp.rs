@@ -13,8 +13,8 @@ use tokio::time;
 
 use crate::agent::{
     AgentClient, AgentRunRequest, AgentRunResult, build_agent_instructions,
-    build_interactive_instructions, build_interpretation_instructions,
-    build_planning_instructions, recap_requires_user_interaction,
+    build_interactive_instructions, build_interpretation_instructions, build_planning_instructions,
+    recap_requires_user_interaction,
 };
 use crate::config::AgentConfig;
 
@@ -27,6 +27,7 @@ pub struct AcpSubprocessClient {
     env: BTreeMap<String, String>,
     interactive_command: Option<String>,
     interactive_args: Option<Vec<String>>,
+    resume_command_template: Option<String>,
 }
 
 impl AcpSubprocessClient {
@@ -39,6 +40,7 @@ impl AcpSubprocessClient {
             env: config.env.clone(),
             interactive_command: config.interactive_command.clone(),
             interactive_args: config.interactive_args.clone(),
+            resume_command_template: config.resume_command_template.clone(),
         }
     }
 }
@@ -162,6 +164,7 @@ impl AcpSubprocessClient {
             requires_user: recap_requires_user_interaction(&recap),
             suggested_agent: None,
             recap,
+            resume_command: None,
         })
     }
 
@@ -209,6 +212,7 @@ impl AcpSubprocessClient {
             let interactive_args =
                 args_for_request(self.interactive_args.as_deref().unwrap_or(&[]), request);
 
+            let started_at = SystemTime::now();
             let mut command_builder = Command::new(&interactive_cmd);
             command_builder
                 .args(&interactive_args)
@@ -227,6 +231,8 @@ impl AcpSubprocessClient {
                 )
             })?;
 
+            let record_handle = self.record_external_session(request, started_at, child.id());
+
             let status = child
                 .wait()
                 .await
@@ -241,10 +247,17 @@ impl AcpSubprocessClient {
                 bail!("agent '{}' exited with status {}", self.agent_name, status,);
             }
 
+            let external_session_id = match record_handle {
+                Some(handle) => handle.await.ok().flatten(),
+                None => None,
+            };
+            let resume_command = self.build_resume_command(request, external_session_id.as_deref());
+
             return Ok(AgentRunResult {
                 recap: "Interactive session completed.\n\nrequires_user: false".to_owned(),
                 requires_user: false,
                 suggested_agent: None,
+                resume_command,
             });
         }
 
@@ -284,7 +297,7 @@ impl AcpSubprocessClient {
             let _ = tokio::io::copy(&mut terminal_stdin, &mut stdin).await;
         });
 
-        self.record_external_session(request, started_at, child.id());
+        let record_handle = self.record_external_session(request, started_at, child.id());
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let log_path = request.session_log_path.clone();
@@ -311,10 +324,17 @@ impl AcpSubprocessClient {
         // We still consume stdout above so it gets logged via the tee.
         drop(stdout_bytes);
 
+        let external_session_id = match record_handle {
+            Some(handle) => handle.await.ok().flatten(),
+            None => None,
+        };
+        let resume_command = self.build_resume_command(request, external_session_id.as_deref());
+
         Ok(AgentRunResult {
             recap: "Interactive session completed.".to_owned(),
             requires_user: false,
             suggested_agent: None,
+            resume_command,
         })
     }
 
@@ -326,41 +346,55 @@ impl AcpSubprocessClient {
                 .any(|a| a == "copilot" || a.starts_with("copilot "))
     }
 
+    /// Spawns the per-agent external-session discovery task and returns a handle whose
+    /// output is the agent's own session id (when found). The spawned task also writes
+    /// `external_session_id=...` to the Varda session log as a side effect.
     fn record_external_session(
         &self,
         request: &AgentRunRequest,
         started_at: SystemTime,
         pid: Option<u32>,
-    ) {
-        let Some(log_path) = request.session_log_path.as_deref() else {
-            return;
-        };
+    ) -> Option<tokio::task::JoinHandle<Option<String>>> {
+        let log_path = request.session_log_path.as_deref()?.to_owned();
 
         if self.command == "claude" {
-            let Some(project) = request.frontmatter.project.as_deref() else {
-                return;
-            };
-            let log_path = log_path.to_owned();
-            let project = project.to_owned();
+            let project = request.frontmatter.project.as_deref()?.to_owned();
             let varda_session_id = request.session_id.clone();
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 record_claude_external_session(log_path, project, varda_session_id, started_at)
-                    .await;
-            });
+                    .await
+            }))
         } else if self.uses_copilot() {
-            if let Some(pid) = pid {
-                let log_path = log_path.to_owned();
-                tokio::spawn(async move {
-                    record_copilot_external_session(log_path, pid).await;
-                });
-            }
+            let pid = pid?;
+            Some(tokio::spawn(async move {
+                record_copilot_external_session(log_path, pid).await
+            }))
         } else if self.command == "codex" {
-            let log_path = log_path.to_owned();
             let project = request.frontmatter.project.clone();
-            tokio::spawn(async move {
-                record_codex_external_session(log_path, started_at, project).await;
-            });
+            Some(tokio::spawn(async move {
+                record_codex_external_session(log_path, started_at, project).await
+            }))
+        } else {
+            None
         }
+    }
+
+    /// Build a resume command from the configured template by substituting the
+    /// agent's external session id and the task's project path. Returns None when
+    /// no template is configured or no session id was discovered.
+    fn build_resume_command(
+        &self,
+        request: &AgentRunRequest,
+        external_session_id: Option<&str>,
+    ) -> Option<String> {
+        let template = self.resume_command_template.as_deref()?;
+        let session_id = external_session_id?;
+        let project = request.frontmatter.project.as_deref().unwrap_or("");
+        Some(
+            template
+                .replace("{external_session_id}", session_id)
+                .replace("{project}", project),
+        )
     }
 }
 
@@ -369,13 +403,14 @@ async fn record_claude_external_session(
     project: String,
     varda_session_id: String,
     started_at: SystemTime,
-) {
+) -> Option<String> {
     for _ in 0..20 {
         if let Some(transcript) = find_claude_transcript(&project, &varda_session_id, started_at) {
             let session_id = transcript
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .unwrap_or("unknown");
+                .unwrap_or("unknown")
+                .to_owned();
             let _ = append_session_log(
                 &log_path,
                 &format!(
@@ -383,10 +418,11 @@ async fn record_claude_external_session(
                     transcript.display()
                 ),
             );
-            return;
+            return Some(session_id);
         }
         time::sleep(Duration::from_millis(250)).await;
     }
+    None
 }
 
 fn find_copilot_process_log(pid: u32) -> Option<PathBuf> {
@@ -416,13 +452,11 @@ fn extract_copilot_workspace_id(log_path: &Path) -> Option<String> {
     None
 }
 
-async fn record_copilot_external_session(log_path: String, pid: u32) {
+async fn record_copilot_external_session(log_path: String, pid: u32) -> Option<String> {
     for _ in 0..20 {
         if let Some(process_log) = find_copilot_process_log(pid) {
             if let Some(workspace_id) = extract_copilot_workspace_id(&process_log) {
-                let Some(home) = std::env::var_os("HOME") else {
-                    return;
-                };
+                let home = std::env::var_os("HOME")?;
                 let events_path = Path::new(&home)
                     .join(".copilot/session-state")
                     .join(&workspace_id)
@@ -434,11 +468,12 @@ async fn record_copilot_external_session(log_path: String, pid: u32) {
                         events_path.display()
                     ),
                 );
-                return;
+                return Some(workspace_id);
             }
         }
         time::sleep(Duration::from_millis(500)).await;
     }
+    None
 }
 
 fn find_codex_session(started_at: SystemTime, project: Option<&str>) -> Option<PathBuf> {
@@ -515,7 +550,7 @@ async fn record_codex_external_session(
     log_path: String,
     started_at: SystemTime,
     project: Option<String>,
-) {
+) -> Option<String> {
     for _ in 0..20 {
         if let Some(session_path) = find_codex_session(started_at, project.as_deref()) {
             let session_id =
@@ -527,10 +562,11 @@ async fn record_codex_external_session(
                     session_path.display()
                 ),
             );
-            return;
+            return Some(session_id);
         }
         time::sleep(Duration::from_millis(500)).await;
     }
+    None
 }
 
 async fn collect_stream<R>(
@@ -849,6 +885,7 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            resume_command_template: None,
         };
         let client = AcpSubprocessClient::new("echo", &config);
 
@@ -869,6 +906,7 @@ mod tests {
                     agent_session_log: None,
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
+                    agent_resume_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
@@ -903,6 +941,7 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            resume_command_template: None,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -923,6 +962,7 @@ mod tests {
                     agent_session_log: None,
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
+                    agent_resume_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
@@ -959,6 +999,7 @@ mod tests {
             env: BTreeMap::from([("VARDA_TEST_PROJECT".to_owned(), "{project}".to_owned())]),
             interactive_command: None,
             interactive_args: None,
+            resume_command_template: None,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -979,6 +1020,7 @@ mod tests {
                     agent_session_log: None,
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
+                    agent_resume_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
@@ -1017,6 +1059,7 @@ mod tests {
                 agent_session_log: None,
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
+                agent_resume_commands: vec![],
                 requires_user: false,
             },
             body: "# Task".to_owned(),
@@ -1070,6 +1113,7 @@ mod tests {
                 agent_session_log: None,
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
+                agent_resume_commands: vec![],
                 requires_user: false,
             },
             body: "# Task".to_owned(),
@@ -1101,5 +1145,84 @@ mod tests {
                 "/work/project",
             ]
         );
+    }
+
+    #[test]
+    fn build_resume_command_substitutes_session_id_and_project() {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            resume_command_template: Some(
+                "claude --resume {external_session_id} --add-dir {project}".to_owned(),
+            ),
+        };
+        let client = AcpSubprocessClient::new("claude", &config);
+        let request = sample_request("claude", "/work/project");
+
+        let resume = client.build_resume_command(&request, Some("abc-123"));
+        assert_eq!(
+            resume.as_deref(),
+            Some("claude --resume abc-123 --add-dir /work/project")
+        );
+
+        assert!(client.build_resume_command(&request, None).is_none());
+    }
+
+    #[test]
+    fn build_resume_command_returns_none_without_template() {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            resume_command_template: None,
+        };
+        let client = AcpSubprocessClient::new("claude", &config);
+        let request = sample_request("claude", "/work/project");
+
+        assert!(
+            client
+                .build_resume_command(&request, Some("abc-123"))
+                .is_none()
+        );
+    }
+
+    fn sample_request(agent: &str, project: &str) -> AgentRunRequest {
+        AgentRunRequest {
+            agent_name: agent.to_owned(),
+            role_instructions: None,
+            task_path: "task.md".to_owned(),
+            frontmatter: TaskFrontmatter {
+                id: None,
+                status: TaskStatus::Ready,
+                project: Some(project.to_owned()),
+                assignee: Some(agent.to_owned()),
+                recap: None,
+                recaps: vec![],
+                plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
+                agent_resume_commands: vec![],
+                requires_user: false,
+            },
+            body: "# Task".to_owned(),
+            timeout: Duration::from_secs(600),
+            session_id: "session-1".to_owned(),
+            session_log_path: None,
+            interactive: false,
+            interpret: false,
+        }
     }
 }

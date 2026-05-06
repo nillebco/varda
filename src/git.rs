@@ -82,11 +82,7 @@ pub fn commit_task_file(task_path: &Path, message: &str) -> Result<()> {
 /// repo are skipped with a warning rather than aborting the commit, so a
 /// careless agent recap can't break the run. Returns Ok(()) when there is
 /// nothing to commit.
-pub fn commit_agent_files(
-    project_repo: &Path,
-    files: &[PathBuf],
-    message: &str,
-) -> Result<()> {
+pub fn commit_agent_files(project_repo: &Path, files: &[PathBuf], message: &str) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
@@ -358,18 +354,12 @@ mod tests {
         let repo = init_test_repo("commit-agent-files");
         let inside = repo.join("changed.txt");
         std::fs::write(&inside, "hello").expect("file should be written");
-        let outside = std::env::temp_dir().join(format!(
-            "varda-git-outside-{}.txt",
-            std::process::id()
-        ));
+        let outside =
+            std::env::temp_dir().join(format!("varda-git-outside-{}.txt", std::process::id()));
         std::fs::write(&outside, "ignored").expect("outside file should be written");
 
-        commit_agent_files(
-            &repo,
-            &[inside.clone(), outside.clone()],
-            "agent commit",
-        )
-        .expect("commit should succeed");
+        commit_agent_files(&repo, &[inside.clone(), outside.clone()], "agent commit")
+            .expect("commit should succeed");
 
         let log = Command::new("git")
             .arg("-C")
@@ -396,7 +386,10 @@ mod tests {
             .output()
             .expect("git log should run");
         let stdout = String::from_utf8_lossy(&log.stdout);
-        assert!(stdout.trim().is_empty(), "expected no commits, got {stdout}");
+        assert!(
+            stdout.trim().is_empty(),
+            "expected no commits, got {stdout}"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
