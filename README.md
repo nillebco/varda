@@ -519,6 +519,8 @@ For a task that needs user input, the commit also includes:
 
 - a notification JSON file under the global `operations/runs/` folder
 
+Agents must NOT run `git add` or `git commit` themselves. Instead, every agent recap must include a `Files touched` heading listing one absolute path per line (or `(none)`). Varda parses that section and, before committing the operations metadata, stages and commits exactly those paths in the project repo (which may differ from the operations repo). This avoids interactive git prompts inside the agent process and keeps the commit boundary under Varda's control. Paths outside the project's git repo are skipped with a warning.
+
 When running on macOS, Varda also sends a best-effort native notification signal for tasks that need user input. Signal delivery failures are reported to stderr but do not prevent the notification JSON from being written.
 
 ## Install The Claude Code Skill

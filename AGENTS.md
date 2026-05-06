@@ -1,13 +1,13 @@
 # Agent Instructions
 
-Every repository change must be committed.
+Do NOT run `git add`, `git commit`, or any other git history-modifying command. Varda owns committing for any task it drives.
 
-When an agent edits, creates, deletes, formats, or otherwise changes tracked project files, it must:
+When you edit, create, delete, format, or otherwise change tracked project files:
 
 1. Run the relevant verification for the change when practical.
-2. Stage only the files that belong to that change.
-3. Commit the change before handing control back.
+2. Leave the changes in the working tree, unstaged.
+3. List every changed file (one absolute path per line) under the `Files touched` heading of your recap. Varda stages and commits exactly those paths after the run.
 
-Do not leave completed work only in the working tree. If unrelated user changes are already present, do not revert them and do not include them in the commit unless they are required for the current change.
+If unrelated user changes are already present, do not revert them and do not list them under `Files touched` unless they are required for the current change.
 
 Think if a README update could make sense.

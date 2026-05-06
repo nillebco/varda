@@ -1023,6 +1023,13 @@ async fn run_task_paths_in_parallel(
                     None
                 };
                 if config.git.auto_commit {
+                    if let Some(project) = report.project.as_deref() {
+                        commit_agent_files_for_task(
+                            &report.task_path,
+                            project,
+                            &report.outcome.files_touched,
+                        );
+                    }
                     git::commit_task_update(
                         &report.task_path,
                         &report.outcome.recap_path,
@@ -1052,6 +1059,7 @@ struct ParallelRunReport {
     agent: String,
     glob: String,
     outcome: runner::RunOutcome,
+    project: Option<String>,
 }
 
 async fn run_task_path_for_parallel(
@@ -1080,6 +1088,7 @@ async fn run_task_path_for_parallel(
         agent: route.display_name().to_owned(),
         glob: route.glob,
         outcome,
+        project: task_document.frontmatter.project.clone(),
     })
 }
 
@@ -1990,6 +1999,9 @@ async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
         None
     };
     if config.git.auto_commit {
+        if let Some(project) = task_document.frontmatter.project.as_deref() {
+            commit_agent_files_for_task(&task_path, project, &outcome.files_touched);
+        }
         git::commit_task_update(
             &task_path,
             &outcome.recap_path,
@@ -2000,6 +2012,34 @@ async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn commit_agent_files_for_task(
+    task_path: &Path,
+    project: &str,
+    files_touched: &[PathBuf],
+) {
+    if files_touched.is_empty() {
+        return;
+    }
+    let project_path = Path::new(project);
+    let id = task_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("task");
+    let message = format!("Apply task {id} agent changes");
+    if let Err(error) = git::commit_agent_files(project_path, files_touched, &message) {
+        eprintln!(
+            "warning: failed to commit agent files for task {}: {error:#}",
+            task_path.display()
+        );
+    } else {
+        println!(
+            "committed {} agent file(s) in {}",
+            files_touched.len(),
+            project_path.display()
+        );
+    }
 }
 
 async fn plan_task_command(task_path: &Path) -> Result<()> {

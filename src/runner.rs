@@ -8,7 +8,10 @@ use anyhow::{Context, Result, bail};
 use tokio::time;
 use uuid::Uuid;
 
-use crate::agent::{AgentClient, AgentRunRequest, AgentRunResult, recap_requires_user_interaction};
+use crate::agent::{
+    AgentClient, AgentRunRequest, AgentRunResult, parse_files_touched,
+    recap_requires_user_interaction,
+};
 use crate::config::Config;
 use crate::task::{TaskDocument, TaskStatus, load_task, write_task};
 
@@ -21,6 +24,9 @@ pub struct RunOutcome {
     pub status: TaskStatus,
     pub recap_path: PathBuf,
     pub session_log_path: PathBuf,
+    /// Absolute paths the agent reported under the `Files touched` heading of
+    /// its recap. Varda commits these in the project repo; the agent does not.
+    pub files_touched: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +164,7 @@ pub async fn run_task(
     };
 
     let requires_user = result.requires_user || recap_requires_user_interaction(&result.recap);
+    let files_touched = parse_files_touched(&result.recap);
     let recap_path = write_recap(config, task_path, &result.recap)?;
     task.set_recap(recap_path.display().to_string());
     task.frontmatter.requires_user = requires_user;
@@ -179,6 +186,7 @@ pub async fn run_task(
         status,
         recap_path,
         session_log_path,
+        files_touched,
     })
 }
 

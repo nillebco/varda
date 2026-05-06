@@ -1,5 +1,6 @@
 //! Agent execution abstractions.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -82,6 +83,8 @@ In your recap, include a section listing every file you created, modified, or de
 Add a markdown heading called Files touched and list one absolute file path per line below it.
 If no files were changed, write (none) under that heading.
 
+Do NOT run `git add`, `git commit`, or any other git history-modifying command. Leave your changes in the working tree, unstaged. Varda stages and commits exactly the files you list under `Files touched` after the run finishes.
+
 At the end of the recap, include exactly one bare machine-readable marker line whose content is either `requires_user: true` or `requires_user: false`.
 
 If you need user input, stop and use the true marker."#
@@ -94,6 +97,8 @@ pub fn build_interactive_instructions() -> String {
 Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder. When those files are present, Varda includes their contents below as Project instructions; treat them as mandatory task requirements.
 
 Help the user accomplish the task. Collaborate with them as you normally would in an interactive shell session: ask clarifying questions when needed, take actions, and report results conversationally. There is no time limit.
+
+Do NOT run `git add`, `git commit`, or any other git history-modifying command. Leave the changes in the working tree, unstaged. Varda commits the files reported by the interpreter pass after the session ends.
 
 Do NOT produce a structured Varda recap, file list, or `requires_user` marker yourself. Once the session ends, Varda will pass the session log to a separate interpreter pass that produces those artifacts. Just focus on doing the work with the user."#.to_owned()
 }
@@ -116,7 +121,53 @@ Include a section listing every file that was created, modified, or deleted duri
 Add a markdown heading called Files touched and list one absolute file path per line below it.
 If no files were changed, write (none) under that heading.
 
+Varda will use this list to stage and commit the changes after the run, so be precise: list only files that were actually touched and use absolute paths. Do not run `git add`, `git commit`, or any other git history-modifying command yourself.
+
 At the end of the recap, include exactly one bare machine-readable marker line whose content is either `requires_user: true` or `requires_user: false`."#.to_owned()
+}
+
+/// Parse the `Files touched` section of a recap into a list of absolute paths.
+///
+/// The recap convention is documented in `build_agent_instructions`: a markdown
+/// heading whose text reads "Files touched" (any heading level), followed by one
+/// path per line until the next heading or end of input. List markers (`-`, `*`,
+/// `•`), backticks, and surrounding whitespace are stripped. Lines that read
+/// `(none)` are ignored, as are non-absolute paths (which Varda cannot stage
+/// safely without guessing the repository root).
+pub fn parse_files_touched(recap: &str) -> Vec<PathBuf> {
+    let mut in_section = false;
+    let mut files = Vec::new();
+
+    for line in recap.lines() {
+        let trimmed = line.trim();
+
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let heading_text = rest.trim_start_matches('#').trim();
+            in_section = heading_text.eq_ignore_ascii_case("files touched");
+            continue;
+        }
+
+        if !in_section || trimmed.is_empty() {
+            continue;
+        }
+
+        let path_str = trimmed
+            .trim_start_matches(|c: char| c == '-' || c == '*' || c == '•')
+            .trim()
+            .trim_matches('`')
+            .trim();
+
+        if path_str.is_empty() || path_str.eq_ignore_ascii_case("(none)") {
+            continue;
+        }
+
+        let path = PathBuf::from(path_str);
+        if path.is_absolute() {
+            files.push(path);
+        }
+    }
+
+    files
 }
 
 pub fn recap_requires_user_interaction(recap: &str) -> bool {
@@ -215,7 +266,36 @@ mod tests {
         assert!(instructions.contains("Files touched"));
         assert!(instructions.contains("absolute file path"));
         assert!(instructions.contains("requires_user"));
+        assert!(instructions.contains("Do NOT run `git add`"));
         assert!(!instructions.contains("Agent field below is `tester`"));
+    }
+
+    #[test]
+    fn parse_files_touched_extracts_absolute_paths() {
+        let recap = "# Recap\n\n## Files touched\n\n- /tmp/a.txt\n- /tmp/b.txt\n* `/tmp/c.txt`\n\nrequires_user: false\n";
+        let files = parse_files_touched(recap);
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("/tmp/a.txt"),
+                PathBuf::from("/tmp/b.txt"),
+                PathBuf::from("/tmp/c.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_files_touched_handles_none_marker_and_relative_paths() {
+        let recap = "# Recap\n\n### Files touched\n\n(none)\n- relative/path.txt\n\n## Next steps\n\nNothing.\n";
+        let files = parse_files_touched(recap);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn parse_files_touched_stops_at_next_heading() {
+        let recap = "## Files touched\n\n/tmp/x\n\n## Other\n\n/tmp/should-not-be-included\n";
+        let files = parse_files_touched(recap);
+        assert_eq!(files, vec![PathBuf::from("/tmp/x")]);
     }
 
     #[test]
