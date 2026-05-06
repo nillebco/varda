@@ -37,13 +37,14 @@ pub trait AgentClient {
     }
 }
 
-pub fn build_planning_instructions(timeout: Duration) -> String {
-    let minutes = timeout.as_secs() / 60;
+pub fn build_planning_instructions(timeout: Option<Duration>) -> String {
+    let time_limit_line = match timeout {
+        Some(timeout) => format!("\n\nYou have at most {} minutes.", timeout.as_secs() / 60),
+        None => String::new(),
+    };
 
     format!(
-        r#"You are producing an execution plan for a task managed by Varda.
-
-You have at most {minutes} minutes.
+        r#"You are producing an execution plan for a task managed by Varda.{time_limit_line}
 
 Analyze the task and produce a structured plan. Do NOT execute the task.
 
@@ -57,17 +58,21 @@ Format the plan as markdown starting with a `# Plan` heading."#
     )
 }
 
-pub fn build_agent_instructions(timeout: Duration) -> String {
-    let minutes = timeout.as_secs() / 60;
+pub fn build_agent_instructions(timeout: Option<Duration>) -> String {
+    let (time_limit_line, deadline_clause) = match timeout {
+        Some(timeout) => (
+            format!("\n\nYou have at most {} minutes.", timeout.as_secs() / 60),
+            "Before the time limit expires, produce",
+        ),
+        None => (String::new(), "When you are done, produce"),
+    };
 
     format!(
-        r#"You are processing a task managed by Varda.
-
-You have at most {minutes} minutes.
+        r#"You are processing a task managed by Varda.{time_limit_line}
 
 Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder. When those files are present, Varda includes their contents below as Project instructions; treat them as mandatory task requirements.
 
-Before the time limit expires, produce a concise recap for the end user.
+{deadline_clause} a concise recap for the end user.
 The recap must include:
 - what you completed
 - what remains
@@ -173,15 +178,27 @@ mod tests {
 
     #[test]
     fn builds_time_limited_agent_instructions() {
-        let instructions = build_agent_instructions(Duration::from_secs(600));
+        let instructions = build_agent_instructions(Some(Duration::from_secs(600)));
 
         assert!(instructions.contains("at most 10 minutes"));
-        assert!(instructions.contains("produce a concise recap"));
+        assert!(instructions.contains("Before the time limit expires, produce a concise recap"));
         assert!(instructions.contains("Project instructions"));
         assert!(instructions.contains("Files touched"));
         assert!(instructions.contains("absolute file path"));
         assert!(instructions.contains("requires_user"));
         assert!(!instructions.contains("Agent field below is `tester`"));
+    }
+
+    #[test]
+    fn builds_unbounded_agent_instructions_when_no_timeout() {
+        let instructions = build_agent_instructions(None);
+
+        assert!(!instructions.contains("at most"));
+        assert!(!instructions.contains("minutes."));
+        assert!(!instructions.contains("Before the time limit expires"));
+        assert!(instructions.contains("When you are done, produce a concise recap"));
+        assert!(instructions.contains("Files touched"));
+        assert!(instructions.contains("requires_user"));
     }
 
     #[test]

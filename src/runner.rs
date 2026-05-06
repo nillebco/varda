@@ -71,7 +71,13 @@ pub async fn run_task(
         interactive,
     };
 
-    let result = match time::timeout(timeout, client.run_task(request)).await {
+    let agent_result = if interactive {
+        Ok(client.run_task(request).await)
+    } else {
+        time::timeout(timeout, client.run_task(request)).await
+    };
+
+    let result = match agent_result {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             append_session_log(&session_log_path, &format!("\nerror:\n{error:#}\n"))?;

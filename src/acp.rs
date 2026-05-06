@@ -665,7 +665,11 @@ Task frontmatter:
 Task markdown:
 {body}
 "#,
-        instructions = build_agent_instructions(request.timeout),
+        instructions = build_agent_instructions(if request.interactive {
+            None
+        } else {
+            Some(request.timeout)
+        }),
         agent = request.agent_name,
         task_path = request.task_path,
         frontmatter = serde_yaml::to_string(&request.frontmatter)
@@ -698,7 +702,7 @@ Task frontmatter:
 Task markdown:
 {body}
 "#,
-        instructions = build_planning_instructions(request.timeout),
+        instructions = build_planning_instructions(Some(request.timeout)),
         agent = request.agent_name,
         task_path = request.task_path,
         frontmatter = serde_yaml::to_string(&request.frontmatter)
