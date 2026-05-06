@@ -791,6 +791,15 @@ fn unix_timestamp() -> Result<u64> {
         .as_secs())
 }
 
+fn file_mtime_seconds(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
 async fn run_command(task_arg: Option<&Path>, plan_arg: Option<&Path>, yes: bool) -> Result<()> {
     match (task_arg, plan_arg) {
         (Some(task), None) => run_task_command(task, false).await,
@@ -1298,6 +1307,8 @@ struct DashboardTask {
     path: String,
     markdown: String,
     recaps: Vec<DashboardRecap>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1457,9 +1468,13 @@ fn load_dashboard_payload(
         let document = task::load_task(&summary.path)?;
         let markdown = fs::read_to_string(&summary.path)
             .with_context(|| format!("failed to read task at {}", summary.path.display()))?;
+        let mut completed_at = file_mtime_seconds(&summary.path);
         let mut recaps = Vec::new();
         for recap_path in &document.frontmatter.recaps {
             let resolved = resolve_recap_path(recap_path, &summary.path);
+            if let Some(mtime) = file_mtime_seconds(&resolved) {
+                completed_at = Some(completed_at.map_or(mtime, |current| current.max(mtime)));
+            }
             let markdown = fs::read_to_string(&resolved).unwrap_or_else(|error| {
                 format!(
                     "# Recap Unavailable\n\nFailed to read {}: {error}",
@@ -1481,6 +1496,7 @@ fn load_dashboard_payload(
             path: summary.path.display().to_string(),
             markdown,
             recaps,
+            completed_at,
         });
     }
     projects.sort();
@@ -1763,9 +1779,21 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }
     }
 
+    function sortTasksByCompletionDesc(tasks) {
+      tasks.sort((a, b) => {
+        const aTime = a.completed_at ?? -Infinity;
+        const bTime = b.completed_at ?? -Infinity;
+        if (aTime !== bTime) return bTime - aTime;
+        const aId = a.id ?? -Infinity;
+        const bId = b.id ?? -Infinity;
+        return bId - aId;
+      });
+    }
+
     async function refresh() {
       const response = await fetch("/api/tasks", { cache: "no-store" });
       payload = await response.json();
+      sortTasksByCompletionDesc(payload.tasks);
       renderBoard();
     }
 
