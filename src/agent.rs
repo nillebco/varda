@@ -23,6 +23,10 @@ pub struct AgentRunRequest {
     /// When true, the agent should only interpret a prior session log into a Varda recap
     /// without performing any new work. Mutually exclusive with `interactive`.
     pub interpret: bool,
+    /// When true and the parent stdout is a TTY, tee the agent's stdout to the parent
+    /// terminal as the agent runs so the user sees progress. The full stdout is still
+    /// captured for recap parsing. Ignored in interactive mode (which already tees).
+    pub stream: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +380,7 @@ mod tests {
                 session_log_path: None,
                 interactive: false,
                 interpret: false,
+                stream: false,
             })
             .await
             .expect("fake agent should return a result");

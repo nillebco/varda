@@ -98,6 +98,9 @@ enum TaskCommand {
         /// Surface the agent output in the current shell and forward stdin for interaction (only meaningful with --exec).
         #[arg(long)]
         interactive: bool,
+        /// Suppress live streaming of the agent's stdout (only meaningful with --exec).
+        #[arg(long)]
+        quiet: bool,
         /// Set the task status to ready after creation (skips backlog).
         #[arg(long)]
         ready: bool,
@@ -118,6 +121,10 @@ enum TaskCommand {
         /// Surface the agent output in the current shell and forward stdin for interaction.
         #[arg(long)]
         interactive: bool,
+        /// Suppress live streaming of the agent's stdout to the terminal (output is still
+        /// written to the session log and the recap is printed after the run).
+        #[arg(long)]
+        quiet: bool,
     },
     /// Generate an agent-driven plan for a task and open it in $EDITOR.
     Plan {
@@ -274,6 +281,7 @@ async fn main() -> Result<()> {
                 edit,
                 background,
                 interactive,
+                quiet,
                 ready,
             } => {
                 use std::io::IsTerminal as _;
@@ -330,7 +338,7 @@ async fn main() -> Result<()> {
                     if background {
                         spawn_task_in_background(&task_path)?;
                     } else {
-                        run_task_command(&task_path, interactive).await?;
+                        run_task_command(&task_path, interactive, quiet).await?;
                     }
                 } else if edit {
                     open_editor(&task_path)?;
@@ -347,11 +355,12 @@ async fn main() -> Result<()> {
                 task,
                 background,
                 interactive,
+                quiet,
             } => {
                 if background {
                     spawn_task_in_background(&task)?;
                 } else {
-                    run_task_command(&task, interactive).await?;
+                    run_task_command(&task, interactive, quiet).await?;
                 }
             }
             TaskCommand::Plan { task } => {
@@ -817,7 +826,7 @@ fn file_mtime_seconds(path: &Path) -> Option<u64> {
 
 async fn run_command(task_arg: Option<&Path>, plan_arg: Option<&Path>, yes: bool) -> Result<()> {
     match (task_arg, plan_arg) {
-        (Some(task), None) => run_task_command(task, false).await,
+        (Some(task), None) => run_task_command(task, false, false).await,
         (Some(_), Some(_)) => {
             anyhow::bail!("pass either --task <TASK> or a plan path, not both")
         }
@@ -825,7 +834,7 @@ async fn run_command(task_arg: Option<&Path>, plan_arg: Option<&Path>, yes: bool
             let config_path = config::config_file()?;
             let config = config::load_config(&config_path)?;
             if looks_like_task(&config, path) {
-                run_task_command(path, false).await
+                run_task_command(path, false, false).await
             } else {
                 run_plan_command(path, yes).await
             }
@@ -910,6 +919,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         session_log_path: None,
         interactive: false,
         interpret: false,
+        stream: false,
     };
     let result = client.run_task(request).await?;
     let json = extract_json_object(&result.recap)?;
@@ -1117,6 +1127,7 @@ async fn run_task_path_for_parallel(
         route.role_instructions.as_deref(),
         &task_path,
         &client,
+        false,
         false,
     )
     .await?;
@@ -2045,7 +2056,7 @@ fn spawn_task_in_background(task_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
+async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
@@ -2077,6 +2088,7 @@ async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
         )?;
         println!("committed task snapshot");
     }
+    let stream = !quiet && !interactive;
     let outcome = runner::run_task(
         &config,
         &display_name,
@@ -2084,6 +2096,7 @@ async fn run_task_command(task_path: &Path, interactive: bool) -> Result<()> {
         &task_path,
         &client,
         interactive,
+        stream,
     )
     .await?;
     println!(
@@ -2205,7 +2218,7 @@ async fn resume_task_command(task_path: &Path) -> Result<()> {
         open_editor(&task_path)?;
     }
 
-    run_task_command(&task_path, false).await
+    run_task_command(&task_path, false, false).await
 }
 
 fn update_tasks_command(

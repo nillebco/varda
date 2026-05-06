@@ -42,6 +42,7 @@ pub async fn run_task(
     task_path: &Path,
     client: &impl AgentClient,
     interactive: bool,
+    stream: bool,
 ) -> Result<RunOutcome> {
     let mut task = load_task(task_path)?;
 
@@ -85,6 +86,7 @@ pub async fn run_task(
         session_log_path: Some(session_log_path.display().to_string()),
         interactive,
         interpret: false,
+        stream,
     };
 
     let agent_result = if interactive {
@@ -229,6 +231,7 @@ pub async fn plan_task(
         session_log_path: None,
         interactive: false,
         interpret: false,
+        stream: false,
     };
 
     let result = match time::timeout(timeout, client.plan_task(request)).await {
@@ -431,6 +434,7 @@ async fn interpret_interactive_session(
         session_log_path: Some(session_log_path.display().to_string()),
         interactive: false,
         interpret: true,
+        stream: false,
     };
 
     eprintln!();
@@ -522,7 +526,7 @@ Do it.
             resume_command: None,
         });
 
-        let outcome = run_task(&config, "codex", None, &task_path, &client, false)
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
             .await
             .expect("task should run");
 
@@ -570,7 +574,7 @@ Do it.
             resume_command: None,
         });
 
-        let outcome = run_task(&config, "codex", None, &task_path, &client, false)
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
             .await
             .expect("task should run");
 
@@ -611,7 +615,7 @@ Do it.
         config.defaults.timeout_seconds = 0;
         let client = PendingAgentClient;
 
-        let outcome = run_task(&config, "codex", None, &task_path, &client, false)
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
             .await
             .expect("task should time out cleanly");
 
@@ -698,7 +702,7 @@ Help interactively.
             },
         };
 
-        let outcome = run_task(&config, "codex", None, &task_path, &client, true)
+        let outcome = run_task(&config, "codex", None, &task_path, &client, true, false)
             .await
             .expect("interactive task should run and be interpreted");
 
@@ -774,7 +778,7 @@ Help interactively.
             },
         };
 
-        run_task(&config, "codex", None, &task_path, &client, true)
+        run_task(&config, "codex", None, &task_path, &client, true, false)
             .await
             .expect("interactive task should run");
 
@@ -864,7 +868,7 @@ Do it.
             resume_command: None,
         });
 
-        let outcome = run_task(&config, "codex", None, &task_path, &client, false)
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
             .await
             .expect("dirty-tree check should produce an outcome, not an error");
 
@@ -920,7 +924,7 @@ Do it.
             resume_command: None,
         });
 
-        let outcome = run_task(&config, "codex", None, &task_path, &client, false)
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
             .await
             .expect("clean working tree should not block the run");
 

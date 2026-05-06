@@ -126,7 +126,15 @@ impl AcpSubprocessClient {
         let stdout_log_path = log_path.clone();
         let stderr_log_path = log_path.clone();
 
-        let stdout_task = collect_stream(stdout, stdout_log_path, "stdout");
+        use std::io::IsTerminal as _;
+        let stream_to_terminal = request.stream && std::io::stdout().is_terminal();
+        let stdout_task = async move {
+            if stream_to_terminal {
+                collect_stream_tee(stdout, stdout_log_path, "stdout").await
+            } else {
+                collect_stream(stdout, stdout_log_path, "stdout").await
+            }
+        };
         let stderr_task = collect_stream(stderr, stderr_log_path, "stderr");
         let wait_task = async {
             child
@@ -915,6 +923,7 @@ mod tests {
                 session_log_path: None,
                 interactive: false,
                 interpret: false,
+                stream: false,
             })
             .await
             .expect("subprocess should echo prompt");
@@ -971,6 +980,7 @@ mod tests {
                 session_log_path: Some(log_path.display().to_string()),
                 interactive: false,
                 interpret: false,
+                stream: false,
             })
             .await
             .expect("subprocess should run");
@@ -1029,6 +1039,7 @@ mod tests {
                 session_log_path: None,
                 interactive: false,
                 interpret: false,
+                stream: false,
             })
             .await
             .expect("subprocess should run");
@@ -1068,6 +1079,7 @@ mod tests {
             session_log_path: None,
             interactive: false,
             interpret: false,
+            stream: false,
         };
 
         let args = args_for_request(
@@ -1122,6 +1134,7 @@ mod tests {
             session_log_path: None,
             interactive: false,
             interpret: false,
+            stream: false,
         };
 
         let args = args_for_request(
@@ -1223,6 +1236,7 @@ mod tests {
             session_log_path: None,
             interactive: false,
             interpret: false,
+            stream: false,
         }
     }
 }

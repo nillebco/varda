@@ -254,6 +254,17 @@ Then run:
 varda task run "$HOME/.varda/operations/tasks/summarize-this-project.md"
 ```
 
+Foreground non-interactive runs stream the agent's stdout to the terminal as it
+runs, so you can watch progress while you wait. The full stdout is still captured
+and parsed for the recap; stderr remains silent unless the run fails. Streaming
+is automatically disabled when stdout is not a TTY (e.g. piped to a script that
+captures the recap) and when running multiple tasks in parallel. Pass `--quiet`
+to opt out for a single run:
+
+```sh
+varda task run 1 --quiet
+```
+
 Pass `--background` to detach immediately:
 
 ```sh
