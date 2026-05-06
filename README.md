@@ -559,6 +559,17 @@ Agents must NOT run `git add` or `git commit` themselves. Instead, every agent r
 
 When running on macOS, Varda also sends a best-effort native notification signal for tasks that need user input. Signal delivery failures are reported to stderr but do not prevent the notification JSON from being written.
 
+### Pre-run dirty-tree check
+
+Before launching an agent, Varda runs `git status --porcelain` against the project repository declared in the task's `project` frontmatter. If anything is reported (modified, staged, or untracked), Varda:
+
+- skips the agent invocation entirely,
+- writes a recap explaining the conflict and listing the offending entries,
+- sets the task to `needs_user` and fires the macOS notification,
+- leaves the user's working tree untouched.
+
+This protects in-progress local work from being entangled with agent edits and keeps the post-run commit unambiguous. Once the listed entries are committed, stashed, or discarded, set the task back to `ready` and re-run it. The check is silently skipped when the project path is missing or not inside a git repository.
+
 ## Install The Claude Code Skill
 
 Varda ships a Claude Code skill that lets any agent session manage tasks with natural language. Install it from the varda project directory:
