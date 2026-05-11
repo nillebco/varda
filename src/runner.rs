@@ -13,7 +13,6 @@ use crate::agent::{
     recap_requires_user_interaction,
 };
 use crate::config::Config;
-use crate::git;
 use crate::task::{TaskDocument, TaskStatus, load_task, write_task};
 
 /// Maximum bytes of session log content embedded in the interpretation prompt body.
@@ -52,10 +51,6 @@ pub async fn run_task(
             task_path.display(),
             task.frontmatter.status
         );
-    }
-
-    if let Some(outcome) = check_clean_working_tree(config, &mut task, task_path)? {
-        return Ok(outcome);
     }
 
     let timeout = Duration::from_secs(config.defaults.timeout_seconds);
@@ -276,83 +271,6 @@ fn write_plan(config: &Config, task_path: &Path, plan: &str) -> Result<PathBuf> 
     fs::write(&plan_path, plan)
         .with_context(|| format!("failed to write plan at {}", plan_path.display()))?;
     Ok(plan_path)
-}
-
-/// If the project repo has uncommitted changes, write a recap, flag the task
-/// as `needs_user`, and return an outcome that short-circuits the run.
-/// Returns `Ok(None)` when the working tree is clean, when the project is not
-/// set, when the project path does not exist, or when the path is not inside a
-/// git repository (in which case the check is skipped with a warning on
-/// stderr).
-fn check_clean_working_tree(
-    config: &Config,
-    task: &mut TaskDocument,
-    task_path: &Path,
-) -> Result<Option<RunOutcome>> {
-    let project = match task.frontmatter.project.as_deref() {
-        Some(value) => value,
-        None => return Ok(None),
-    };
-    let project_path = Path::new(project);
-    if !project_path.is_dir() {
-        return Ok(None);
-    }
-
-    let changes = match git::uncommitted_changes(project_path) {
-        Ok(changes) => changes,
-        Err(error) => {
-            eprintln!(
-                "pre-run dirty-tree check skipped for {}: {error:#}",
-                project_path.display()
-            );
-            return Ok(None);
-        }
-    };
-    if changes.is_empty() {
-        return Ok(None);
-    }
-
-    let session_id = Uuid::new_v4().to_string();
-    let session_log_path = session_log_path(config, &session_id);
-    write_session_log(
-        &session_log_path,
-        &format!(
-            "session_id={session_id}\ntask={}\npre_run_check=dirty_working_tree\nuncommitted_entries={}\n{}\n",
-            task_path.display(),
-            changes.len(),
-            changes.join("\n"),
-        ),
-    )?;
-
-    let recap = format!(
-        "# Pre-run Check Failed\n\n\
-        The project repository at `{project}` has uncommitted changes. Varda \
-        refused to start the agent because its edits would be entangled with \
-        the existing modifications, making the post-run commit ambiguous.\n\n\
-        ## Uncommitted entries (`git status --porcelain`)\n\n```\n{entries}\n```\n\n\
-        ## What to do\n\n\
-        1. Review the listed changes and either commit, stash, or discard them.\n\
-        2. Set the task status back to `ready` and re-run it once `git status` is clean.\n\n\
-        User interaction required: yes.\n",
-        entries = changes.join("\n"),
-    );
-
-    let recap_path = write_recap(config, task_path, &recap)?;
-    task.set_recap(recap_path.display().to_string());
-    task.frontmatter.requires_user = true;
-    task.frontmatter.agent_session_ids.push(session_id);
-    task.frontmatter
-        .agent_session_logs
-        .push(session_log_path.display().to_string());
-    task.set_status(TaskStatus::NeedsUser);
-    write_task(task)?;
-
-    Ok(Some(RunOutcome {
-        status: TaskStatus::NeedsUser,
-        recap_path,
-        session_log_path,
-        files_touched: Vec::new(),
-    }))
 }
 
 fn write_recap(config: &Config, task_path: &Path, recap: &str) -> Result<PathBuf> {
@@ -792,144 +710,6 @@ Help interactively.
         let raw = fs::read_to_string(&task_path).expect("task file should be readable");
         assert!(raw.contains("agent_resume_commands:"));
         assert!(raw.contains("codex resume abc-123"));
-    }
-
-    fn init_project_repo(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "varda-run-project-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&root).expect("project root should be created");
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("init")
-            .arg("--quiet")
-            .status()
-            .expect("git init should run");
-        assert!(status.success(), "git init failed");
-        for (key, value) in [
-            ("user.email", "varda-test@example.com"),
-            ("user.name", "Varda Test"),
-            ("commit.gpgsign", "false"),
-        ] {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(["config", "--local", key, value])
-                .status()
-                .expect("git config should run");
-            assert!(status.success(), "git config {key} failed");
-        }
-        root
-    }
-
-    #[tokio::test]
-    async fn run_task_flags_dirty_project_for_user() {
-        let project_repo = init_project_repo("dirty");
-        // Create an unstaged change in the project repo so the pre-run check
-        // sees a dirty working tree.
-        std::fs::write(project_repo.join("staged_in_user.txt"), "user work")
-            .expect("project file should be written");
-
-        let root = std::env::temp_dir().join(format!("varda-run-dirty-{}", std::process::id()));
-        let operations_dir = root.join("operations");
-        let task_dir = operations_dir.join("tasks/codex");
-        fs::create_dir_all(&task_dir).expect("task directory should be created");
-        let task_path = task_dir.join("example.md");
-        fs::write(
-            &task_path,
-            format!(
-                r#"---
-status: ready
-project: {project}
-assignee: codex
-requires_user: false
----
-
-# Task
-
-Do it.
-"#,
-                project = project_repo.display()
-            ),
-        )
-        .expect("task should be written");
-
-        let config = test_config(operations_dir.display().to_string());
-        let client = FakeAgentClient::new(AgentRunResult {
-            recap: "# Recap\n\nShould not run.".to_owned(),
-            requires_user: false,
-            suggested_agent: None,
-            resume_command: None,
-        });
-
-        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
-            .await
-            .expect("dirty-tree check should produce an outcome, not an error");
-
-        assert_eq!(outcome.status, TaskStatus::NeedsUser);
-        let recap = fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
-        assert!(recap.contains("Pre-run Check Failed"));
-        assert!(recap.contains("staged_in_user.txt"));
-
-        let updated = fs::read_to_string(&task_path).expect("task should be readable");
-        assert!(updated.contains("status: needs_user"));
-        assert!(updated.contains("requires_user: true"));
-
-        let log = fs::read_to_string(&outcome.session_log_path).expect("log should be readable");
-        assert!(log.contains("pre_run_check=dirty_working_tree"));
-        assert!(log.contains("staged_in_user.txt"));
-
-        let _ = std::fs::remove_dir_all(&project_repo);
-    }
-
-    #[tokio::test]
-    async fn run_task_proceeds_when_project_repo_is_clean() {
-        let project_repo = init_project_repo("clean");
-
-        let root = std::env::temp_dir().join(format!("varda-run-clean-{}", std::process::id()));
-        let operations_dir = root.join("operations");
-        let task_dir = operations_dir.join("tasks/codex");
-        fs::create_dir_all(&task_dir).expect("task directory should be created");
-        let task_path = task_dir.join("example.md");
-        fs::write(
-            &task_path,
-            format!(
-                r#"---
-status: ready
-project: {project}
-assignee: codex
-requires_user: false
----
-
-# Task
-
-Do it.
-"#,
-                project = project_repo.display()
-            ),
-        )
-        .expect("task should be written");
-
-        let config = test_config(operations_dir.display().to_string());
-        let client = FakeAgentClient::new(AgentRunResult {
-            recap: "# Recap\n\nCompleted.".to_owned(),
-            requires_user: false,
-            suggested_agent: None,
-            resume_command: None,
-        });
-
-        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
-            .await
-            .expect("clean working tree should not block the run");
-
-        assert_eq!(outcome.status, TaskStatus::Pending);
-        let _ = std::fs::remove_dir_all(&project_repo);
     }
 
     fn test_config(operations_dir: String) -> Config {

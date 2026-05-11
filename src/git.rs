@@ -281,33 +281,6 @@ fn repo_relative_path_lenient(canonical_repo: &Path, path: &Path) -> Result<Stri
     Ok(relative.display().to_string())
 }
 
-/// Return the `git status --porcelain` lines for `repo_path`, or an empty vec
-/// if the working tree is clean. Errors if the path is not inside a git repo
-/// or if git fails.
-pub fn uncommitted_changes(repo_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(["status", "--porcelain"])
-        .output()
-        .with_context(|| format!("failed to inspect git status for {}", repo_path.display()))?;
-
-    if !output.status.success() {
-        bail!(
-            "git status failed for {}: {}",
-            repo_path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let stdout = String::from_utf8(output.stdout).context("git status was not valid UTF-8")?;
-    Ok(stdout
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
-
 fn has_staged_changes(repo: &Path) -> Result<bool> {
     let output = Command::new("git")
         .arg("-C")
