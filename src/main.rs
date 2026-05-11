@@ -76,10 +76,13 @@ enum Command {
 enum TaskCommand {
     /// Create a new markdown task.
     Add {
-        /// Human-readable task name.
-        taskname: String,
+        /// Human-readable task name. Omit when using --file.
+        taskname: Option<String>,
         /// Optional task description (body text). Reads from stdin if stdin is not a terminal.
         description: Option<String>,
+        /// Read task name (filename stem) and description (file content) from a file.
+        #[arg(long)]
+        file: Option<PathBuf>,
         /// Project path this task belongs to. Defaults to the current directory.
         #[arg(long)]
         project: Option<PathBuf>,
@@ -275,6 +278,7 @@ async fn main() -> Result<()> {
             TaskCommand::Add {
                 taskname,
                 description,
+                file,
                 project,
                 agent,
                 exec,
@@ -285,19 +289,30 @@ async fn main() -> Result<()> {
                 ready,
             } => {
                 use std::io::IsTerminal as _;
-                let description = if description.is_some() {
-                    description
-                } else if !std::io::stdin().is_terminal() {
-                    let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
-                    let trimmed = buf.trim_end().to_owned();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed)
-                    }
+                let (taskname, description) = if let Some(file_path) = file {
+                    let stem = file_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .with_context(|| format!("cannot derive task name from {}", file_path.display()))?
+                        .to_owned();
+                    let content = fs::read_to_string(&file_path)
+                        .with_context(|| format!("failed to read {}", file_path.display()))?;
+                    let trimmed = content.trim_end().to_owned();
+                    (stem, if trimmed.is_empty() { None } else { Some(trimmed) })
                 } else {
-                    None
+                    let name = taskname
+                        .context("taskname is required when --file is not used")?;
+                    let desc = if description.is_some() {
+                        description
+                    } else if !std::io::stdin().is_terminal() {
+                        let mut buf = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                        let trimmed = buf.trim_end().to_owned();
+                        if trimmed.is_empty() { None } else { Some(trimmed) }
+                    } else {
+                        None
+                    };
+                    (name, desc)
                 };
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
