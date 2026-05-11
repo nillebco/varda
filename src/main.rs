@@ -24,6 +24,7 @@ use crate::agent::AgentClient;
 #[derive(Debug, Parser)]
 #[command(name = "varda")]
 #[command(about = "Drive ACP agents from markdown operations tasks")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
