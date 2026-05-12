@@ -118,7 +118,7 @@ impl AcpSubprocessClient {
             .context("failed to write task prompt to agent stdin")?;
         drop(stdin);
 
-        self.record_external_session(request, started_at, child.id());
+        self.record_external_session(request, started_at);
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let stderr = child.stderr.take().context("failed to open agent stderr")?;
@@ -296,7 +296,7 @@ impl AcpSubprocessClient {
                 )
             })?;
 
-            let record_handle = self.record_external_session(request, started_at, child.id());
+            let record_handle = self.record_external_session(request, started_at);
 
             let status = child
                 .wait()
@@ -362,7 +362,7 @@ impl AcpSubprocessClient {
             let _ = tokio::io::copy(&mut terminal_stdin, &mut stdin).await;
         });
 
-        let record_handle = self.record_external_session(request, started_at, child.id());
+        let record_handle = self.record_external_session(request, started_at);
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let log_path = request.session_log_path.clone();
@@ -418,7 +418,6 @@ impl AcpSubprocessClient {
         &self,
         request: &AgentRunRequest,
         started_at: SystemTime,
-        pid: Option<u32>,
     ) -> Option<tokio::task::JoinHandle<Option<String>>> {
         let log_path = request.session_log_path.as_deref()?.to_owned();
 
@@ -430,9 +429,8 @@ impl AcpSubprocessClient {
                     .await
             }))
         } else if self.uses_copilot() {
-            let pid = pid?;
             Some(tokio::spawn(async move {
-                record_copilot_external_session(log_path, pid).await
+                record_copilot_external_session(log_path, started_at).await
             }))
         } else if self.command == "codex" {
             let project = request.frontmatter.project.clone();
@@ -490,20 +488,32 @@ async fn record_claude_external_session(
     None
 }
 
-fn find_copilot_process_log(pid: u32) -> Option<PathBuf> {
+fn find_copilot_process_log(started_at: SystemTime) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let logs_dir = Path::new(&home).join(".copilot/logs");
-    let suffix = format!("-{pid}.log");
-    std::fs::read_dir(logs_dir)
+    find_copilot_process_log_in(&logs_dir, started_at)
+}
+
+fn find_copilot_process_log_in(logs_dir: &Path, started_at: SystemTime) -> Option<PathBuf> {
+    let mut candidates: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(logs_dir)
         .ok()?
         .flatten()
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("process-") && n.ends_with(&suffix))
-                .unwrap_or(false)
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_str()?.to_owned();
+            if !name.starts_with("process-") || !name.ends_with(".log") {
+                return None;
+            }
+            let mtime = e.metadata().ok()?.modified().ok()?;
+            if mtime < started_at {
+                return None;
+            }
+            Some((mtime, path))
         })
+        .collect();
+    // Pick the file whose mtime is closest to (and at or after) started_at.
+    candidates.sort_by_key(|(mtime, _)| *mtime);
+    candidates.into_iter().map(|(_, p)| p).next()
 }
 
 fn extract_copilot_workspace_id(log_path: &Path) -> Option<String> {
@@ -517,9 +527,9 @@ fn extract_copilot_workspace_id(log_path: &Path) -> Option<String> {
     None
 }
 
-async fn record_copilot_external_session(log_path: String, pid: u32) -> Option<String> {
+async fn record_copilot_external_session(log_path: String, started_at: SystemTime) -> Option<String> {
     for _ in 0..20 {
-        if let Some(process_log) = find_copilot_process_log(pid) {
+        if let Some(process_log) = find_copilot_process_log(started_at) {
             if let Some(workspace_id) = extract_copilot_workspace_id(&process_log) {
                 let home = std::env::var_os("HOME")?;
                 let events_path = Path::new(&home)
@@ -1294,6 +1304,59 @@ mod tests {
             resume_args_for_command("agent", "opaque resume string"),
             vec!["opaque resume string".to_owned()]
         );
+    }
+
+    #[test]
+    fn find_copilot_process_log_in_picks_earliest_after_start() {
+        let dir =
+            std::env::temp_dir().join(format!("varda-copilot-logs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create a file before started_at.
+        std::fs::write(dir.join("process-11111.log"), b"old").unwrap();
+        // Non-process file should always be ignored.
+        std::fs::write(dir.join("other.log"), b"decoy").unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+
+        let started_at = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(15));
+
+        // First valid file after started_at — should be chosen.
+        std::fs::write(dir.join("process-22222.log"), b"current").unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+
+        // A later file — should not be chosen because 22222 has an earlier mtime.
+        std::fs::write(dir.join("process-33333.log"), b"later").unwrap();
+
+        let result = find_copilot_process_log_in(&dir, started_at);
+        assert!(result.is_some(), "expected a match after started_at");
+        let name = result
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(name, "process-22222.log");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn find_copilot_process_log_in_returns_none_when_no_log_after_start() {
+        let dir = std::env::temp_dir()
+            .join(format!("varda-copilot-logs-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("process-00000.log"), b"old").unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+
+        let started_at = SystemTime::now();
+
+        let result = find_copilot_process_log_in(&dir, started_at);
+        assert!(result.is_none(), "expected no match when all logs predate started_at");
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn sample_request(agent: &str, project: &str) -> AgentRunRequest {
