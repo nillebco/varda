@@ -27,6 +27,9 @@ pub struct AgentRunRequest {
     /// terminal as the agent runs so the user sees progress. The full stdout is still
     /// captured for recap parsing. Ignored in interactive mode (which already tees).
     pub stream: bool,
+    /// Concrete command captured from a prior interactive agent session. When set,
+    /// interactive execution resumes that session instead of delivering the task prompt.
+    pub resume_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,6 +384,7 @@ mod tests {
                 interactive: false,
                 interpret: false,
                 stream: false,
+                resume_command: None,
             })
             .await
             .expect("fake agent should return a result");

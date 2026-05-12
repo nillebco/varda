@@ -82,6 +82,7 @@ pub async fn run_task(
         interactive,
         interpret: false,
         stream,
+        resume_command: None,
     };
 
     let agent_result = if interactive {
@@ -205,6 +206,132 @@ pub async fn run_task(
     })
 }
 
+pub async fn resume_interactive_task(
+    config: &Config,
+    agent_name: &str,
+    role_instructions: Option<&str>,
+    task_path: &Path,
+    client: &impl AgentClient,
+    resume_command: String,
+) -> Result<RunOutcome> {
+    let mut task = load_task(task_path)?;
+
+    if task.frontmatter.status != TaskStatus::Ready {
+        bail!(
+            "task {} is not ready; current status is {:?}",
+            task_path.display(),
+            task.frontmatter.status
+        );
+    }
+
+    let timeout = Duration::from_secs(config.defaults.timeout_seconds);
+    let session_id = Uuid::new_v4().to_string();
+    let session_log_path = session_log_path(config, &session_id);
+    task.set_status(TaskStatus::Running);
+    task.frontmatter.agent_session_ids.push(session_id.clone());
+    task.frontmatter
+        .agent_session_logs
+        .push(session_log_path.display().to_string());
+    write_task(&task)?;
+
+    write_session_log(
+        &session_log_path,
+        &format!(
+            "session_id={session_id}\nagent={agent_name}\ntask={}\nresume_command={resume_command}\n[interactive_resume]\n",
+            task_path.display()
+        ),
+    )?;
+
+    let request = AgentRunRequest {
+        agent_name: agent_name.to_owned(),
+        role_instructions: role_instructions.map(str::to_owned),
+        task_path: task_path.display().to_string(),
+        frontmatter: task.frontmatter.clone(),
+        body: String::new(),
+        timeout,
+        session_id: session_id.clone(),
+        session_log_path: Some(session_log_path.display().to_string()),
+        interactive: true,
+        interpret: false,
+        stream: false,
+        resume_command: Some(resume_command),
+    };
+
+    let session_result = client.run_task(request).await.with_context(|| {
+        format!(
+            "failed to resume interactive agent session for {}",
+            task_path.display()
+        )
+    })?;
+
+    if let Some(resume) = session_result.resume_command.as_deref() {
+        task.frontmatter
+            .agent_resume_commands
+            .push(resume.to_owned());
+        write_task(&task)?;
+        eprintln!("captured resume command: {resume}");
+    }
+
+    let result = match interpret_interactive_session(
+        config,
+        client,
+        agent_name,
+        role_instructions,
+        task_path,
+        &task,
+        &session_id,
+        &session_log_path,
+        timeout,
+    )
+    .await
+    {
+        Ok(interpreted) => interpreted,
+        Err(error) => {
+            append_session_log(
+                &session_log_path,
+                &format!("\ninterpretation_error:\n{error:#}\n"),
+            )?;
+            AgentRunResult {
+                recap: format!(
+                    "# Interactive Session Completed\n\nThe resumed interactive session ended successfully but Varda's interpreter pass failed: {error}\n\nFalling back to the agent's session-end output.\n\n{}\n\nSession log: [{}]({})\n\nrequires_user: false",
+                    session_result.recap,
+                    session_log_path.display(),
+                    session_log_path.display()
+                ),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            }
+        }
+    };
+
+    let requires_user = result.requires_user || recap_requires_user_interaction(&result.recap);
+    let files_touched = parse_files_touched(&result.recap);
+    let recap_path = write_recap(config, task_path, &result.recap)?;
+    task.set_recap(recap_path.display().to_string());
+    task.frontmatter.requires_user = requires_user;
+
+    let status = if requires_user {
+        TaskStatus::NeedsUser
+    } else if result.recap.starts_with("# Agent Run Failed")
+        || result.recap.starts_with("# Agent Run Timed Out")
+    {
+        TaskStatus::Failed
+    } else {
+        TaskStatus::Pending
+    };
+
+    task.set_status(status);
+    write_task(&task)?;
+
+    Ok(RunOutcome {
+        status,
+        recap_path,
+        session_log_path,
+        files_touched,
+    })
+}
+
 pub async fn plan_task(
     config: &Config,
     agent_name: &str,
@@ -227,6 +354,7 @@ pub async fn plan_task(
         interactive: false,
         interpret: false,
         stream: false,
+        resume_command: None,
     };
 
     let result = match time::timeout(timeout, client.plan_task(request)).await {
@@ -353,6 +481,7 @@ async fn interpret_interactive_session(
         interactive: false,
         interpret: true,
         stream: false,
+        resume_command: None,
     };
 
     eprintln!();
@@ -710,6 +839,77 @@ Help interactively.
         let raw = fs::read_to_string(&task_path).expect("task file should be readable");
         assert!(raw.contains("agent_resume_commands:"));
         assert!(raw.contains("codex resume abc-123"));
+    }
+
+    #[tokio::test]
+    async fn resume_interactive_task_uses_captured_command_then_interprets() {
+        let root =
+            std::env::temp_dir().join(format!("varda-run-captured-resume-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: codex
+requires_user: false
+agent_resume_commands:
+- codex resume abc-123
+---
+
+# Task
+
+Help interactively.
+"#,
+        )
+        .expect("task should be written");
+
+        let mut config = test_config(operations_dir.display().to_string());
+        config.git.auto_commit = false;
+        let client = RecordingAgentClient {
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            session_response: AgentRunResult {
+                recap: "Interactive resume session completed.".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+            interpretation_response: AgentRunResult {
+                recap: "# Interpreted Recap\n\nResumed the work.\n\nrequires_user: false"
+                    .to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+        };
+
+        let outcome = resume_interactive_task(
+            &config,
+            "codex",
+            None,
+            &task_path,
+            &client,
+            "codex resume abc-123".to_owned(),
+        )
+        .await
+        .expect("captured resume command should run and be interpreted");
+
+        let recorded = client.requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded[0].interactive);
+        assert!(!recorded[0].interpret);
+        assert_eq!(
+            recorded[0].resume_command.as_deref(),
+            Some("codex resume abc-123")
+        );
+        assert!(recorded[0].body.is_empty());
+        assert!(!recorded[1].interactive);
+        assert!(recorded[1].interpret);
+        assert!(recorded[1].body.contains("Session log"));
+        assert_eq!(outcome.status, TaskStatus::Pending);
     }
 
     fn test_config(operations_dir: String) -> Config {

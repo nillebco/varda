@@ -198,7 +198,7 @@ The interactive prompt also drops the structured recap requirements (file lists,
 
 When the interpreter pass starts, Varda prints a notice on stderr so you don't mistake the wait for a hang and kill the process.
 
-If the agent the route resolves to has a `resume_command_template` set in `config.toml`, Varda also captures the agent's own session id from its on-disk session storage (claude → `~/.claude/projects/...`, codex → `~/.codex/sessions/...`, copilot → `~/.copilot/session-state/...`) and stores a ready-to-run resume command on the task in the `agent_resume_commands:` frontmatter list. Wiring that command back into a `varda task resume` flow is a follow-up.
+If the agent the route resolves to has a `resume_command_template` set in `config.toml`, Varda also captures the agent's own session id from its on-disk session storage (claude -> `~/.claude/projects/...`, codex -> `~/.codex/sessions/...`, copilot -> `~/.copilot/session-state/...`) and stores a ready-to-run resume command on the task in the `agent_resume_commands:` frontmatter list. A later `varda task resume` can offer to use that command instead of starting over.
 
 `make install` also installs three convenience wrappers next to the `varda` binary:
 
@@ -428,8 +428,15 @@ varda task resume 1
 2. Sets `requires_user: false`.
 3. If the task was in `needs_user`, offers to open `$EDITOR` so you can add the missing user input.
 4. If the task was not in `needs_user`, skips the editor prompt.
-5. Commits that resume edit to the Varda home git repo.
-6. Runs the task immediately with `varda task run`.
+5. If `agent_resume_commands` contains a non-empty command, offers to resume the latest captured agent session.
+6. If accepted, runs the captured command interactively and then runs the interpreter pass to produce the standard Varda recap.
+7. If declined, if no captured command exists, or if `--fresh` is passed, starts a new agent session with `varda task run`.
+
+Use `--fresh` to skip any captured command and start over:
+
+```sh
+varda task resume 1 --fresh
+```
 
 If you set `VARDA_HOME`, use that path instead of `$HOME/.varda`.
 
@@ -442,6 +449,12 @@ varda task resume-session 1
 ```
 
 Varda scans `operations/runs/*.log` for sessions tied to that task, prompts for the session to resume, stores the selected `agent_session_id` and `agent_session_log` in task frontmatter, sets `status: ready`, and clears `requires_user`.
+
+Frontmatter precedence:
+
+- `agent_resume_commands` is the only field `varda task resume` can execute directly. When multiple commands exist, Varda offers the latest non-empty entry.
+- `agent_session_ids` and `agent_session_logs` remain the Varda run history and inspection trail. They are not enough by themselves to resume an agent-owned interactive session.
+- `varda task resume-session` uses historical Varda run logs to attach a past `agent_session_id` and `agent_session_log` to a task, but it does not create an agent resume command.
 
 ## What The Agent Is Told
 

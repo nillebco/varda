@@ -204,6 +204,63 @@ impl AcpSubprocessClient {
             );
         }
 
+        if let Some(resume_command) = request.resume_command.as_deref() {
+            let interactive_cmd = self
+                .interactive_command
+                .as_deref()
+                .map(|cmd| expand_request_value(cmd, request))
+                .unwrap_or_else(|| "sh".to_owned());
+            let interactive_args = resume_args_for_command(&interactive_cmd, resume_command);
+
+            if let Some(log_path) = request.session_log_path.as_deref() {
+                let _ = append_session_log(
+                    log_path,
+                    &format!(
+                        "resume_command={resume_command}\nresume_invocation={} {:?}\n",
+                        interactive_cmd, interactive_args
+                    ),
+                );
+            }
+
+            let mut command_builder = Command::new(&interactive_cmd);
+            command_builder
+                .args(&interactive_args)
+                .envs(env)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            if let Some(working_dir) = working_dir.as_deref() {
+                command_builder.current_dir(working_dir);
+            }
+
+            let mut child = command_builder.spawn().with_context(|| {
+                format!(
+                    "failed to resume interactive agent '{}' with command '{}'",
+                    self.agent_name, interactive_cmd
+                )
+            })?;
+
+            let status = child
+                .wait()
+                .await
+                .context("failed to wait for resumed interactive agent subprocess")?;
+
+            if let Some(log_path) = request.session_log_path.as_deref() {
+                let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
+            }
+
+            if !status.success() {
+                bail!("agent '{}' exited with status {}", self.agent_name, status,);
+            }
+
+            return Ok(AgentRunResult {
+                recap: "Interactive resume session completed.\n\nrequires_user: false".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            });
+        }
+
         // Write the task prompt to a temp file so truly-interactive agents can read it.
         let prompt_file =
             std::env::temp_dir().join(format!("varda-prompt-{}.txt", request.session_id));
@@ -792,6 +849,14 @@ fn expand_arg(arg: &str, request: &AgentRunRequest, project: &str) -> String {
         .replace("{task}", &request.task_path)
 }
 
+fn resume_args_for_command(command: &str, resume_command: &str) -> Vec<String> {
+    if command == "sh" || command.ends_with("/sh") {
+        vec!["-c".to_owned(), resume_command.to_owned()]
+    } else {
+        vec![resume_command.to_owned()]
+    }
+}
+
 fn expand_request_value(value: &str, request: &AgentRunRequest) -> String {
     let Some(project) = request.frontmatter.project.as_deref() else {
         return value.replace("{task}", &request.task_path);
@@ -924,6 +989,7 @@ mod tests {
                 interactive: false,
                 interpret: false,
                 stream: false,
+                resume_command: None,
             })
             .await
             .expect("subprocess should echo prompt");
@@ -981,6 +1047,7 @@ mod tests {
                 interactive: false,
                 interpret: false,
                 stream: false,
+                resume_command: None,
             })
             .await
             .expect("subprocess should run");
@@ -1040,6 +1107,7 @@ mod tests {
                 interactive: false,
                 interpret: false,
                 stream: false,
+                resume_command: None,
             })
             .await
             .expect("subprocess should run");
@@ -1080,6 +1148,7 @@ mod tests {
             interactive: false,
             interpret: false,
             stream: false,
+            resume_command: None,
         };
 
         let args = args_for_request(
@@ -1135,6 +1204,7 @@ mod tests {
             interactive: false,
             interpret: false,
             stream: false,
+            resume_command: None,
         };
 
         let args = args_for_request(
@@ -1210,6 +1280,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resume_args_run_stored_command_through_shell_when_available() {
+        assert_eq!(
+            resume_args_for_command("sh", "codex resume abc-123"),
+            vec!["-c".to_owned(), "codex resume abc-123".to_owned()]
+        );
+        assert_eq!(
+            resume_args_for_command("/bin/sh", "claude --resume abc-123"),
+            vec!["-c".to_owned(), "claude --resume abc-123".to_owned()]
+        );
+        assert_eq!(
+            resume_args_for_command("agent", "opaque resume string"),
+            vec!["opaque resume string".to_owned()]
+        );
+    }
+
     fn sample_request(agent: &str, project: &str) -> AgentRunRequest {
         AgentRunRequest {
             agent_name: agent.to_owned(),
@@ -1237,6 +1323,7 @@ mod tests {
             interactive: false,
             interpret: false,
             stream: false,
+            resume_command: None,
         }
     }
 }

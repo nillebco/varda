@@ -139,6 +139,9 @@ enum TaskCommand {
     Resume {
         /// Markdown task file or task id to resume.
         task: PathBuf,
+        /// Start a fresh agent session instead of using a captured agent resume command.
+        #[arg(long)]
+        fresh: bool,
     },
     /// Choose a past run session for a task and move it back to ready.
     ResumeSession {
@@ -294,22 +297,34 @@ async fn main() -> Result<()> {
                     let stem = file_path
                         .file_stem()
                         .and_then(|s| s.to_str())
-                        .with_context(|| format!("cannot derive task name from {}", file_path.display()))?
+                        .with_context(|| {
+                            format!("cannot derive task name from {}", file_path.display())
+                        })?
                         .to_owned();
                     let content = fs::read_to_string(&file_path)
                         .with_context(|| format!("failed to read {}", file_path.display()))?;
                     let trimmed = content.trim_end().to_owned();
-                    (stem, if trimmed.is_empty() { None } else { Some(trimmed) })
+                    (
+                        stem,
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        },
+                    )
                 } else {
-                    let name = taskname
-                        .context("taskname is required when --file is not used")?;
+                    let name = taskname.context("taskname is required when --file is not used")?;
                     let desc = if description.is_some() {
                         description
                     } else if !std::io::stdin().is_terminal() {
                         let mut buf = String::new();
                         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
                         let trimmed = buf.trim_end().to_owned();
-                        if trimmed.is_empty() { None } else { Some(trimmed) }
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        }
                     } else {
                         None
                     };
@@ -382,8 +397,8 @@ async fn main() -> Result<()> {
             TaskCommand::Plan { task } => {
                 plan_task_command(&task).await?;
             }
-            TaskCommand::Resume { task } => {
-                resume_task_command(&task).await?;
+            TaskCommand::Resume { task, fresh } => {
+                resume_task_command(&task, fresh).await?;
             }
             TaskCommand::ResumeSession { task } => {
                 resume_task_session_command(&task)?;
@@ -936,6 +951,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         interactive: false,
         interpret: false,
         stream: false,
+        resume_command: None,
     };
     let result = client.run_task(request).await?;
     let json = extract_json_object(&result.recap)?;
@@ -2219,12 +2235,17 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn resume_task_command(task_path: &Path) -> Result<()> {
+async fn resume_task_command(task_path: &Path, fresh: bool) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
     let mut task_document = task::load_task(&task_path)?;
     let was_needs_user = task_document.frontmatter.status == task::TaskStatus::NeedsUser;
+    let captured_resume_command = if fresh {
+        None
+    } else {
+        latest_agent_resume_command(&task_document)
+    };
 
     task_document.set_status(task::TaskStatus::Ready);
     task_document.frontmatter.requires_user = false;
@@ -2234,7 +2255,84 @@ async fn resume_task_command(task_path: &Path) -> Result<()> {
         open_editor(&task_path)?;
     }
 
+    if let Some(resume_command) = captured_resume_command {
+        println!("Captured agent resume command found:");
+        println!("  {resume_command}");
+        if prompt_yes_no("Resume the previous agent session?", true)? {
+            return run_captured_resume_command(
+                &config,
+                &task_path,
+                &task_document,
+                resume_command,
+            )
+            .await;
+        }
+        println!("Starting a fresh agent session.");
+    }
+
     run_task_command(&task_path, false, false).await
+}
+
+fn latest_agent_resume_command(task_document: &task::TaskDocument) -> Option<String> {
+    task_document
+        .frontmatter
+        .agent_resume_commands
+        .iter()
+        .rev()
+        .find(|command| !command.trim().is_empty())
+        .cloned()
+}
+
+async fn run_captured_resume_command(
+    config: &config::Config,
+    task_path: &Path,
+    task_document: &task::TaskDocument,
+    resume_command: String,
+) -> Result<()> {
+    let route = routing::match_route_for_task(config, task_document, false)?;
+    println!("estimated_prompt_tokens: {}", route.estimated_prompt_tokens);
+    let agent_config = config
+        .agents
+        .get(&route.agent)
+        .expect("routing ensures the selected agent exists");
+    let display_name = route.display_name().to_owned();
+    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    if config.git.auto_commit {
+        git::commit_task_file(
+            task_path,
+            &format!("Snapshot task {} before resume", task_path.display()),
+        )?;
+        println!("committed task snapshot");
+    }
+    let outcome = runner::resume_interactive_task(
+        config,
+        &display_name,
+        route.role_instructions.as_deref(),
+        task_path,
+        &client,
+        resume_command,
+    )
+    .await?;
+    println!(
+        "processed task={} agent={} glob={} status={:?} recap={}",
+        task_path.display(),
+        display_name,
+        route.glob,
+        outcome.status,
+        outcome.recap_path.display()
+    );
+
+    let recap_content = fs::read_to_string(&outcome.recap_path)
+        .with_context(|| format!("failed to read recap at {}", outcome.recap_path.display()))?;
+    println!();
+    println!("---");
+    println!();
+    print!("{recap_content}");
+    if !recap_content.ends_with('\n') {
+        println!();
+    }
+
+    Ok(())
 }
 
 fn update_tasks_command(
@@ -2705,6 +2803,51 @@ planner_agent: codex
             Some("/tmp/task.md")
         );
         assert_eq!(session_log_value(content, "missing"), None);
+    }
+
+    #[test]
+    fn latest_agent_resume_command_uses_latest_non_empty_entry() {
+        let mut task = test_task_document();
+        task.frontmatter.agent_resume_commands = vec![
+            "codex resume old".to_owned(),
+            "   ".to_owned(),
+            "codex resume new".to_owned(),
+        ];
+
+        assert_eq!(
+            latest_agent_resume_command(&task).as_deref(),
+            Some("codex resume new")
+        );
+    }
+
+    #[test]
+    fn latest_agent_resume_command_returns_none_when_empty() {
+        let mut task = test_task_document();
+        task.frontmatter.agent_resume_commands = vec!["".to_owned(), "  ".to_owned()];
+
+        assert_eq!(latest_agent_resume_command(&task), None);
+    }
+
+    fn test_task_document() -> task::TaskDocument {
+        task::TaskDocument {
+            path: PathBuf::from("task.md"),
+            frontmatter: task::TaskFrontmatter {
+                id: None,
+                status: task::TaskStatus::Ready,
+                project: None,
+                assignee: None,
+                recap: None,
+                recaps: vec![],
+                plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
+                agent_resume_commands: vec![],
+                requires_user: false,
+            },
+            body: "# Task\n".to_owned(),
+        }
     }
 
     #[test]
