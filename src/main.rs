@@ -2519,17 +2519,19 @@ fn open_editor(path: &Path) -> Result<()> {
     let path_str = path.to_str().unwrap_or_default();
 
     if let Ok(nvim_socket) = std::env::var("NVIM") {
-        // Running inside Neovim's terminal — open in the parent instance
+        // Running inside Neovim's terminal — open in the parent instance and wait
         let status = ProcessCommand::new("nvim")
-            .args(["--server", &nvim_socket, "--remote", path_str])
+            .args(["--server", &nvim_socket, "--remote-wait", path_str])
             .status()?;
         if !status.success() {
-            anyhow::bail!("nvim --remote exited with status {status}");
+            anyhow::bail!("nvim --remote-wait exited with status {status}");
         }
     } else if std::env::var("ZED_TERM").is_ok() {
-        let status = ProcessCommand::new("zed").arg(path_str).status()?;
+        let status = ProcessCommand::new("zed")
+            .args(["--wait", path_str])
+            .status()?;
         if !status.success() {
-            anyhow::bail!("zed exited with status {status}");
+            anyhow::bail!("zed --wait exited with status {status}");
         }
     } else if std::env::var("VSCODE_GIT_IPC_HANDLE").is_ok() {
         // VS Code or Cursor (a VS Code fork) — prefer Cursor if it's on PATH
@@ -2539,10 +2541,10 @@ fn open_editor(path: &Path) -> Result<()> {
             "code"
         };
         let status = ProcessCommand::new(cli)
-            .args(["--reuse-window", path_str])
+            .args(["--reuse-window", "--wait", path_str])
             .status()?;
         if !status.success() {
-            anyhow::bail!("'{cli} --reuse-window' exited with status {status}");
+            anyhow::bail!("'{cli} --reuse-window --wait' exited with status {status}");
         }
     } else {
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
