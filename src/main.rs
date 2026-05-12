@@ -142,6 +142,9 @@ enum TaskCommand {
         /// Start a fresh agent session instead of using a captured agent resume command.
         #[arg(long)]
         fresh: bool,
+        /// Surface the agent output in the current shell and forward stdin for interaction.
+        #[arg(long)]
+        interactive: bool,
     },
     /// Choose a past run session for a task and move it back to ready.
     ResumeSession {
@@ -397,8 +400,8 @@ async fn main() -> Result<()> {
             TaskCommand::Plan { task } => {
                 plan_task_command(&task).await?;
             }
-            TaskCommand::Resume { task, fresh } => {
-                resume_task_command(&task, fresh).await?;
+            TaskCommand::Resume { task, fresh, interactive } => {
+                resume_task_command(&task, fresh, interactive).await?;
             }
             TaskCommand::ResumeSession { task } => {
                 resume_task_session_command(&task)?;
@@ -2235,7 +2238,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn resume_task_command(task_path: &Path, fresh: bool) -> Result<()> {
+async fn resume_task_command(task_path: &Path, fresh: bool, interactive: bool) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
@@ -2270,7 +2273,7 @@ async fn resume_task_command(task_path: &Path, fresh: bool) -> Result<()> {
         println!("Starting a fresh agent session.");
     }
 
-    run_task_command(&task_path, false, false).await
+    run_task_command(&task_path, interactive, false).await
 }
 
 fn latest_agent_resume_command(task_document: &task::TaskDocument) -> Option<String> {
