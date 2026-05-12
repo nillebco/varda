@@ -42,7 +42,7 @@ resume_command_template = "claude --resume {external_session_id} --add-dir {proj
 kind = "acp"
 command = "sh"
 args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"]
-resume_command_template = "copilot --resume-session {external_session_id} --add-dir {project} --allow-all-tools"
+resume_command_template = "copilot --resume={external_session_id} --add-dir {project} --allow-all-tools"
 
 [roles.tester]
 backend = "codex"
