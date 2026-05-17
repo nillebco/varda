@@ -28,6 +28,8 @@ agents = ["codex"]
 kind = "acp"
 command = "codex"
 args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
+interactive_command = "sh"
+interactive_args = ["-c", "codex \"$(cat $VARDA_PROMPT_FILE)\" -C {project} -s workspace-write"]
 resume_command_template = "codex resume {external_session_id}"
 
 [agents.claude]
