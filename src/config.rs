@@ -27,24 +27,24 @@ agents = ["codex"]
 [agents.codex]
 kind = "acp"
 command = "codex"
-args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
+args = ["exec", "--cd", ".", "--add-dir", "{varda_project}", "--add-dir", "{varda_home}", "--sandbox", "workspace-write", "-"]
 interactive_command = "sh"
-interactive_args = ["-c", "codex \"$(cat $VARDA_PROMPT_FILE)\" -C {project} -s workspace-write"]
-resume_command_template = "codex resume {external_session_id}"
+interactive_args = ["-c", "codex \"$(cat $VARDA_PROMPT_FILE)\" -C {project} --add-dir {varda_project} --add-dir {varda_home} -s workspace-write"]
+resume_command_template = "codex resume -C {project} --add-dir {varda_project} --add-dir {varda_home} -s workspace-write {external_session_id}"
 
 [agents.claude]
 kind = "acp"
 command = "claude"
-args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
+args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}", "--add-dir", "{varda_project}", "--add-dir", "{varda_home}"]
 interactive_command = "sh"
-interactive_args = ["-c", "claude \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --permission-mode acceptEdits"]
-resume_command_template = "claude --resume {external_session_id} --add-dir {project} --permission-mode acceptEdits"
+interactive_args = ["-c", "claude \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --permission-mode acceptEdits"]
+resume_command_template = "claude --resume {external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --permission-mode acceptEdits"
 
 [agents.copilot]
 kind = "acp"
 command = "sh"
-args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"]
-resume_command_template = "copilot --resume={external_session_id} --add-dir {project} --allow-all-tools"
+args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} -s"]
+resume_command_template = "copilot --resume={external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --allow-all-tools"
 
 [roles.tester]
 backend = "codex"
@@ -243,6 +243,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
         .with_context(|| format!("failed to parse config at {}", path.display()))?;
     resolve_config_paths(path, &mut config)?;
     remove_legacy_codex_exec_args(&mut config);
+    add_varda_project_dir_to_default_agents(&mut config);
 
     Ok(config)
 }
@@ -323,6 +324,117 @@ fn remove_legacy_codex_exec_args(config: &mut Config) {
     }
 }
 
+fn add_varda_project_dir_to_default_agents(config: &mut Config) {
+    for agent in config.agents.values_mut() {
+        match agent.command.as_str() {
+            "codex" => add_codex_varda_project_dir(agent),
+            "claude" => add_varda_dirs_as_arg_pairs(&mut agent.args),
+            "sh" if agent.args.first().is_some_and(|arg| arg == "-c")
+                && agent
+                    .args
+                    .get(1)
+                    .is_some_and(|arg| arg.contains("copilot ")) =>
+            {
+                add_varda_dirs_to_shell_arg(&mut agent.args);
+            }
+            _ => {}
+        }
+
+        if agent
+            .interactive_command
+            .as_deref()
+            .is_some_and(|command| command == "sh")
+        {
+            if agent
+                .interactive_args
+                .as_deref()
+                .and_then(|args| args.get(1))
+                .is_some_and(|arg| arg.contains("codex "))
+            {
+                if let Some(args) = agent.interactive_args.as_mut() {
+                    add_varda_dirs_to_shell_arg(args);
+                }
+            } else if agent
+                .interactive_args
+                .as_deref()
+                .and_then(|args| args.get(1))
+                .is_some_and(|arg| arg.contains("claude "))
+            {
+                if let Some(args) = agent.interactive_args.as_mut() {
+                    add_varda_dirs_to_shell_arg(args);
+                }
+            }
+        }
+
+        if let Some(template) = agent.resume_command_template.as_mut() {
+            if template.contains("codex resume") && !template.contains(" -C ") {
+                template.push_str(" -C {project}");
+            }
+            if template.contains("codex resume") && !template.contains(" -s ") {
+                template.push_str(" -s workspace-write");
+            }
+            if template.contains("codex resume")
+                || template.contains("claude --resume")
+                || template.contains("copilot --resume=")
+            {
+                add_shell_fragment_once(template, "--add-dir {varda_project}", "{varda_project}");
+                add_shell_fragment_once(template, "--add-dir {varda_home}", "{varda_home}");
+            }
+        }
+    }
+}
+
+fn add_codex_varda_project_dir(agent: &mut AgentConfig) {
+    let mut additions = Vec::new();
+    if !agent.args.iter().any(|arg| arg == "{varda_project}") {
+        additions.extend(["--add-dir".to_owned(), "{varda_project}".to_owned()]);
+    }
+    if !agent.args.iter().any(|arg| arg == "{varda_home}") {
+        additions.extend(["--add-dir".to_owned(), "{varda_home}".to_owned()]);
+    }
+    if additions.is_empty() {
+        return;
+    }
+
+    let insert_at = agent
+        .args
+        .iter()
+        .position(|arg| arg == "--sandbox")
+        .unwrap_or(agent.args.len());
+    agent.args.splice(insert_at..insert_at, additions);
+}
+
+fn add_varda_dirs_as_arg_pairs(args: &mut Vec<String>) {
+    add_arg_pair_once(args, "--add-dir", "{varda_project}");
+    add_arg_pair_once(args, "--add-dir", "{varda_home}");
+}
+
+fn add_arg_pair_once(args: &mut Vec<String>, flag: &str, value: &str) {
+    if args.iter().any(|arg| arg == value) {
+        return;
+    }
+    args.push(flag.to_owned());
+    args.push(value.to_owned());
+}
+
+fn add_varda_dirs_to_shell_arg(args: &mut [String]) {
+    if let Some(shell_command) = args.get_mut(1) {
+        add_shell_fragment_once(
+            shell_command,
+            "--add-dir {varda_project}",
+            "{varda_project}",
+        );
+        add_shell_fragment_once(shell_command, "--add-dir {varda_home}", "{varda_home}");
+    }
+}
+
+fn add_shell_fragment_once(command: &mut String, addition: &str, marker: &str) {
+    if !command.contains(marker) {
+        command.push(' ');
+        command.push_str(addition);
+    }
+}
+
 fn ensure_keep_file(path: &Path) -> Result<()> {
     if !path.exists() {
         fs::write(path, "").with_context(|| format!("failed to write {}", path.display()))?;
@@ -357,7 +469,11 @@ mod tests {
                 "--permission-mode",
                 "acceptEdits",
                 "--add-dir",
-                "{project}"
+                "{project}",
+                "--add-dir",
+                "{varda_project}",
+                "--add-dir",
+                "{varda_home}"
             ]
         );
         assert_eq!(
@@ -375,7 +491,7 @@ mod tests {
             config.agents["copilot"].args,
             vec![
                 "-c",
-                "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"
+                "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} -s"
             ]
         );
         assert_eq!(config.agents["codex"].max_prompt_tokens, None);
@@ -393,7 +509,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("varda-legacy-codex-{}.toml", std::process::id()));
         let config = DEFAULT_CONFIG.replace(
-            r#"args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]"#,
+            r#"args = ["exec", "--cd", ".", "--add-dir", "{varda_project}", "--add-dir", "{varda_home}", "--sandbox", "workspace-write", "-"]"#,
             r#"args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "--ask-for-approval", "never", "-"]"#,
         );
         fs::write(&path, config).expect("config should be written");
@@ -403,7 +519,18 @@ mod tests {
 
         assert_eq!(
             config.agents["codex"].args,
-            vec!["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
+            vec![
+                "exec",
+                "--cd",
+                ".",
+                "--add-dir",
+                "{varda_project}",
+                "--add-dir",
+                "{varda_home}",
+                "--sandbox",
+                "workspace-write",
+                "-"
+            ]
         );
     }
 

@@ -527,7 +527,10 @@ fn extract_copilot_workspace_id(log_path: &Path) -> Option<String> {
     None
 }
 
-async fn record_copilot_external_session(log_path: String, started_at: SystemTime) -> Option<String> {
+async fn record_copilot_external_session(
+    log_path: String,
+    started_at: SystemTime,
+) -> Option<String> {
     for _ in 0..20 {
         if let Some(process_log) = find_copilot_process_log(started_at) {
             if let Some(workspace_id) = extract_copilot_workspace_id(&process_log) {
@@ -855,7 +858,8 @@ fn args_for_request(args: &[String], request: &AgentRunRequest) -> Vec<String> {
 }
 
 fn expand_arg(arg: &str, request: &AgentRunRequest, project: &str) -> String {
-    arg.replace("{project}", project)
+    expand_varda_project(arg)
+        .replace("{project}", project)
         .replace("{task}", &request.task_path)
 }
 
@@ -869,9 +873,28 @@ fn resume_args_for_command(command: &str, resume_command: &str) -> Vec<String> {
 
 fn expand_request_value(value: &str, request: &AgentRunRequest) -> String {
     let Some(project) = request.frontmatter.project.as_deref() else {
-        return value.replace("{task}", &request.task_path);
+        return expand_varda_project(value).replace("{task}", &request.task_path);
     };
     expand_arg(value, request, project)
+}
+
+fn expand_varda_project(value: &str) -> String {
+    value
+        .replace("{varda_project}", env!("CARGO_MANIFEST_DIR"))
+        .replace("{varda_home}", &default_varda_home())
+}
+
+fn default_varda_home() -> String {
+    if let Ok(home) = std::env::var("VARDA_HOME") {
+        if !home.trim().is_empty() {
+            return home;
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+    std::path::Path::new(&home)
+        .join(".varda")
+        .display()
+        .to_string()
 }
 
 fn env_for_request(
@@ -1241,6 +1264,39 @@ mod tests {
     }
 
     #[test]
+    fn expands_varda_project_placeholders_in_args() {
+        let request = sample_request("codex", "/work/project");
+
+        let args = args_for_request(
+            &[
+                "exec".to_owned(),
+                "--cd".to_owned(),
+                ".".to_owned(),
+                "--add-dir".to_owned(),
+                "{varda_project}".to_owned(),
+                "--add-dir".to_owned(),
+                "{varda_home}".to_owned(),
+                "-".to_owned(),
+            ],
+            &request,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_owned(),
+                "--cd".to_owned(),
+                "/work/project".to_owned(),
+                "--add-dir".to_owned(),
+                env!("CARGO_MANIFEST_DIR").to_owned(),
+                "--add-dir".to_owned(),
+                default_varda_home(),
+                "-".to_owned()
+            ]
+        );
+    }
+
+    #[test]
     fn build_resume_command_substitutes_session_id_and_project() {
         let config = AgentConfig {
             kind: crate::config::AgentKind::Acp,
@@ -1308,8 +1364,7 @@ mod tests {
 
     #[test]
     fn find_copilot_process_log_in_picks_earliest_after_start() {
-        let dir =
-            std::env::temp_dir().join(format!("varda-copilot-logs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("varda-copilot-logs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // Create a file before started_at.
@@ -1344,8 +1399,8 @@ mod tests {
 
     #[test]
     fn find_copilot_process_log_in_returns_none_when_no_log_after_start() {
-        let dir = std::env::temp_dir()
-            .join(format!("varda-copilot-logs-none-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("varda-copilot-logs-none-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         std::fs::write(dir.join("process-00000.log"), b"old").unwrap();
@@ -1354,7 +1409,10 @@ mod tests {
         let started_at = SystemTime::now();
 
         let result = find_copilot_process_log_in(&dir, started_at);
-        assert!(result.is_none(), "expected no match when all logs predate started_at");
+        assert!(
+            result.is_none(),
+            "expected no match when all logs predate started_at"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

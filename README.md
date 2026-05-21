@@ -509,17 +509,24 @@ agents = ["codex"]
 [agents.codex]
 kind = "acp"
 command = "codex"
-args = ["exec", "--cd", ".", "--sandbox", "workspace-write", "-"]
+args = ["exec", "--cd", ".", "--add-dir", "{varda_project}", "--add-dir", "{varda_home}", "--sandbox", "workspace-write", "-"]
+interactive_command = "sh"
+interactive_args = ["-c", "codex \"$(cat $VARDA_PROMPT_FILE)\" -C {project} --add-dir {varda_project} --add-dir {varda_home} -s workspace-write"]
+resume_command_template = "codex resume -C {project} --add-dir {varda_project} --add-dir {varda_home} -s workspace-write {external_session_id}"
 
 [agents.claude]
 kind = "acp"
 command = "claude"
-args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}"]
+args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}", "--add-dir", "{varda_project}", "--add-dir", "{varda_home}"]
+interactive_command = "sh"
+interactive_args = ["-c", "claude \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --permission-mode acceptEdits"]
+resume_command_template = "claude --resume {external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --permission-mode acceptEdits"
 
 [agents.copilot]
 kind = "acp"
 command = "sh"
-args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} -s"]
+args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} -s"]
+resume_command_template = "copilot --resume={external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --allow-all-tools"
 
 [roles.tester]
 backend = "codex"
@@ -535,7 +542,7 @@ Run `varda config edit` to open the global config in `$EDITOR`. If `EDITOR` is n
 
 For now, `kind = "acp"` means Varda uses its ACP-facing agent abstraction. The concrete POC adapter drives the local Codex CLI with `codex exec` through stdin/stdout because this machine's Codex CLI does not expose a direct `--acp` flag.
 
-When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder.
+When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder. Varda also expands `{varda_project}` to the Varda source project directory and `{varda_home}` to the Varda control-plane directory, then passes both as additional writable directories to the default Codex, Claude, and Copilot launch commands, so interpreter and resume sessions can create follow-up Varda tasks after the current task finishes.
 
 ### Roles
 
@@ -559,7 +566,7 @@ Assign a task to `tester` after implementation when you want the agent to define
 
 To define a custom role, add a `[roles.<name>]` entry to your config with a `backend` that names an existing agent and an optional `instructions` string. No code changes are needed — Varda injects the instructions as a `## Role` section in the agent prompt at run time.
 
-The generated Claude Code args use `-p` for non-interactive output through stdin/stdout. Varda expands `{project}` in `--add-dir "{project}"` so Claude can access the tracked project while the task file remains in the global Varda control-plane folder.
+The generated Claude Code args use `-p` for non-interactive output through stdin/stdout. Varda expands `{project}` in `--add-dir "{project}"` so Claude can access the tracked project while the task file remains in the global Varda control-plane folder. The default Claude and Copilot configs also receive `{varda_project}` and `{varda_home}` as extra `--add-dir` entries.
 
 The generated GitHub Copilot args use `gh copilot suggest -t shell -` to drive the GitHub CLI copilot extension through stdin/stdout. The `-` at the end signals stdin input mode. You must have the `gh` CLI installed with the copilot extension (`gh extension install github/gh-copilot`).
 
