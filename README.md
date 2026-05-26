@@ -194,7 +194,7 @@ varda task add "Summarize this project" --exec --interactive
 
 In interactive mode the agent's stderr appears directly in the terminal (so you can see tool calls and progress in real time), stdout is streamed to the terminal and also captured for the session log, and your keyboard input is forwarded to the agent's stdin after the initial prompt is delivered. Interactive runs bypass the configured `timeout_seconds`: Varda will wait for the agent for as long as the session lasts, and the time-limit hint is omitted from the agent prompt.
 
-The interactive prompt also drops the structured recap requirements (file lists, `requires_user` markers, etc.), since those don't fit a free-form conversation. Once the interactive session ends, Varda prints a status line and runs a non-interactive **interpretation pass**: the same agent backend re-reads the session log and produces the standard Varda recap. The interpretation pass is bounded by `timeout_seconds`.
+The interactive prompt also drops the structured recap requirements (file lists, `requires_user` markers, etc.), since those don't fit a free-form conversation. By default, interactive agents still leave project changes unstaged for Varda to commit after the session, but if the task or live conversation explicitly asks the agent to commit, the agent may create a commit scoped to its own work. Once the interactive session ends, Varda prints a status line and runs a non-interactive **interpretation pass**: the same agent backend re-reads the session log and produces the standard Varda recap. The interpretation pass is bounded by `timeout_seconds`.
 
 When the interpreter pass starts, Varda prints a notice on stderr so you don't mistake the wait for a hang and kill the process.
 
@@ -586,7 +586,9 @@ For a task that needs user input, the commit also includes:
 
 - a notification JSON file under the global `operations/runs/` folder
 
-Agents must NOT run `git add` or `git commit` themselves. Instead, every agent recap must include a `Files touched` heading listing one absolute path per line (or `(none)`). Varda parses that section and, before committing the operations metadata, stages and commits exactly those paths in the project repo (which may differ from the operations repo). This avoids interactive git prompts inside the agent process and keeps the commit boundary under Varda's control. Paths outside the project's git repo are skipped with a warning.
+Agents must NOT run `git add` or `git commit` themselves during normal non-interactive runs. Instead, every agent recap must include a `Files touched` heading listing one absolute path per line (or `(none)`). Varda parses that section and, before committing the operations metadata, stages and commits exactly those paths in the project repo (which may differ from the operations repo). This avoids interactive git prompts inside the agent process and keeps the commit boundary under Varda's control. Paths outside the project's git repo are skipped with a warning.
+
+Interactive runs use the same Varda-owned commit flow by default. The exception is an explicit user request: when the task text or live interactive conversation asks the agent to commit, the interactive agent may stage and commit only its own changes. Varda still runs the interpretation pass afterward; if the reported project files are already committed, Varda's project-file commit step has nothing further to commit.
 
 When running on macOS, Varda also sends a best-effort native notification signal for tasks that need user input. Signal delivery failures are reported to stderr but do not prevent the notification JSON from being written.
 

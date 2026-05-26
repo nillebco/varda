@@ -105,11 +105,13 @@ If you need user input, stop and use the true marker."#
 pub fn build_interactive_instructions() -> String {
     r#"You are running an interactive task session managed by Varda.
 
-Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder. When those files are present, Varda includes their contents below as Project instructions; treat them as mandatory task requirements.
+Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder. When those files are present, Varda includes their contents below as Project instructions; treat them as mandatory task requirements. If those project instructions describe Varda's default git handoff by forbidding agent commits, apply the interactive git rule below.
 
 Help the user accomplish the task. Collaborate with them as you normally would in an interactive shell session: ask clarifying questions when needed, take actions, and report results conversationally. There is no time limit.
 
-Do NOT run `git add`, `git commit`, or any other git history-modifying command. Leave the changes in the working tree, unstaged. Varda commits the files reported by the interpreter pass after the session ends.
+By default, do NOT run `git add`, `git commit`, or any other git history-modifying command. Leave the changes in the working tree, unstaged. Varda commits the files reported by the interpreter pass after the session ends.
+
+If the user explicitly asks you to commit in the task or during this interactive session, you may run the git commands needed to commit the changes you made. Keep the commit scoped to your own work and leave unrelated user changes untouched.
 
 Do NOT produce a structured Varda recap, file list, or `requires_user` marker yourself. Once the session ends, Varda will pass the session log to a separate interpreter pass that produces those artifacts. Just focus on doing the work with the user."#.to_owned()
 }
@@ -278,6 +280,7 @@ mod tests {
         assert!(instructions.contains("absolute file path"));
         assert!(instructions.contains("requires_user"));
         assert!(instructions.contains("Do NOT run `git add`"));
+        assert!(!instructions.contains("interactive git rule"));
         assert!(!instructions.contains("Agent field below is `tester`"));
     }
 
@@ -317,6 +320,8 @@ mod tests {
         assert!(!instructions.contains("at most"));
         assert!(!instructions.contains("minutes."));
         assert!(!instructions.contains("Files touched"));
+        assert!(instructions.contains("By default, do NOT run `git add`"));
+        assert!(instructions.contains("If the user explicitly asks you to commit"));
         assert!(instructions.contains("Do NOT produce a structured Varda recap"));
         assert!(instructions.contains("interpreter pass"));
     }
