@@ -91,6 +91,12 @@ pub async fn run_task(
         time::timeout(timeout, client.run_task(request)).await
     };
 
+    let _interactive_finalization_guard = if interactive {
+        Some(InteractiveFinalizationGuard::activate()?)
+    } else {
+        None
+    };
+
     let session_outcome = match agent_result {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(error)) => {
@@ -263,6 +269,8 @@ pub async fn resume_interactive_task(
             task_path.display()
         )
     })?;
+
+    let _interactive_finalization_guard = InteractiveFinalizationGuard::activate()?;
 
     if let Some(resume) = session_result.resume_command.as_deref() {
         task.frontmatter
@@ -509,6 +517,71 @@ async fn interpret_interactive_session(
     eprintln!("Interpreter pass completed; writing recap.");
 
     Ok(result)
+}
+
+#[cfg(unix)]
+struct InteractiveFinalizationGuard {
+    previous_sigint_action: libc::sigaction,
+}
+
+#[cfg(unix)]
+impl InteractiveFinalizationGuard {
+    fn activate() -> Result<Self> {
+        let mut ignore_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        ignore_action.sa_sigaction = libc::SIG_IGN;
+        unsafe {
+            libc::sigemptyset(&mut ignore_action.sa_mask);
+        }
+        ignore_action.sa_flags = 0;
+
+        let mut previous_sigint_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        let result =
+            unsafe { libc::sigaction(libc::SIGINT, &ignore_action, &mut previous_sigint_action) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to protect interactive finalization from Ctrl-C");
+        }
+
+        eprintln!(
+            "Ctrl-C is temporarily disabled while Varda stores the interactive session result."
+        );
+
+        Ok(Self {
+            previous_sigint_action,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InteractiveFinalizationGuard {
+    fn drop(&mut self) {
+        let result = unsafe {
+            libc::sigaction(
+                libc::SIGINT,
+                &self.previous_sigint_action,
+                std::ptr::null_mut(),
+            )
+        };
+        if result == -1 {
+            eprintln!(
+                "warning: failed to restore Ctrl-C handling after interactive finalization: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct InteractiveFinalizationGuard;
+
+#[cfg(not(unix))]
+impl InteractiveFinalizationGuard {
+    fn activate() -> Result<Self> {
+        eprintln!(
+            "Please wait while Varda stores the interactive session result before closing this process."
+        );
+        Ok(Self)
+    }
 }
 
 fn read_session_log_excerpt(path: &Path) -> Result<String> {
