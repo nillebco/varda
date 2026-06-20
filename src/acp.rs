@@ -101,6 +101,7 @@ impl AcpSubprocessClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        protect_interpreter_from_terminal_sigint(&mut command_builder, request);
         if let Some(working_dir) = working_dir.as_deref() {
             command_builder.current_dir(working_dir);
         }
@@ -878,6 +879,23 @@ fn resume_args_for_command(command: &str, resume_command: &str) -> Vec<String> {
     }
 }
 
+#[cfg(unix)]
+fn protect_interpreter_from_terminal_sigint(
+    command_builder: &mut Command,
+    request: &AgentRunRequest,
+) {
+    if request.interpret {
+        command_builder.process_group(0);
+    }
+}
+
+#[cfg(not(unix))]
+fn protect_interpreter_from_terminal_sigint(
+    _command_builder: &mut Command,
+    _request: &AgentRunRequest,
+) {
+}
+
 fn expand_request_value(value: &str, request: &AgentRunRequest) -> String {
     let Some(project) = request.frontmatter.project.as_deref() else {
         return expand_varda_project(value).replace("{task}", &request.task_path);
@@ -1064,6 +1082,69 @@ mod tests {
         assert!(result.recap.contains("You have at most 10 minutes"));
         assert!(result.recap.contains("Do it."));
         assert!(!result.requires_user);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interpreter_subprocess_uses_separate_process_group() {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf '%s' \"$(ps -o pgid= -p $$ | tr -d ' ')\"".to_owned(),
+            ],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            resume_command_template: None,
+        };
+        let client = AcpSubprocessClient::new("shell", &config);
+
+        let result = client
+            .run_task(AgentRunRequest {
+                agent_name: "shell".to_owned(),
+                role_instructions: None,
+                task_path: "task.md".to_owned(),
+                frontmatter: TaskFrontmatter {
+                    id: None,
+                    status: TaskStatus::Ready,
+                    project: Some("/work/project".to_owned()),
+                    assignee: Some("shell".to_owned()),
+                    recap: None,
+                    recaps: vec![],
+                    plan: None,
+                    agent_session_id: None,
+                    agent_session_log: None,
+                    agent_session_ids: vec![],
+                    agent_session_logs: vec![],
+                    agent_resume_commands: vec![],
+                    requires_user: false,
+                },
+                body: "# Task\n\nInterpret it.".to_owned(),
+                timeout: Duration::from_secs(600),
+                session_id: "session-1-interpret".to_owned(),
+                session_log_path: None,
+                interactive: false,
+                interpret: true,
+                stream: false,
+                resume_command: None,
+            })
+            .await
+            .expect("interpreter subprocess should run");
+
+        let child_process_group: libc::pid_t = result
+            .recap
+            .parse()
+            .expect("subprocess should print its process group");
+        let parent_process_group = unsafe { libc::getpgrp() };
+
+        assert_ne!(
+            child_process_group, parent_process_group,
+            "interpreter subprocess should not share Varda's foreground process group"
+        );
     }
 
     #[tokio::test]
