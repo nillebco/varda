@@ -1,6 +1,7 @@
 //! ACP transport support.
 
 use std::collections::BTreeMap;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
@@ -233,6 +234,8 @@ impl AcpSubprocessClient {
                 command_builder.current_dir(working_dir);
             }
 
+            set_terminal_title_for_agent(&self.agent_name);
+
             let mut child = command_builder.spawn().with_context(|| {
                 format!(
                     "failed to resume interactive agent '{}' with command '{}'",
@@ -289,6 +292,8 @@ impl AcpSubprocessClient {
                 command_builder.current_dir(working_dir);
             }
 
+            set_terminal_title_for_agent(&self.agent_name);
+
             let mut child = command_builder.spawn().with_context(|| {
                 format!(
                     "failed to start interactive agent '{}' with command '{}'",
@@ -343,6 +348,8 @@ impl AcpSubprocessClient {
         if let Some(working_dir) = working_dir.as_deref() {
             command_builder.current_dir(working_dir);
         }
+
+        set_terminal_title_for_agent(&self.agent_name);
 
         let mut child = command_builder.spawn().with_context(|| {
             format!(
@@ -972,6 +979,33 @@ fn append_session_log(path: &str, content: &str) -> Result<()> {
     Ok(())
 }
 
+fn set_terminal_title_for_agent(agent_name: &str) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(terminal_title_sequence(agent_name).as_bytes());
+    let _ = stdout.flush();
+}
+
+fn terminal_title_sequence(agent_name: &str) -> String {
+    format!("\x1b]0;{}\x07", terminal_title(agent_name))
+}
+
+fn terminal_title(agent_name: &str) -> String {
+    let agent_name = agent_name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>();
+    let agent_name = agent_name.trim();
+    if agent_name.is_empty() {
+        "varda + agent".to_owned()
+    } else {
+        format!("varda + {agent_name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1360,6 +1394,17 @@ mod tests {
             resume_args_for_command("agent", "opaque resume string"),
             vec!["opaque resume string".to_owned()]
         );
+    }
+
+    #[test]
+    fn terminal_title_sequence_names_varda_and_agent() {
+        assert_eq!(terminal_title_sequence("codex"), "\x1b]0;varda + codex\x07");
+    }
+
+    #[test]
+    fn terminal_title_sanitizes_control_characters() {
+        assert_eq!(terminal_title("co\x1bdex\x07"), "varda + co dex");
+        assert_eq!(terminal_title("\n\t"), "varda + agent");
     }
 
     #[test]
