@@ -114,6 +114,9 @@ enum TaskCommand {
         /// Project path to list tasks for. Defaults to the current directory.
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Include backlog and done tasks.
+        #[arg(long)]
+        all: bool,
     },
     /// Run a markdown task through the configured agent.
     Run {
@@ -378,11 +381,14 @@ async fn main() -> Result<()> {
                     open_editor(&task_path)?;
                 }
             }
-            TaskCommand::List { project } => {
+            TaskCommand::List { project, all } => {
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
-                let tasks = task::list_tasks(&config, &project_path)?;
+                let mut tasks = task::list_tasks(&config, &project_path)?;
+                if !all {
+                    tasks.retain(|task| is_active_task_status(task.status));
+                }
                 print_task_list(&project_path, &tasks);
             }
             TaskCommand::Run {
@@ -400,7 +406,11 @@ async fn main() -> Result<()> {
             TaskCommand::Plan { task } => {
                 plan_task_command(&task).await?;
             }
-            TaskCommand::Resume { task, fresh, interactive } => {
+            TaskCommand::Resume {
+                task,
+                fresh,
+                interactive,
+            } => {
                 resume_task_command(&task, fresh, interactive).await?;
             }
             TaskCommand::ResumeSession { task } => {
@@ -2055,6 +2065,10 @@ fn print_task_list(project_path: &Path, tasks: &[task::TaskSummary]) {
     }
 }
 
+fn is_active_task_status(status: task::TaskStatus) -> bool {
+    !matches!(status, task::TaskStatus::Backlog | task::TaskStatus::Done)
+}
+
 fn truncate_for_table(value: &str, width: usize) -> String {
     if value.chars().count() <= width {
         return value.to_owned();
@@ -2791,6 +2805,24 @@ planner_agent: codex
 "#;
 
         assert_eq!(plan_planner_agent(content).as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn task_list_active_statuses_exclude_backlog_and_done() {
+        use task::TaskStatus;
+
+        for status in [
+            TaskStatus::Ready,
+            TaskStatus::Running,
+            TaskStatus::Pending,
+            TaskStatus::NeedsUser,
+            TaskStatus::Failed,
+        ] {
+            assert!(is_active_task_status(status));
+        }
+
+        assert!(!is_active_task_status(TaskStatus::Backlog));
+        assert!(!is_active_task_status(TaskStatus::Done));
     }
 
     #[test]

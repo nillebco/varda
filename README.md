@@ -242,6 +242,13 @@ List tasks for the current project with:
 varda task list
 ```
 
+By default, `task list` shows active tasks only and hides `backlog` and `done`.
+Include every task for the project with:
+
+```sh
+varda task list --all
+```
+
 Or list tasks for another project path:
 
 ```sh
