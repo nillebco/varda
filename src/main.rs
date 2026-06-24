@@ -1399,10 +1399,15 @@ struct DashboardTask {
     assignee: Option<String>,
     title: String,
     path: String,
-    markdown: String,
-    recaps: Vec<DashboardRecap>,
     #[serde(skip_serializing_if = "Option::is_none")]
     completed_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardTaskDetail {
+    path: String,
+    markdown: String,
+    recaps: Vec<DashboardRecap>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1513,6 +1518,14 @@ fn handle_dashboard_connection(
                 serde_json::to_string(&payload).context("failed to encode dashboard JSON")?;
             write_http_response(stream, "200 OK", "application/json", &json)
         }
+        ("GET", "/api/tasks/detail") => {
+            let path =
+                query_param(target, "path").context("missing required query parameter 'path'")?;
+            let detail = load_dashboard_task_detail(config, Path::new(&path))?;
+            let json = serde_json::to_string(&detail)
+                .context("failed to encode dashboard task detail JSON")?;
+            write_http_response(stream, "200 OK", "application/json", &json)
+        }
         ("POST", "/api/tasks/status") => {
             let update: DashboardStatusUpdate =
                 serde_json::from_str(body).context("failed to decode dashboard status update")?;
@@ -1603,27 +1616,7 @@ fn load_dashboard_payload(
             }
         }
 
-        let document = task::load_task(&summary.path)?;
-        let markdown = fs::read_to_string(&summary.path)
-            .with_context(|| format!("failed to read task at {}", summary.path.display()))?;
-        let mut completed_at = file_mtime_seconds(&summary.path);
-        let mut recaps = Vec::new();
-        for recap_path in &document.frontmatter.recaps {
-            let resolved = resolve_recap_path(recap_path, &summary.path);
-            if let Some(mtime) = file_mtime_seconds(&resolved) {
-                completed_at = Some(completed_at.map_or(mtime, |current| current.max(mtime)));
-            }
-            let markdown = fs::read_to_string(&resolved).unwrap_or_else(|error| {
-                format!(
-                    "# Recap Unavailable\n\nFailed to read {}: {error}",
-                    resolved.display()
-                )
-            });
-            recaps.push(DashboardRecap {
-                path: resolved.display().to_string(),
-                markdown,
-            });
-        }
+        let completed_at = file_mtime_seconds(&summary.path);
 
         tasks.push(DashboardTask {
             id: summary.id,
@@ -1632,8 +1625,6 @@ fn load_dashboard_payload(
             assignee: summary.assignee,
             title: summary.title,
             path: summary.path.display().to_string(),
-            markdown,
-            recaps,
             completed_at,
         });
     }
@@ -1655,6 +1646,79 @@ fn load_dashboard_payload(
             "done",
         ],
     })
+}
+
+fn load_dashboard_task_detail(
+    config: &config::Config,
+    task_path: &Path,
+) -> Result<DashboardTaskDetail> {
+    let task_path = task::resolve_task_reference(config, task_path)?;
+    let document = task::load_task(&task_path)?;
+    let markdown = fs::read_to_string(&task_path)
+        .with_context(|| format!("failed to read task at {}", task_path.display()))?;
+    let recaps = document
+        .frontmatter
+        .recaps
+        .iter()
+        .map(|recap_path| {
+            let resolved = resolve_recap_path(recap_path, &task_path);
+            let markdown = fs::read_to_string(&resolved).unwrap_or_else(|error| {
+                format!(
+                    "# Recap Unavailable\n\nFailed to read {}: {error}",
+                    resolved.display()
+                )
+            });
+            DashboardRecap {
+                path: resolved.display().to_string(),
+                markdown,
+            }
+        })
+        .collect();
+
+    Ok(DashboardTaskDetail {
+        path: task_path.display().to_string(),
+        markdown,
+        recaps,
+    })
+}
+
+fn query_param(target: &str, name: &str) -> Option<String> {
+    let query = target.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == name {
+            Some(percent_decode(value.replace('+', " ").as_bytes()))
+        } else {
+            None
+        }
+    })
+}
+
+fn percent_decode(input: &[u8]) -> String {
+    let mut output = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            if let (Some(high), Some(low)) = (hex_value(input[i + 1]), hex_value(input[i + 2])) {
+                output.push((high << 4) | low);
+                i += 3;
+                continue;
+            }
+        }
+        output.push(input[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 const DASHBOARD_HTML: &str = r##"<!doctype html>
@@ -1721,6 +1785,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     const statuses = ["backlog", "ready", "running", "needs_user", "failed", "pending", "done"];
     let payload = { tasks: [], projects: [], statuses };
     let selectedPath = "";
+    let selectedDetail = null;
+    let detailLoadingPath = "";
     let initializedFilters = false;
 
     function label(value) {
@@ -1757,6 +1823,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function closeDetails() {
       selectedPath = "";
+      selectedDetail = null;
+      detailLoadingPath = "";
       document.querySelector("main").classList.remove("details-open");
       document.getElementById("details").className = "empty";
       document.getElementById("details").innerHTML = "";
@@ -1821,7 +1889,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             button.classList.add("dragging");
           };
           button.ondragend = () => button.classList.remove("dragging");
-          button.onclick = () => { selectedPath = task.path; renderBoard(); renderDetails(task); };
+          button.onclick = () => { selectedPath = task.path; selectedDetail = null; detailLoadingPath = ""; renderBoard(); renderDetails(task); };
           const id = task.id === null || task.id === undefined ? "unversioned" : `#${task.id}`;
           const projectChip = (payload.scope === "all projects" && task.project)
             ? task.project.replace(/\\/g, "/").split("/").filter(Boolean).pop() || task.project
@@ -1894,19 +1962,34 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const taskHeading = document.createElement("h3");
       taskHeading.textContent = "Task";
       details.appendChild(taskHeading);
+      if (!selectedDetail || selectedDetail.path !== task.path) {
+        const loading = document.createElement("p");
+        loading.className = "meta";
+        loading.textContent = "Loading task details...";
+        details.appendChild(loading);
+        if (detailLoadingPath !== task.path) {
+          detailLoadingPath = task.path;
+          fetchTaskDetail(task.path).catch(error => {
+            if (selectedPath === task.path) {
+              details.textContent = `Failed to load task details: ${error}`;
+            }
+          });
+        }
+        return;
+      }
       const taskPre = document.createElement("pre");
-      taskPre.textContent = task.markdown;
+      taskPre.textContent = selectedDetail.markdown;
       details.appendChild(taskPre);
       const recapHeading = document.createElement("h3");
       recapHeading.textContent = "Recaps";
       details.appendChild(recapHeading);
-      if (!task.recaps.length) {
+      if (!selectedDetail.recaps.length) {
         const empty = document.createElement("p");
         empty.className = "meta";
         empty.textContent = "No recaps are associated with this task.";
         details.appendChild(empty);
       }
-      for (const recap of task.recaps) {
+      for (const recap of selectedDetail.recaps) {
         const recapPath = document.createElement("div");
         recapPath.className = "path";
         recapPath.textContent = recap.path;
@@ -1914,6 +1997,20 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         const recapPre = document.createElement("pre");
         recapPre.textContent = recap.markdown;
         details.appendChild(recapPre);
+      }
+    }
+
+    async function fetchTaskDetail(path) {
+      const response = await fetch(`/api/tasks/detail?path=${encodeURIComponent(path)}`, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const detail = await response.json();
+      if (selectedPath === path) {
+        detailLoadingPath = "";
+        selectedDetail = detail;
+        const task = payload.tasks.find(task => task.path === path);
+        if (task) renderDetails(task);
       }
     }
 
@@ -2838,6 +2935,17 @@ planner_agent: codex
             Some("/tmp/task.md")
         );
         assert_eq!(session_log_value(content, "missing"), None);
+    }
+
+    #[test]
+    fn decodes_dashboard_query_params() {
+        let target = "/api/tasks/detail?path=%2Ftmp%2Ftask%20one.md&unused=true";
+
+        assert_eq!(
+            query_param(target, "path").as_deref(),
+            Some("/tmp/task one.md")
+        );
+        assert_eq!(query_param(target, "missing"), None);
     }
 
     #[test]
