@@ -1,7 +1,7 @@
 ---
 name: varda
 description: This skill should be used when the user asks to "add a varda task", "create a task", "list varda tasks", "run a task", "show a task", "resume a task", "plan tasks", "add a project to varda", or manage their AI-agent task pipeline via Varda. Varda routes markdown tasks to AI agents (Claude, Codex, Copilot) and tracks their lifecycle.
-version: 0.2.0
+version: 0.3.0
 ---
 
 # Varda Task Management
@@ -15,7 +15,10 @@ Varda is a CLI tool that routes markdown tasks to AI agents and tracks their lif
 | Create a task | `varda task add "task name" --project /path/to/project --agent claude` |
 | Create with a detailed body, ready to run | `varda task add "task name" --project /path --agent claude --ready < body.md` |
 | Run a one-line task immediately (body ignored) | `varda task add "do X" --project /path --agent claude --exec` |
-| Run a task in the background | `varda task run <id> --background` |
+| Run a task in the background (no wait) | `varda task run <id> --background` |
+| Run a task in the foreground (wait until done) | `varda task run <id>` |
+| Set a task's status directly | `varda task set-status <id> ready` |
+| Runtime diagnostics / live processes | `varda task inspect <id>` |
 | List tasks for a project | `varda task list --project /path/to/project` |
 | List all tasks (from project dir) | `varda task list` |
 | Run a task | `varda task run <task_path_or_id>` |
@@ -87,6 +90,34 @@ varda task list --project /Users/nilleb/dev/brain   # confirm status flips to "r
 `varda task run` flags: `--background` (spawn and return immediately), `--interactive` (forward stdin/stdout), `--quiet` (suppress live streaming).
 
 **Project + agent choice for research/writing tasks:** the catch-all route `glob = "**"` in `~/.varda/config.toml` maps to agents `codex` and `claude`. A non-code investigation whose deliverable is a vault doc can use `--project /Users/nilleb/dev/brain --agent claude`; the agent runs with `--add-dir {project}` so it can write into `ADB/Documentation/` etc. Always pass an explicit `--agent` to skip the interactive assignee prompt.
+
+### Run modes & waiting for a task
+
+There is **no `wait` command and no queue/lock** to block on an *already-detached* background run. Whether `varda task run` waits is decided entirely by the run mode you pick at launch:
+
+| Mode | Flag | Waiting behavior |
+|------|------|------------------|
+| **Foreground** (default) | *(none)* | **Blocks until the agent finishes**, streams stdout live, then prints the recap. This *is* the built-in "wait in line." |
+| Background | `--background` | Detaches immediately, returns a PID — does **not** wait. |
+| Interactive | `--interactive` | Waits for the whole session; **bypasses `timeout_seconds`**. |
+
+So to "wait in line" for a task, run it in the **foreground** (omit `--background`) and the call blocks until done. Notes:
+
+- Parallel runs are **allowed, not serialized** — running multiple tasks at once just disables live stdout streaming (also disabled when stdout isn't a TTY). There is no lock to queue behind.
+- For an *already* backgrounded run there's no Varda-native wait: wait at the OS level (`wait <pid>` in the same shell) or poll `varda task list` / `varda task show <id>`. `varda task inspect <id>` shows live-process diagnostics but does **not** block.
+- Prefer a **foreground** run when you want to act on the result immediately; reserve `--background` for fire-and-forget where you'll poll later.
+
+### Re-spin a finished task with new indications
+
+To iterate on a task that already ran (status `pending`/`failed`) — e.g. to feed back corrections or verified facts — append your notes to the task `.md` body, flip it back to runnable, and run again. The new run appends another recap + session id; prior recaps are preserved.
+
+```bash
+varda task edit <id>                 # append an "ITERATION 2" section with new indications
+varda task set-status <id> ready     # pending → ready (or just run; run re-executes regardless)
+varda task run <id>                  # foreground to wait, or --background to detach
+```
+
+`varda task show <id>` then prints **all** recaps in order, so you can compare iterations.
 
 ### Check task status and recap
 
