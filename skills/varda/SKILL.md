@@ -1,7 +1,7 @@
 ---
 name: varda
 description: This skill should be used when the user asks to "add a varda task", "create a task", "list varda tasks", "run a task", "show a task", "resume a task", "plan tasks", "add a project to varda", or manage their AI-agent task pipeline via Varda. Varda routes markdown tasks to AI agents (Claude, Codex, Copilot) and tracks their lifecycle.
-version: 0.1.0
+version: 0.2.0
 ---
 
 # Varda Task Management
@@ -13,7 +13,9 @@ Varda is a CLI tool that routes markdown tasks to AI agents and tracks their lif
 | Goal | Command |
 |------|---------|
 | Create a task | `varda task add "task name" --project /path/to/project --agent claude` |
-| Create and run immediately | `varda task add "task name" --project /path --agent claude --exec` |
+| Create with a detailed body, ready to run | `varda task add "task name" --project /path --agent claude --ready < body.md` |
+| Run a one-line task immediately (body ignored) | `varda task add "do X" --project /path --agent claude --exec` |
+| Run a task in the background | `varda task run <id> --background` |
 | List tasks for a project | `varda task list --project /path/to/project` |
 | List all tasks (from project dir) | `varda task list` |
 | Run a task | `varda task run <task_path_or_id>` |
@@ -62,6 +64,29 @@ varda task add "fix login bug" --project /Users/nilleb/dev/myapp --agent claude 
 ```
 
 Without `--exec`, Varda opens `$EDITOR` so the user can fill in the task details before it becomes ready.
+
+### Create a detailed task non-interactively, then run it (preferred for agents)
+
+`--exec` treats the **task name itself as the entire one-line task** — any body you provide is ignored, and it would otherwise block on `$EDITOR`. So for a real task with a multi-paragraph brief, **do not use `--exec`**. Instead give the body and mark it ready in one shot, then run it separately:
+
+- The **task name** is the first positional arg.
+- The **body** is the second positional arg, OR is read from **stdin** when stdin is not a terminal (pipe or `<` redirect — best for long, multi-line briefs to avoid shell-quoting pain).
+- `--ready` sets status to `ready` immediately (skips the backlog), so the task can be run without an editor round-trip.
+
+```bash
+# Write the brief to a temp file, then pipe it as the task body:
+varda task add "Short task title" \
+  --project /Users/nilleb/dev/brain --agent claude --ready < /tmp/task-body.md
+# → prints: created task #NNN /Users/.../tasks/.../short-task-title.md
+
+# Then start it in the background so it doesn't block the session:
+varda task run NNN --background          # prints the pid
+varda task list --project /Users/nilleb/dev/brain   # confirm status flips to "running"
+```
+
+`varda task run` flags: `--background` (spawn and return immediately), `--interactive` (forward stdin/stdout), `--quiet` (suppress live streaming).
+
+**Project + agent choice for research/writing tasks:** the catch-all route `glob = "**"` in `~/.varda/config.toml` maps to agents `codex` and `claude`. A non-code investigation whose deliverable is a vault doc can use `--project /Users/nilleb/dev/brain --agent claude`; the agent runs with `--add-dir {project}` so it can write into `ADB/Documentation/` etc. Always pass an explicit `--agent` to skip the interactive assignee prompt.
 
 ### Check task status and recap
 
@@ -116,7 +141,8 @@ The glob pattern matches the project path during task routing.
 
 ## When to Use Which Command
 
-- User wants to **delegate work to an agent**: `varda task add --exec`
+- User wants to **delegate a detailed task to an agent**: `varda task add ... --ready < body.md` then `varda task run <id> --background`
+- User wants to **fire off a quick one-liner**: `varda task add "do X" --exec` (the name *is* the task; body ignored)
 - User wants to **review what was done**: `varda task show`
 - User wants to **see all pending work**: `varda task list`
 - Agent stopped and **needs information**: `varda task resume`
