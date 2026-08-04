@@ -748,6 +748,292 @@ impl SandboxSession for DockerSession {
     }
 }
 
+/// microVM provider backed by the `msb` (microsandbox) CLI.
+///
+/// Mirrors [`DockerProvider`] but shells to `msb` instead of `docker`, so the
+/// spawn / stdin-prompt / stdout-capture / kill-on-drop path in `acp.rs` is
+/// unchanged. The isolation is stronger (own-kernel microVM rather than a
+/// shared-kernel container); the session-store handling reuses the docker
+/// "materialize after the run via `cp`" model, since a microVM's guest HOME is
+/// not a host bind mount.
+///
+/// NOTE ON CLI GRAMMAR: the exact `msb` flag spellings below were derived from
+/// the installed `msb 0.6.8` binary's embedded help (`run` takes an image plus
+/// a command; `--name`, `--mount HOST:GUEST`, `--workdir`, `--env K=V`,
+/// `--cpus`/`--memory`, network rules via `--net-*`). They are centralized in
+/// [`MicrosandboxSession::wrap`] / [`MicrosandboxSession::extract_session_store`]
+/// so a single `msb <cmd> --help` can confirm or correct them in one place.
+pub struct MicrosandboxProvider {
+    name: String,
+    /// Pre-existing OCI image reference `msb` can pull, or the tag produced by a
+    /// docker build of `build`. `None` when `build` is set.
+    image: Option<String>,
+    /// Path to a Dockerfile built (via docker, content-addressed) into an image
+    /// `msb` then runs. Lets a project bake its agent CLI into the microVM.
+    build: Option<String>,
+    /// Extra host mounts (origin-tagged, `source[:target][:mode]` grammar),
+    /// unioned and de-duplicated by target at wrap time — same as docker.
+    mounts: Vec<(MountOrigin, String)>,
+    /// Egress allow-list of hostnames. Empty ⇒ fully offline; non-empty ⇒
+    /// default-deny with only these hosts permitted outbound.
+    egress: Vec<String>,
+}
+
+impl MicrosandboxProvider {
+    /// Build a microsandbox provider from its `[sandboxes.<name>]` entry. Same
+    /// shape as [`DockerProvider::from_config`]: `image` or `build` is required,
+    /// the mount set is the union of sandbox- and route-origin mounts.
+    pub fn from_config(
+        name: &str,
+        config: &SandboxConfig,
+        route_mounts: &[String],
+    ) -> Result<Self> {
+        let image = config.image.clone().filter(|image| !image.is_empty());
+        let build = config.build.clone().filter(|build| !build.is_empty());
+        if image.is_none() && build.is_none() {
+            bail!(
+                "sandbox '{name}' needs an `image` or a `build` path (required for the microsandbox provider)"
+            );
+        }
+        let mounts = config
+            .mounts
+            .iter()
+            .map(|m| (MountOrigin::Sandbox, m.clone()))
+            .chain(route_mounts.iter().map(|m| (MountOrigin::Route, m.clone())))
+            .collect();
+        Ok(Self {
+            name: name.to_owned(),
+            image,
+            build,
+            mounts,
+            egress: config.egress.clone(),
+        })
+    }
+
+    /// Resolve the concrete image reference to run: a `build` sandbox builds its
+    /// Dockerfile (content-addressed, cached, via docker) into a tag `msb` runs;
+    /// otherwise the configured OCI reference is used verbatim.
+    async fn resolve_image(&self) -> Result<String> {
+        if let Some(build) = &self.build {
+            return build_image(&self.name, build).await;
+        }
+        self.image
+            .clone()
+            .with_context(|| format!("sandbox '{}' has neither image nor build", self.name))
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for MicrosandboxProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn prepare(&self, ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
+        // Host-side dir the guest session store is `msb cp`-ed into after the run
+        // (never a bind mount — the microVM guest HOME lives in VM storage).
+        let session_store = varda_sessions_root().join(ctx.session_id);
+        std::fs::create_dir_all(&session_store).with_context(|| {
+            format!(
+                "failed to create sandbox session store {}",
+                session_store.display()
+            )
+        })?;
+        let handle = sanitize_docker_name(ctx.session_id);
+        let image = self.resolve_image().await?;
+        Ok(Box::new(MicrosandboxSession {
+            image,
+            project_root: ctx.project_root.to_path_buf(),
+            mounts: self.mounts.clone(),
+            egress: self.egress.clone(),
+            session_store,
+            sandbox: format!("varda-sbx-{handle}"),
+            home: "/home/agent".to_owned(),
+        }))
+    }
+}
+
+pub struct MicrosandboxSession {
+    image: String,
+    project_root: PathBuf,
+    mounts: Vec<(MountOrigin, String)>,
+    /// Egress allow-list of hostnames (unresolved — `msb` net rules take names /
+    /// CIDRs directly). Empty ⇒ fully offline.
+    egress: Vec<String>,
+    /// Host dir the guest session store is `msb cp`-ed into AFTER the run.
+    session_store: PathBuf,
+    /// Per-session microVM sandbox name (for `exec`/`cp`/`stop`/`rm`).
+    sandbox: String,
+    /// In-guest HOME path; the agent writes its session store here.
+    home: String,
+}
+
+#[async_trait]
+impl SandboxSession for MicrosandboxSession {
+    fn wrap(&self, spec: CommandSpec) -> Result<CommandSpec> {
+        // Mount the project at the SAME absolute path inside the guest so
+        // `{project}`-style expansions stay valid, and run there.
+        let proj = self.project_root.display().to_string();
+        let cwd = spec
+            .cwd
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| proj.clone());
+
+        // `msb run` creates a sandbox from an image and runs a command in it,
+        // streaming stdio like `docker run -i` (stdin reaches the guest, stdout
+        // is captured, exit code propagates). A stable `--name` lets teardown
+        // `msb cp`/`stop`/`rm` the same sandbox.
+        let mut args = vec![
+            "run".to_owned(),
+            "--name".to_owned(),
+            self.sandbox.clone(),
+        ];
+
+        // Egress: empty ⇒ fully offline; non-empty ⇒ default-deny plus an allow
+        // rule per host. `msb` enforces net policy in-guest (own-kernel), so
+        // unlike docker we hand it hostnames/CIDRs rather than pre-resolved IPs.
+        if self.egress.is_empty() {
+            args.push("--net-default".to_owned());
+            args.push("deny".to_owned());
+        } else {
+            args.push("--net-default-egress".to_owned());
+            args.push("deny".to_owned());
+            for host in &self.egress {
+                args.push("--net-rule".to_owned());
+                args.push(format!("egress:allow:{host}"));
+            }
+        }
+
+        // Project root always mounted at its absolute path; nothing else unless
+        // explicitly allow-listed. `msb --mount HOST:GUEST` is a bind mount.
+        args.push("--mount".to_owned());
+        args.push(format!("{proj}:{proj}"));
+        // Effective extra mounts = union(sandbox, route), de-duplicated by the
+        // expanded absolute target; first declaration wins. Read-only unless the
+        // spec says otherwise (msb appends `:ro`/`:rw` like docker).
+        let mut seen_targets: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for (_origin, raw) in &self.mounts {
+            let mspec = parse_mount(raw)
+                .with_context(|| format!("invalid mount '{raw}' for sandbox '{}'", self.image))?;
+            let source = expand_mount_path(&mspec.source, &self.project_root);
+            let target = expand_mount_path(&mspec.target, &self.project_root);
+            if !seen_targets.insert(target.clone()) {
+                continue;
+            }
+            let source = source.display().to_string();
+            let target = target.display().to_string();
+            args.push("--mount".to_owned());
+            if mspec.writable {
+                args.push(format!("{source}:{target}:rw"));
+            } else {
+                args.push(format!("{source}:{target}:ro"));
+            }
+        }
+
+        args.push("--workdir".to_owned());
+        args.push(cwd);
+        // Clean base env in the guest; force HOME to the guest session store so
+        // the agent writes its resume state there. Sorted for a deterministic argv.
+        let mut env = spec.env;
+        env.insert("HOME".to_owned(), self.home.clone());
+        for (key, value) in &env {
+            args.push("--env".to_owned());
+            args.push(format!("{key}={value}"));
+        }
+
+        // Image is positional, then the command after `--` so its flags are not
+        // parsed by `msb`.
+        args.push(self.image.clone());
+        args.push("--".to_owned());
+        args.push(spec.program);
+        args.extend(spec.args);
+
+        Ok(CommandSpec {
+            program: "msb".to_owned(),
+            args,
+            // The `msb` CLI inherits the host env (PATH etc.); the guest env is
+            // fully specified by the `--env` flags above.
+            env: BTreeMap::new(),
+            cwd: None,
+        })
+    }
+
+    fn session_store_root(&self) -> Option<PathBuf> {
+        Some(self.session_store.clone())
+    }
+
+    fn store_is_live(&self) -> bool {
+        // Guest HOME lives in VM storage during the run; it only reaches the host
+        // after `extract_session_store`, so discovery must run post-exit.
+        false
+    }
+
+    fn validate_mounts(&self) -> Result<()> {
+        // Fail loudly when a bind SOURCE is absent on the host — same rationale
+        // as docker: a missing source would otherwise mount an empty guest stub.
+        if !self.project_root.exists() {
+            bail!(
+                "sandbox project mount source '{}' does not exist on the host (check the path / VM share)",
+                self.project_root.display()
+            );
+        }
+        for (origin, raw) in &self.mounts {
+            let mspec = parse_mount(raw)
+                .with_context(|| format!("invalid mount '{raw}' for sandbox '{}'", self.image))?;
+            let source = expand_mount_path(&mspec.source, &self.project_root);
+            if !source.exists() {
+                bail!(
+                    "sandbox {origin:?} mount source '{}' does not exist on the host (check the path / VM share)",
+                    source.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn extract_session_store(&self) -> Result<()> {
+        // Copy the guest HOME *contents* into the host session-store dir. Runs
+        // after the agent exits and before teardown, so resume-capture can read
+        // it back from the host even though the guest HOME was never bind-mounted.
+        let src = format!("{}:{}/.", self.sandbox, self.home);
+        let dst = self.session_store.display().to_string();
+        let output = tokio::process::Command::new("msb")
+            .args(["cp", &src, &dst])
+            .output()
+            .await
+            .with_context(|| {
+                format!("failed to spawn `msb cp` from sandbox '{}'", self.sandbox)
+            })?;
+        if !output.status.success() {
+            bail!(
+                "`msb cp {src} {dst}` failed with status {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    async fn teardown(self: Box<Self>) -> Result<()> {
+        // Best-effort: stop then remove the per-session sandbox; a cleanup
+        // failure must not fail the run.
+        let _ = tokio::process::Command::new("msb")
+            .args(["stop", &self.sandbox])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        let _ = tokio::process::Command::new("msb")
+            .args(["rm", "-f", &self.sandbox])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        Ok(())
+    }
+}
+
 /// Resolve the effective provider for a sandbox name against the config.
 ///
 /// Dispatch is driven by the resolved [`SandboxConfig::primitive`] (the "what
@@ -755,8 +1041,9 @@ impl SandboxSession for DockerSession {
 /// tools are installed"):
 /// - `"local"` → [`LocalProvider`] (no isolation)
 /// - `"docker"` → [`DockerProvider`] (shared-kernel container)
-/// - `"microsandbox"` / `"clawk"` → [`StubProvider`] (own-kernel microVMs;
-///   `prepare()` errors until the runtime exists in a later milestone)
+/// - `"microsandbox"` → [`MicrosandboxProvider`] (own-kernel microVM via `msb`)
+/// - `"clawk"` → [`StubProvider`] (own-kernel microVM; `prepare()` errors until
+///   the runtime is wired up in a later milestone)
 ///
 /// The bare name `"local"` with no `[sandboxes.local]` entry stays a shortcut
 /// for the identity provider; any other name must have a `[sandboxes.<name>]`
@@ -774,7 +1061,12 @@ pub fn provider_for(
                 config,
                 route_mounts,
             )?)),
-            "microsandbox" | "clawk" => Ok(std::sync::Arc::new(StubProvider {
+            "microsandbox" => Ok(std::sync::Arc::new(MicrosandboxProvider::from_config(
+                name,
+                config,
+                route_mounts,
+            )?)),
+            "clawk" => Ok(std::sync::Arc::new(StubProvider {
                 name: name.to_owned(),
                 primitive: config.primitive.clone(),
             })),
@@ -1250,13 +1542,61 @@ mod tests {
         assert!(provider_for("weird", &sandboxes, &[]).is_err());
     }
 
-    /// M5: the microsandbox/clawk stub parses and resolves, but `prepare()`
-    /// fails with a clear "runtime not installed" message.
+    /// M4: `msb run` argv shape — image positional after flags, command after
+    /// `--`, project bound at its absolute path, offline by default, HOME forced
+    /// to the guest session store. Pure unit test; needs no `msb`.
+    #[test]
+    fn microsandbox_wrap_produces_expected_argv() {
+        let session = MicrosandboxSession {
+            image: "busybox".to_owned(),
+            project_root: PathBuf::from("/proj"),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-abc".to_owned(),
+            home: "/home/agent".to_owned(),
+        };
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec!["--acp".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec).unwrap();
+        assert_eq!(wrapped.program, "msb");
+        assert_eq!(
+            wrapped.args,
+            vec![
+                "run",
+                "--name",
+                "varda-sbx-abc",
+                "--net-default",
+                "deny",
+                "--mount",
+                "/proj:/proj",
+                "--workdir",
+                "/proj",
+                "--env",
+                "HOME=/home/agent",
+                "busybox",
+                "--",
+                "claude",
+                "--acp",
+            ]
+        );
+        assert!(wrapped.env.is_empty());
+        assert!(!session.store_is_live());
+        assert_eq!(session.session_store_root(), Some(PathBuf::from("/host/store")));
+    }
+
+    /// M5: the clawk stub parses and resolves, but `prepare()` fails with a
+    /// clear "runtime not installed" message (microsandbox is now a real
+    /// provider; clawk stays stubbed).
     #[tokio::test]
     async fn stub_provider_prepare_errors_clearly() {
         let provider = StubProvider {
             name: "vm".to_owned(),
-            primitive: "microsandbox".to_owned(),
+            primitive: "clawk".to_owned(),
         };
         let root = Path::new("/proj");
         let err = match provider.prepare(&ctx(root)).await {
@@ -1264,7 +1604,7 @@ mod tests {
             Err(err) => err.to_string(),
         };
         assert!(
-            err.contains("not yet available") && err.contains("microsandbox"),
+            err.contains("not yet available") && err.contains("clawk"),
             "unexpected stub error: {err}"
         );
     }
