@@ -94,7 +94,11 @@ impl SandboxSession for LocalSession {
 /// only reachable network hosts are an explicit egress allow-list.
 pub struct DockerProvider {
     name: String,
-    image: String,
+    /// A pre-existing image tag/reference. `None` when `build` is set.
+    image: Option<String>,
+    /// Path to a Dockerfile to build at `prepare()`. Takes precedence over
+    /// `image` when both are set; the resulting content-addressed tag is used.
+    build: Option<String>,
     /// Extra host paths (beyond the project root) the sandbox may see,
     /// bind-mounted read-only. Empty by default: project-root-only.
     mounts: Vec<String>,
@@ -107,29 +111,124 @@ pub struct DockerProvider {
 impl DockerProvider {
     /// Build a docker provider named `name` from its `[sandboxes.<name>]` entry.
     ///
-    /// The image is required. `mounts` and `egress` are threaded through from the
-    /// config (M0) and applied by [`DockerSession`] at wrap time.
+    /// Either `image` or `build` must be supplied. `mounts` and `egress` are
+    /// threaded through from the config (M0/M2) and applied by [`DockerSession`]
+    /// at wrap time.
     pub fn from_config(name: &str, config: &SandboxConfig) -> Result<Self> {
-        let image = match config.image.as_deref() {
-            Some(image) if !image.is_empty() => image.to_owned(),
-            _ => bail!("sandbox '{name}' is missing an `image` (required for the docker provider)"),
-        };
+        let image = config.image.clone().filter(|image| !image.is_empty());
+        let build = config.build.clone().filter(|build| !build.is_empty());
+        if image.is_none() && build.is_none() {
+            bail!(
+                "sandbox '{name}' needs an `image` or a `build` path (required for the docker provider)"
+            );
+        }
         Ok(Self {
             name: name.to_owned(),
             image,
+            build,
             mounts: config.mounts.clone(),
             egress: config.egress.clone(),
         })
+    }
+
+    /// Resolve the concrete image tag to run: build the Dockerfile when `build`
+    /// is set (content-addressed, cached), otherwise use the configured image.
+    async fn resolve_image(&self) -> Result<String> {
+        if let Some(build) = &self.build {
+            return build_image(&self.name, build).await;
+        }
+        self.image
+            .clone()
+            .with_context(|| format!("sandbox '{}' has neither image nor build", self.name))
     }
 
     #[cfg(test)]
     fn new_for_test(name: &str, image: &str, mounts: &[&str], egress: &[&str]) -> Self {
         Self {
             name: name.to_owned(),
-            image: image.to_owned(),
+            image: Some(image.to_owned()),
+            build: None,
             mounts: mounts.iter().map(|m| m.to_string()).collect(),
             egress: egress.iter().map(|e| e.to_string()).collect(),
         }
+    }
+}
+
+/// Build the Dockerfile at `dockerfile` and return a content-addressed image tag.
+///
+/// The tag encodes a hash of the Dockerfile's contents, so an unchanged
+/// Dockerfile reuses the cached image (we skip the build when the tag already
+/// exists locally). The build context is the Dockerfile's parent directory.
+async fn build_image(name: &str, dockerfile: &str) -> Result<String> {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let contents = std::fs::read(dockerfile)
+        .with_context(|| format!("failed to read Dockerfile '{dockerfile}' for sandbox '{name}'"))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    contents.hash(&mut hasher);
+    let tag = format!("varda-sandbox:{:016x}", hasher.finish());
+
+    let context_dir = Path::new(dockerfile)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Skip the build when an image with this content-addressed tag already exists.
+    let exists = tokio::process::Command::new("docker")
+        .args(["image", "inspect", &tag])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if exists {
+        return Ok(tag);
+    }
+
+    let output = tokio::process::Command::new("docker")
+        .arg("build")
+        .arg("-q")
+        .arg("-t")
+        .arg(&tag)
+        .arg("-f")
+        .arg(dockerfile)
+        .arg(&context_dir)
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn `docker build` for sandbox '{name}'"))?;
+    if !output.status.success() {
+        bail!(
+            "`docker build` for sandbox '{name}' failed with status {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(tag)
+}
+
+/// Placeholder provider for isolation primitives whose runtime is not yet
+/// wired up (microsandbox, clawk). Config parses and routing resolves, but
+/// `prepare()` fails with a clear "runtime not installed" error so the missing
+/// capability surfaces at launch rather than being silently ignored.
+pub struct StubProvider {
+    name: String,
+    primitive: String,
+}
+
+#[async_trait]
+impl SandboxProvider for StubProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn prepare(&self, _ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
+        bail!(
+            "sandbox primitive '{}' not yet available: runtime not installed",
+            self.primitive
+        )
     }
 }
 
@@ -164,8 +263,11 @@ impl SandboxProvider for DockerProvider {
                 session_store.display()
             )
         })?;
+        // Resolve the concrete image only now: a `build` sandbox builds its
+        // Dockerfile here (once, content-addressed) rather than at config load.
+        let image = self.resolve_image().await?;
         Ok(Box::new(DockerSession {
-            image: self.image.clone(),
+            image,
             project_root: ctx.project_root.to_path_buf(),
             mounts: self.mounts.clone(),
             egress_pins,
@@ -313,17 +415,34 @@ impl SandboxSession for DockerSession {
 
 /// Resolve the effective provider for a sandbox name against the config.
 ///
-/// `local` is always available; any other name must have a `[sandboxes.<name>]`
-/// entry that supplies a docker `image`.
+/// Dispatch is driven by the resolved [`SandboxConfig::primitive`] (the "what
+/// kind of boundary" knob), which is orthogonal to the image/rootfs ("what
+/// tools are installed"):
+/// - `"local"` → [`LocalProvider`] (no isolation)
+/// - `"docker"` → [`DockerProvider`] (shared-kernel container)
+/// - `"microsandbox"` / `"clawk"` → [`StubProvider`] (own-kernel microVMs;
+///   `prepare()` errors until the runtime exists in a later milestone)
+///
+/// The bare name `"local"` with no `[sandboxes.local]` entry stays a shortcut
+/// for the identity provider; any other name must have a `[sandboxes.<name>]`
+/// entry (whose `primitive` defaults to `"docker"`).
 pub fn provider_for(
     name: &str,
     sandboxes: &BTreeMap<String, SandboxConfig>,
 ) -> Result<std::sync::Arc<dyn SandboxProvider>> {
-    if name == "local" {
-        return Ok(std::sync::Arc::new(LocalProvider));
-    }
     match sandboxes.get(name) {
-        Some(config) => Ok(std::sync::Arc::new(DockerProvider::from_config(name, config)?)),
+        Some(config) => match config.primitive.as_str() {
+            "local" => Ok(std::sync::Arc::new(LocalProvider)),
+            "docker" => Ok(std::sync::Arc::new(DockerProvider::from_config(name, config)?)),
+            "microsandbox" | "clawk" => Ok(std::sync::Arc::new(StubProvider {
+                name: name.to_owned(),
+                primitive: config.primitive.clone(),
+            })),
+            other => bail!(
+                "sandbox '{name}' has unknown primitive '{other}' (expected local, docker, microsandbox, or clawk)"
+            ),
+        },
+        None if name == "local" => Ok(std::sync::Arc::new(LocalProvider)),
         None => bail!("sandbox '{name}' is not defined under [sandboxes]"),
     }
 }
@@ -597,21 +716,106 @@ mod tests {
             "docker".to_owned(),
             SandboxConfig {
                 image: Some("varda:latest".to_owned()),
-                mounts: vec![],
-                egress: vec![],
+                ..Default::default()
             },
         );
         assert_eq!(provider_for("docker", &sandboxes).unwrap().name(), "docker");
 
-        // Missing image errors.
+        // Missing image AND build errors under the docker primitive.
         sandboxes.insert(
             "broken".to_owned(),
             SandboxConfig {
                 image: None,
-                mounts: vec![],
-                egress: vec![],
+                ..Default::default()
             },
         );
         assert!(provider_for("broken", &sandboxes).is_err());
+    }
+
+    /// M5: `primitive` selects the boundary kind independently of the image.
+    /// An explicit `primitive = "local"` yields the identity provider even with
+    /// an image set; microsandbox/clawk yield the stub.
+    #[test]
+    fn provider_for_dispatches_on_primitive() {
+        let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
+        sandboxes.insert(
+            "isolated".to_owned(),
+            SandboxConfig {
+                image: Some("busybox".to_owned()),
+                primitive: "local".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            provider_for("isolated", &sandboxes).unwrap().name(),
+            "local"
+        );
+
+        for primitive in ["microsandbox", "clawk"] {
+            sandboxes.insert(
+                "vm".to_owned(),
+                SandboxConfig {
+                    image: Some("busybox".to_owned()),
+                    primitive: primitive.to_owned(),
+                    ..Default::default()
+                },
+            );
+            // The stub resolves at provider_for time but errors at prepare().
+            let provider = provider_for("vm", &sandboxes).unwrap();
+            assert_eq!(provider.name(), "vm");
+        }
+
+        // An unknown primitive is rejected outright.
+        sandboxes.insert(
+            "weird".to_owned(),
+            SandboxConfig {
+                image: Some("busybox".to_owned()),
+                primitive: "qemu".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert!(provider_for("weird", &sandboxes).is_err());
+    }
+
+    /// M5: the microsandbox/clawk stub parses and resolves, but `prepare()`
+    /// fails with a clear "runtime not installed" message.
+    #[tokio::test]
+    async fn stub_provider_prepare_errors_clearly() {
+        let provider = StubProvider {
+            name: "vm".to_owned(),
+            primitive: "microsandbox".to_owned(),
+        };
+        let root = Path::new("/proj");
+        let err = match provider.prepare(&ctx(root)).await {
+            Ok(_) => panic!("stub prepare should not succeed"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("not yet available") && err.contains("microsandbox"),
+            "unexpected stub error: {err}"
+        );
+    }
+
+    /// M5: a `build` sandbox defers image resolution to `prepare()`; a missing
+    /// Dockerfile surfaces there as a read error rather than at config time.
+    #[tokio::test]
+    async fn docker_build_missing_dockerfile_errors_at_prepare() {
+        let provider = DockerProvider::from_config(
+            "built",
+            &SandboxConfig {
+                build: Some("/nonexistent/Dockerfile.does-not-exist".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let root = Path::new("/proj");
+        let err = match provider.prepare(&ctx(root)).await {
+            Ok(_) => panic!("build prepare with a missing Dockerfile should not succeed"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("Dockerfile") || err.contains("failed to read"),
+            "unexpected build error: {err}"
+        );
     }
 }

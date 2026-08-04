@@ -118,14 +118,41 @@ pub struct Route {
     pub sandbox: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Path to a Dockerfile to build the sandbox image from. When set, the
+    /// docker provider builds it at `prepare()` and uses the resulting tag.
+    /// Mutually exclusive-ish with `image` (build wins when both are set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    /// Isolation primitive: `"docker"` | `"microsandbox"` | `"clawk"` | `"local"`.
+    /// Orthogonal to the image/rootfs: the same OCI image can run under docker
+    /// (shared kernel) or an own-kernel microVM.
+    #[serde(default = "default_primitive")]
+    pub primitive: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<String>,
+}
+
+/// Default isolation primitive when a `[sandboxes.<name>]` entry omits one.
+pub fn default_primitive() -> String {
+    "docker".to_owned()
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            image: None,
+            build: None,
+            primitive: default_primitive(),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -387,21 +414,12 @@ fn add_varda_project_dir_to_default_agents(config: &mut Config) {
             .as_deref()
             .is_some_and(|command| command == "sh")
         {
-            if agent
+            let is_wrapped_agent = agent
                 .interactive_args
                 .as_deref()
                 .and_then(|args| args.get(1))
-                .is_some_and(|arg| arg.contains("codex "))
-            {
-                if let Some(args) = agent.interactive_args.as_mut() {
-                    add_varda_dirs_to_shell_arg(args);
-                }
-            } else if agent
-                .interactive_args
-                .as_deref()
-                .and_then(|args| args.get(1))
-                .is_some_and(|arg| arg.contains("claude "))
-            {
+                .is_some_and(|arg| arg.contains("codex ") || arg.contains("claude "));
+            if is_wrapped_agent {
                 if let Some(args) = agent.interactive_args.as_mut() {
                     add_varda_dirs_to_shell_arg(args);
                 }
@@ -663,6 +681,29 @@ mod tests {
         assert_eq!(docker.image.as_deref(), Some("varda:latest"));
         assert_eq!(docker.mounts, vec!["/tmp"]);
         assert_eq!(docker.egress, vec!["api.example.com"]);
+        // `primitive` defaults to "docker" when omitted, `build` to None.
+        assert_eq!(docker.primitive, "docker");
+        assert!(docker.build.is_none());
+    }
+
+    #[test]
+    fn sandbox_config_round_trips_primitive_and_build() {
+        let toml = format!(
+            "{DEFAULT_CONFIG}\n[sandboxes.rustvm]\nbuild = \"./testdata/Dockerfile.rust\"\nprimitive = \"microsandbox\"\n"
+        );
+        let config: Config = toml::from_str(&toml).expect("config with build should parse");
+
+        let rustvm = &config.sandboxes["rustvm"];
+        assert!(rustvm.image.is_none());
+        assert_eq!(rustvm.build.as_deref(), Some("./testdata/Dockerfile.rust"));
+        assert_eq!(rustvm.primitive, "microsandbox");
+
+        // Round-trip: serialize then reparse to an identical config.
+        let serialized = toml::to_string_pretty(&config).expect("config should serialize");
+        let reparsed: Config = toml::from_str(&serialized).expect("serialized config should parse");
+        assert_eq!(config, reparsed);
+        // The explicit primitive survives serialization.
+        assert_eq!(reparsed.sandboxes["rustvm"].primitive, "microsandbox");
     }
 
     #[test]

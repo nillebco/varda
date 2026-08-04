@@ -1236,10 +1236,49 @@ mod tests {
                 image: Some("busybox:latest".to_owned()),
                 mounts,
                 egress,
+                ..Default::default()
             },
         )
         .expect("docker provider"));
         AcpSubprocessClient::with_sandbox("shell", &config, provider)
+    }
+
+    /// M5: build a sandbox image from `testdata/Dockerfile.rust` (a trivial
+    /// `FROM busybox` — installs nothing heavy) and run a shell agent under it,
+    /// asserting the recap is parsed. Proves the `build` knob is honoured end to
+    /// end. Requires a running docker daemon; run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon"]
+    async fn docker_build_sandbox_returns_parsed_recap() {
+        let dockerfile = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/Dockerfile.rust");
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "cat".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            resume_command_template: None,
+        };
+        let provider = std::sync::Arc::new(
+            crate::sandbox::DockerProvider::from_config(
+                "built",
+                &crate::config::SandboxConfig {
+                    build: Some(dockerfile.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .expect("docker provider from build config"),
+        );
+        let client = AcpSubprocessClient::with_sandbox("shell", &config, provider);
+        let result = client
+            .run_task(docker_request("/tmp", "docker-build-recap"))
+            .await
+            .expect("built docker agent should return a recap");
+        assert!(result.recap.contains("Do it."));
+        assert!(!result.requires_user);
     }
 
     /// Integration: a trivial shell agent under `sandbox="docker"` returns a

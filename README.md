@@ -567,16 +567,26 @@ agents = ["codex"]
 sandbox = "docker"         # per-route override
 
 [sandboxes.docker]
-image = "varda:latest"        # required for the docker provider
+image = "varda:latest"        # image/rootfs, or use `build` below instead
+primitive = "docker"          # isolation kind; defaults to "docker" when omitted
 egress = ["api.example.com"]  # optional egress allow-list (default-deny)
 mounts = ["/opt/cache"]       # optional extra read-only host mounts
+
+[sandboxes.rustvm]
+build = "./testdata/Dockerfile.rust"  # build the image from a Dockerfile at prepare()
 ```
 
 The effective provider for a route resolves as `route.sandbox` → `defaults.sandbox` → `"local"`. All keys are optional, so existing `config.toml` files parse and re-serialize unchanged. These keys are orthogonal to Codex's own `--sandbox workspace-write` CLI flag in the agent `args`.
 
-**`local`** (the default) runs the agent exactly as before — no isolation.
+Two knobs are deliberately separate. **`image`/`build`** decides *what tools are installed* (the OCI image or rootfs); **`primitive`** decides *what kind of boundary* runs it. The same image can run under `docker` (shared kernel) or an own-kernel microVM, so nested projects can pick both independently.
 
-**`docker`** wraps the agent invocation in `docker run --rm --init -i` and executes it inside the named `image`. The container's environment is built solely from the agent's configured `env` (passed as `-e K=V`); the host environment is not inherited.
+- **`image`** names a pre-existing image tag/reference.
+- **`build`** points at a Dockerfile; the docker provider builds it at run time and uses the resulting content-addressed tag (an unchanged Dockerfile reuses the cached image). When both are set, `build` wins.
+- **`primitive`** is one of `"docker"` (default), `"local"`, `"microsandbox"`, or `"clawk"`. `microsandbox`/`clawk` are own-kernel microVM runtimes reserved for a later milestone: they parse and route today, but launching one fails fast with `sandbox primitive '<p>' not yet available: runtime not installed`.
+
+**`local`** (the default provider name) runs the agent exactly as before — no isolation. Setting `primitive = "local"` on a named sandbox does the same, even if an `image` is present.
+
+**`docker`** wraps the agent invocation in `docker run --rm --init -i` and executes it inside the resolved `image` (or the image built from `build`). The container's environment is built solely from the agent's configured `env` (passed as `-e K=V`); the host environment is not inherited.
 
 - **Project-only mounts.** Only the task's **project directory** is bind-mounted, at the same absolute path, so host secrets outside the project (e.g. `~/.aws`) are not reachable from inside the container. Any paths listed under `mounts` are added as **read-only** bind mounts; nothing else on the host is visible.
 - **Default-deny egress with an allow-list.** With no `egress` hosts the container gets `--network none` — it is fully offline. Declaring `egress` hosts attaches the container to the bridge network, disables ambient DNS (`--dns 0.0.0.0`), and pins **only** the allow-listed hostnames to their host-resolved IPs via `--add-host`. A non-allow-listed hostname cannot resolve and is therefore unreachable, while allow-listed hosts stay reachable. (This is a name-resolution allow-list; IP-level firewalling of raw egress is a later milestone.)
