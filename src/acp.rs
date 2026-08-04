@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -18,8 +19,9 @@ use crate::agent::{
     recap_requires_user_interaction,
 };
 use crate::config::AgentConfig;
+use crate::sandbox::{CommandSpec, LocalProvider, SandboxContext, SandboxProvider};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AcpSubprocessClient {
     agent_name: String,
     command: String,
@@ -29,10 +31,22 @@ pub struct AcpSubprocessClient {
     interactive_command: Option<String>,
     interactive_args: Option<Vec<String>>,
     resume_command_template: Option<String>,
+    sandbox: Arc<dyn SandboxProvider>,
 }
 
 impl AcpSubprocessClient {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(agent_name: impl Into<String>, config: &AgentConfig) -> Self {
+        // Default to the identity `local` provider so callers that do not opt
+        // into sandboxing keep the exact pre-provider behavior.
+        Self::with_sandbox(agent_name, config, Arc::new(LocalProvider))
+    }
+
+    pub fn with_sandbox(
+        agent_name: impl Into<String>,
+        config: &AgentConfig,
+        sandbox: Arc<dyn SandboxProvider>,
+    ) -> Self {
         Self {
             agent_name: agent_name.into(),
             command: config.command.clone(),
@@ -42,6 +56,7 @@ impl AcpSubprocessClient {
             interactive_command: config.interactive_command.clone(),
             interactive_args: config.interactive_args.clone(),
             resume_command_template: config.resume_command_template.clone(),
+            sandbox,
         }
     }
 }
@@ -93,23 +108,57 @@ impl AcpSubprocessClient {
             );
         }
 
-        let mut command_builder = Command::new(&command);
+        // Resolve the invocation, then let the sandbox provider rewrite it. For
+        // the `local` provider this is the identity, so the spawn below is
+        // byte-for-byte the same command as before providers existed.
+        let spec = CommandSpec {
+            program: command.clone(),
+            args: args.clone(),
+            env: env.clone(),
+            cwd: working_dir.as_deref().map(PathBuf::from),
+        };
+        let sandbox_ctx = SandboxContext {
+            project_root: Path::new(
+                request
+                    .frontmatter
+                    .project
+                    .as_deref()
+                    .unwrap_or_else(|| working_dir.as_deref().unwrap_or(".")),
+            ),
+            route_glob: "",
+            agent_kind: crate::config::AgentKind::Acp,
+            session_id: &request.session_id,
+        };
+        let session = self
+            .sandbox
+            .prepare(&sandbox_ctx)
+            .await
+            .with_context(|| format!("failed to prepare '{}' sandbox", self.sandbox.name()))?;
+        let capture_session = session.session_store_root().is_some();
+        if !capture_session {
+            eprintln!("WARN resume-command unavailable under sandbox");
+        }
+        let spec = session
+            .wrap(spec)
+            .with_context(|| format!("failed to wrap command for '{}' sandbox", self.sandbox.name()))?;
+
+        let mut command_builder = Command::new(&spec.program);
         command_builder
-            .args(&args)
-            .envs(env)
+            .args(&spec.args)
+            .envs(&spec.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         protect_interpreter_from_terminal_sigint(&mut command_builder, request);
-        if let Some(working_dir) = working_dir.as_deref() {
-            command_builder.current_dir(working_dir);
+        if let Some(cwd) = spec.cwd.as_deref() {
+            command_builder.current_dir(cwd);
         }
 
         let mut child = command_builder.spawn().with_context(|| {
             format!(
                 "failed to start agent '{}' with command '{}'",
-                self.agent_name, command
+                self.agent_name, spec.program
             )
         })?;
 
@@ -120,7 +169,11 @@ impl AcpSubprocessClient {
             .context("failed to write task prompt to agent stdin")?;
         drop(stdin);
 
-        self.record_external_session(request, started_at);
+        // Resume-capture depends on reaching the agent's session store on the
+        // host; skip it when the sandbox hides that store (docker in M1).
+        if capture_session {
+            self.record_external_session(request, started_at);
+        }
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let stderr = child.stderr.take().context("failed to open agent stderr")?;
@@ -146,6 +199,10 @@ impl AcpSubprocessClient {
         };
         let (stdout, stderr, status) = tokio::try_join!(stdout_task, stderr_task, wait_task)
             .context("failed while waiting for agent subprocess")?;
+
+        if let Err(error) = session.teardown().await {
+            eprintln!("warning: failed to tear down sandbox session: {error:#}");
+        }
 
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
@@ -184,6 +241,14 @@ impl AcpSubprocessClient {
         args: Vec<String>,
         request: &AgentRunRequest,
     ) -> Result<AgentRunResult> {
+        // Interactive execution under a non-identity sandbox is deferred to M5.
+        if self.sandbox.name() != "local" {
+            bail!(
+                "interactive runs are not supported under the '{}' sandbox yet; \
+                 run non-interactively or use sandbox=\"local\"",
+                self.sandbox.name()
+            );
+        }
         let command = expand_request_value(&self.command, request);
         let working_dir = self
             .working_dir
@@ -1082,6 +1147,104 @@ mod tests {
         assert!(result.recap.contains("You have at most 10 minutes"));
         assert!(result.recap.contains("Do it."));
         assert!(!result.requires_user);
+    }
+
+    fn docker_request(project: &str, session_id: &str) -> AgentRunRequest {
+        AgentRunRequest {
+            agent_name: "shell".to_owned(),
+            role_instructions: None,
+            task_path: "task.md".to_owned(),
+            frontmatter: TaskFrontmatter {
+                id: None,
+                status: TaskStatus::Ready,
+                project: Some(project.to_owned()),
+                assignee: Some("shell".to_owned()),
+                recap: None,
+                recaps: vec![],
+                plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
+                agent_resume_commands: vec![],
+                requires_user: false,
+            },
+            body: "# Task\n\nDo it.".to_owned(),
+            timeout: Duration::from_secs(600),
+            session_id: session_id.to_owned(),
+            session_log_path: None,
+            interactive: false,
+            interpret: false,
+            stream: false,
+            resume_command: None,
+        }
+    }
+
+    fn docker_client(command: &str, args: &[&str]) -> AcpSubprocessClient {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: command.to_owned(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            resume_command_template: None,
+        };
+        let provider = std::sync::Arc::new(crate::sandbox::DockerProvider::from_config(
+            "docker",
+            &crate::config::SandboxConfig {
+                image: Some("busybox:latest".to_owned()),
+                mounts: vec![],
+                egress: vec![],
+            },
+        )
+        .expect("docker provider"));
+        AcpSubprocessClient::with_sandbox("shell", &config, provider)
+    }
+
+    /// Integration: a trivial shell agent under `sandbox="docker"` returns a
+    /// parsed recap. Requires a running docker daemon and network to pull
+    /// `busybox`. Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon"]
+    async fn docker_agent_returns_parsed_recap() {
+        // `cat` echoes the prompt (delivered on stdin) straight back as the recap.
+        let client = docker_client("cat", &[]);
+        let result = client
+            .run_task(docker_request("/tmp", "docker-recap"))
+            .await
+            .expect("docker agent should return a recap");
+        assert!(result.recap.contains("Do it."));
+        assert!(!result.requires_user);
+    }
+
+    /// Security assertion (the point of M1): the agent container mounts only the
+    /// project and therefore CANNOT read the host's `~/.aws` — mirrors the Colima
+    /// probe (`ls ~/.aws` inside ⇒ not found). Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon"]
+    async fn docker_agent_cannot_read_host_aws_credentials() {
+        // Probe for ~/.aws inside the container; print a sentinel plus a recap.
+        let client = docker_client(
+            "sh",
+            &[
+                "-c",
+                "if [ -e \"$HOME/.aws\" ]; then echo AWS_VISIBLE; else echo AWS_HIDDEN; fi; \
+                 echo; echo 'requires_user: false'",
+            ],
+        );
+        let result = client
+            .run_task(docker_request("/tmp", "docker-aws"))
+            .await
+            .expect("docker agent should run the probe");
+        assert!(
+            result.recap.contains("AWS_HIDDEN"),
+            "host ~/.aws must not be visible inside the sandbox; recap was: {}",
+            result.recap
+        );
+        assert!(!result.recap.contains("AWS_VISIBLE"));
     }
 
     #[cfg(unix)]

@@ -19,6 +19,8 @@ pub struct RouteMatch {
     pub glob: String,
     pub allowed_agents: Vec<String>,
     pub estimated_prompt_tokens: usize,
+    /// Effective sandbox provider for this route (`route` → `defaults` → `local`).
+    pub sandbox: String,
 }
 
 impl RouteMatch {
@@ -57,6 +59,7 @@ pub fn match_route(
         glob: route.glob.clone(),
         allowed_agents: route.agents.clone(),
         estimated_prompt_tokens: 0,
+        sandbox: config.effective_sandbox(route).to_owned(),
     })
 }
 
@@ -89,6 +92,7 @@ pub fn match_route_for_task(
         glob: route.glob.clone(),
         allowed_agents: route.agents.clone(),
         estimated_prompt_tokens,
+        sandbox: config.effective_sandbox(route).to_owned(),
     })
 }
 

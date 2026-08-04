@@ -553,9 +553,9 @@ For now, `kind = "acp"` means Varda uses its ACP-facing agent abstraction. The c
 
 When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder. Varda also expands `{varda_project}` to the Varda source project directory and `{varda_home}` to the Varda control-plane directory, then passes both as additional writable directories to the default Codex, Claude, and Copilot launch commands, so interpreter and resume sessions can create follow-up Varda tasks after the current task finishes.
 
-### Sandbox providers (config surface)
+### Sandbox providers
 
-Varda reserves a `sandbox` config surface for future L1 isolation of agent runs. It is **inert today** — the keys parse and round-trip but do not yet change behavior:
+Varda can run an agent inside an isolated sandbox instead of directly on your machine:
 
 ```toml
 [defaults]
@@ -567,12 +567,21 @@ agents = ["codex"]
 sandbox = "docker"         # per-route override
 
 [sandboxes.docker]
-image = "varda:latest"     # optional
-mounts = ["/tmp"]          # optional
-egress = ["api.example.com"]  # optional
+image = "varda:latest"     # required for the docker provider
+egress = ["api.example.com"]  # optional; presence switches the container to a bridge network
+mounts = ["/tmp"]          # reserved (not yet applied)
 ```
 
-The effective provider for a route resolves as `route.sandbox` → `defaults.sandbox` → `"local"`. All keys are optional, so existing `config.toml` files parse and re-serialize unchanged. Note: these keys are orthogonal to Codex's own `--sandbox workspace-write` CLI flag in the agent `args`.
+The effective provider for a route resolves as `route.sandbox` → `defaults.sandbox` → `"local"`. All keys are optional, so existing `config.toml` files parse and re-serialize unchanged. These keys are orthogonal to Codex's own `--sandbox workspace-write` CLI flag in the agent `args`.
+
+**`local`** (the default) runs the agent exactly as before — no isolation.
+
+**`docker`** wraps the agent invocation in `docker run --rm --init -i` and executes it inside the named `image`. Only the task's **project directory** is bind-mounted, at the same absolute path, so host secrets outside the project (e.g. `~/.aws`) are not reachable from inside the container. The container's environment is built solely from the agent's configured `env` (passed as `-e K=V`); the host environment is not inherited. With no `egress` hosts the container gets `--network none`; declaring egress hosts switches it to a bridge network.
+
+Current limitations (M1):
+
+- **Non-interactive runs only.** Starting an interactive or resume session under a non-`local` sandbox returns a clear error (interactive-under-sandbox is a later milestone).
+- **Resume-capture is disabled under docker.** The agent's own session store lives inside the container, so Varda logs `WARN resume-command unavailable under sandbox` and skips capturing a resume command.
 
 ### Roles
 

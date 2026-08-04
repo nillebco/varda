@@ -178,8 +178,6 @@ impl Config {
     /// Resolve the effective sandbox provider for a route.
     ///
     /// Precedence: `route.sandbox` → `defaults.sandbox` → [`DEFAULT_SANDBOX_PROVIDER`].
-    /// Consumed by task execution in a later `SandboxProvider` milestone (M1).
-    #[allow(dead_code)]
     pub fn effective_sandbox<'a>(&'a self, route: &'a Route) -> &'a str {
         route
             .sandbox

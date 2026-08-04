@@ -5,6 +5,7 @@ mod git;
 mod notify;
 mod routing;
 mod runner;
+mod sandbox;
 mod task;
 
 use std::fs;
@@ -932,7 +933,12 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         .agents
         .get(&planner_agent)
         .with_context(|| format!("plan transformer agent '{planner_agent}' is not configured"))?;
-    let client = acp::AcpSubprocessClient::new(&planner_agent, agent_config);
+    let client = build_client(
+        &config,
+        &planner_agent,
+        agent_config,
+        config::DEFAULT_SANDBOX_PROVIDER,
+    )?;
     let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
     let request = agent::AgentRunRequest {
         agent_name: planner_agent.clone(),
@@ -1142,6 +1148,23 @@ struct ParallelRunReport {
     project: Option<String>,
 }
 
+/// Build an ACP client for `display_name`, injecting the sandbox provider that
+/// `sandbox_name` resolves to. `local` yields the identity provider; any other
+/// name must have a matching `[sandboxes.<name>]` entry.
+fn build_client(
+    config: &config::Config,
+    display_name: &str,
+    agent_config: &config::AgentConfig,
+    sandbox_name: &str,
+) -> Result<acp::AcpSubprocessClient> {
+    let provider = sandbox::provider_for(sandbox_name, &config.sandboxes)?;
+    Ok(acp::AcpSubprocessClient::with_sandbox(
+        display_name,
+        agent_config,
+        provider,
+    ))
+}
+
 async fn run_task_path_for_parallel(
     config: config::Config,
     task_path: PathBuf,
@@ -1165,7 +1188,7 @@ async fn run_task_path_for_parallel(
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    let client = build_client(&config, &display_name, agent_config, &route.sandbox)?;
     let outcome = runner::run_task(
         &config,
         &display_name,
@@ -2226,7 +2249,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    let client = build_client(&config, &display_name, agent_config, &route.sandbox)?;
     if config.git.auto_commit {
         git::commit_task_file(
             &task_path,
@@ -2326,7 +2349,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    let client = build_client(&config, &display_name, agent_config, &route.sandbox)?;
     let outcome = runner::plan_task(
         &config,
         &display_name,
@@ -2410,7 +2433,7 @@ async fn run_captured_resume_command(
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    let client = build_client(&config, &display_name, agent_config, &route.sandbox)?;
     if config.git.auto_commit {
         git::commit_task_file(
             task_path,
