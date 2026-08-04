@@ -580,11 +580,11 @@ The effective provider for a route resolves as `route.sandbox` → `defaults.san
 
 - **Project-only mounts.** Only the task's **project directory** is bind-mounted, at the same absolute path, so host secrets outside the project (e.g. `~/.aws`) are not reachable from inside the container. Any paths listed under `mounts` are added as **read-only** bind mounts; nothing else on the host is visible.
 - **Default-deny egress with an allow-list.** With no `egress` hosts the container gets `--network none` — it is fully offline. Declaring `egress` hosts attaches the container to the bridge network, disables ambient DNS (`--dns 0.0.0.0`), and pins **only** the allow-listed hostnames to their host-resolved IPs via `--add-host`. A non-allow-listed hostname cannot resolve and is therefore unreachable, while allow-listed hosts stay reachable. (This is a name-resolution allow-list; IP-level firewalling of raw egress is a later milestone.)
+- **Resume-capture without exposing `$HOME`.** The container's `HOME` is set to a dedicated per-session host directory (`~/.varda/sessions/{session_id}`) that is bind-mounted read-write — the host's real `$HOME` is never mounted, so credentials stay out of the container. Because the agent writes its own session store (claude/copilot/codex) under that HOME, Varda reads it back from the host after the run and produces a working `resume_command`.
 
 Current limitations:
 
 - **Non-interactive runs only.** Starting an interactive or resume session under a non-`local` sandbox returns a clear error (interactive-under-sandbox is a later milestone).
-- **Resume-capture is disabled under docker.** The agent's own session store lives inside the container, so Varda logs `WARN resume-command unavailable under sandbox` and skips capturing a resume command.
 
 ### Roles
 

@@ -134,8 +134,8 @@ impl AcpSubprocessClient {
             .prepare(&sandbox_ctx)
             .await
             .with_context(|| format!("failed to prepare '{}' sandbox", self.sandbox.name()))?;
-        let capture_session = session.session_store_root().is_some();
-        if !capture_session {
+        let session_store_root = session.session_store_root();
+        if session_store_root.is_none() {
             eprintln!("WARN resume-command unavailable under sandbox");
         }
         let spec = session
@@ -170,9 +170,11 @@ impl AcpSubprocessClient {
         drop(stdin);
 
         // Resume-capture depends on reaching the agent's session store on the
-        // host; skip it when the sandbox hides that store (docker in M1).
-        if capture_session {
-            self.record_external_session(request, started_at);
+        // host; skip it when the sandbox hides that store. The store root is the
+        // provider's HOME view (host `$HOME` for `local`, the per-session mount
+        // for `docker`), so discovery reads exactly where the agent wrote.
+        if let Some(session_root) = session_store_root.as_deref() {
+            self.record_external_session(request, started_at, session_root);
         }
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
@@ -367,7 +369,10 @@ impl AcpSubprocessClient {
                 )
             })?;
 
-            let record_handle = self.record_external_session(request, started_at);
+            // Interactive runs are local-only (guarded above), so the agent's
+            // session store lives under the host's real HOME.
+            let record_handle =
+                self.record_external_session(request, started_at, &host_session_root());
 
             let status = child
                 .wait()
@@ -435,7 +440,9 @@ impl AcpSubprocessClient {
             let _ = tokio::io::copy(&mut terminal_stdin, &mut stdin).await;
         });
 
-        let record_handle = self.record_external_session(request, started_at);
+        // Local-only interactive fallback: store lives under the host's HOME.
+        let record_handle =
+            self.record_external_session(request, started_at, &host_session_root());
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let log_path = request.session_log_path.clone();
@@ -491,24 +498,32 @@ impl AcpSubprocessClient {
         &self,
         request: &AgentRunRequest,
         started_at: SystemTime,
+        session_root: &Path,
     ) -> Option<tokio::task::JoinHandle<Option<String>>> {
         let log_path = request.session_log_path.as_deref()?.to_owned();
+        let session_root = session_root.to_path_buf();
 
         if self.command == "claude" {
             let project = request.frontmatter.project.as_deref()?.to_owned();
             let varda_session_id = request.session_id.clone();
             Some(tokio::spawn(async move {
-                record_claude_external_session(log_path, project, varda_session_id, started_at)
-                    .await
+                record_claude_external_session(
+                    session_root,
+                    log_path,
+                    project,
+                    varda_session_id,
+                    started_at,
+                )
+                .await
             }))
         } else if self.uses_copilot() {
             Some(tokio::spawn(async move {
-                record_copilot_external_session(log_path, started_at).await
+                record_copilot_external_session(session_root, log_path, started_at).await
             }))
         } else if self.command == "codex" {
             let project = request.frontmatter.project.clone();
             Some(tokio::spawn(async move {
-                record_codex_external_session(log_path, started_at, project).await
+                record_codex_external_session(session_root, log_path, started_at, project).await
             }))
         } else {
             None
@@ -535,13 +550,16 @@ impl AcpSubprocessClient {
 }
 
 async fn record_claude_external_session(
+    session_root: PathBuf,
     log_path: String,
     project: String,
     varda_session_id: String,
     started_at: SystemTime,
 ) -> Option<String> {
     for _ in 0..20 {
-        if let Some(transcript) = find_claude_transcript(&project, &varda_session_id, started_at) {
+        if let Some(transcript) =
+            find_claude_transcript(&session_root, &project, &varda_session_id, started_at)
+        {
             let session_id = transcript
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -561,9 +579,8 @@ async fn record_claude_external_session(
     None
 }
 
-fn find_copilot_process_log(started_at: SystemTime) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let logs_dir = Path::new(&home).join(".copilot/logs");
+fn find_copilot_process_log(session_root: &Path, started_at: SystemTime) -> Option<PathBuf> {
+    let logs_dir = session_root.join(".copilot/logs");
     find_copilot_process_log_in(&logs_dir, started_at)
 }
 
@@ -601,14 +618,14 @@ fn extract_copilot_workspace_id(log_path: &Path) -> Option<String> {
 }
 
 async fn record_copilot_external_session(
+    session_root: PathBuf,
     log_path: String,
     started_at: SystemTime,
 ) -> Option<String> {
     for _ in 0..20 {
-        if let Some(process_log) = find_copilot_process_log(started_at) {
+        if let Some(process_log) = find_copilot_process_log(&session_root, started_at) {
             if let Some(workspace_id) = extract_copilot_workspace_id(&process_log) {
-                let home = std::env::var_os("HOME")?;
-                let events_path = Path::new(&home)
+                let events_path = session_root
                     .join(".copilot/session-state")
                     .join(&workspace_id)
                     .join("events.jsonl");
@@ -627,9 +644,12 @@ async fn record_copilot_external_session(
     None
 }
 
-fn find_codex_session(started_at: SystemTime, project: Option<&str>) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let sessions_base = Path::new(&home).join(".codex/sessions");
+fn find_codex_session(
+    session_root: &Path,
+    started_at: SystemTime,
+    project: Option<&str>,
+) -> Option<PathBuf> {
+    let sessions_base = session_root.join(".codex/sessions");
     let mut matches: Vec<(SystemTime, PathBuf)> = Vec::new();
 
     let years = std::fs::read_dir(&sessions_base).ok()?;
@@ -698,12 +718,15 @@ fn extract_codex_session_id(path: &Path) -> Option<String> {
 }
 
 async fn record_codex_external_session(
+    session_root: PathBuf,
     log_path: String,
     started_at: SystemTime,
     project: Option<String>,
 ) -> Option<String> {
     for _ in 0..20 {
-        if let Some(session_path) = find_codex_session(started_at, project.as_deref()) {
+        if let Some(session_path) =
+            find_codex_session(&session_root, started_at, project.as_deref())
+        {
             let session_id =
                 extract_codex_session_id(&session_path).unwrap_or_else(|| "unknown".to_owned());
             let _ = append_session_log(
@@ -974,6 +997,12 @@ fn expand_varda_project(value: &str) -> String {
         .replace("{varda_home}", &default_varda_home())
 }
 
+/// Host `$HOME` as the session-store root for un-sandboxed (interactive) runs,
+/// mirroring [`crate::sandbox::LocalSession::session_store_root`].
+fn host_session_root() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+}
+
 fn default_varda_home() -> String {
     if let Ok(home) = std::env::var("VARDA_HOME") {
         if !home.trim().is_empty() {
@@ -997,11 +1026,12 @@ fn env_for_request(
 }
 
 fn find_claude_transcript(
+    session_root: &Path,
     project: &str,
     varda_session_id: &str,
     started_at: SystemTime,
 ) -> Option<PathBuf> {
-    let project_dir = claude_project_dir(project)?;
+    let project_dir = claude_project_dir(session_root, project)?;
     let entries = std::fs::read_dir(project_dir).ok()?;
     let mut matches = Vec::new();
 
@@ -1033,10 +1063,9 @@ fn find_claude_transcript(
     matches.into_iter().map(|(_, path)| path).next()
 }
 
-fn claude_project_dir(project: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
+fn claude_project_dir(session_root: &Path, project: &str) -> Option<PathBuf> {
     let slug = project.replace('/', "-");
-    Some(Path::new(&home).join(".claude/projects").join(slug))
+    Some(session_root.join(".claude/projects").join(slug))
 }
 
 fn append_session_log(path: &str, content: &str) -> Result<()> {
@@ -1229,21 +1258,24 @@ mod tests {
         assert!(!result.requires_user);
     }
 
-    /// Security assertion (the point of M1): the agent container mounts only the
-    /// project and therefore CANNOT read the host's `~/.aws` — mirrors the Colima
-    /// probe (`ls ~/.aws` inside ⇒ not found). Run with `cargo test -- --ignored`.
+    /// Security assertion (the point of M1, preserved through M3): the agent
+    /// container mounts only the project and a dedicated per-session HOME — never
+    /// the host's real `$HOME` — so it CANNOT read the host's `~/.aws`. M3 sets
+    /// the container `HOME` to the session store, so `$HOME/.aws` would only test
+    /// that empty dir; probe the host's *absolute* `~/.aws` path instead to prove
+    /// the real credential dir is not mounted. Run with `cargo test -- --ignored`.
     #[tokio::test]
     #[ignore = "requires a running docker daemon"]
     async fn docker_agent_cannot_read_host_aws_credentials() {
-        // Probe for ~/.aws inside the container; print a sentinel plus a recap.
-        let client = docker_client(
-            "sh",
-            &[
-                "-c",
-                "if [ -e \"$HOME/.aws\" ]; then echo AWS_VISIBLE; else echo AWS_HIDDEN; fi; \
-                 echo; echo 'requires_user: false'",
-            ],
+        // Absolute host credential path; must not be visible from inside.
+        let host_aws = host_session_root().join(".aws");
+        let host_aws = host_aws.display();
+        // Probe for the host ~/.aws inside the container; print a sentinel + recap.
+        let probe = format!(
+            "if [ -e \"{host_aws}\" ]; then echo AWS_VISIBLE; else echo AWS_HIDDEN; fi; \
+             echo; echo 'requires_user: false'"
         );
+        let client = docker_client("sh", &["-c", probe.as_str()]);
         let result = client
             .run_task(docker_request("/tmp", "docker-aws"))
             .await

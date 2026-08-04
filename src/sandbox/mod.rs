@@ -153,13 +153,38 @@ impl SandboxProvider for DockerProvider {
             })?;
             egress_pins.push((host.clone(), ip));
         }
+        // Give the container a dedicated, host-visible HOME so the agent's own
+        // session store (claude/copilot/codex) lands in a directory we can read
+        // back after the run — WITHOUT mounting the host's real `$HOME` (which
+        // would leak credentials). Only this per-session dir is mounted.
+        let session_store = varda_sessions_root().join(ctx.session_id);
+        std::fs::create_dir_all(&session_store).with_context(|| {
+            format!(
+                "failed to create sandbox session store {}",
+                session_store.display()
+            )
+        })?;
         Ok(Box::new(DockerSession {
             image: self.image.clone(),
             project_root: ctx.project_root.to_path_buf(),
             mounts: self.mounts.clone(),
             egress_pins,
+            session_store,
         }))
     }
+}
+
+/// Host directory under which per-session sandbox HOME dirs are created.
+///
+/// Mirrors `acp::default_varda_home`: honours `VARDA_HOME`, else `$HOME/.varda`,
+/// then appends `sessions`.
+fn varda_sessions_root() -> PathBuf {
+    let base = std::env::var_os("VARDA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".varda")))
+        .unwrap_or_else(|| PathBuf::from(".varda"));
+    base.join("sessions")
 }
 
 /// Resolve `host` to a single IP address using the host's blocking resolver.
@@ -188,6 +213,9 @@ pub struct DockerSession {
     mounts: Vec<String>,
     /// Resolved `(hostname, ip)` egress allow-list. Empty ⇒ `--network none`.
     egress_pins: Vec<(String, String)>,
+    /// Per-session host dir mounted as the container's `HOME`, so the agent's
+    /// session store is reachable from the host for resume-capture.
+    session_store: PathBuf,
 }
 
 #[async_trait]
@@ -235,6 +263,12 @@ impl SandboxSession for DockerSession {
         // is unless explicitly allow-listed via `mounts` (read-only).
         args.push("-v".to_owned());
         args.push(format!("{proj}:{proj}"));
+        // The per-session HOME is mounted read-write at the same absolute path
+        // inside the container so the agent's session store writes land on the
+        // host (enabling resume-capture) without exposing the host's real HOME.
+        let store = self.session_store.display().to_string();
+        args.push("-v".to_owned());
+        args.push(format!("{store}:{store}"));
         for mount in &self.mounts {
             args.push("-v".to_owned());
             args.push(format!("{mount}:{mount}:ro"));
@@ -242,9 +276,12 @@ impl SandboxSession for DockerSession {
         args.push("-w".to_owned());
         args.push(cwd);
         // Move the resolved env into `-e K=V`; the container starts with a clean
-        // base env, so host secrets are never inherited implicitly. BTreeMap
-        // iteration is sorted, keeping the produced argv deterministic.
-        for (key, value) in &spec.env {
+        // base env, so host secrets are never inherited implicitly. Force HOME to
+        // the mounted per-session store so the agent writes its session there.
+        // BTreeMap iteration is sorted, keeping the produced argv deterministic.
+        let mut env = spec.env;
+        env.insert("HOME".to_owned(), store);
+        for (key, value) in &env {
             args.push("-e".to_owned());
             args.push(format!("{key}={value}"));
         }
@@ -263,9 +300,9 @@ impl SandboxSession for DockerSession {
     }
 
     fn session_store_root(&self) -> Option<PathBuf> {
-        // The agent's session store lives inside the container in M1, so it is
-        // not reachable from the host: resume-capture is degraded until M3.
-        None
+        // The container's HOME is this host dir (mounted read-write), so the
+        // agent's session store is reachable from the host for resume-capture.
+        Some(self.session_store.clone())
     }
 
     async fn teardown(self: Box<Self>) -> Result<()> {
@@ -339,6 +376,11 @@ mod tests {
         };
 
         let wrapped = session.wrap(spec).unwrap();
+        // Discover the per-session store dir the provider created for this ctx so
+        // the expected argv stays independent of the host's VARDA_HOME/HOME.
+        let store = session.session_store_root().unwrap().display().to_string();
+        let store_mount = format!("{store}:{store}");
+        let home_env = format!("HOME={store}");
         assert_eq!(wrapped.program, "docker");
         assert_eq!(
             wrapped.args,
@@ -351,13 +393,17 @@ mod tests {
                 "none",
                 "-v",
                 "/home/me/project:/home/me/project",
+                "-v",
+                store_mount.as_str(),
                 "-w",
                 "/home/me/project",
-                // sorted env: ALPHA before FOO
+                // sorted env: ALPHA before FOO before the injected HOME
                 "-e",
                 "ALPHA=beta",
                 "-e",
                 "FOO=bar",
+                "-e",
+                home_env.as_str(),
                 "varda:latest",
                 "claude",
                 "--print",
@@ -385,15 +431,21 @@ mod tests {
         assert_eq!(wrapped.args[w + 1], "/srv/app");
     }
 
+    /// M3: the container's HOME is a host-visible per-session dir, so the store
+    /// root is reachable (Some) and resume-capture can read it back.
     #[test]
-    fn docker_session_store_root_is_none() {
+    fn docker_session_store_root_is_the_session_mount() {
         let session = DockerSession {
             image: "img".to_owned(),
             project_root: PathBuf::from("/proj"),
             mounts: vec![],
             egress_pins: vec![],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
         };
-        assert!(session.session_store_root().is_none());
+        assert_eq!(
+            session.session_store_root(),
+            Some(PathBuf::from("/var/varda/sessions/s1"))
+        );
     }
 
     /// M2 mount allow-list: the project root is always mounted; extra `mounts`
@@ -406,6 +458,7 @@ mod tests {
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![],
             egress_pins: vec![],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -422,7 +475,14 @@ mod tests {
             .filter(|(i, _)| *i > 0 && wrapped.args[i - 1] == "-v")
             .map(|(_, v)| v)
             .collect();
-        assert_eq!(mounts, vec!["/srv/app:/srv/app"]);
+        // Project root plus the per-session HOME mount; nothing else.
+        assert_eq!(
+            mounts,
+            vec![
+                "/srv/app:/srv/app",
+                "/var/varda/sessions/s1:/var/varda/sessions/s1"
+            ]
+        );
     }
 
     /// M2 mount allow-list: an explicit extra mount is bind-mounted read-only.
@@ -433,6 +493,7 @@ mod tests {
             project_root: PathBuf::from("/srv/app"),
             mounts: vec!["/opt/cache".to_owned()],
             egress_pins: vec![],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -449,7 +510,15 @@ mod tests {
             .filter(|(i, _)| *i > 0 && wrapped.args[i - 1] == "-v")
             .map(|(_, v)| v)
             .collect();
-        assert_eq!(mounts, vec!["/srv/app:/srv/app", "/opt/cache:/opt/cache:ro"]);
+        // Project root, then the per-session HOME mount, then the read-only extra.
+        assert_eq!(
+            mounts,
+            vec![
+                "/srv/app:/srv/app",
+                "/var/varda/sessions/s1:/var/varda/sessions/s1",
+                "/opt/cache:/opt/cache:ro"
+            ]
+        );
     }
 
     /// M2 egress: no allow-list ⇒ fully offline (`--network none`, no DNS/host
@@ -461,6 +530,7 @@ mod tests {
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![],
             egress_pins: vec![],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -488,6 +558,7 @@ mod tests {
                 ("api.example.com".to_owned(), "93.184.216.34".to_owned()),
                 ("cdn.example.com".to_owned(), "203.0.113.7".to_owned()),
             ],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
         };
         let wrapped = session
             .wrap(CommandSpec {
