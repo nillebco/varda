@@ -123,11 +123,13 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: root.display().to_string(),
+                sandbox: None,
             },
             routes: vec![],
             agents: BTreeMap::new(),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
 
         let notification = notify_user_interaction(

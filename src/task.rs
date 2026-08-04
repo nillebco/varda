@@ -678,14 +678,17 @@ Do the work.
             defaults: crate::config::Defaults {
                 timeout_seconds: 600,
                 operations_dir: operations_dir.display().to_string(),
+                sandbox: None,
             },
             routes: vec![crate::config::Route {
                 glob: "**".to_owned(),
                 agents: vec!["codex".to_owned()],
+                sandbox: None,
             }],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
 
         let project_path = Path::new("/work/project");
@@ -733,11 +736,13 @@ requires_user: false
             defaults: crate::config::Defaults {
                 timeout_seconds: 600,
                 operations_dir: root.join("operations").display().to_string(),
+                sandbox: None,
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
 
         let path = create_task(&config, "Next Task", Path::new("/work/project"), None, None)
@@ -764,11 +769,13 @@ requires_user: false
             defaults: crate::config::Defaults {
                 timeout_seconds: 600,
                 operations_dir: operations_dir.display().to_string(),
+                sandbox: None,
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
 
         let first = create_task(&config, "Project Task", &first_project, None, None)
@@ -839,11 +846,13 @@ requires_user: false
             defaults: crate::config::Defaults {
                 timeout_seconds: 600,
                 operations_dir: root.join("operations").display().to_string(),
+                sandbox: None,
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
 
         let tasks = list_tasks(&config, &project_path).expect("tasks should list");
@@ -879,11 +888,13 @@ requires_user: false
             defaults: crate::config::Defaults {
                 timeout_seconds: 600,
                 operations_dir: root.join("operations").display().to_string(),
+                sandbox: None,
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
 
         let resolved =

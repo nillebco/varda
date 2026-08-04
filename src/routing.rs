@@ -338,15 +338,18 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
+                sandbox: None,
             },
             routes: vec![
                 Route {
                     glob: "/work/special/**".to_owned(),
                     agents: vec!["codex".to_owned()],
+                    sandbox: None,
                 },
                 Route {
                     glob: "**".to_owned(),
                     agents: vec!["fallback".to_owned()],
+                    sandbox: None,
                 },
             ],
             agents: BTreeMap::from([
@@ -381,6 +384,7 @@ mod tests {
             ]),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
 
         let route = match_route(&config, Path::new("/work/special/project"), None)
@@ -395,15 +399,18 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
+                sandbox: None,
             },
             routes: vec![
                 Route {
                     glob: "**/AsianDevBank/**".to_owned(),
                     agents: vec!["copilot".to_owned()],
+                    sandbox: None,
                 },
                 Route {
                     glob: "**".to_owned(),
                     agents: vec!["codex".to_owned(), "claude".to_owned()],
+                    sandbox: None,
                 },
             ],
             agents: BTreeMap::from([
@@ -452,6 +459,7 @@ mod tests {
             ]),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
 
         let adb_route = match_route(
@@ -473,10 +481,12 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
+                sandbox: None,
             },
             routes: vec![Route {
                 glob: "**".to_owned(),
                 agents: vec!["codex".to_owned()],
+                sandbox: None,
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),
@@ -494,6 +504,7 @@ mod tests {
             )]),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
 
         let error = match_route(&config, Path::new("/work/project"), Some("claude"))
@@ -508,10 +519,12 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
+                sandbox: None,
             },
             routes: vec![Route {
                 glob: "**".to_owned(),
                 agents: vec!["small".to_owned(), "large".to_owned()],
+                sandbox: None,
             }],
             agents: BTreeMap::from([
                 (
@@ -545,6 +558,7 @@ mod tests {
             ]),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),
@@ -579,10 +593,12 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
+                sandbox: None,
             },
             routes: vec![Route {
                 glob: "**".to_owned(),
                 agents: vec!["small".to_owned(), "large".to_owned()],
+                sandbox: None,
             }],
             agents: BTreeMap::from([
                 (
@@ -616,6 +632,7 @@ mod tests {
             ]),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),

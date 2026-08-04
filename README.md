@@ -553,6 +553,27 @@ For now, `kind = "acp"` means Varda uses its ACP-facing agent abstraction. The c
 
 When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder. Varda also expands `{varda_project}` to the Varda source project directory and `{varda_home}` to the Varda control-plane directory, then passes both as additional writable directories to the default Codex, Claude, and Copilot launch commands, so interpreter and resume sessions can create follow-up Varda tasks after the current task finishes.
 
+### Sandbox providers (config surface)
+
+Varda reserves a `sandbox` config surface for future L1 isolation of agent runs. It is **inert today** — the keys parse and round-trip but do not yet change behavior:
+
+```toml
+[defaults]
+sandbox = "local"          # default provider for routes that don't override it
+
+[[routes]]
+glob = "/work/project/**"
+agents = ["codex"]
+sandbox = "docker"         # per-route override
+
+[sandboxes.docker]
+image = "varda:latest"     # optional
+mounts = ["/tmp"]          # optional
+egress = ["api.example.com"]  # optional
+```
+
+The effective provider for a route resolves as `route.sandbox` → `defaults.sandbox` → `"local"`. All keys are optional, so existing `config.toml` files parse and re-serialize unchanged. Note: these keys are orthogonal to Codex's own `--sandbox workspace-write` CLI flag in the agent `args`.
+
 ### Roles
 
 Roles are prompt personas that layer on top of an agent backend. They let you assign a different behavioral mode (e.g. verification, planning, review) without changing the underlying executable.

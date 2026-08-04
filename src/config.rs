@@ -15,6 +15,10 @@ pub const TASKS_DIRNAME: &str = "tasks";
 pub const RECAPS_DIRNAME: &str = "recaps";
 pub const RUNS_DIRNAME: &str = "runs";
 pub const OPERATIONS_README: &str = "README.md";
+/// Fallback sandbox provider when neither a route nor defaults specify one.
+/// Wired into task execution in a later `SandboxProvider` milestone (M1).
+#[allow(dead_code)]
+pub const DEFAULT_SANDBOX_PROVIDER: &str = "local";
 
 const DEFAULT_CONFIG: &str = r#"[defaults]
 timeout_seconds = 600
@@ -84,6 +88,8 @@ pub struct Config {
     pub roles: BTreeMap<String, RoleConfig>,
     #[serde(default)]
     pub git: GitConfig,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sandboxes: BTreeMap<String, SandboxConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,6 +103,9 @@ pub struct RoleConfig {
 pub struct Defaults {
     pub timeout_seconds: u64,
     pub operations_dir: String,
+    /// Default sandbox provider applied to routes that do not set their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +113,19 @@ pub struct Route {
     pub glob: String,
     #[serde(default)]
     pub agents: Vec<String>,
+    /// Sandbox provider for this route; overrides the default when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SandboxConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +171,21 @@ impl Default for GitConfig {
         Self {
             auto_commit: default_auto_commit(),
         }
+    }
+}
+
+impl Config {
+    /// Resolve the effective sandbox provider for a route.
+    ///
+    /// Precedence: `route.sandbox` → `defaults.sandbox` → [`DEFAULT_SANDBOX_PROVIDER`].
+    /// Consumed by task execution in a later `SandboxProvider` milestone (M1).
+    #[allow(dead_code)]
+    pub fn effective_sandbox<'a>(&'a self, route: &'a Route) -> &'a str {
+        route
+            .sandbox
+            .as_deref()
+            .or(self.defaults.sandbox.as_deref())
+            .unwrap_or(DEFAULT_SANDBOX_PROVIDER)
     }
 }
 
@@ -270,7 +307,14 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
         }
     }
 
-    config.routes.insert(0, Route { glob, agents });
+    config.routes.insert(
+        0,
+        Route {
+            glob,
+            agents,
+            sandbox: None,
+        },
+    );
     save_config(path, &config)
 }
 
@@ -568,6 +612,59 @@ mod tests {
             config.defaults.operations_dir,
             root.join("operations").display().to_string()
         );
+    }
+
+    #[test]
+    fn default_config_round_trips_without_sandbox_keys() {
+        let config: Config = toml::from_str(DEFAULT_CONFIG).expect("default config should parse");
+
+        assert!(config.sandboxes.is_empty());
+        assert!(config.defaults.sandbox.is_none());
+        assert!(config.routes.iter().all(|route| route.sandbox.is_none()));
+
+        let serialized = toml::to_string_pretty(&config).expect("config should serialize");
+        // The only "sandbox" occurrences must be Codex's own `--sandbox` CLI args,
+        // never our config keys (`sandbox = ` under [defaults]/[[routes]] or a
+        // `[sandboxes]` table).
+        assert!(
+            !serialized.contains("sandbox = ") && !serialized.contains("[sandboxes"),
+            "no sandbox config keys should be emitted when none are set: {serialized}"
+        );
+
+        let reparsed: Config = toml::from_str(&serialized).expect("serialized config should parse");
+        assert_eq!(config, reparsed);
+    }
+
+    #[test]
+    fn resolves_effective_sandbox_provider_precedence() {
+        let mut config: Config =
+            toml::from_str(DEFAULT_CONFIG).expect("default config should parse");
+
+        let route = config.routes[0].clone();
+        assert_eq!(config.effective_sandbox(&route), DEFAULT_SANDBOX_PROVIDER);
+
+        config.defaults.sandbox = Some("docker".to_owned());
+        assert_eq!(config.effective_sandbox(&route), "docker");
+
+        let route_with_sandbox = Route {
+            glob: "**".to_owned(),
+            agents: vec!["codex".to_owned()],
+            sandbox: Some("firejail".to_owned()),
+        };
+        assert_eq!(config.effective_sandbox(&route_with_sandbox), "firejail");
+    }
+
+    #[test]
+    fn parses_sandboxes_table() {
+        let toml = format!(
+            "{DEFAULT_CONFIG}\n[sandboxes.docker]\nimage = \"varda:latest\"\nmounts = [\"/tmp\"]\negress = [\"api.example.com\"]\n"
+        );
+        let config: Config = toml::from_str(&toml).expect("config with sandboxes should parse");
+
+        let docker = &config.sandboxes["docker"];
+        assert_eq!(docker.image.as_deref(), Some("varda:latest"));
+        assert_eq!(docker.mounts, vec!["/tmp"]);
+        assert_eq!(docker.egress, vec!["api.example.com"]);
     }
 
     #[test]

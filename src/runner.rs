@@ -990,10 +990,12 @@ Help interactively.
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir,
+                sandbox: None,
             },
             routes: vec![Route {
                 glob: "**".to_owned(),
                 agents: vec!["codex".to_owned()],
+                sandbox: None,
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),
@@ -1011,6 +1013,7 @@ Help interactively.
             )]),
             roles: std::collections::BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         }
     }
 }

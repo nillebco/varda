@@ -3021,11 +3021,13 @@ planner_agent: codex
             defaults: config::Defaults {
                 timeout_seconds: 600,
                 operations_dir: operations_dir.display().to_string(),
+                sandbox: None,
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
             git: config::GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
         };
 
         let sessions = task_sessions(&config, &task_path).expect("sessions should be found");
