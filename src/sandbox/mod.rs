@@ -218,7 +218,31 @@ pub trait SandboxSession: Send + Sync {
     fn wrap(&self, spec: CommandSpec) -> Result<CommandSpec>;
     /// Filesystem root under which the agent's own session store lives, when it
     /// is reachable from the host. `None` degrades resume-capture (M1 docker).
+    ///
+    /// For live stores this path is written during the run; for extracted stores
+    /// (docker volume + `docker cp`) it is only populated by
+    /// [`extract_session_store`](Self::extract_session_store) after the run.
     fn session_store_root(&self) -> Option<PathBuf>;
+    /// `true` when the session store is written directly to a host-visible path
+    /// during the run (so resume-discovery can poll live). `false` when the store
+    /// is materialized only after the run (docker volume + `docker cp`); callers
+    /// must call [`extract_session_store`](Self::extract_session_store) and then
+    /// discover once, rather than polling during the run.
+    fn store_is_live(&self) -> bool {
+        true
+    }
+    /// Fail loudly when a declared bind-mount SOURCE is not reachable on the host
+    /// (a would-be empty in-VM stub on a VM-backed daemon), naming the path.
+    /// No-op for providers that do not bind host paths.
+    fn validate_mounts(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Materialize the agent's session store on the host after the run and before
+    /// teardown (e.g. `docker cp` from a per-session volume into
+    /// [`session_store_root`](Self::session_store_root)). No-op for live stores.
+    async fn extract_session_store(&self) -> Result<()> {
+        Ok(())
+    }
     async fn teardown(self: Box<Self>) -> Result<()>;
 }
 
@@ -433,10 +457,14 @@ impl SandboxProvider for DockerProvider {
             })?;
             egress_pins.push((host.clone(), ip));
         }
-        // Give the container a dedicated, host-visible HOME so the agent's own
-        // session store (claude/copilot/codex) lands in a directory we can read
-        // back after the run — WITHOUT mounting the host's real `$HOME` (which
-        // would leak credentials). Only this per-session dir is mounted.
+        // Give the container a dedicated HOME backed by a PER-SESSION DOCKER
+        // NAMED VOLUME (not a host bind mount). The volume lives in the daemon/VM
+        // storage, so it works on a VM-backed daemon whose shared tree excludes
+        // `~/.varda` (e.g. a Colima profile sharing only `~/dev`) — a host bind of
+        // `~/.varda/sessions/{id}` there silently mounts an empty in-VM stub and
+        // the agent's session store never reaches the host. After the run we
+        // `docker cp` the store out of the container into `session_store` (a
+        // host-side dir we create, never mounted), which resume-capture reads.
         let session_store = varda_sessions_root().join(ctx.session_id);
         std::fs::create_dir_all(&session_store).with_context(|| {
             format!(
@@ -444,6 +472,7 @@ impl SandboxProvider for DockerProvider {
                 session_store.display()
             )
         })?;
+        let handle = sanitize_docker_name(ctx.session_id);
         // Resolve the concrete image only now: a `build` sandbox builds its
         // Dockerfile here (once, content-addressed) rather than at config load.
         let image = self.resolve_image().await?;
@@ -453,6 +482,9 @@ impl SandboxProvider for DockerProvider {
             mounts: self.mounts.clone(),
             egress_pins,
             session_store,
+            volume: format!("varda-sbx-{handle}"),
+            container: format!("varda-sbx-{handle}"),
+            home: "/home/agent".to_owned(),
         }))
     }
 }
@@ -468,6 +500,24 @@ fn varda_sessions_root() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".varda")))
         .unwrap_or_else(|| PathBuf::from(".varda"));
     base.join("sessions")
+}
+
+/// Sanitize a session id into a docker-safe name/volume component.
+///
+/// Docker names must match `[a-zA-Z0-9][a-zA-Z0-9_.-]*`; every other character
+/// is folded to `-`. The `varda-sbx-` prefix guarantees a valid leading char, so
+/// the result is always usable even for an empty or exotic session id.
+fn sanitize_docker_name(session_id: &str) -> String {
+    session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Resolve `host` to a single IP address using the host's blocking resolver.
@@ -497,9 +547,17 @@ pub struct DockerSession {
     mounts: Vec<(MountOrigin, String)>,
     /// Resolved `(hostname, ip)` egress allow-list. Empty ⇒ `--network none`.
     egress_pins: Vec<(String, String)>,
-    /// Per-session host dir mounted as the container's `HOME`, so the agent's
-    /// session store is reachable from the host for resume-capture.
+    /// Host dir into which the agent's session store is `docker cp`-ed AFTER the
+    /// run (never bind-mounted). Resume-capture reads this back from the host.
     session_store: PathBuf,
+    /// Per-session docker named volume backing the container `HOME`. Lives in
+    /// daemon/VM storage, independent of any host-share configuration.
+    volume: String,
+    /// Per-session container name (the run drops `--rm` so the container
+    /// survives its process exit long enough to `docker cp` the store out).
+    container: String,
+    /// In-container mount point for `volume`, used as the agent's `HOME`.
+    home: String,
 }
 
 #[async_trait]
@@ -516,9 +574,14 @@ impl SandboxSession for DockerSession {
 
         let mut args = vec![
             "run".to_owned(),
-            "--rm".to_owned(),
+            // A stable per-session name so we can `docker cp` the session store
+            // out and `docker rm` the container in teardown. NOTE: we deliberately
+            // do NOT pass `--rm` — the container must outlive its process exit so
+            // the store can be extracted before removal.
+            "--name".to_owned(),
+            self.container.clone(),
             // `--init` reaps the container's PID 1 so a killed/dropped `docker`
-            // client (timeout, kill_on_drop) tears the container down cleanly.
+            // client (timeout, kill_on_drop) still stops the container cleanly.
             "--init".to_owned(),
             // `-i` keeps stdin open so the prompt-then-EOF still reaches the agent.
             "-i".to_owned(),
@@ -547,12 +610,12 @@ impl SandboxSession for DockerSession {
         // is unless explicitly allow-listed via `mounts` (read-only).
         args.push("-v".to_owned());
         args.push(format!("{proj}:{proj}"));
-        // The per-session HOME is mounted read-write at the same absolute path
-        // inside the container so the agent's session store writes land on the
-        // host (enabling resume-capture) without exposing the host's real HOME.
-        let store = self.session_store.display().to_string();
+        // The container's HOME is a per-session DOCKER NAMED VOLUME (not a host
+        // bind). It lives in daemon/VM storage, so it works on a VM-backed daemon
+        // whose share excludes `~/.varda`; the store is `docker cp`-ed to the
+        // host after the run. The host's real HOME is never exposed.
         args.push("-v".to_owned());
-        args.push(format!("{store}:{store}"));
+        args.push(format!("{}:{}", self.volume, self.home));
         // Effective extra mounts = union(sandbox, route), de-duplicated by the
         // (expanded, absolute) target so a later origin does not double-mount a
         // target an earlier one already claimed. First declaration wins.
@@ -581,7 +644,7 @@ impl SandboxSession for DockerSession {
         // the mounted per-session store so the agent writes its session there.
         // BTreeMap iteration is sorted, keeping the produced argv deterministic.
         let mut env = spec.env;
-        env.insert("HOME".to_owned(), store);
+        env.insert("HOME".to_owned(), self.home.clone());
         for (key, value) in &env {
             args.push("-e".to_owned());
             args.push(format!("{key}={value}"));
@@ -601,13 +664,86 @@ impl SandboxSession for DockerSession {
     }
 
     fn session_store_root(&self) -> Option<PathBuf> {
-        // The container's HOME is this host dir (mounted read-write), so the
-        // agent's session store is reachable from the host for resume-capture.
+        // The host dir that `extract_session_store` populates via `docker cp`;
+        // resume-capture reads it back after the run.
         Some(self.session_store.clone())
     }
 
+    fn store_is_live(&self) -> bool {
+        // The store lives in a docker volume during the run; it only reaches the
+        // host after `extract_session_store`, so discovery must run post-exit.
+        false
+    }
+
+    fn validate_mounts(&self) -> Result<()> {
+        // Fail loudly when a bind SOURCE is absent on the host: on a VM-backed
+        // daemon docker would otherwise create an empty in-VM stub and the mount
+        // would silently look successful. (The session store is a volume, not a
+        // bind, so it is exempt.) A non-existent source is the host-observable
+        // proxy for "not reachable inside the VM".
+        if !self.project_root.exists() {
+            bail!(
+                "sandbox project mount source '{}' does not exist on the host; \
+                 docker would mount an empty stub (check the path / VM share)",
+                self.project_root.display()
+            );
+        }
+        for (origin, raw) in &self.mounts {
+            let spec = parse_mount(raw)
+                .with_context(|| format!("invalid mount '{raw}' for sandbox '{}'", self.image))?;
+            let source = expand_mount_path(&spec.source, &self.project_root);
+            if !source.exists() {
+                bail!(
+                    "sandbox {origin:?} mount source '{}' does not exist on the host; \
+                     docker would mount an empty stub (check the path / VM share)",
+                    source.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn extract_session_store(&self) -> Result<()> {
+        // Copy the container HOME *contents* into the host session-store dir. The
+        // trailing `/.` copies what is inside `home` into the (existing) host dir
+        // rather than nesting it. Runs after the agent exits and before teardown.
+        let src = format!("{}:{}/.", self.container, self.home);
+        let dst = self.session_store.display().to_string();
+        let output = tokio::process::Command::new("docker")
+            .args(["cp", &src, &dst])
+            .output()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to spawn `docker cp` from sandbox container '{}'",
+                    self.container
+                )
+            })?;
+        if !output.status.success() {
+            bail!(
+                "`docker cp {src} {dst}` failed with status {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     async fn teardown(self: Box<Self>) -> Result<()> {
-        // `--rm` removes the container on exit; nothing extra to tear down.
+        // Without `--rm` the container and its per-session volume persist; remove
+        // both here. Best-effort: a cleanup failure must not fail the run.
+        let _ = tokio::process::Command::new("docker")
+            .args(["rm", "-f", &self.container])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        let _ = tokio::process::Command::new("docker")
+            .args(["volume", "rm", "-f", &self.volume])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
         Ok(())
     }
 }
@@ -652,17 +788,70 @@ pub fn provider_for(
 }
 
 #[cfg(test)]
+impl DockerSession {
+    /// Construct a session directly for wrap/argv/mount unit tests, bypassing
+    /// `prepare()` (which would need a live docker daemon). The volume/container
+    /// names and HOME are fixed so argv assertions stay deterministic.
+    fn for_test(
+        image: &str,
+        project_root: &str,
+        mounts: Vec<(MountOrigin, String)>,
+        egress_pins: Vec<(String, String)>,
+        session_store: &str,
+    ) -> Self {
+        Self {
+            image: image.to_owned(),
+            project_root: PathBuf::from(project_root),
+            mounts,
+            egress_pins,
+            session_store: PathBuf::from(session_store),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
 
     fn ctx<'a>(project_root: &'a Path) -> SandboxContext<'a> {
+        ctx_with_id(project_root, "session-1")
+    }
+
+    /// Like [`ctx`] but with an explicit session id. Docker integration tests
+    /// that actually launch a container must each use a UNIQUE id: `prepare`
+    /// derives the container/volume name (`varda-sbx-<id>`) from it, and the
+    /// docker path drops `--rm` (the container must outlive its process so the
+    /// session store can be `docker cp`-ed out), so a shared id collides.
+    fn ctx_with_id<'a>(project_root: &'a Path, session_id: &'a str) -> SandboxContext<'a> {
         SandboxContext {
             project_root,
             route_glob: "**",
             agent_kind: AgentKind::Acp,
-            session_id: "session-1",
+            session_id,
         }
+    }
+
+    /// Best-effort removal of a `varda-sbx-<id>` container + its volume, so a
+    /// test is robust to a leftover from a prior panicked run (teardown skipped).
+    async fn docker_cleanup(session_id: &str) {
+        let name = format!("varda-sbx-{}", sanitize_docker_name(session_id));
+        let quiet = |mut c: tokio::process::Command| async move {
+            let _ = c
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        };
+        let mut rm = tokio::process::Command::new("docker");
+        rm.args(["rm", "-f", &name]);
+        quiet(rm).await;
+        let mut vol = tokio::process::Command::new("docker");
+        vol.args(["volume", "rm", "-f", &name]);
+        quiet(vol).await;
     }
 
     #[tokio::test]
@@ -699,17 +888,15 @@ mod tests {
         };
 
         let wrapped = session.wrap(spec).unwrap();
-        // Discover the per-session store dir the provider created for this ctx so
-        // the expected argv stays independent of the host's VARDA_HOME/HOME.
-        let store = session.session_store_root().unwrap().display().to_string();
-        let store_mount = format!("{store}:{store}");
-        let home_env = format!("HOME={store}");
+        // HOME is a per-session named volume mounted at a fixed in-container path;
+        // its name derives from the (sanitized) session id "session-1".
         assert_eq!(wrapped.program, "docker");
         assert_eq!(
             wrapped.args,
             vec![
                 "run",
-                "--rm",
+                "--name",
+                "varda-sbx-session-1",
                 "--init",
                 "-i",
                 "--network",
@@ -717,7 +904,7 @@ mod tests {
                 "-v",
                 "/home/me/project:/home/me/project",
                 "-v",
-                store_mount.as_str(),
+                "varda-sbx-session-1:/home/agent",
                 "-w",
                 "/home/me/project",
                 // sorted env: ALPHA before FOO before the injected HOME
@@ -726,7 +913,7 @@ mod tests {
                 "-e",
                 "FOO=bar",
                 "-e",
-                home_env.as_str(),
+                "HOME=/home/agent",
                 "varda:latest",
                 "claude",
                 "--print",
@@ -764,11 +951,81 @@ mod tests {
             mounts: vec![],
             egress_pins: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
         };
         assert_eq!(
             session.session_store_root(),
             Some(PathBuf::from("/var/varda/sessions/s1"))
         );
+    }
+
+    /// M9: the docker store is NOT live during the run — it lives in a volume and
+    /// is only materialized on the host by `extract_session_store` afterwards.
+    #[test]
+    fn docker_store_is_not_live() {
+        let session =
+            DockerSession::for_test("img", "/proj", vec![], vec![], "/var/varda/sessions/s1");
+        assert!(!session.store_is_live());
+    }
+
+    /// M9 fail-loud guard: a bind-mount SOURCE that does not exist on the host
+    /// (a would-be empty in-VM stub on a VM-backed daemon) is rejected loudly,
+    /// naming the offending path — both for the project root and for extra mounts.
+    #[test]
+    fn docker_validate_mounts_errors_on_unreachable_source() {
+        // Bogus project root.
+        let bad_project = DockerSession::for_test(
+            "img",
+            "/nonexistent/varda-m9-project",
+            vec![],
+            vec![],
+            "/var/varda/sessions/s1",
+        );
+        let err = bad_project
+            .validate_mounts()
+            .expect_err("nonexistent project mount source must fail loudly");
+        assert!(
+            err.to_string().contains("/nonexistent/varda-m9-project")
+                && err.to_string().contains("empty stub"),
+            "unexpected error: {err:#}"
+        );
+
+        // Existing project, bogus extra mount source.
+        let real_project = std::env::temp_dir();
+        let bad_mount = DockerSession::for_test(
+            "img",
+            &real_project.display().to_string(),
+            vec![(
+                MountOrigin::Route,
+                "/nonexistent/varda-m9-context:/ctx".to_owned(),
+            )],
+            vec![],
+            "/var/varda/sessions/s1",
+        );
+        let err = bad_mount
+            .validate_mounts()
+            .expect_err("nonexistent extra mount source must fail loudly");
+        assert!(
+            err.to_string().contains("/nonexistent/varda-m9-context"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// M9: `validate_mounts` passes when every bind source exists on the host.
+    #[test]
+    fn docker_validate_mounts_ok_when_sources_exist() {
+        let real = std::env::temp_dir();
+        let real = real.display().to_string();
+        let session = DockerSession::for_test(
+            "img",
+            &real,
+            vec![(MountOrigin::Sandbox, format!("{real}:/ctx:ro"))],
+            vec![],
+            "/var/varda/sessions/s1",
+        );
+        assert!(session.validate_mounts().is_ok());
     }
 
     /// M2 mount allow-list: the project root is always mounted; extra `mounts`
@@ -782,6 +1039,9 @@ mod tests {
             mounts: vec![],
             egress_pins: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -803,7 +1063,7 @@ mod tests {
             mounts,
             vec![
                 "/srv/app:/srv/app",
-                "/var/varda/sessions/s1:/var/varda/sessions/s1"
+                "varda-sbx-s1:/home/agent"
             ]
         );
     }
@@ -817,6 +1077,9 @@ mod tests {
             mounts: vec![(MountOrigin::Sandbox, "/opt/cache".to_owned())],
             egress_pins: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -838,7 +1101,7 @@ mod tests {
             mounts,
             vec![
                 "/srv/app:/srv/app",
-                "/var/varda/sessions/s1:/var/varda/sessions/s1",
+                "varda-sbx-s1:/home/agent",
                 "/opt/cache:/opt/cache:ro"
             ]
         );
@@ -854,6 +1117,9 @@ mod tests {
             mounts: vec![],
             egress_pins: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -882,6 +1148,9 @@ mod tests {
                 ("cdn.example.com".to_owned(), "203.0.113.7".to_owned()),
             ],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1131,6 +1400,9 @@ mod tests {
             mounts: vec![(MountOrigin::Route, "/ctx/adb:ro".to_owned())],
             egress_pins: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1144,7 +1416,7 @@ mod tests {
             mount_values(&wrapped),
             vec![
                 "/srv/app:/srv/app".to_owned(),
-                "/var/varda/sessions/s1:/var/varda/sessions/s1".to_owned(),
+                "varda-sbx-s1:/home/agent".to_owned(),
                 "/ctx/adb:/ctx/adb:ro".to_owned(),
             ]
         );
@@ -1160,6 +1432,9 @@ mod tests {
             mounts: vec![(MountOrigin::Route, "/host/adb:/context/adb".to_owned())],
             egress_pins: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1190,6 +1465,9 @@ mod tests {
             ],
             egress_pins: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1231,6 +1509,9 @@ mod tests {
             ],
             egress_pins: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1303,7 +1584,8 @@ mod tests {
             .join("target")
             .join("m6a-proj");
         std::fs::create_dir_all(&root).unwrap();
-        let session = provider.prepare(&ctx(&root)).await.unwrap();
+        docker_cleanup("ro-mount-1").await;
+        let session = provider.prepare(&ctx_with_id(&root, "ro-mount-1")).await.unwrap();
 
         // Reading the mounted file succeeds; writing into it fails (ro).
         let spec = session
@@ -1322,9 +1604,84 @@ mod tests {
             .status()
             .await
             .expect("failed to run docker");
+        // Tear down (remove the named container/volume) before asserting so a
+        // failure never leaks docker resources for the next run.
+        session.teardown().await.ok();
         assert!(
             status.success(),
             "read should succeed and write should fail under a read-only route mount"
+        );
+    }
+
+    /// M9 exit criterion — the REAL host round-trip the earlier tests never
+    /// checked. An agent writes its session store under `$HOME` (a per-session
+    /// docker VOLUME, not a host bind), and Varda must read it back FROM THE HOST
+    /// via `docker cp`. This works even on a VM-backed daemon whose share excludes
+    /// `~/.varda` (the Colima `~/dev`-only case that silently broke the M3 bind).
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn docker_session_store_round_trips_to_host_via_volume() {
+        use tokio::process::Command as TokioCommand;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("m9-rt-proj");
+        std::fs::create_dir_all(&root).unwrap();
+        docker_cleanup("store-rt-1").await;
+
+        let provider = DockerProvider::from_config(
+            "docker",
+            &SandboxConfig {
+                image: Some("busybox".to_owned()),
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let session = provider
+            .prepare(&ctx_with_id(&root, "store-rt-1"))
+            .await
+            .unwrap();
+        let store = session.session_store_root().expect("docker store root");
+        std::fs::create_dir_all(&store).unwrap();
+
+        // Simulate the agent writing a session-store file under HOME (the volume).
+        let spec = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "mkdir -p \"$HOME/.claude\" && echo hi > \"$HOME/.claude/transcript.jsonl\""
+                        .to_owned(),
+                ],
+                env: BTreeMap::new(),
+                cwd: Some(root.clone()),
+            })
+            .unwrap();
+        let status = TokioCommand::new(&spec.program)
+            .args(&spec.args)
+            .status()
+            .await
+            .expect("failed to run docker");
+
+        // Extract the store from the volume to the HOST, capture the outcome, then
+        // ALWAYS tear down before asserting so a failure never leaks resources.
+        let extracted = if status.success() {
+            session.extract_session_store().await
+        } else {
+            Ok(())
+        };
+        let host_file = store.join(".claude/transcript.jsonl");
+        let got = std::fs::read_to_string(&host_file);
+        session.teardown().await.ok();
+
+        assert!(status.success(), "container write should succeed");
+        extracted.expect("docker cp extraction should succeed");
+        assert_eq!(
+            got.expect("session-store file must exist on the host after extraction")
+                .trim(),
+            "hi",
+            "the session store must round-trip container→host via the volume + docker cp"
         );
     }
 }

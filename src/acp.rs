@@ -138,6 +138,14 @@ impl AcpSubprocessClient {
         if session_store_root.is_none() {
             eprintln!("WARN resume-command unavailable under sandbox");
         }
+        // Fail loudly if a declared bind-mount source is unreachable on the host
+        // (a would-be empty in-VM stub on a VM-backed daemon) before we run.
+        session.validate_mounts().with_context(|| {
+            format!("unusable mount for '{}' sandbox", self.sandbox.name())
+        })?;
+        // Live stores (local) are polled while the agent runs; extracted stores
+        // (docker volume + `docker cp`) are only discovered post-exit.
+        let store_is_live = session.store_is_live();
         let spec = session
             .wrap(spec)
             .with_context(|| format!("failed to wrap command for '{}' sandbox", self.sandbox.name()))?;
@@ -170,11 +178,14 @@ impl AcpSubprocessClient {
         drop(stdin);
 
         // Resume-capture depends on reaching the agent's session store on the
-        // host; skip it when the sandbox hides that store. The store root is the
-        // provider's HOME view (host `$HOME` for `local`, the per-session mount
-        // for `docker`), so discovery reads exactly where the agent wrote.
-        if let Some(session_root) = session_store_root.as_deref() {
-            self.record_external_session(request, started_at, session_root);
+        // host. For a LIVE store (host `$HOME` for `local`) discovery polls while
+        // the agent runs, exactly where it writes. For an EXTRACTED store
+        // (`docker` volume) the store is not host-visible yet, so we defer
+        // discovery until after the run has been `docker cp`-ed out (below).
+        if store_is_live {
+            if let Some(session_root) = session_store_root.as_deref() {
+                self.record_external_session(request, started_at, session_root);
+            }
         }
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
@@ -202,9 +213,39 @@ impl AcpSubprocessClient {
         let (stdout, stderr, status) = tokio::try_join!(stdout_task, stderr_task, wait_task)
             .context("failed while waiting for agent subprocess")?;
 
+        // Extracted stores (docker): the agent has exited, so materialize its
+        // session store on the host (`docker cp` from the volume) and THEN run a
+        // single discovery pass — the files already exist, so the first poll hits
+        // immediately. This is the container→host round-trip that makes
+        // resume-capture work on a VM-backed daemon with a narrow share.
+        let mut extracted_record_handle = None;
+        if !store_is_live {
+            match session.extract_session_store().await {
+                Ok(()) => {
+                    if let Some(session_root) = session_store_root.as_deref() {
+                        extracted_record_handle =
+                            self.record_external_session(request, started_at, session_root);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("warning: failed to extract sandbox session store: {error:#}");
+                }
+            }
+        }
+
         if let Err(error) = session.teardown().await {
             eprintln!("warning: failed to tear down sandbox session: {error:#}");
         }
+
+        // For an extracted store the external session id (hence resume command)
+        // is only known after discovery ran against the copied-out store above.
+        let resume_command = match extracted_record_handle {
+            Some(handle) => {
+                let external_session_id = handle.await.ok().flatten();
+                self.build_resume_command(request, external_session_id.as_deref())
+            }
+            None => None,
+        };
 
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
@@ -233,7 +274,7 @@ impl AcpSubprocessClient {
             requires_user: recap_requires_user_interaction(&recap),
             suggested_agent: None,
             recap,
-            resume_command: None,
+            resume_command,
         })
     }
 
