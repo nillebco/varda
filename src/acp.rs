@@ -1292,10 +1292,12 @@ mod tests {
             "sh",
             &[
                 "-c",
-                // The allow-listed host is pinned via /etc/hosts (getent), the
-                // other cannot resolve because ambient DNS is disabled.
-                "if getent hosts example.com >/dev/null 2>&1; then echo ALLOWED_OK; else echo ALLOWED_FAIL; fi; \
-                 if getent hosts blocked.invalid >/dev/null 2>&1; then echo BLOCKED_OPEN; else echo BLOCKED_DENIED; fi; \
+                // The allow-listed host is pinned into /etc/hosts via `--add-host`;
+                // the other is absent because ambient DNS is disabled and it was
+                // never pinned. We assert on the pin directly (grep is a busybox
+                // builtin; `getent` is not, and `nslookup` bypasses /etc/hosts).
+                "if grep -qw example.com /etc/hosts; then echo ALLOWED_OK; else echo ALLOWED_FAIL; fi; \
+                 if grep -qw blocked.invalid /etc/hosts; then echo BLOCKED_OPEN; else echo BLOCKED_DENIED; fi; \
                  echo; echo 'requires_user: false'",
             ],
             vec![],
