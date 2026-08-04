@@ -684,6 +684,7 @@ Do the work.
                 glob: "**".to_owned(),
                 agents: vec!["codex".to_owned()],
                 sandbox: None,
+                mounts: Vec::new(),
             }],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),

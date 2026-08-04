@@ -116,6 +116,14 @@ pub struct Route {
     /// Sandbox provider for this route; overrides the default when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
+    /// Project-context mounts tied to the code↔context mapping (M6a). These
+    /// compose with the image-intrinsic `[sandboxes.X].mounts` (effective set =
+    /// their union). Each entry follows the `source[:target][:mode]` grammar
+    /// parsed by [`crate::sandbox::parse_mount`]; both are trusted origins in
+    /// M6a, so no hardening floor applies yet (that arrives with the untrusted
+    /// `.varda` origin in M6b).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -338,6 +346,7 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
             glob,
             agents,
             sandbox: None,
+            mounts: Vec::new(),
         },
     );
     save_config(path, &config)
@@ -666,6 +675,7 @@ mod tests {
             glob: "**".to_owned(),
             agents: vec!["codex".to_owned()],
             sandbox: Some("firejail".to_owned()),
+            mounts: Vec::new(),
         };
         assert_eq!(config.effective_sandbox(&route_with_sandbox), "firejail");
     }

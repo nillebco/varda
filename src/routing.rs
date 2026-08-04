@@ -21,6 +21,9 @@ pub struct RouteMatch {
     pub estimated_prompt_tokens: usize,
     /// Effective sandbox provider for this route (`route` → `defaults` → `local`).
     pub sandbox: String,
+    /// Project-context mounts declared on the matched route (M6a). Composed with
+    /// the sandbox's image-intrinsic mounts by the docker provider.
+    pub route_mounts: Vec<String>,
 }
 
 impl RouteMatch {
@@ -60,6 +63,7 @@ pub fn match_route(
         allowed_agents: route.agents.clone(),
         estimated_prompt_tokens: 0,
         sandbox: config.effective_sandbox(route).to_owned(),
+        route_mounts: route.mounts.clone(),
     })
 }
 
@@ -93,6 +97,7 @@ pub fn match_route_for_task(
         allowed_agents: route.agents.clone(),
         estimated_prompt_tokens,
         sandbox: config.effective_sandbox(route).to_owned(),
+        route_mounts: route.mounts.clone(),
     })
 }
 
@@ -349,11 +354,13 @@ mod tests {
                     glob: "/work/special/**".to_owned(),
                     agents: vec!["codex".to_owned()],
                     sandbox: None,
+                    mounts: Vec::new(),
                 },
                 Route {
                     glob: "**".to_owned(),
                     agents: vec!["fallback".to_owned()],
                     sandbox: None,
+                    mounts: Vec::new(),
                 },
             ],
             agents: BTreeMap::from([
@@ -410,11 +417,13 @@ mod tests {
                     glob: "**/AsianDevBank/**".to_owned(),
                     agents: vec!["copilot".to_owned()],
                     sandbox: None,
+                    mounts: Vec::new(),
                 },
                 Route {
                     glob: "**".to_owned(),
                     agents: vec!["codex".to_owned(), "claude".to_owned()],
                     sandbox: None,
+                    mounts: Vec::new(),
                 },
             ],
             agents: BTreeMap::from([
@@ -491,6 +500,7 @@ mod tests {
                 glob: "**".to_owned(),
                 agents: vec!["codex".to_owned()],
                 sandbox: None,
+                mounts: Vec::new(),
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),
@@ -529,6 +539,7 @@ mod tests {
                 glob: "**".to_owned(),
                 agents: vec!["small".to_owned(), "large".to_owned()],
                 sandbox: None,
+                mounts: Vec::new(),
             }],
             agents: BTreeMap::from([
                 (
@@ -603,6 +614,7 @@ mod tests {
                 glob: "**".to_owned(),
                 agents: vec!["small".to_owned(), "large".to_owned()],
                 sandbox: None,
+                mounts: Vec::new(),
             }],
             agents: BTreeMap::from([
                 (

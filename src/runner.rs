@@ -996,6 +996,7 @@ Help interactively.
                 glob: "**".to_owned(),
                 agents: vec!["codex".to_owned()],
                 sandbox: None,
+                mounts: Vec::new(),
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),

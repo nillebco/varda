@@ -13,8 +13,172 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use serde::Deserialize;
 
 use crate::config::{AgentKind, SandboxConfig};
+
+/// Where a mount declaration came from. Mounts compose across origins (effective
+/// set = their union). In M6a both origins are the trusted central
+/// `config.toml`, so no clamping is applied; this enum is the seam M6b extends
+/// with a `Varda` (untrusted `.varda`) origin plus a hardening floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountOrigin {
+    /// Image-intrinsic `[sandboxes.X].mounts` — same for every project using
+    /// the image.
+    Sandbox,
+    /// Project-context `Route.mounts` — tied to the code↔context mapping.
+    Route,
+    // M6b: Varda — untrusted `.varda` origin; will be clamped by a floor.
+}
+
+/// A parsed mount request: a host `source` bind-mounted at `target` inside the
+/// container, read-only unless `writable`.
+///
+/// `source`/`target` are stored as written (they may still contain `~` or
+/// `{project}` and may be relative to the project root); expansion to absolute
+/// host/container paths happens at wrap time via [`expand_mount_path`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountSpec {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub writable: bool,
+}
+
+/// Interpret a mode segment (`ro`/`rw`/`w`) as a writability flag.
+fn mount_mode_writable(segment: &str) -> Option<bool> {
+    match segment {
+        "ro" => Some(false),
+        "rw" | "w" => Some(true),
+        _ => None,
+    }
+}
+
+/// Parse the `source[:target][:mode]` string grammar into a [`MountSpec`].
+///
+/// Forms (aligned with docker `src:dst:mode`):
+/// - `SOURCE` — target defaults to SOURCE, read-only.
+/// - `SOURCE:ro|:rw|:w` — target defaults to SOURCE, mode as given.
+/// - `SOURCE:TARGET` — TARGET must be absolute (`/…`); read-only.
+/// - `SOURCE:TARGET:ro|:rw|:w` — explicit target and mode.
+///
+/// Disambiguation of the segment after SOURCE: a value equal to `ro`/`rw`/`w`
+/// is the MODE; a value starting with `/` is the TARGET. Anything else is an
+/// error.
+pub fn parse_mount(raw: &str) -> Result<MountSpec> {
+    let parts: Vec<&str> = raw.split(':').collect();
+    match parts.as_slice() {
+        [source] if !source.is_empty() => Ok(MountSpec {
+            source: PathBuf::from(source),
+            target: PathBuf::from(source),
+            writable: false,
+        }),
+        [source, second] if !source.is_empty() => {
+            if let Some(writable) = mount_mode_writable(second) {
+                Ok(MountSpec {
+                    source: PathBuf::from(source),
+                    target: PathBuf::from(source),
+                    writable,
+                })
+            } else if second.starts_with('/') {
+                Ok(MountSpec {
+                    source: PathBuf::from(source),
+                    target: PathBuf::from(second),
+                    writable: false,
+                })
+            } else {
+                bail!(
+                    "invalid mount '{raw}': expected SOURCE, SOURCE:MODE, SOURCE:/ABS_TARGET, or SOURCE:/ABS_TARGET:MODE (MODE = ro|rw|w)"
+                )
+            }
+        }
+        [source, target, mode] if !source.is_empty() => {
+            let writable = mount_mode_writable(mode).with_context(|| {
+                format!("invalid mount '{raw}': trailing segment '{mode}' is not a mode (ro|rw|w)")
+            })?;
+            if !target.starts_with('/') {
+                bail!("invalid mount '{raw}': TARGET '{target}' must be an absolute path");
+            }
+            Ok(MountSpec {
+                source: PathBuf::from(source),
+                target: PathBuf::from(target),
+                writable,
+            })
+        }
+        _ => bail!("invalid mount '{raw}': malformed (empty or too many ':'-separated segments)"),
+    }
+}
+
+impl<'de> Deserialize<'de> for MountSpec {
+    /// Serde helper accepting BOTH the string shorthand (parsed by
+    /// [`parse_mount`]) and the canonical table form
+    /// `{ source, target?, mode? }`.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Str(String),
+            Table {
+                source: String,
+                #[serde(default)]
+                target: Option<String>,
+                #[serde(default)]
+                mode: Option<String>,
+            },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Str(s) => parse_mount(&s).map_err(serde::de::Error::custom),
+            Raw::Table {
+                source,
+                target,
+                mode,
+            } => {
+                let writable = match mode.as_deref() {
+                    None | Some("ro") => false,
+                    Some("rw") | Some("w") => true,
+                    Some(other) => {
+                        return Err(serde::de::Error::custom(format!(
+                            "invalid mount mode '{other}' (expected ro|rw|w)"
+                        )));
+                    }
+                };
+                let target = target
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(&source));
+                Ok(MountSpec {
+                    source: PathBuf::from(source),
+                    target,
+                    writable,
+                })
+            }
+        }
+    }
+}
+
+/// Expand `~` (HOME), `{project}` (the matched project root), and
+/// project-root-relative paths into an absolute host/container path.
+fn expand_mount_path(raw: &Path, project_root: &Path) -> PathBuf {
+    let text = raw.to_string_lossy();
+    let text = text.replace("{project}", &project_root.to_string_lossy());
+    let expanded = if text == "~" {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(text.clone()))
+    } else if let Some(rest) = text.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(|home| Path::new(&home).join(rest))
+            .unwrap_or_else(|| PathBuf::from(text.clone()))
+    } else {
+        PathBuf::from(text)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        project_root.join(expanded)
+    }
+}
 
 /// A fully-resolved subprocess invocation, before it is handed to the OS.
 ///
@@ -99,9 +263,11 @@ pub struct DockerProvider {
     /// Path to a Dockerfile to build at `prepare()`. Takes precedence over
     /// `image` when both are set; the resulting content-addressed tag is used.
     build: Option<String>,
-    /// Extra host paths (beyond the project root) the sandbox may see,
-    /// bind-mounted read-only. Empty by default: project-root-only.
-    mounts: Vec<String>,
+    /// Extra host paths (beyond the project root) the sandbox may see, tagged by
+    /// origin and following the `source[:target][:mode]` grammar. The effective
+    /// set is the union of the image-intrinsic (`Sandbox`) and project-context
+    /// (`Route`) mounts, de-duplicated by target at wrap time.
+    mounts: Vec<(MountOrigin, String)>,
     /// Egress allow-list of hostnames. Empty ⇒ the container is fully offline
     /// (`--network none`); non-empty ⇒ default-deny with only these hosts
     /// resolvable inside the container.
@@ -111,10 +277,16 @@ pub struct DockerProvider {
 impl DockerProvider {
     /// Build a docker provider named `name` from its `[sandboxes.<name>]` entry.
     ///
-    /// Either `image` or `build` must be supplied. `mounts` and `egress` are
-    /// threaded through from the config (M0/M2) and applied by [`DockerSession`]
-    /// at wrap time.
-    pub fn from_config(name: &str, config: &SandboxConfig) -> Result<Self> {
+    /// Either `image` or `build` must be supplied. The effective mount set is
+    /// the union of the image-intrinsic `config.mounts` (origin `Sandbox`) and
+    /// the project-context `route_mounts` (origin `Route`); `egress` is threaded
+    /// through from the config. All are applied by [`DockerSession`] at wrap
+    /// time.
+    pub fn from_config(
+        name: &str,
+        config: &SandboxConfig,
+        route_mounts: &[String],
+    ) -> Result<Self> {
         let image = config.image.clone().filter(|image| !image.is_empty());
         let build = config.build.clone().filter(|build| !build.is_empty());
         if image.is_none() && build.is_none() {
@@ -122,11 +294,17 @@ impl DockerProvider {
                 "sandbox '{name}' needs an `image` or a `build` path (required for the docker provider)"
             );
         }
+        let mounts = config
+            .mounts
+            .iter()
+            .map(|m| (MountOrigin::Sandbox, m.clone()))
+            .chain(route_mounts.iter().map(|m| (MountOrigin::Route, m.clone())))
+            .collect();
         Ok(Self {
             name: name.to_owned(),
             image,
             build,
-            mounts: config.mounts.clone(),
+            mounts,
             egress: config.egress.clone(),
         })
     }
@@ -148,7 +326,10 @@ impl DockerProvider {
             name: name.to_owned(),
             image: Some(image.to_owned()),
             build: None,
-            mounts: mounts.iter().map(|m| m.to_string()).collect(),
+            mounts: mounts
+                .iter()
+                .map(|m| (MountOrigin::Sandbox, m.to_string()))
+                .collect(),
             egress: egress.iter().map(|e| e.to_string()).collect(),
         }
     }
@@ -311,8 +492,9 @@ async fn resolve_host(host: &str) -> Result<String> {
 pub struct DockerSession {
     image: String,
     project_root: PathBuf,
-    /// Extra read-only host mounts (allow-listed via config).
-    mounts: Vec<String>,
+    /// Extra host mounts (origin-tagged, `source[:target][:mode]` grammar),
+    /// merged and de-duplicated by target at wrap time.
+    mounts: Vec<(MountOrigin, String)>,
     /// Resolved `(hostname, ip)` egress allow-list. Empty ⇒ `--network none`.
     egress_pins: Vec<(String, String)>,
     /// Per-session host dir mounted as the container's `HOME`, so the agent's
@@ -371,9 +553,26 @@ impl SandboxSession for DockerSession {
         let store = self.session_store.display().to_string();
         args.push("-v".to_owned());
         args.push(format!("{store}:{store}"));
-        for mount in &self.mounts {
+        // Effective extra mounts = union(sandbox, route), de-duplicated by the
+        // (expanded, absolute) target so a later origin does not double-mount a
+        // target an earlier one already claimed. First declaration wins.
+        let mut seen_targets: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for (_origin, raw) in &self.mounts {
+            let spec = parse_mount(raw)
+                .with_context(|| format!("invalid mount '{raw}' for sandbox '{}'", self.image))?;
+            let source = expand_mount_path(&spec.source, &self.project_root);
+            let target = expand_mount_path(&spec.target, &self.project_root);
+            if !seen_targets.insert(target.clone()) {
+                continue;
+            }
+            let source = source.display().to_string();
+            let target = target.display().to_string();
             args.push("-v".to_owned());
-            args.push(format!("{mount}:{mount}:ro"));
+            if spec.writable {
+                args.push(format!("{source}:{target}"));
+            } else {
+                args.push(format!("{source}:{target}:ro"));
+            }
         }
         args.push("-w".to_owned());
         args.push(cwd);
@@ -429,11 +628,16 @@ impl SandboxSession for DockerSession {
 pub fn provider_for(
     name: &str,
     sandboxes: &BTreeMap<String, SandboxConfig>,
+    route_mounts: &[String],
 ) -> Result<std::sync::Arc<dyn SandboxProvider>> {
     match sandboxes.get(name) {
         Some(config) => match config.primitive.as_str() {
             "local" => Ok(std::sync::Arc::new(LocalProvider)),
-            "docker" => Ok(std::sync::Arc::new(DockerProvider::from_config(name, config)?)),
+            "docker" => Ok(std::sync::Arc::new(DockerProvider::from_config(
+                name,
+                config,
+                route_mounts,
+            )?)),
             "microsandbox" | "clawk" => Ok(std::sync::Arc::new(StubProvider {
                 name: name.to_owned(),
                 primitive: config.primitive.clone(),
@@ -610,7 +814,7 @@ mod tests {
         let session = DockerSession {
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
-            mounts: vec!["/opt/cache".to_owned()],
+            mounts: vec![(MountOrigin::Sandbox, "/opt/cache".to_owned())],
             egress_pins: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
         };
@@ -707,10 +911,10 @@ mod tests {
     #[test]
     fn provider_for_local_and_docker() {
         let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
-        assert_eq!(provider_for("local", &sandboxes).unwrap().name(), "local");
+        assert_eq!(provider_for("local", &sandboxes, &[]).unwrap().name(), "local");
 
         // Unknown sandbox errors.
-        assert!(provider_for("docker", &sandboxes).is_err());
+        assert!(provider_for("docker", &sandboxes, &[]).is_err());
 
         sandboxes.insert(
             "docker".to_owned(),
@@ -719,7 +923,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(provider_for("docker", &sandboxes).unwrap().name(), "docker");
+        assert_eq!(provider_for("docker", &sandboxes, &[]).unwrap().name(), "docker");
 
         // Missing image AND build errors under the docker primitive.
         sandboxes.insert(
@@ -729,7 +933,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(provider_for("broken", &sandboxes).is_err());
+        assert!(provider_for("broken", &sandboxes, &[]).is_err());
     }
 
     /// M5: `primitive` selects the boundary kind independently of the image.
@@ -747,7 +951,7 @@ mod tests {
             },
         );
         assert_eq!(
-            provider_for("isolated", &sandboxes).unwrap().name(),
+            provider_for("isolated", &sandboxes, &[]).unwrap().name(),
             "local"
         );
 
@@ -761,7 +965,7 @@ mod tests {
                 },
             );
             // The stub resolves at provider_for time but errors at prepare().
-            let provider = provider_for("vm", &sandboxes).unwrap();
+            let provider = provider_for("vm", &sandboxes, &[]).unwrap();
             assert_eq!(provider.name(), "vm");
         }
 
@@ -774,7 +978,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(provider_for("weird", &sandboxes).is_err());
+        assert!(provider_for("weird", &sandboxes, &[]).is_err());
     }
 
     /// M5: the microsandbox/clawk stub parses and resolves, but `prepare()`
@@ -806,6 +1010,7 @@ mod tests {
                 build: Some("/nonexistent/Dockerfile.does-not-exist".to_owned()),
                 ..Default::default()
             },
+            &[],
         )
         .unwrap();
         let root = Path::new("/proj");
@@ -816,6 +1021,310 @@ mod tests {
         assert!(
             err.contains("Dockerfile") || err.contains("failed to read"),
             "unexpected build error: {err}"
+        );
+    }
+
+    // ---- M6a: mount grammar + three-origin (two in M6a) merge ----
+
+    /// Collect the `-v` mount values (the arg after each `-v`) from a wrapped
+    /// docker argv.
+    fn mount_values(wrapped: &CommandSpec) -> Vec<String> {
+        wrapped
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && wrapped.args[i - 1] == "-v")
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    /// M6a grammar: source-only ⇒ same-path, read-only.
+    #[test]
+    fn parse_mount_source_only_is_same_path_ro() {
+        let spec = parse_mount("/data").unwrap();
+        assert_eq!(
+            spec,
+            MountSpec {
+                source: PathBuf::from("/data"),
+                target: PathBuf::from("/data"),
+                writable: false,
+            }
+        );
+    }
+
+    /// M6a grammar: `SOURCE:ro|:w` sets the mode, target defaults to source.
+    #[test]
+    fn parse_mount_source_with_mode() {
+        assert!(!parse_mount("/data:ro").unwrap().writable);
+        assert!(parse_mount("/data:w").unwrap().writable);
+        assert!(parse_mount("/data:rw").unwrap().writable);
+        let w = parse_mount("~/ctx:w").unwrap();
+        assert_eq!(w.source, PathBuf::from("~/ctx"));
+        assert_eq!(w.target, PathBuf::from("~/ctx"));
+        assert!(w.writable);
+    }
+
+    /// M6a grammar: `SOURCE:TARGET` (absolute target) is an explicit target, ro.
+    #[test]
+    fn parse_mount_explicit_target() {
+        let spec = parse_mount("~/dev/brain/AsianDevBank:/context/adb").unwrap();
+        assert_eq!(spec.source, PathBuf::from("~/dev/brain/AsianDevBank"));
+        assert_eq!(spec.target, PathBuf::from("/context/adb"));
+        assert!(!spec.writable);
+    }
+
+    /// M6a grammar: full `SOURCE:TARGET:mode` form.
+    #[test]
+    fn parse_mount_explicit_target_and_mode() {
+        let spec = parse_mount("/src:/dst:w").unwrap();
+        assert_eq!(spec.source, PathBuf::from("/src"));
+        assert_eq!(spec.target, PathBuf::from("/dst"));
+        assert!(spec.writable);
+    }
+
+    /// M6a grammar: malformed forms error (non-mode/non-abs middle segment,
+    /// relative target in the 3-segment form, and empty source).
+    #[test]
+    fn parse_mount_malformed_errors() {
+        assert!(parse_mount("/src:relative").is_err());
+        assert!(parse_mount("/src:relative:ro").is_err());
+        assert!(parse_mount("/src:/dst:bogus").is_err());
+        assert!(parse_mount("").is_err());
+    }
+
+    /// M6a: the canonical TOML table form deserializes into a `MountSpec`
+    /// (source-only ⇒ same-path ro; explicit target + mode honoured).
+    #[test]
+    fn mount_spec_table_form_deserializes() {
+        #[derive(Deserialize)]
+        struct Wrap {
+            mount: MountSpec,
+        }
+        let only: Wrap = toml::from_str("mount = { source = \"/data\" }").unwrap();
+        assert_eq!(
+            only.mount,
+            MountSpec {
+                source: PathBuf::from("/data"),
+                target: PathBuf::from("/data"),
+                writable: false,
+            }
+        );
+        let full: Wrap = toml::from_str(
+            "mount = { source = \"~/dev/brain/AsianDevBank\", target = \"/context/adb\", mode = \"ro\" }",
+        )
+        .unwrap();
+        assert_eq!(full.mount.target, PathBuf::from("/context/adb"));
+        assert!(!full.mount.writable);
+        // The string shorthand also flows through the same Deserialize helper.
+        let shorthand: Wrap = toml::from_str("mount = \"/opt/cache:w\"").unwrap();
+        assert!(shorthand.mount.writable);
+    }
+
+    /// M6a exit criterion: a `Route.mounts` entry in the string form reaches the
+    /// docker argv as `-v SOURCE:SOURCE:ro` (target defaults to the expanded
+    /// source). Uses an absolute source so the assertion is host-independent.
+    #[test]
+    fn route_mount_reaches_argv_same_path_ro() {
+        let session = DockerSession {
+            image: "img".to_owned(),
+            project_root: PathBuf::from("/srv/app"),
+            mounts: vec![(MountOrigin::Route, "/ctx/adb:ro".to_owned())],
+            egress_pins: vec![],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
+        };
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        assert_eq!(
+            mount_values(&wrapped),
+            vec![
+                "/srv/app:/srv/app".to_owned(),
+                "/var/varda/sessions/s1:/var/varda/sessions/s1".to_owned(),
+                "/ctx/adb:/ctx/adb:ro".to_owned(),
+            ]
+        );
+    }
+
+    /// M6a exit criterion: an explicit-target route mount maps to
+    /// `-v SOURCE:/context/adb:ro`.
+    #[test]
+    fn route_mount_explicit_target_reaches_argv() {
+        let session = DockerSession {
+            image: "img".to_owned(),
+            project_root: PathBuf::from("/srv/app"),
+            mounts: vec![(MountOrigin::Route, "/host/adb:/context/adb".to_owned())],
+            egress_pins: vec![],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
+        };
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        assert!(
+            mount_values(&wrapped).contains(&"/host/adb:/context/adb:ro".to_owned()),
+            "expected explicit-target mount, got {:?}",
+            mount_values(&wrapped)
+        );
+    }
+
+    /// M6a: `{project}` expansion and project-root-relative sources (no env
+    /// mutation, so this test is isolated). `~` expansion is covered directly
+    /// against the ambient HOME below.
+    #[test]
+    fn route_mount_expands_project_and_relative() {
+        let session = DockerSession {
+            image: "img".to_owned(),
+            project_root: PathBuf::from("/srv/app"),
+            mounts: vec![
+                (MountOrigin::Route, "{project}/vendor:/vendor:ro".to_owned()),
+                (MountOrigin::Route, "subdir:ro".to_owned()),
+            ],
+            egress_pins: vec![],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
+        };
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        let values = mount_values(&wrapped);
+        assert!(values.contains(&"/srv/app/vendor:/vendor:ro".to_owned()));
+        assert!(values.contains(&"/srv/app/subdir:/srv/app/subdir:ro".to_owned()));
+    }
+
+    /// M6a: `~` expands against HOME. Read (never mutate) the ambient HOME so
+    /// this test does not perturb the shared test process env.
+    #[test]
+    fn expand_mount_path_expands_tilde_against_home() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return; // No HOME in this environment; nothing to assert.
+        };
+        let home = PathBuf::from(home);
+        let expanded = expand_mount_path(Path::new("~/notes"), Path::new("/srv/app"));
+        assert_eq!(expanded, home.join("notes"));
+    }
+
+    /// M6a: effective mounts = union(sandbox, route), de-duplicated by target.
+    /// A sandbox and a route mount claiming the same target collapse to one
+    /// (first origin — sandbox — wins), while distinct targets both appear.
+    #[test]
+    fn effective_mounts_union_dedups_by_target() {
+        let session = DockerSession {
+            image: "img".to_owned(),
+            project_root: PathBuf::from("/srv/app"),
+            mounts: vec![
+                (MountOrigin::Sandbox, "/shared:/context:ro".to_owned()),
+                (MountOrigin::Route, "/other:/context:w".to_owned()),
+                (MountOrigin::Route, "/extra:ro".to_owned()),
+            ],
+            egress_pins: vec![],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
+        };
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        let values = mount_values(&wrapped);
+        // Same target `/context` de-duped to the sandbox origin's ro mount.
+        assert!(values.contains(&"/shared:/context:ro".to_owned()));
+        assert!(!values.iter().any(|v| v == "/other:/context"));
+        // The distinct target still appears.
+        assert!(values.contains(&"/extra:/extra:ro".to_owned()));
+    }
+
+    /// M6a: `from_config` composes sandbox + route mounts into one origin-tagged
+    /// set (union), in that order.
+    #[test]
+    fn from_config_unions_sandbox_and_route_mounts() {
+        let provider = DockerProvider::from_config(
+            "docker",
+            &SandboxConfig {
+                image: Some("img".to_owned()),
+                mounts: vec!["/img/cache".to_owned()],
+                ..Default::default()
+            },
+            &["~/dev/brain/AsianDevBank:ro".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(
+            provider.mounts,
+            vec![
+                (MountOrigin::Sandbox, "/img/cache".to_owned()),
+                (MountOrigin::Route, "~/dev/brain/AsianDevBank:ro".to_owned()),
+            ]
+        );
+    }
+
+    /// M6a docker integration: a route context mount is visible READ-ONLY inside
+    /// the container — a write attempt fails. Requires a docker daemon.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn docker_route_mount_is_read_only() {
+        use tokio::process::Command as TokioCommand;
+
+        // A host dir to expose read-only as a route context mount. It must live
+        // under a path the docker VM can actually see: on a hardened Colima that
+        // mounts only ~/dev, sources outside it bind as empty stubs. The repo
+        // (CARGO_MANIFEST_DIR) is under the developer's mounted tree, so use its
+        // target/ dir rather than ~/.varda (which may be unmounted in the VM).
+        let ctx_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("m6a-ro-probe");
+        std::fs::create_dir_all(&ctx_dir).unwrap();
+        std::fs::write(ctx_dir.join("seed.txt"), b"seed").unwrap();
+        let ctx_str = ctx_dir.display().to_string();
+
+        let provider = DockerProvider::from_config(
+            "docker",
+            &SandboxConfig {
+                image: Some("busybox".to_owned()),
+                ..Default::default()
+            },
+            &[format!("{ctx_str}:/context:ro")],
+        )
+        .unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("m6a-proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let session = provider.prepare(&ctx(&root)).await.unwrap();
+
+        // Reading the mounted file succeeds; writing into it fails (ro).
+        let spec = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "cat /context/seed.txt && ! (echo x > /context/probe.txt)".to_owned(),
+                ],
+                env: BTreeMap::new(),
+                cwd: Some(root.clone()),
+            })
+            .unwrap();
+        let status = TokioCommand::new(&spec.program)
+            .args(&spec.args)
+            .status()
+            .await
+            .expect("failed to run docker");
+        assert!(
+            status.success(),
+            "read should succeed and write should fail under a read-only route mount"
         );
     }
 }

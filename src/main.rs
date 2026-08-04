@@ -938,6 +938,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         &planner_agent,
         agent_config,
         config::DEFAULT_SANDBOX_PROVIDER,
+        &[],
     )?;
     let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
     let request = agent::AgentRunRequest {
@@ -1156,8 +1157,9 @@ fn build_client(
     display_name: &str,
     agent_config: &config::AgentConfig,
     sandbox_name: &str,
+    route_mounts: &[String],
 ) -> Result<acp::AcpSubprocessClient> {
-    let provider = sandbox::provider_for(sandbox_name, &config.sandboxes)?;
+    let provider = sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts)?;
     Ok(acp::AcpSubprocessClient::with_sandbox(
         display_name,
         agent_config,
@@ -1188,7 +1190,7 @@ async fn run_task_path_for_parallel(
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = build_client(&config, &display_name, agent_config, &route.sandbox)?;
+    let client = build_client(&config, &display_name, agent_config, &route.sandbox, &route.route_mounts)?;
     let outcome = runner::run_task(
         &config,
         &display_name,
@@ -2249,7 +2251,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = build_client(&config, &display_name, agent_config, &route.sandbox)?;
+    let client = build_client(&config, &display_name, agent_config, &route.sandbox, &route.route_mounts)?;
     if config.git.auto_commit {
         git::commit_task_file(
             &task_path,
@@ -2349,7 +2351,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = build_client(&config, &display_name, agent_config, &route.sandbox)?;
+    let client = build_client(&config, &display_name, agent_config, &route.sandbox, &route.route_mounts)?;
     let outcome = runner::plan_task(
         &config,
         &display_name,
@@ -2433,7 +2435,7 @@ async fn run_captured_resume_command(
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = build_client(&config, &display_name, agent_config, &route.sandbox)?;
+    let client = build_client(&config, &display_name, agent_config, &route.sandbox, &route.route_mounts)?;
     if config.git.auto_commit {
         git::commit_task_file(
             task_path,

@@ -1238,6 +1238,7 @@ mod tests {
                 egress,
                 ..Default::default()
             },
+            &[],
         )
         .expect("docker provider"));
         AcpSubprocessClient::with_sandbox("shell", &config, provider)
@@ -1269,6 +1270,7 @@ mod tests {
                     build: Some(dockerfile.to_owned()),
                     ..Default::default()
                 },
+                &[],
             )
             .expect("docker provider from build config"),
         );
