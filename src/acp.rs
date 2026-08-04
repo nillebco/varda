@@ -1181,6 +1181,15 @@ mod tests {
     }
 
     fn docker_client(command: &str, args: &[&str]) -> AcpSubprocessClient {
+        docker_client_cfg(command, args, vec![], vec![])
+    }
+
+    fn docker_client_cfg(
+        command: &str,
+        args: &[&str],
+        mounts: Vec<String>,
+        egress: Vec<String>,
+    ) -> AcpSubprocessClient {
         let config = AgentConfig {
             kind: crate::config::AgentKind::Acp,
             command: command.to_owned(),
@@ -1196,8 +1205,8 @@ mod tests {
             "docker",
             &crate::config::SandboxConfig {
                 image: Some("busybox:latest".to_owned()),
-                mounts: vec![],
-                egress: vec![],
+                mounts,
+                egress,
             },
         )
         .expect("docker provider"));
@@ -1245,6 +1254,67 @@ mod tests {
             result.recap
         );
         assert!(!result.recap.contains("AWS_VISIBLE"));
+    }
+
+    /// M2 egress exit criterion: with no allow-list the container is fully
+    /// offline, so a DNS lookup of any external host must fail. Run with
+    /// `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon"]
+    async fn docker_agent_default_deny_blocks_egress() {
+        // busybox `nslookup` fails (non-zero / no answer) with --network none.
+        let client = docker_client(
+            "sh",
+            &[
+                "-c",
+                "if nslookup example.com >/dev/null 2>&1; then echo NET_OPEN; else echo NET_BLOCKED; fi; \
+                 echo; echo 'requires_user: false'",
+            ],
+        );
+        let result = client
+            .run_task(docker_request("/tmp", "docker-egress-deny"))
+            .await
+            .expect("docker agent should run the egress probe");
+        assert!(
+            result.recap.contains("NET_BLOCKED"),
+            "default-deny must block egress; recap was: {}",
+            result.recap
+        );
+        assert!(!result.recap.contains("NET_OPEN"));
+    }
+
+    /// M2 egress exit criterion: an allow-listed host resolves (pinned) while a
+    /// non-allow-listed host does not. Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon and outbound DNS on the host"]
+    async fn docker_agent_egress_allow_list_pins_only_listed_hosts() {
+        let client = docker_client_cfg(
+            "sh",
+            &[
+                "-c",
+                // The allow-listed host is pinned via /etc/hosts (getent), the
+                // other cannot resolve because ambient DNS is disabled.
+                "if getent hosts example.com >/dev/null 2>&1; then echo ALLOWED_OK; else echo ALLOWED_FAIL; fi; \
+                 if getent hosts blocked.invalid >/dev/null 2>&1; then echo BLOCKED_OPEN; else echo BLOCKED_DENIED; fi; \
+                 echo; echo 'requires_user: false'",
+            ],
+            vec![],
+            vec!["example.com".to_owned()],
+        );
+        let result = client
+            .run_task(docker_request("/tmp", "docker-egress-allow"))
+            .await
+            .expect("docker agent should run the allow-list probe");
+        assert!(
+            result.recap.contains("ALLOWED_OK"),
+            "allow-listed host must be reachable; recap was: {}",
+            result.recap
+        );
+        assert!(
+            result.recap.contains("BLOCKED_DENIED"),
+            "non-allow-listed host must be unreachable; recap was: {}",
+            result.recap
+        );
     }
 
     #[cfg(unix)]

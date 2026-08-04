@@ -567,18 +567,21 @@ agents = ["codex"]
 sandbox = "docker"         # per-route override
 
 [sandboxes.docker]
-image = "varda:latest"     # required for the docker provider
-egress = ["api.example.com"]  # optional; presence switches the container to a bridge network
-mounts = ["/tmp"]          # reserved (not yet applied)
+image = "varda:latest"        # required for the docker provider
+egress = ["api.example.com"]  # optional egress allow-list (default-deny)
+mounts = ["/opt/cache"]       # optional extra read-only host mounts
 ```
 
 The effective provider for a route resolves as `route.sandbox` → `defaults.sandbox` → `"local"`. All keys are optional, so existing `config.toml` files parse and re-serialize unchanged. These keys are orthogonal to Codex's own `--sandbox workspace-write` CLI flag in the agent `args`.
 
 **`local`** (the default) runs the agent exactly as before — no isolation.
 
-**`docker`** wraps the agent invocation in `docker run --rm --init -i` and executes it inside the named `image`. Only the task's **project directory** is bind-mounted, at the same absolute path, so host secrets outside the project (e.g. `~/.aws`) are not reachable from inside the container. The container's environment is built solely from the agent's configured `env` (passed as `-e K=V`); the host environment is not inherited. With no `egress` hosts the container gets `--network none`; declaring egress hosts switches it to a bridge network.
+**`docker`** wraps the agent invocation in `docker run --rm --init -i` and executes it inside the named `image`. The container's environment is built solely from the agent's configured `env` (passed as `-e K=V`); the host environment is not inherited.
 
-Current limitations (M1):
+- **Project-only mounts.** Only the task's **project directory** is bind-mounted, at the same absolute path, so host secrets outside the project (e.g. `~/.aws`) are not reachable from inside the container. Any paths listed under `mounts` are added as **read-only** bind mounts; nothing else on the host is visible.
+- **Default-deny egress with an allow-list.** With no `egress` hosts the container gets `--network none` — it is fully offline. Declaring `egress` hosts attaches the container to the bridge network, disables ambient DNS (`--dns 0.0.0.0`), and pins **only** the allow-listed hostnames to their host-resolved IPs via `--add-host`. A non-allow-listed hostname cannot resolve and is therefore unreachable, while allow-listed hosts stay reachable. (This is a name-resolution allow-list; IP-level firewalling of raw egress is a later milestone.)
+
+Current limitations:
 
 - **Non-interactive runs only.** Starting an interactive or resume session under a non-`local` sandbox returns a clear error (interactive-under-sandbox is a later milestone).
 - **Resume-capture is disabled under docker.** The agent's own session store lives inside the container, so Varda logs `WARN resume-command unavailable under sandbox` and skips capturing a resume command.

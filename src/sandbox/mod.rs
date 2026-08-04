@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use crate::config::{AgentKind, SandboxConfig};
@@ -90,41 +90,45 @@ impl SandboxSession for LocalSession {
 }
 
 /// Docker provider: wraps the agent invocation in `docker run` so it executes
-/// inside a container whose only bind mount is the project directory.
+/// inside a container whose only bind mount is the project directory and whose
+/// only reachable network hosts are an explicit egress allow-list.
 pub struct DockerProvider {
     name: String,
     image: String,
-    network: String,
+    /// Extra host paths (beyond the project root) the sandbox may see,
+    /// bind-mounted read-only. Empty by default: project-root-only.
+    mounts: Vec<String>,
+    /// Egress allow-list of hostnames. Empty ⇒ the container is fully offline
+    /// (`--network none`); non-empty ⇒ default-deny with only these hosts
+    /// resolvable inside the container.
+    egress: Vec<String>,
 }
 
 impl DockerProvider {
     /// Build a docker provider named `name` from its `[sandboxes.<name>]` entry.
     ///
-    /// The image is required. Network defaults to `none` (fully isolated) unless
-    /// the sandbox declares egress hosts, in which case `bridge` is used.
+    /// The image is required. `mounts` and `egress` are threaded through from the
+    /// config (M0) and applied by [`DockerSession`] at wrap time.
     pub fn from_config(name: &str, config: &SandboxConfig) -> Result<Self> {
         let image = match config.image.as_deref() {
             Some(image) if !image.is_empty() => image.to_owned(),
             _ => bail!("sandbox '{name}' is missing an `image` (required for the docker provider)"),
         };
-        let network = if config.egress.is_empty() {
-            "none".to_owned()
-        } else {
-            "bridge".to_owned()
-        };
         Ok(Self {
             name: name.to_owned(),
             image,
-            network,
+            mounts: config.mounts.clone(),
+            egress: config.egress.clone(),
         })
     }
 
     #[cfg(test)]
-    fn new_for_test(name: &str, image: &str, network: &str) -> Self {
+    fn new_for_test(name: &str, image: &str, mounts: &[&str], egress: &[&str]) -> Self {
         Self {
             name: name.to_owned(),
             image: image.to_owned(),
-            network: network.to_owned(),
+            mounts: mounts.iter().map(|m| m.to_string()).collect(),
+            egress: egress.iter().map(|e| e.to_string()).collect(),
         }
     }
 }
@@ -136,18 +140,54 @@ impl SandboxProvider for DockerProvider {
     }
 
     async fn prepare(&self, ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
+        // Resolve each allow-listed hostname to a concrete IP on the host so the
+        // container can be pinned to exactly those addresses via `--add-host`
+        // while ambient DNS is disabled (default-deny by name resolution).
+        let mut egress_pins = Vec::with_capacity(self.egress.len());
+        for host in &self.egress {
+            let ip = resolve_host(host).await.with_context(|| {
+                format!(
+                    "failed to resolve egress-allow-listed host '{host}' for sandbox '{}'",
+                    self.name
+                )
+            })?;
+            egress_pins.push((host.clone(), ip));
+        }
         Ok(Box::new(DockerSession {
             image: self.image.clone(),
-            network: self.network.clone(),
             project_root: ctx.project_root.to_path_buf(),
+            mounts: self.mounts.clone(),
+            egress_pins,
         }))
     }
 }
 
+/// Resolve `host` to a single IP address using the host's blocking resolver.
+///
+/// Runs on the blocking pool so we don't need tokio's optional `net` feature.
+async fn resolve_host(host: &str) -> Result<String> {
+    use std::net::ToSocketAddrs as _;
+    let host = host.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let ip = (host.as_str(), 0u16)
+            .to_socket_addrs()?
+            .next()
+            .with_context(|| format!("host '{host}' resolved to no addresses"))?
+            .ip()
+            .to_string();
+        anyhow::Ok(ip)
+    })
+    .await
+    .context("egress DNS resolution task panicked")?
+}
+
 pub struct DockerSession {
     image: String,
-    network: String,
     project_root: PathBuf,
+    /// Extra read-only host mounts (allow-listed via config).
+    mounts: Vec<String>,
+    /// Resolved `(hostname, ip)` egress allow-list. Empty ⇒ `--network none`.
+    egress_pins: Vec<(String, String)>,
 }
 
 #[async_trait]
@@ -171,12 +211,36 @@ impl SandboxSession for DockerSession {
             // `-i` keeps stdin open so the prompt-then-EOF still reaches the agent.
             "-i".to_owned(),
             "--network".to_owned(),
-            self.network.clone(),
-            "-v".to_owned(),
-            format!("{proj}:{proj}"),
-            "-w".to_owned(),
-            cwd,
         ];
+        if self.egress_pins.is_empty() {
+            // No allow-list ⇒ fully offline: nothing outbound is reachable.
+            args.push("none".to_owned());
+        } else {
+            // Default-deny by name: attach to the bridge for connectivity, break
+            // ambient DNS (`--dns 0.0.0.0` ⇒ no working resolver), then re-add
+            // exactly the allow-listed hosts pinned to their resolved IPs. A
+            // non-allow-listed hostname cannot resolve and is therefore
+            // unreachable, while allow-listed hosts stay reachable. NOTE: this is
+            // a name-resolution allow-list; IP-level firewalling of raw egress is
+            // a later milestone.
+            args.push("bridge".to_owned());
+            args.push("--dns".to_owned());
+            args.push("0.0.0.0".to_owned());
+            for (host, ip) in &self.egress_pins {
+                args.push("--add-host".to_owned());
+                args.push(format!("{host}:{ip}"));
+            }
+        }
+        // Project root is always mounted at the same absolute path; nothing else
+        // is unless explicitly allow-listed via `mounts` (read-only).
+        args.push("-v".to_owned());
+        args.push(format!("{proj}:{proj}"));
+        for mount in &self.mounts {
+            args.push("-v".to_owned());
+            args.push(format!("{mount}:{mount}:ro"));
+        }
+        args.push("-w".to_owned());
+        args.push(cwd);
         // Move the resolved env into `-e K=V`; the container starts with a clean
         // base env, so host secrets are never inherited implicitly. BTreeMap
         // iteration is sorted, keeping the produced argv deterministic.
@@ -260,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn docker_wrap_produces_exact_argv() {
-        let provider = DockerProvider::new_for_test("docker", "varda:latest", "none");
+        let provider = DockerProvider::new_for_test("docker", "varda:latest", &[], &[]);
         let root = Path::new("/home/me/project");
         let session = provider.prepare(&ctx(root)).await.unwrap();
 
@@ -306,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn docker_wrap_defaults_cwd_to_project_root() {
-        let provider = DockerProvider::new_for_test("docker", "img", "none");
+        let provider = DockerProvider::new_for_test("docker", "img", &[], &[]);
         let root = Path::new("/srv/app");
         let session = provider.prepare(&ctx(root)).await.unwrap();
         let spec = CommandSpec {
@@ -325,10 +389,129 @@ mod tests {
     fn docker_session_store_root_is_none() {
         let session = DockerSession {
             image: "img".to_owned(),
-            network: "none".to_owned(),
             project_root: PathBuf::from("/proj"),
+            mounts: vec![],
+            egress_pins: vec![],
         };
         assert!(session.session_store_root().is_none());
+    }
+
+    /// M2 mount allow-list: the project root is always mounted; extra `mounts`
+    /// are added read-only and nothing else appears. With no extra mounts, only
+    /// the single project bind mount is present.
+    #[test]
+    fn docker_wrap_mounts_only_project_root_by_default() {
+        let session = DockerSession {
+            image: "img".to_owned(),
+            project_root: PathBuf::from("/srv/app"),
+            mounts: vec![],
+            egress_pins: vec![],
+        };
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        let mounts: Vec<&String> = wrapped
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && wrapped.args[i - 1] == "-v")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(mounts, vec!["/srv/app:/srv/app"]);
+    }
+
+    /// M2 mount allow-list: an explicit extra mount is bind-mounted read-only.
+    #[test]
+    fn docker_wrap_adds_extra_mounts_read_only() {
+        let session = DockerSession {
+            image: "img".to_owned(),
+            project_root: PathBuf::from("/srv/app"),
+            mounts: vec!["/opt/cache".to_owned()],
+            egress_pins: vec![],
+        };
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        let mounts: Vec<&String> = wrapped
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && wrapped.args[i - 1] == "-v")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(mounts, vec!["/srv/app:/srv/app", "/opt/cache:/opt/cache:ro"]);
+    }
+
+    /// M2 egress: no allow-list ⇒ fully offline (`--network none`, no DNS/host
+    /// overrides).
+    #[test]
+    fn docker_wrap_no_egress_is_network_none() {
+        let session = DockerSession {
+            image: "img".to_owned(),
+            project_root: PathBuf::from("/srv/app"),
+            mounts: vec![],
+            egress_pins: vec![],
+        };
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        let n = wrapped.args.iter().position(|a| a == "--network").unwrap();
+        assert_eq!(wrapped.args[n + 1], "none");
+        assert!(!wrapped.args.iter().any(|a| a == "--add-host"));
+        assert!(!wrapped.args.iter().any(|a| a == "--dns"));
+    }
+
+    /// M2 egress allow-list: declared hosts switch the container to `bridge`,
+    /// disable ambient DNS, and pin exactly the allow-listed hosts to their IPs.
+    #[test]
+    fn docker_wrap_egress_pins_allow_listed_hosts() {
+        let session = DockerSession {
+            image: "img".to_owned(),
+            project_root: PathBuf::from("/srv/app"),
+            mounts: vec![],
+            egress_pins: vec![
+                ("api.example.com".to_owned(), "93.184.216.34".to_owned()),
+                ("cdn.example.com".to_owned(), "203.0.113.7".to_owned()),
+            ],
+        };
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        let n = wrapped.args.iter().position(|a| a == "--network").unwrap();
+        assert_eq!(wrapped.args[n + 1], "bridge");
+        let d = wrapped.args.iter().position(|a| a == "--dns").unwrap();
+        assert_eq!(wrapped.args[d + 1], "0.0.0.0");
+        let add_hosts: Vec<&String> = wrapped
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && wrapped.args[i - 1] == "--add-host")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            add_hosts,
+            vec!["api.example.com:93.184.216.34", "cdn.example.com:203.0.113.7"]
+        );
     }
 
     #[test]
