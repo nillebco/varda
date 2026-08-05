@@ -12,6 +12,7 @@ use crate::agent::{
     AgentClient, AgentRunRequest, AgentRunResult, parse_blocked_commands, parse_files_touched,
     recap_requires_user_interaction,
 };
+use crate::acp::AcpSubprocessClient;
 use crate::config::Config;
 use crate::task::{TaskDocument, TaskStatus, load_task, write_task};
 
@@ -932,7 +933,32 @@ async fn interpret_interactive_session(
 
     append_session_log(session_log_path, "\ninterpretation_pass: starting\n")?;
 
-    let result = time::timeout(timeout, client.run_task(request))
+    // Dispatch the interpretation pass through the interpreter agent's REAL
+    // client so the interpreter BINARY runs — not the driving agent's command.
+    // Setting `request.agent_name` alone is cosmetic: the passed-in `client` was
+    // built from the DRIVING agent's config, so a `shell` agent with
+    // `interpreter_agent = "claude"` would still spawn `sh`. When the interpreter
+    // agent differs from the driving agent (and is a known agent), build a fresh
+    // AcpSubprocessClient from its config — LOCAL/unsandboxed by construction
+    // (`::new` uses the identity `local` provider), matching the design that this
+    // pass always runs unsandboxed. Fall back to the passed-in client otherwise.
+    let interpreter_client = if interpreter_agent != agent_name {
+        config
+            .agents
+            .get(interpreter_agent)
+            .map(|agent_config| AcpSubprocessClient::new(interpreter_agent, agent_config))
+    } else {
+        None
+    };
+
+    let dispatch = async {
+        match &interpreter_client {
+            Some(interpreter_client) => interpreter_client.run_task(request).await,
+            None => client.run_task(request).await,
+        }
+    };
+
+    let result = time::timeout(timeout, dispatch)
         .await
         .map_err(|_| {
             anyhow::anyhow!(
@@ -1443,10 +1469,20 @@ Help interactively.
         // that cannot write a Varda recap, so it delegates the interpretation pass
         // to the real `claude` agent via `interpreter_agent`.
         let base = config.agents.get("codex").cloned().expect("codex agent");
+        // The interpreter agent's command is a distinguishable stub: it ignores
+        // stdin and prints a recap carrying a unique marker. If the interpretation
+        // pass truly dispatches through this agent's binary, that marker lands in
+        // the recap file. If the old cosmetic behavior (dispatch through the
+        // driving `shell` client, only relabeling `agent_name`) were still in
+        // effect, `sh` would run instead and the marker would never appear.
         config.agents.insert(
             "claude".to_owned(),
             AgentConfig {
-                command: "claude".to_owned(),
+                command: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf '# Interpreted Recap\\n\\nINTERPRETER_STUB_EXECUTED\\n\\nrequires_user: false\\n'".to_owned(),
+                ],
                 ..base.clone()
             },
         );
@@ -1467,36 +1503,48 @@ Help interactively.
                 suggested_agent: None,
                 resume_command: None,
             },
+            // Never returned: the interpretation pass must NOT flow through this
+            // recording client — it must dispatch through the real interpreter
+            // binary built above.
             interpretation_response: AgentRunResult {
-                recap: "# Interpreted Recap\n\nDid the work.\n\nrequires_user: false".to_owned(),
+                recap: "SHOULD_NOT_BE_USED".to_owned(),
                 requires_user: false,
                 suggested_agent: None,
                 resume_command: None,
             },
         };
 
-        run_task(&config, "shell", None, &task_path, &client, true, false)
+        let outcome = run_task(&config, "shell", None, &task_path, &client, true, false)
             .await
             .expect("interactive task should run and be interpreted");
 
         let recorded = client.requests.lock().unwrap().clone();
+        // Only the interactive session goes through the passed-in (driving) client;
+        // the interpretation pass is dispatched through the interpreter agent's own
+        // binary, so the recording client sees exactly one call.
         assert_eq!(
             recorded.len(),
-            2,
-            "expected one session call and one interpretation call"
+            1,
+            "only the interactive session should flow through the driving client"
         );
         assert_eq!(
             recorded[0].agent_name, "shell",
             "the interactive session must run via the driving agent"
         );
         assert!(recorded[0].interactive);
+        assert!(!recorded[0].interpret);
+
+        // Command-level assertion: the interpreter agent's actual binary ran and
+        // produced the recap, proving real dispatch (not a relabeled request).
+        let recap =
+            fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
         assert!(
-            recorded[1].interpret,
-            "second call should be the interpretation pass"
+            recap.contains("INTERPRETER_STUB_EXECUTED"),
+            "the interpreter agent's binary must actually run and emit the recap; got:\n{recap}"
         );
-        assert_eq!(
-            recorded[1].agent_name, "claude",
-            "the interpretation pass must route to the configured interpreter_agent's backend"
+        assert!(
+            !recap.contains("SHOULD_NOT_BE_USED"),
+            "the interpretation pass must not fall back to the driving client's response"
         );
     }
 
