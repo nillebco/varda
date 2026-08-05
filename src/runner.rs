@@ -74,7 +74,14 @@ pub async fn run_task(
         );
     }
 
-    let timeout = Duration::from_secs(config.defaults.timeout_seconds);
+    // Hint reflects the effective ceiling (not the legacy 600s) so the agent
+    // plans against its real budget instead of self-scoping early.
+    let timeout = Duration::from_secs(
+        config
+            .defaults
+            .effective_max_seconds()
+            .unwrap_or(config.defaults.timeout_seconds),
+    );
     let session_id = Uuid::new_v4().to_string();
     let session_log_path = session_log_path(config, &session_id);
     task.set_status(TaskStatus::Running);
@@ -252,7 +259,14 @@ pub async fn resume_interactive_task(
         );
     }
 
-    let timeout = Duration::from_secs(config.defaults.timeout_seconds);
+    // Hint reflects the effective ceiling (not the legacy 600s) so the agent
+    // plans against its real budget instead of self-scoping early.
+    let timeout = Duration::from_secs(
+        config
+            .defaults
+            .effective_max_seconds()
+            .unwrap_or(config.defaults.timeout_seconds),
+    );
     let session_id = Uuid::new_v4().to_string();
     let session_log_path = session_log_path(config, &session_id);
     task.set_status(TaskStatus::Running);
@@ -371,7 +385,14 @@ pub async fn plan_task(
 ) -> Result<PlanOutcome> {
     let mut task = load_task(task_path)?;
 
-    let timeout = Duration::from_secs(config.defaults.timeout_seconds);
+    // Hint reflects the effective ceiling (not the legacy 600s) so the agent
+    // plans against its real budget instead of self-scoping early.
+    let timeout = Duration::from_secs(
+        config
+            .defaults
+            .effective_max_seconds()
+            .unwrap_or(config.defaults.timeout_seconds),
+    );
     let request = AgentRunRequest {
         agent_name: agent_name.to_owned(),
         role_instructions: role_instructions.map(str::to_owned),
