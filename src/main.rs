@@ -16,13 +16,14 @@ use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
 use crate::agent::AgentClient;
 
@@ -2534,8 +2535,17 @@ fn spawn_task_in_background(task_path: &Path) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
     let resolved = task::resolve_task_reference(&config, task_path)?;
+    let initial_task = task::load_task(&resolved)?;
+    if initial_task.frontmatter.status != task::TaskStatus::Ready {
+        anyhow::bail!(
+            "task {} is not ready; current status is {:?}",
+            resolved.display(),
+            initial_task.frontmatter.status
+        );
+    }
+    let initial_session_count = initial_task.frontmatter.agent_session_ids.len();
     let exe = std::env::current_exe().context("failed to locate the varda executable")?;
-    let child = ProcessCommand::new(&exe)
+    let mut child = ProcessCommand::new(&exe)
         .args(["task", "run"])
         .arg(&resolved)
         .stdin(std::process::Stdio::null())
@@ -2548,11 +2558,134 @@ fn spawn_task_in_background(task_path: &Path) -> Result<()> {
                 resolved.display()
             )
         })?;
+    wait_for_background_launch(&config, &resolved, initial_session_count, &mut child)?;
     println!(
         "task running in background: {} (pid: {})",
         resolved.display(),
         child.id()
     );
+    Ok(())
+}
+
+fn wait_for_background_launch(
+    config: &config::Config,
+    task_path: &Path,
+    initial_session_count: usize,
+    child: &mut std::process::Child,
+) -> Result<()> {
+    const BACKGROUND_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+    const BACKGROUND_LAUNCH_POLL: Duration = Duration::from_millis(100);
+
+    let started = Instant::now();
+    loop {
+        let task = task::load_task(task_path)?;
+        let recorded_launch = task.frontmatter.agent_session_ids.len() > initial_session_count
+            && task.frontmatter.agent_session_logs.len() > initial_session_count
+            && Path::new(&task.frontmatter.agent_session_logs[initial_session_count]).exists();
+        if recorded_launch && task.frontmatter.status != task::TaskStatus::Ready {
+            return Ok(());
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect background agent process")?
+        {
+            if recorded_launch {
+                return Ok(());
+            }
+            record_background_launch_failure(
+                config,
+                task_path,
+                &format!(
+                    "background child pid {} exited before recording a session (status: {status})",
+                    child.id()
+                ),
+            )?;
+            anyhow::bail!(
+                "background agent for {} exited before recording a session (status: {status})",
+                task_path.display()
+            );
+        }
+
+        if started.elapsed() >= BACKGROUND_LAUNCH_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            record_background_launch_failure(
+                config,
+                task_path,
+                &format!(
+                    "background child pid {} did not record a running session within {} seconds",
+                    child.id(),
+                    BACKGROUND_LAUNCH_TIMEOUT.as_secs()
+                ),
+            )?;
+            anyhow::bail!(
+                "background agent for {} did not record a session within {} seconds",
+                task_path.display(),
+                BACKGROUND_LAUNCH_TIMEOUT.as_secs()
+            );
+        }
+
+        std::thread::sleep(BACKGROUND_LAUNCH_POLL);
+    }
+}
+
+fn record_background_launch_failure(
+    config: &config::Config,
+    task_path: &Path,
+    reason: &str,
+) -> Result<()> {
+    let mut task = task::load_task(task_path)?;
+    if !matches!(
+        task.frontmatter.status,
+        task::TaskStatus::Ready | task::TaskStatus::Running
+    ) {
+        return Ok(());
+    }
+
+    let session_id = Uuid::new_v4().to_string();
+    let session_log_path = Path::new(&config.defaults.operations_dir)
+        .join(config::RUNS_DIRNAME)
+        .join(format!("{session_id}.log"));
+    if let Some(parent) = session_log_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create session log directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(
+        &session_log_path,
+        format!(
+            "session_id={session_id}\nagent=background-launcher\ntask={}\nlaunch_failure={reason}\n",
+            task_path.display()
+        ),
+    )
+    .with_context(|| format!("failed to write session log at {}", session_log_path.display()))?;
+
+    let recap_dir = Path::new(&config.defaults.operations_dir).join(config::RECAPS_DIRNAME);
+    fs::create_dir_all(&recap_dir)
+        .with_context(|| format!("failed to create recap directory {}", recap_dir.display()))?;
+    let recap_path = recap_dir.join(format!("{}.md", Uuid::new_v4()));
+    let recap = format!(
+        "---\ntask: {}\n---\n\n# Agent Run Failed\n\nThe background launch failed before Varda could record a running agent session.\n\nReason: {reason}\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})\n",
+        task_path.display(),
+        session_log_path.display(),
+        session_log_path.display()
+    );
+    fs::write(&recap_path, recap)
+        .with_context(|| format!("failed to write recap at {}", recap_path.display()))?;
+
+    task.frontmatter.agent_session_ids.push(session_id);
+    task.frontmatter
+        .agent_session_logs
+        .push(session_log_path.display().to_string());
+    task.set_recap(recap_path.display().to_string());
+    task.frontmatter.requires_user = false;
+    task.set_status(task::TaskStatus::Failed);
+    task::write_task(&task)?;
+
     Ok(())
 }
 
@@ -3462,6 +3595,66 @@ planner_agent: codex
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "session-1");
         assert_eq!(sessions[0].log_path, runs_dir.join("session-1.log"));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn background_launch_failure_marks_task_failed_with_recap_and_log() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-background-launch-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: codex
+requires_user: false
+---
+
+# Task
+
+Do it.
+"#,
+        )
+        .expect("task should be written");
+        let config = config::Config {
+            defaults: config::Defaults {
+                timeout_seconds: 600,
+                operations_dir: operations_dir.display().to_string(),
+                sandbox: None,
+                ..Default::default()
+            },
+            routes: vec![],
+            agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
+            git: config::GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
+        };
+
+        record_background_launch_failure(&config, &task_path, "agent binary was not found")
+            .expect("failure should be recorded");
+
+        let task = task::load_task(&task_path).expect("task should load");
+        assert_eq!(task.frontmatter.status, task::TaskStatus::Failed);
+        assert_eq!(task.frontmatter.agent_session_ids.len(), 1);
+        assert_eq!(task.frontmatter.agent_session_logs.len(), 1);
+        assert_eq!(task.frontmatter.recaps.len(), 1);
+
+        let log = fs::read_to_string(&task.frontmatter.agent_session_logs[0])
+            .expect("session log should be readable");
+        let recap =
+            fs::read_to_string(&task.frontmatter.recaps[0]).expect("recap should be readable");
+        assert!(log.contains("launch_failure=agent binary was not found"));
+        assert!(recap.contains("Agent Run Failed"));
+        assert!(recap.contains("agent binary was not found"));
 
         fs::remove_dir_all(root).expect("test directory should be removable");
     }
