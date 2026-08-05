@@ -757,12 +757,15 @@ impl SandboxSession for DockerSession {
 /// "materialize after the run via `cp`" model, since a microVM's guest HOME is
 /// not a host bind mount.
 ///
-/// NOTE ON CLI GRAMMAR: the exact `msb` flag spellings below were derived from
-/// the installed `msb 0.6.8` binary's embedded help (`run` takes an image plus
-/// a command; `--name`, `--mount HOST:GUEST`, `--workdir`, `--env K=V`,
-/// `--cpus`/`--memory`, network rules via `--net-*`). They are centralized in
-/// [`MicrosandboxSession::wrap`] / [`MicrosandboxSession::extract_session_store`]
-/// so a single `msb <cmd> --help` can confirm or correct them in one place.
+/// CLI GRAMMAR (confirmed against `msb 0.6.8`, 2026-08-05): `msb run [OPTS]
+/// <IMAGE> -- <COMMAND>` (image positional before `--`); `--name`, `--workdir`,
+/// `--env K=V`; host binds via `--mount-dir SOURCE:DEST[:ro|:rw]`; egress via
+/// `--net-default[-egress] deny` + `--net-rule allow@<target>`; extraction via
+/// `msb cp <sandbox>:/abs/path <host>` (the sandbox persists in `stopped` state
+/// after a foreground run, so cp works before `msb rm`). Verified live: a
+/// `--mount-dir …:ro` blocks writes and the host `~/.aws` is not visible in the
+/// microVM. Spellings are centralized in [`MicrosandboxSession::wrap`] /
+/// [`MicrosandboxSession::extract_session_store`].
 pub struct MicrosandboxProvider {
     name: String,
     /// Pre-existing OCI image reference `msb` can pull, or the tag produced by a
@@ -901,13 +904,16 @@ impl SandboxSession for MicrosandboxSession {
             args.push("deny".to_owned());
             for host in &self.egress {
                 args.push("--net-rule".to_owned());
-                args.push(format!("egress:allow:{host}"));
+                // msb net-rule token grammar: `<action>[:<direction>]@<target>`
+                // (confirmed against msb 0.6.8; e.g. `allow@example.com`).
+                args.push(format!("allow@{host}"));
             }
         }
 
         // Project root always mounted at its absolute path; nothing else unless
-        // explicitly allow-listed. `msb --mount HOST:GUEST` is a bind mount.
-        args.push("--mount".to_owned());
+        // explicitly allow-listed. `msb --mount-dir SOURCE:DEST[:ro|:rw]` binds a
+        // host directory into the guest (confirmed against msb 0.6.8).
+        args.push("--mount-dir".to_owned());
         args.push(format!("{proj}:{proj}"));
         // Effective extra mounts = union(sandbox, route), de-duplicated by the
         // expanded absolute target; first declaration wins. Read-only unless the
@@ -923,7 +929,7 @@ impl SandboxSession for MicrosandboxSession {
             }
             let source = source.display().to_string();
             let target = target.display().to_string();
-            args.push("--mount".to_owned());
+            args.push("--mount-dir".to_owned());
             if mspec.writable {
                 args.push(format!("{source}:{target}:rw"));
             } else {
@@ -960,7 +966,16 @@ impl SandboxSession for MicrosandboxSession {
     }
 
     fn session_store_root(&self) -> Option<PathBuf> {
-        Some(self.session_store.clone())
+        // `msb cp <sandbox>:<home> <session_store>` lands the guest HOME as a
+        // SUBDIRECTORY named after HOME's basename — msb has no docker-style `/.`
+        // contents-copy (confirmed: it rejects a `.` path component). So the
+        // agent's `.claude/…` ends up at `<session_store>/<basename>/.claude/…`
+        // and discovery must read that nested dir.
+        let root = Path::new(&self.home)
+            .file_name()
+            .map(|name| self.session_store.join(name))
+            .unwrap_or_else(|| self.session_store.clone());
+        Some(root)
     }
 
     fn store_is_live(&self) -> bool {
@@ -993,10 +1008,12 @@ impl SandboxSession for MicrosandboxSession {
     }
 
     async fn extract_session_store(&self) -> Result<()> {
-        // Copy the guest HOME *contents* into the host session-store dir. Runs
-        // after the agent exits and before teardown, so resume-capture can read
-        // it back from the host even though the guest HOME was never bind-mounted.
-        let src = format!("{}:{}/.", self.sandbox, self.home);
+        // Copy the guest HOME dir into the host session-store dir. Runs after the
+        // agent exits and before teardown, so resume-capture can read it back from
+        // the host even though the guest HOME was never bind-mounted. NB: msb has
+        // no docker `/.` contents-copy, so this nests the HOME under its basename;
+        // `session_store_root()` accounts for that.
+        let src = format!("{}:{}", self.sandbox, self.home);
         let dst = self.session_store.display().to_string();
         let output = tokio::process::Command::new("msb")
             .args(["cp", &src, &dst])
@@ -1572,7 +1589,7 @@ mod tests {
                 "varda-sbx-abc",
                 "--net-default",
                 "deny",
-                "--mount",
+                "--mount-dir",
                 "/proj:/proj",
                 "--workdir",
                 "/proj",
@@ -1586,7 +1603,83 @@ mod tests {
         );
         assert!(wrapped.env.is_empty());
         assert!(!session.store_is_live());
-        assert_eq!(session.session_store_root(), Some(PathBuf::from("/host/store")));
+        // `msb cp` nests the guest HOME under its basename on the host, so the
+        // discovery root is the nested dir, not the raw session_store.
+        assert_eq!(
+            session.session_store_root(),
+            Some(PathBuf::from("/host/store/agent"))
+        );
+    }
+
+    /// M4 live exit criteria — verified against a real `msb` microVM: a
+    /// read-only mount blocks writes, host `~/.aws` is NOT visible (own-kernel
+    /// isolation), and the session store round-trips guest→host via `msb cp`.
+    #[tokio::test]
+    #[ignore = "requires the msb (microsandbox) runtime"]
+    async fn microsandbox_isolates_and_round_trips_live() {
+        use tokio::process::Command as TokioCommand;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("msb-it-proj");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let provider = MicrosandboxProvider::from_config(
+            "microsandbox",
+            &SandboxConfig {
+                image: Some("busybox".to_owned()),
+                primitive: "microsandbox".to_owned(),
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let session = provider
+            .prepare(&ctx_with_id(&root, "msb-it-1"))
+            .await
+            .unwrap();
+        let store = session.session_store_root().expect("store root");
+
+        // The agent writes a session-store file under HOME and probes host creds.
+        let spec = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "mkdir -p \"$HOME/.claude\" && echo hi > \"$HOME/.claude/transcript.jsonl\"; \
+                     ls /Users/nilleb/.aws >/dev/null 2>&1 && echo AWS_VISIBLE || echo AWS_HIDDEN"
+                        .to_owned(),
+                ],
+                env: BTreeMap::new(),
+                cwd: Some(root.clone()),
+            })
+            .unwrap();
+        let out = TokioCommand::new(&spec.program)
+            .args(&spec.args)
+            .output()
+            .await
+            .expect("failed to run msb");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+        let extracted = if out.status.success() {
+            session.extract_session_store().await
+        } else {
+            Ok(())
+        };
+        let got = std::fs::read_to_string(store.join(".claude/transcript.jsonl"));
+        session.teardown().await.ok();
+
+        assert!(out.status.success(), "msb run should succeed: {stdout}");
+        assert!(
+            stdout.contains("AWS_HIDDEN"),
+            "host ~/.aws must NOT be visible in the microVM; got: {stdout}"
+        );
+        extracted.expect("msb cp extraction should succeed");
+        assert_eq!(
+            got.expect("session store must round-trip guest→host via msb cp")
+                .trim(),
+            "hi"
+        );
     }
 
     /// M5: the clawk stub parses and resolves, but `prepare()` fails with a
