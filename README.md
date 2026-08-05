@@ -240,6 +240,46 @@ For the example above, the file is:
 $VARDA_HOME/operations/tasks/some-project-path/summarize-this-project.md
 ```
 
+### Repo-local task store (`.varda/`)
+
+A repository can carry its own task DEFINITIONS and workflow rules alongside its
+code. Create a `.varda/` directory at the repo root and Varda splits a task in
+two:
+
+- **Definition** (committed, travels with the code) —
+  `.varda/tasks/<id>-<slug>.md` holds the frontmatter spec (`id`, `project`,
+  `assignee`, `allow_commands`, cooperative bounds, `requires_user`) plus the
+  brief. It NEVER carries runtime state.
+- **State** (control plane, not committed to the code repo) — status
+  transitions, recaps, session logs, and notifications stay under `~/.varda`,
+  linked to the definition by `{repo, task_id}`.
+
+Behavior:
+
+- `varda task add` in a repo that has a `.varda/` directory writes the definition
+  to `.varda/tasks/` and registers state in `~/.varda`.
+- `varda task run <id>` reads the definition from the repo and writes state to
+  `~/.varda`. A fresh clone/worktree that carries only the definition
+  materializes its home state on first run — state is never committed back into
+  the code repo. Materialization is portable and runnable:
+  - It binds the runtime `project` to the CURRENT checkout (the repo you run
+    from), not the absolute path the definition was committed with, so a clone
+    or worktree routes against a real repo.
+  - It lands the materialized task in `ready`, so the first `run` of a
+    repo-defined task is accepted instead of stalling in `backlog`.
+  - The lookup walks up to the repo root, so `run <id>` works from any
+    subdirectory of the repo, not just its top level.
+- `varda task list` unions the repo's definitions with the home store, so a
+  clone sees every task the code ships even before it has run anything.
+- `.varda/WORKFLOW.md` documents the multi-agent contribution rules
+  (worktree-per-task, no agent git commits, file ownership, local gate,
+  cross-review, resolver + post-merge check).
+
+**Back-compat:** repos WITHOUT a `.varda/` directory keep the existing
+home-only behavior (`$VARDA_HOME/operations/tasks/<project-folder>/`)
+unchanged. The `.varda/` *directory* is distinct from the legacy `.varda`
+sandbox *file*; a repo has one or the other, and Varda never confuses them.
+
 List tasks for the current project with:
 
 ```sh
