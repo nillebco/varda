@@ -1626,6 +1626,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
         };
@@ -1726,6 +1727,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
         };
@@ -1788,6 +1790,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
         };
@@ -1941,6 +1944,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
         };
@@ -1982,6 +1986,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
         };
@@ -2053,6 +2058,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
         };
@@ -2119,6 +2125,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
         };
@@ -2329,6 +2336,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            streams_output: None,
             resume_command_template: Some(
                 "claude --resume {external_session_id} --add-dir {project}".to_owned(),
             ),
@@ -2359,6 +2367,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
         };
@@ -2516,6 +2525,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
         }

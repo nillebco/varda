@@ -86,15 +86,18 @@ enum SessionKill {
 ///
 /// The agent's acp streaming path appends every stdout/stderr chunk to the
 /// session log, so a growing log is a direct proxy for a productive run. This
-/// polls the log's size on [`IDLE_POLL_INTERVAL`]; a run is cancelled ONLY after
-/// `idle_timeout` of no growth — a productive long run never trips it, a wedged
-/// loop/hung process does. `max_seconds` layers the soft total ceiling on top:
-/// on reaching it the session stops with [`SessionKill::Budget`] (a graceful
-/// checkpoint), distinct from the idle stall.
+/// polls the log's size on [`IDLE_POLL_INTERVAL`]. For agents known to stream
+/// output, a run is cancelled after `idle_timeout` of no growth. For buffered or
+/// unknown agents, log silence is not enough evidence that the child is wedged,
+/// so the child future and the cumulative `max_seconds` ceiling are the liveness
+/// bounds. `max_seconds` layers the soft total ceiling on top: on reaching it the
+/// session stops with [`SessionKill::Budget`] (a graceful checkpoint), distinct
+/// from the idle stall.
 async fn run_session_watched<F>(
     idle_timeout: Duration,
     max_seconds: Option<u64>,
     log_path: &Path,
+    streams_output: bool,
     fut: F,
 ) -> Result<Result<AgentRunResult>, SessionKill>
 where
@@ -126,7 +129,7 @@ where
                             max_secs: max_seconds.unwrap_or_default(),
                         });
                     }
-                if now.duration_since(last_activity) >= idle_timeout {
+                if streams_output && now.duration_since(last_activity) >= idle_timeout {
                     return Err(SessionKill::Idle {
                         idle_secs: idle_timeout.as_secs(),
                     });
@@ -284,6 +287,7 @@ async fn run_auto_resume_loop(
     bounds: OperationBounds,
     timeout: Duration,
     stream: bool,
+    streams_output: bool,
     first_session_id: String,
     first_session_log: PathBuf,
     first_request: AgentRunRequest,
@@ -307,6 +311,7 @@ async fn run_auto_resume_loop(
             bounds.idle_timeout,
             remaining_secs,
             &log_path,
+            streams_output,
             client.run_task(request),
         )
         .await;
@@ -491,6 +496,11 @@ pub async fn run_task(
             bounds.max_tool_calls
         );
     }
+    let streams_output = config
+        .agents
+        .get(agent_name)
+        .and_then(|agent| agent.streams_output)
+        .unwrap_or(false);
     let (session_outcome, _interactive_finalization_guard) = if interactive {
         let agent_result = Ok(client.run_task(request).await);
         let guard = InteractiveFinalizationGuard::activate()?;
@@ -509,6 +519,7 @@ pub async fn run_task(
             bounds,
             timeout,
             stream,
+            streams_output,
             session_id.clone(),
             session_log_path.clone(),
             request,
@@ -1122,6 +1133,7 @@ mod tests {
             Duration::from_millis(250),
             None,
             &log_path,
+            true,
             std::future::pending::<Result<AgentRunResult>>(),
         )
         .await;
@@ -1145,10 +1157,53 @@ mod tests {
                 resume_command: None,
             })
         };
-        let chatty = run_session_watched(Duration::from_millis(250), None, &log_path, fut).await;
+        let chatty =
+            run_session_watched(Duration::from_millis(250), None, &log_path, true, fut).await;
         assert!(
             matches!(chatty, Ok(Ok(_))),
             "a session that keeps emitting output must not be idle-cancelled, got {chatty:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_watchdog_does_not_cancel_buffered_session_before_budget() {
+        let dir = std::env::temp_dir().join(format!("varda-buffered-idle-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let log_path = dir.join("session.log");
+        fs::write(&log_path, "header\n").expect("seed log");
+
+        let buffered = run_session_watched(
+            Duration::from_millis(100),
+            Some(2),
+            &log_path,
+            false,
+            async {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                Ok(AgentRunResult {
+                    recap: "# Recap\n\nBuffered output arrived at process exit.".to_owned(),
+                    requires_user: false,
+                    suggested_agent: None,
+                    resume_command: None,
+                })
+            },
+        )
+        .await;
+        assert!(
+            matches!(buffered, Ok(Ok(_))),
+            "a live buffered session must not be cancelled solely for log silence, got {buffered:?}"
+        );
+
+        let exceeded = run_session_watched(
+            Duration::from_millis(100),
+            Some(0),
+            &log_path,
+            false,
+            std::future::pending::<Result<AgentRunResult>>(),
+        )
+        .await;
+        assert!(
+            matches!(exceeded, Err(SessionKill::Budget { .. })),
+            "the cumulative budget must still stop buffered sessions, got {exceeded:?}"
         );
     }
 
@@ -1990,6 +2045,7 @@ Help interactively.
                     interactive_args: None,
                     auth_token_env: None,
                     auth_token_target: None,
+                    streams_output: Some(true),
                     resume_command_template: None,
                     interpreter_agent: None,
                 },

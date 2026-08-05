@@ -37,6 +37,7 @@ agents = ["codex"]
 kind = "acp"
 command = "codex"
 args = ["exec", "--cd", ".", "--add-dir", "{varda_project}", "--add-dir", "{varda_home}", "--sandbox", "workspace-write", "-"]
+streams_output = true
 interactive_command = "sh"
 interactive_args = ["-c", "codex \"$(cat $VARDA_PROMPT_FILE)\" -C {project} --add-dir {varda_project} --add-dir {varda_home} -s workspace-write"]
 resume_command_template = "codex resume -C {project} --add-dir {varda_project} --add-dir {varda_home} -s workspace-write {external_session_id}"
@@ -645,6 +646,13 @@ pub struct AgentConfig {
     pub working_dir: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Whether the agent streams stdout/stderr while working. When `true`, Varda's
+    /// idle watchdog may treat session-log growth as a liveness signal. When
+    /// `false` or unset, the agent is buffered-safe: no log growth alone is not
+    /// evidence that the child is wedged, so only natural process exit or the
+    /// cumulative `max_seconds` ceiling stops it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams_output: Option<bool>,
     /// M11 auth-token injection. Name of a HOST env var (resolved from the
     /// environment / a secret store like `fnox`, NEVER a raw secret in the repo)
     /// holding a DEDICATED, scoped, rotatable sandbox token — not the user's
