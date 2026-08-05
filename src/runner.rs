@@ -165,7 +165,9 @@ impl OperationBounds {
                 .unwrap_or(config.defaults.idle_timeout_seconds),
         );
         let max_seconds = match &bounds.max_seconds {
-            Some(over) => crate::config::effective_max_seconds(over, config.defaults.timeout_seconds),
+            Some(over) => {
+                crate::config::effective_max_seconds(over, config.defaults.timeout_seconds)
+            }
             None => config.defaults.effective_max_seconds(),
         };
         Self {
@@ -174,7 +176,9 @@ impl OperationBounds {
             max_continuations: bounds
                 .max_continuations
                 .unwrap_or(config.defaults.max_continuations),
-            max_tool_calls: bounds.max_tool_calls.unwrap_or(config.defaults.max_tool_calls),
+            max_tool_calls: bounds
+                .max_tool_calls
+                .unwrap_or(config.defaults.max_tool_calls),
         }
     }
 }
@@ -271,7 +275,7 @@ fn combine_recaps(prior: &[String], last: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn run_auto_resume_loop(
     config: &Config,
-    client: &impl AgentClient,
+    client: &(impl AgentClient + ?Sized),
     agent_name: &str,
     role_instructions: Option<&str>,
     task_path: &Path,
@@ -352,6 +356,7 @@ async fn run_auto_resume_loop(
                         interpret: false,
                         stream,
                         resume_command: Some(resume),
+                        orchestration_socket_path: None,
                     };
                     continue;
                 }
@@ -402,8 +407,10 @@ async fn run_auto_resume_loop(
                     return Ok(Err(failure));
                 }
                 let earlier = prior_recaps.join("\n\n---\n\n");
-                let recap =
-                    format!("{}\n\n## Earlier continuation recaps\n\n{earlier}", failure.recap);
+                let recap = format!(
+                    "{}\n\n## Earlier continuation recaps\n\n{earlier}",
+                    failure.recap
+                );
                 return Ok(Err(AgentRunResult { recap, ..failure }));
             }
         }
@@ -415,7 +422,7 @@ pub async fn run_task(
     agent_name: &str,
     role_instructions: Option<&str>,
     task_path: &Path,
-    client: &impl AgentClient,
+    client: &(impl AgentClient + ?Sized),
     interactive: bool,
     stream: bool,
 ) -> Result<RunOutcome> {
@@ -466,6 +473,7 @@ pub async fn run_task(
         interpret: false,
         stream,
         resume_command: None,
+        orchestration_socket_path: None,
     };
 
     // M10 cooperative model: an interactive run stays fully user-driven (no
@@ -601,7 +609,7 @@ pub async fn resume_interactive_task(
     agent_name: &str,
     role_instructions: Option<&str>,
     task_path: &Path,
-    client: &impl AgentClient,
+    client: &(impl AgentClient + ?Sized),
     resume_command: String,
 ) -> Result<RunOutcome> {
     let mut task = load_task(task_path)?;
@@ -652,6 +660,7 @@ pub async fn resume_interactive_task(
         interpret: false,
         stream: false,
         resume_command: Some(resume_command),
+        orchestration_socket_path: None,
     };
 
     let session_result = client.run_task(request).await.with_context(|| {
@@ -738,7 +747,7 @@ pub async fn plan_task(
     agent_name: &str,
     role_instructions: Option<&str>,
     task_path: &Path,
-    client: &(impl AgentClient + Sync),
+    client: &impl AgentClient,
 ) -> Result<PlanOutcome> {
     let mut task = load_task(task_path)?;
 
@@ -763,6 +772,7 @@ pub async fn plan_task(
         interpret: false,
         stream: false,
         resume_command: None,
+        orchestration_socket_path: None,
     };
 
     let result = match run_under_ceiling(
@@ -861,7 +871,7 @@ fn append_session_log(path: &Path, content: &str) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn interpret_interactive_session(
     _config: &Config,
-    client: &impl AgentClient,
+    client: &(impl AgentClient + ?Sized),
     agent_name: &str,
     role_instructions: Option<&str>,
     task_path: &Path,
@@ -895,6 +905,7 @@ async fn interpret_interactive_session(
         interpret: true,
         stream: false,
         resume_command: None,
+        orchestration_socket_path: None,
     };
 
     eprintln!();
@@ -1235,8 +1246,7 @@ Do it.
     /// recap, never `failed` and never a mid-work kill.
     #[tokio::test]
     async fn run_task_budget_ceiling_marks_needs_user_not_failed() {
-        let root =
-            std::env::temp_dir().join(format!("varda-run-budget-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("varda-run-budget-{}", std::process::id()));
         let operations_dir = root.join("operations");
         let task_dir = operations_dir.join("tasks/codex");
         fs::create_dir_all(&task_dir).expect("task directory should be created");
@@ -1557,8 +1567,8 @@ Help interactively.
         config.defaults.max_continuations = 8;
         let client = ScriptedResumeClient {
             requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            responses: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
-                vec![
+            responses: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::from(vec![
                     AgentRunResult {
                         recap: "# Hop one\n\nStarted the work.".to_owned(),
                         requires_user: false,
@@ -1571,8 +1581,8 @@ Help interactively.
                         suggested_agent: None,
                         resume_command: None,
                     },
-                ],
-            ))),
+                ]),
+            )),
             fallback: AgentRunResult {
                 recap: "unexpected extra call".to_owned(),
                 requires_user: false,
@@ -1599,7 +1609,11 @@ Help interactively.
         let hop_two = recap.find("Hop two").expect("hop two recap preserved");
         assert!(hop_one < hop_two, "recaps must be preserved in hop order");
 
-        assert_eq!(outcome.status, TaskStatus::Pending, "a stitched run completes");
+        assert_eq!(
+            outcome.status,
+            TaskStatus::Pending,
+            "a stitched run completes"
+        );
         let task = crate::task::load_task(&task_path).expect("task loads");
         assert_eq!(
             task.frontmatter.agent_session_ids.len(),
@@ -1701,7 +1715,9 @@ Help interactively.
         config.defaults.max_continuations = 2;
         let client = ScriptedResumeClient {
             requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            responses: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            responses: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::VecDeque::new()),
+            ),
             // Every call reports more work: the loop must stop on the cap, not here.
             fallback: AgentRunResult {
                 recap: "# Still working\n\nMore to do.".to_owned(),
@@ -1740,7 +1756,10 @@ Help interactively.
         };
         // Defaults come from config first.
         let base = OperationBounds::resolve(&config, &fm);
-        assert_eq!(base.idle_timeout.as_secs(), config.defaults.idle_timeout_seconds);
+        assert_eq!(
+            base.idle_timeout.as_secs(),
+            config.defaults.idle_timeout_seconds
+        );
         assert_eq!(base.max_continuations, config.defaults.max_continuations);
 
         // A per-task override wins for each of the four bounds.

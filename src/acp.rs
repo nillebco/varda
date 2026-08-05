@@ -318,11 +318,9 @@ impl AcpSubprocessClient {
         // after `docker cp`). Previously the live handle was discarded, so `local`
         // headless runs never produced a resume_command and auto-resume never fired.
         let mut record_handle = None;
-        if store_is_live
-            && let Some(session_root) = session_store_root.as_deref() {
-                record_handle =
-                    self.record_external_session(request, started_at, session_root);
-            }
+        if store_is_live && let Some(session_root) = session_store_root.as_deref() {
+            record_handle = self.record_external_session(request, started_at, session_root);
+        }
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let stderr = child.stderr.take().context("failed to open agent stderr")?;
@@ -800,20 +798,21 @@ async fn record_copilot_external_session(
 ) -> Option<String> {
     for _ in 0..20 {
         if let Some(process_log) = find_copilot_process_log(&session_root, started_at)
-            && let Some(workspace_id) = extract_copilot_workspace_id(&process_log) {
-                let events_path = session_root
-                    .join(".copilot/session-state")
-                    .join(&workspace_id)
-                    .join("events.jsonl");
-                let _ = append_session_log(
-                    &log_path,
-                    &format!(
-                        "external_session_id={workspace_id}\nexternal_session_log={}\n",
-                        events_path.display()
-                    ),
-                );
-                return Some(workspace_id);
-            }
+            && let Some(workspace_id) = extract_copilot_workspace_id(&process_log)
+        {
+            let events_path = session_root
+                .join(".copilot/session-state")
+                .join(&workspace_id)
+                .join("events.jsonl");
+            let _ = append_session_log(
+                &log_path,
+                &format!(
+                    "external_session_id={workspace_id}\nexternal_session_log={}\n",
+                    events_path.display()
+                ),
+            );
+            return Some(workspace_id);
+        }
         time::sleep(Duration::from_millis(500)).await;
     }
     None
@@ -860,22 +859,21 @@ fn find_codex_session(
                     }
                     if let Some(project) = project
                         && let Ok(content) = std::fs::read_to_string(&path)
-                            && let Some(first_line) = content.lines().next()
-                                && let Ok(event) =
-                                    serde_json::from_str::<serde_json::Value>(first_line)
-                                {
-                                    let cwd = event["payload"]["cwd"].as_str().unwrap_or_default();
-                                    if !cwd.starts_with(project) && cwd != project {
-                                        continue;
-                                    }
-                                }
+                        && let Some(first_line) = content.lines().next()
+                        && let Ok(event) = serde_json::from_str::<serde_json::Value>(first_line)
+                    {
+                        let cwd = event["payload"]["cwd"].as_str().unwrap_or_default();
+                        if !cwd.starts_with(project) && cwd != project {
+                            continue;
+                        }
+                    }
                     matches.push((modified, path));
                 }
             }
         }
     }
 
-    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches.sort_by_key(|item| std::cmp::Reverse(item.0));
     matches.into_iter().map(|(_, p)| p).next()
 }
 
@@ -1033,9 +1031,18 @@ fn build_prompt(request: &AgentRunRequest) -> String {
         .and_then(|plan_path| std::fs::read_to_string(plan_path).ok())
         .map(|content| format!("\n## Task plan\n\n{content}\n"))
         .unwrap_or_default();
+    let orchestration_section = request
+        .orchestration_socket_path
+        .as_deref()
+        .map(|socket| {
+            format!(
+                "\n## Nested orchestration MCP\n\nA host-gated MCP broker is available at Unix socket `{socket}`. Speak newline-delimited JSON-RPC over that socket; `tools/list` advertises the available tools. The only spawn capability is `spawn_subtask`, and denials are hard errors.\n"
+            )
+        })
+        .unwrap_or_default();
 
     format!(
-        r#"{instructions}{role_section}{instructions_section}{plan_section}
+        r#"{instructions}{role_section}{instructions_section}{plan_section}{orchestration_section}
 Agent: {agent}
 Task path: {task_path}
 Task frontmatter:
@@ -1108,15 +1115,16 @@ fn args_for_request(args: &[String], request: &AgentRunRequest) -> Vec<String> {
         resolved.push(expand_arg(arg, request, project));
 
         if arg == "--cd"
-            && let Some(value) = args.get(index + 1) {
-                resolved.push(if value == "." {
-                    project.to_owned()
-                } else {
-                    expand_arg(value, request, project)
-                });
-                index += 2;
-                continue;
-            }
+            && let Some(value) = args.get(index + 1)
+        {
+            resolved.push(if value == "." {
+                project.to_owned()
+            } else {
+                expand_arg(value, request, project)
+            });
+            index += 2;
+            continue;
+        }
 
         index += 1;
     }
@@ -1176,9 +1184,10 @@ fn host_session_root() -> PathBuf {
 
 fn default_varda_home() -> String {
     if let Ok(home) = std::env::var("VARDA_HOME")
-        && !home.trim().is_empty() {
-            return home;
-        }
+        && !home.trim().is_empty()
+    {
+        return home;
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     std::path::Path::new(&home)
         .join(".varda")
@@ -1200,6 +1209,10 @@ fn env_for_request(
             .iter()
             .map(|(key, value)| (key.clone(), expand_env_value(value, request))),
     );
+    // M8-transport: expose the per-session MCP broker socket to the sandboxed agent.
+    if let Some(socket) = request.orchestration_socket_path.as_deref() {
+        out.insert("VARDA_MCP_SOCKET".to_owned(), socket.to_owned());
+    }
     out
 }
 
@@ -1253,7 +1266,7 @@ fn find_claude_transcript(
         }
     }
 
-    matches.sort_by(|left, right| right.0.cmp(&left.0));
+    matches.sort_by_key(|item| std::cmp::Reverse(item.0));
     matches.into_iter().map(|(_, path)| path).next()
 }
 
@@ -1441,6 +1454,7 @@ mod tests {
                 interpret: false,
                 stream: false,
                 resume_command: None,
+                orchestration_socket_path: None,
             })
             .await
             .expect("subprocess should echo prompt");
@@ -1480,6 +1494,7 @@ mod tests {
             interpret: false,
             stream: false,
             resume_command: None,
+            orchestration_socket_path: None,
         }
     }
 
@@ -1791,6 +1806,7 @@ mod tests {
                 interpret: true,
                 stream: false,
                 resume_command: None,
+                orchestration_socket_path: None,
             })
             .await
             .expect("interpreter subprocess should run");
@@ -1860,6 +1876,7 @@ mod tests {
                 interpret: false,
                 stream: false,
                 resume_command: None,
+                orchestration_socket_path: None,
             })
             .await
             .expect("subprocess should run");
@@ -1924,6 +1941,7 @@ mod tests {
                 interpret: false,
                 stream: false,
                 resume_command: None,
+                orchestration_socket_path: None,
             })
             .await
             .expect("subprocess should run");
@@ -1967,6 +1985,7 @@ mod tests {
             interpret: false,
             stream: false,
             resume_command: None,
+            orchestration_socket_path: None,
         };
 
         let args = args_for_request(
@@ -2025,6 +2044,7 @@ mod tests {
             interpret: false,
             stream: false,
             resume_command: None,
+            orchestration_socket_path: None,
         };
 
         let args = args_for_request(
@@ -2249,6 +2269,7 @@ mod tests {
             interpret: false,
             stream: false,
             resume_command: None,
+            orchestration_socket_path: None,
         }
     }
 }

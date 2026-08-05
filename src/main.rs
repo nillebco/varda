@@ -3,6 +3,7 @@ mod agent;
 mod capability;
 mod config;
 mod git;
+mod mcp_transport;
 mod notify;
 mod orchestration;
 mod routing;
@@ -18,6 +19,7 @@ use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -978,6 +980,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         interpret: false,
         stream: false,
         resume_command: None,
+        orchestration_socket_path: None,
     };
     let result = client.run_task(request).await?;
     let json = extract_json_object(&result.recap)?;
@@ -1085,7 +1088,7 @@ async fn run_task_paths_in_parallel(
     let mut runs = JoinSet::new();
     for task_path in task_paths {
         let config = config.clone();
-        runs.spawn(async move { run_task_path_for_parallel(config, task_path).await });
+        runs.spawn(async move { run_task_path_for_parallel(config, task_path, None).await });
     }
 
     let mut failures = 0usize;
@@ -1153,6 +1156,139 @@ struct ParallelRunReport {
     glob: String,
     outcome: runner::RunOutcome,
     project: Option<String>,
+}
+
+#[derive(Clone)]
+struct VardaSubtaskLauncher {
+    config: config::Config,
+    project_path: PathBuf,
+    fallback_agent: String,
+    spawn_state: orchestration::SharedSpawnState,
+}
+
+impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
+    fn launch(
+        &mut self,
+        req: &orchestration::SpawnRequest,
+        grant: &orchestration::SpawnGrant,
+    ) -> anyhow::Result<orchestration::SubtaskId> {
+        let project = req
+            .route
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.project_path.clone());
+        let assignee = req.agent.as_deref().unwrap_or(&self.fallback_agent);
+        let short = uuid::Uuid::new_v4().to_string();
+        let task_name = format!("spawned-subtask-{}", &short[..8]);
+        let task_path = task::create_task(
+            &self.config,
+            &task_name,
+            &project,
+            Some(assignee),
+            Some(&req.brief),
+        )
+        .context("failed to create spawned subtask")?;
+        let mut task_doc = task::load_task(&task_path)?;
+        task_doc.set_status(task::TaskStatus::Ready);
+        task::write_task(&task_doc)?;
+        let subtask_id = task_doc
+            .frontmatter
+            .id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| task_path.display().to_string());
+
+        let lineage = SpawnLineage {
+            root_id: subtask_id.clone(),
+            root_depth: grant.child_depth,
+            state: self.spawn_state.clone(),
+        };
+        let config = self.config.clone();
+        let path = task_path.clone();
+        if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::CurrentThread
+        {
+            anyhow::bail!("synchronous spawn_subtask launch requires Tokio's multi-thread runtime");
+        }
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                run_task_path_for_parallel(config, path, Some(lineage)).await
+            })
+        })
+        .context("failed to run spawned subtask")?;
+
+        Ok(subtask_id)
+    }
+}
+
+struct OrchestratedAgentClient {
+    inner: acp::AcpSubprocessClient,
+    config: config::Config,
+    policy: orchestration::OrchestrationPolicy,
+    project_path: PathBuf,
+    fallback_agent: String,
+    lineage: Option<SpawnLineage>,
+}
+
+#[derive(Clone)]
+struct SpawnLineage {
+    root_id: orchestration::SubtaskId,
+    root_depth: u32,
+    state: orchestration::SharedSpawnState,
+}
+
+#[async_trait]
+impl AgentClient for OrchestratedAgentClient {
+    async fn run_task(&self, mut request: agent::AgentRunRequest) -> Result<agent::AgentRunResult> {
+        if !self.policy.enabled || request.interactive || request.interpret {
+            return self.inner.run_task(request).await;
+        }
+
+        let socket_dir = self.project_path.join(".varda-mcp");
+        let socket_path = socket_dir.join(format!("{}.sock", request.session_id));
+        let default_root_id = request
+            .frontmatter
+            .id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| request.session_id.clone());
+        let (root_id, root_depth, spawn_state) = self.lineage.as_ref().map_or_else(
+            || (default_root_id, 0, orchestration::SharedSpawnState::new()),
+            |lineage| {
+                (
+                    lineage.root_id.clone(),
+                    lineage.root_depth,
+                    lineage.state.clone(),
+                )
+            },
+        );
+        let launcher = VardaSubtaskLauncher {
+            config: self.config.clone(),
+            project_path: self.project_path.clone(),
+            fallback_agent: self.fallback_agent.clone(),
+            spawn_state: spawn_state.clone(),
+        };
+        let broker = std::sync::Arc::new(orchestration::SpawnBroker::with_shared_state(
+            self.policy.clone(),
+            root_id.clone(),
+            root_depth,
+            spawn_state,
+            launcher,
+        ));
+        let server_path = socket_path.clone();
+        let server = tokio::spawn(async move {
+            if let Err(error) =
+                mcp_transport::serve_unix_socket(&server_path, root_id, broker).await
+            {
+                eprintln!("warning: MCP broker transport exited: {error:#}");
+            }
+        });
+
+        request.orchestration_socket_path = Some(socket_path.display().to_string());
+        let result = self.inner.run_task(request).await;
+        server.abort();
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir(&socket_dir);
+        result
+    }
 }
 
 /// Build an ACP client for `display_name`, injecting the resolved sandbox
@@ -1330,6 +1466,7 @@ fn routing_root_for(project_path: &Path) -> PathBuf {
 async fn run_task_path_for_parallel(
     config: config::Config,
     task_path: PathBuf,
+    lineage: Option<SpawnLineage>,
 ) -> Result<ParallelRunReport> {
     let task_path = task::resolve_task_reference(&config, &task_path)?;
     let task_document = task::load_task(&task_path)?;
@@ -1359,12 +1496,35 @@ async fn run_task_path_for_parallel(
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
     )?;
+    let policy = task_document
+        .frontmatter
+        .project
+        .as_deref()
+        .map(Path::new)
+        .map(|path| config.resolve_orchestration_for(path))
+        .unwrap_or_else(|| config.orchestration.clone());
+    let orchestrated_client = task_document
+        .frontmatter
+        .project
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|_| policy.enabled)
+        .map(|project_path| OrchestratedAgentClient {
+            inner: client.clone(),
+            config: config.clone(),
+            policy,
+            project_path,
+            fallback_agent: route.agent.clone(),
+            lineage,
+        });
     let outcome = runner::run_task(
         &config,
         &display_name,
         route.role_instructions.as_deref(),
         &task_path,
-        &client,
+        orchestrated_client
+            .as_ref()
+            .map_or(&client as &dyn AgentClient, |c| c as &dyn AgentClient),
         false,
         false,
     )
@@ -1804,9 +1964,10 @@ fn load_dashboard_payload(
     let mut tasks = Vec::new();
     for summary in summaries {
         if let Some(project) = summary.project.as_ref()
-            && !projects.contains(project) {
-                projects.push(project.clone());
-            }
+            && !projects.contains(project)
+        {
+            projects.push(project.clone());
+        }
 
         let completed_at = file_mtime_seconds(&summary.path);
 
@@ -1890,12 +2051,14 @@ fn percent_decode(input: &[u8]) -> String {
     let mut output = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {
-        if input[i] == b'%' && i + 2 < input.len()
-            && let (Some(high), Some(low)) = (hex_value(input[i + 1]), hex_value(input[i + 2])) {
-                output.push((high << 4) | low);
-                i += 3;
-                continue;
-            }
+        if input[i] == b'%'
+            && i + 2 < input.len()
+            && let (Some(high), Some(low)) = (hex_value(input[i + 1]), hex_value(input[i + 2]))
+        {
+            output.push((high << 4) | low);
+            i += 3;
+            continue;
+        }
         output.push(input[i]);
         i += 1;
     }
@@ -2672,6 +2835,7 @@ async fn run_captured_resume_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_tasks_command(
     task_ref: Option<&Path>,
     set_status: Option<&str>,
@@ -2711,9 +2875,10 @@ fn update_tasks_command(
                     return false;
                 }
                 if let Some(agent) = filter_agent
-                    && t.assignee.as_deref() != Some(agent) {
-                        return false;
-                    }
+                    && t.assignee.as_deref() != Some(agent)
+                {
+                    return false;
+                }
                 true
             })
             .map(|t| t.path)
@@ -2856,7 +3021,7 @@ fn task_sessions(config: &config::Config, task_path: &Path) -> Result<Vec<TaskSe
         });
     }
 
-    sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified));
     Ok(sessions)
 }
 

@@ -480,10 +480,6 @@ impl Config {
     /// master, so every live spawn is gated by exactly the policy that governs the
     /// code being worked on.
     ///
-    /// `allow(dead_code)` until the run path stands up the broker per task (the MCP
-    /// transport-into-sandbox step of this milestone); the resolver + policy surface
-    /// are landed and unit-tested ahead of that wiring.
-    #[allow(dead_code)]
     pub fn resolve_orchestration_for(
         &self,
         project_path: &Path,

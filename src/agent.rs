@@ -30,6 +30,9 @@ pub struct AgentRunRequest {
     /// Concrete command captured from a prior interactive agent session. When set,
     /// interactive execution resumes that session instead of delivering the task prompt.
     pub resume_command: Option<String>,
+    /// Sandbox-visible Unix socket for the host-gated nested-orchestration MCP
+    /// broker. When present, Varda also exports it as `VARDA_MCP_SOCKET`.
+    pub orchestration_socket_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +47,7 @@ pub struct AgentRunResult {
 }
 
 #[async_trait]
-pub trait AgentClient {
+pub trait AgentClient: Send + Sync {
     async fn run_task(&self, request: AgentRunRequest) -> Result<AgentRunResult>;
 
     async fn plan_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
@@ -480,6 +483,7 @@ mod tests {
                 interpret: false,
                 stream: false,
                 resume_command: None,
+                orchestration_socket_path: None,
             })
             .await
             .expect("fake agent should return a result");
