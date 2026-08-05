@@ -260,6 +260,11 @@ pub struct SandboxIdentity {
     /// Scoped auth token(s) injected as in-box env vars (`target_name → value`).
     /// The value is resolved from the host env / a secret store at prepare time.
     pub auth_env: BTreeMap<String, String>,
+    /// Scoped credential value(s) staged as read-only guest FILES
+    /// (`guest_abs_path → value`), materialized via the session's `stage_file` at
+    /// prepare time and cleaned on teardown. Resolved host-side like `auth_env`;
+    /// only the minimal scoped value is written — never a credential dir mount.
+    pub auth_files: BTreeMap<String, String>,
 }
 
 impl SandboxIdentity {
@@ -271,6 +276,7 @@ impl SandboxIdentity {
             && self.git_name.is_none()
             && self.git_email.is_none()
             && self.auth_env.is_empty()
+            && self.auth_files.is_empty()
     }
 
     /// Guest env additions from channels 1 & 2: the scoped auth token(s), the
@@ -576,6 +582,14 @@ pub trait SandboxSession: Send + Sync {
         std::fs::write(&tmp, content)
             .with_context(|| format!("failed to stage file {}", tmp.display()))?;
         Ok(tmp.display().to_string())
+    }
+    /// Scoped credential values (`guest_abs_path → value`) that must be staged as
+    /// read-only files INSIDE the guest before the process starts (M11-ext file
+    /// targets). The caller stages each via [`stage_file`](Self::stage_file) between
+    /// `prepare` and `wrap`. The default is empty (`local` crosses no boundary);
+    /// boundary-crossing providers return their identity's `auth_files`.
+    fn identity_files(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
     }
     /// Drive a provider-specific interactive launch lifecycle and return the FINAL
     /// command the caller spawns with the user's TTY inherited (M13a §2). `wrapped`
@@ -1370,6 +1384,10 @@ impl SandboxSession for DockerSession {
         Ok(guest_path.to_owned())
     }
 
+    fn identity_files(&self) -> BTreeMap<String, String> {
+        self.identity.auth_files.clone()
+    }
+
     async fn begin_interactive(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
         // `wrapped` is `docker create … -it …`. Run it to create (but not start)
         // the container, then `docker cp` every staged file into it, then return
@@ -1794,6 +1812,10 @@ impl SandboxSession for MicrosandboxSession {
             .expect("staged_files mutex poisoned")
             .push((tmp, guest_path.to_owned()));
         Ok(guest_path.to_owned())
+    }
+
+    fn identity_files(&self) -> BTreeMap<String, String> {
+        self.identity.auth_files.clone()
     }
 
     fn session_store_root(&self) -> Option<PathBuf> {
@@ -2381,6 +2403,71 @@ mod tests {
                 "no credential dir may be mounted: {v}"
             );
         }
+    }
+
+    /// M11-ext: a MULTI-credential run mixes an env target and a file target. The env
+    /// target lands as a scoped `-e`; the file target flows through
+    /// [`SandboxSession::identity_files`] → `stage_file` (staged, never a mount). NO
+    /// credential dir (`~/.config/gcloud`, `~/.aws`, `~/.azure`, `~/.terraform.d`) is
+    /// ever bind-mounted.
+    #[test]
+    fn m11ext_multi_credential_env_and_file_targets_no_creds_mount() {
+        let mut auth_env = BTreeMap::new();
+        auth_env.insert(
+            "CLOUDSDK_AUTH_ACCESS_TOKEN".to_owned(),
+            "scoped-access-token".to_owned(),
+        );
+        let mut auth_files = BTreeMap::new();
+        auth_files.insert(
+            "/home/agent/.config/gcloud-token".to_owned(),
+            "scoped-file-token".to_owned(),
+        );
+        let id = SandboxIdentity {
+            auth_env,
+            auth_files,
+            ..Default::default()
+        };
+        assert!(!id.is_empty(), "a file-only credential still activates identity wiring");
+        let session =
+            DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
+        let wrapped = session
+            .wrap(
+                CommandSpec {
+                    program: "claude".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+        // Env target injects as a scoped -e; the file target is NOT an env var.
+        let env = docker_env_flags(&wrapped.args);
+        assert!(
+            env.iter().any(|e| *e == "CLOUDSDK_AUTH_ACCESS_TOKEN=scoped-access-token"),
+            "env-target credential must be a scoped -e: {env:?}"
+        );
+        // No credential dir/file is ever a bind-mount SOURCE — not even the file target.
+        for v in docker_v_flags(&wrapped.args) {
+            assert!(
+                !v.contains("gcloud-token")
+                    && !v.contains("/.config/gcloud")
+                    && !v.contains("/.aws")
+                    && !v.contains("/.azure")
+                    && !v.contains("/.terraform.d"),
+                "no credential dir/file may be mounted: {v}"
+            );
+        }
+        // The file target is exposed as a staged read-only guest file, not a mount.
+        let files = session.identity_files();
+        assert_eq!(
+            files.get("/home/agent/.config/gcloud-token").map(String::as_str),
+            Some("scoped-file-token")
+        );
+        let guest = session
+            .stage_file("scoped-file-token", "/home/agent/.config/gcloud-token")
+            .unwrap();
+        assert_eq!(guest, "/home/agent/.config/gcloud-token");
     }
 
     /// M11 channel 2 (git identity): SSH_AUTH_SOCK is forwarded as a bind + env, and

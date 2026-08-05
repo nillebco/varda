@@ -746,6 +746,56 @@ auth_token_target = "ANTHROPIC_API_KEY"
 
 At `prepare`, Varda reads `$CLAUDE_SANDBOX_TOKEN` on the host and re-exports its value into the box as `-e ANTHROPIC_API_KEY=…`. If the host var is unset/empty the run still boots (with a warning) — it just isn't authenticated. The stronger form — the agent never holds the key, LLM calls proxied through a broker — is the **M8 capability-broker** pattern (out of scope here).
 
+**Multiple credentials per agent (`[[agents.X.credentials]]`).** The single `auth_token_env` pair is **one-entry sugar** over a general credential list. Each entry names exactly one **source** (where the scoped value is minted, on the host) and exactly one **target** (how it reaches the box). None of them ever mounts a credential dir — only the resolved, minimal value crosses the boundary.
+
+| | key | meaning |
+|---|---|---|
+| **source** (one) | `from_env = "NAME"` | value of a HOST env var |
+| | `from_secret = "name"` | a named secret from the host store (`fnox get name`) |
+| | `command = "…"` | run on the HOST at `prepare`; stdout (newline-trimmed) is the value — for host-minted, least-privilege, short-lived tokens |
+| **target** (one) | `env = "IN_BOX_VAR"` | scoped `-e IN_BOX_VAR=…` (default) |
+| | `file = "/guest/abs/path"` | staged as a **read-only file** in the guest (via `stage_file`, cleaned on teardown) |
+
+A `from_env`/`from_secret` source that is unset is skipped (the box still boots unauthenticated); a `command` that errors or prints nothing **fails the run loudly** — a broken mint must never silently degrade to an unauthenticated session. `refresh_seconds` is accepted for forward-compat but the value is currently minted **once** at `prepare` (periodic re-mint is a follow-up). Sources belong in the **trusted central `config.toml`** only; a `.varda` may reference a secret *name* (`from_secret`) but never a raw value or a `command`.
+
+Recipes (each injects a scoped value — **no** `~/.config/gcloud`, `~/.azure`, `~/.aws`, `~/.terraform.d` mount):
+
+```toml
+# GCP deploy with a host-minted, impersonated, short-lived access token — no local Docker.
+# Use with `gcloud run deploy --source` inside the box.
+[[agents.claude.credentials]]
+command = "gcloud auth print-access-token --impersonate-service-account=deployer@PROJECT.iam"
+env = "CLOUDSDK_AUTH_ACCESS_TOKEN"
+[[agents.claude.credentials]]
+command = "gcloud auth print-access-token --impersonate-service-account=deployer@PROJECT.iam"
+env = "GOOGLE_OAUTH_ACCESS_TOKEN"
+
+# Terraform Cloud API token from the host secret store.
+[[agents.claude.credentials]]
+from_secret = "tfc-token"
+env = "TF_TOKEN_app_terraform_io"
+
+# Azure DevOps PAT from the host secret store.
+[[agents.claude.credentials]]
+from_secret = "azdo-pat"
+env = "AZURE_DEVOPS_EXT_PAT"
+
+# Azure CLI — service principal via env (NOT a ~/.azure mount)…
+[[agents.claude.credentials]]
+from_secret = "azure-client-id"
+env = "AZURE_CLIENT_ID"
+[[agents.claude.credentials]]
+from_secret = "azure-client-secret"
+env = "AZURE_CLIENT_SECRET"
+[[agents.claude.credentials]]
+from_secret = "azure-tenant-id"
+env = "AZURE_TENANT_ID"
+# …or a host-minted access token instead of the SP secret:
+[[agents.claude.credentials]]
+command = "az account get-access-token --query accessToken -o tsv"
+env = "AZURE_TOKEN"
+```
+
 **2. Git identity via SSH-agent forwarding (channel 2).** Forward the host **SSH agent socket** so `git push` signs/authenticates on the host and **private keys never enter the box** (`ls ~/.ssh` in-guest stays empty). The read-only git identity is forwarded as `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env so commits are attributed correctly without mounting `~/.gitconfig`.
 
 ```toml

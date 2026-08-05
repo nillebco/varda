@@ -2045,6 +2045,7 @@ Help interactively.
                     interactive_args: None,
                     auth_token_env: None,
                     auth_token_target: None,
+                    credentials: Vec::new(),
                     streams_output: Some(true),
                     resume_command_template: None,
                     interpreter_agent: None,
