@@ -1,5 +1,6 @@
 mod acp;
 mod agent;
+mod capability;
 mod config;
 mod git;
 mod notify;
@@ -960,6 +961,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
             agent_session_ids: vec![],
             agent_session_logs: vec![],
             agent_resume_commands: vec![],
+            allow_commands: vec![],
             requires_user: false,
         },
         body: format!(
@@ -1192,9 +1194,7 @@ fn build_client(
             );
             sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &identity)?
         }
-        None => {
-            sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?
-        }
+        None => sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?,
     };
     Ok(acp::AcpSubprocessClient::with_sandbox(
         display_name,
@@ -1225,7 +1225,10 @@ fn resolve_sandbox_identity(
     if let Some(src) = &agent_config.auth_token_env {
         match std::env::var(src) {
             Ok(value) if !value.is_empty() => {
-                let target = agent_config.auth_token_target.clone().unwrap_or_else(|| src.clone());
+                let target = agent_config
+                    .auth_token_target
+                    .clone()
+                    .unwrap_or_else(|| src.clone());
                 auth_env.insert(target, value);
             }
             _ => eprintln!(
@@ -2413,6 +2416,14 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         println!();
     }
 
+    if !outcome.blocked_commands.is_empty() {
+        println!();
+        println!("blocked_commands: {}", outcome.blocked_commands.join(", "));
+        println!(
+            "hint: add these to the task's `allow_commands` frontmatter and re-run to authorize them headlessly"
+        );
+    }
+
     let notification = if outcome.status == task::TaskStatus::NeedsUser {
         let notification =
             notify::notify_user_interaction(&config, &task_path, &outcome.recap_path)?;
@@ -3150,6 +3161,7 @@ planner_agent: codex
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n".to_owned(),

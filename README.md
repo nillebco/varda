@@ -778,6 +778,52 @@ Invariants 1 and 2 are enforced at the mount layer (folded into `check_credentia
 
 > **Status:** the host-side policy engine (allow/deny, depth, fan-out, budget, approval gate) and the invariant-1/2 mount floor are implemented and unit-tested. Wiring the live `spawn_subtask` MCP tool into a running sandbox and launching the sibling box end-to-end is the remaining step of this milestone.
 
+### Per-task capability allowlist (headless permission grants)
+
+A headless Varda run has **no interactive approver**. The agent backend's own permission layer therefore denies any command it was not pre-authorized to execute — in Claude Code `-p`/print mode there is no human to answer the "allow this command?" prompt, so the command simply fails and the agent (correctly) degrades to `needs_user`. This is the friction that blocked the sandbox-self-test agent, which needed host `msb`/`docker` to live-verify.
+
+Declare the commands a task is allowed to run in its frontmatter:
+
+```yaml
+---
+id: 123
+status: ready
+project: /Users/you/dev/project
+assignee: claude
+allow_commands:
+  - msb            # → Bash(msb:*)
+  - docker         # → Bash(docker:*)
+  - "Bash(cargo test:*)"   # full tool patterns pass through verbatim
+---
+```
+
+At run time Varda translates `allow_commands` into the backend's permission config — for Claude Code, a **run-scoped settings file** (`<runs>/<session_id>.settings.json`) carrying `permissions.allow`, injected via `--settings`. Each bare name becomes a single `Bash(<cmd>:*)` prefix rule; an entry that already looks like a tool pattern (it contains `(`) is passed through unchanged. This is:
+
+- **Deterministic** — no human in the loop.
+- **Scoped** — only the declared commands are authorized; a command *not* on the list still blocks. This is **not** `--dangerously-skip-permissions`; no global bypass is ever introduced.
+- **Per-task** — the grant lives on the task, not on the agent config or a shared route, so one task's allowance does not widen another's.
+
+> Backend coverage: this targets the Claude Code backend, whose headless permission model is the one that blocks un-approved commands. The `codex` (`--sandbox workspace-write`) and `copilot` (`--allow-all-tools`) backends already grant broad non-interactive execution, so `allow_commands` is a no-op there.
+
+#### Actionable denial (scripted re-run)
+
+When the permission layer blocks a command, the agent lists it under a `Blocked commands` heading in its recap (one command per line). Varda parses that into the structured `blocked_commands` field of the run outcome and prints it:
+
+```
+blocked_commands: msb, docker build
+hint: add these to the task's `allow_commands` frontmatter and re-run to authorize them headlessly
+```
+
+An orchestrator can read that list, append the names to `allow_commands`, and re-run **automatically** — rather than guessing which capability was missing.
+
+#### Sandbox-self-test carve-out (host allowlist, not sandboxed)
+
+There is one class of task that **must** run with an explicit *host* allowlist rather than inside a sandbox: tasks that **develop or test the sandbox providers themselves**. Building/running a microsandbox (`msb`) or docker image is exactly the operation the isolation invariants forbid *inside* an agent container — **no `--privileged`, no docker-in-docker; sub-sandboxes are siblings spawned by the host, never nested** (see [Isolation invariants](#isolation-invariants-never-violate) invariant 3 and [Orchestration isolation invariants](#orchestration-isolation-invariants-mandatory--never-violate) invariant 3). You cannot nest a docker/microVM build inside a box that is itself denied the docker socket and DinD.
+
+So a sandbox-provider task runs **on the host** (`sandbox = "local"`, or no sandbox) with a narrow `allow_commands = ["msb", "docker", "cargo"]`. The capability allowlist keeps that host execution **deterministic and scoped to the named build/test commands** instead of requiring an interactive approver or a blanket bypass. This is the deliberate exception to "everything runs sandboxed", and it exists precisely *because* those commands operate the isolation layer that everything else relies on.
+
+The deeper fix (tracked separately) is to run Varda's own agents *inside* the sandbox and then safely relax in-box permissions — a strong L1 isolation primitive substitutes for L2 approval prompts. This per-task allowlist is the near-term, deterministic step that also remains necessary for the self-test carve-out above.
+
 ### Roles
 
 Roles are prompt personas that layer on top of an agent backend. They let you assign a different behavioral mode (e.g. verification, planning, review) without changing the underlying executable.

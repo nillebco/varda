@@ -80,7 +80,7 @@ impl AcpSubprocessClient {
     async fn execute(
         &self,
         prompt: String,
-        args: Vec<String>,
+        mut args: Vec<String>,
         request: &AgentRunRequest,
     ) -> Result<AgentRunResult> {
         if request.interactive {
@@ -88,6 +88,47 @@ impl AcpSubprocessClient {
         }
         let started_at = SystemTime::now();
         let command = expand_request_value(&self.command, request);
+
+        // M12 per-task capability allowlist: for the Claude Code backend, a
+        // headless (`-p`) run has no interactive approver, so any command not
+        // pre-authorized is denied. Materialize the task's declared
+        // `allow_commands` into a run-scoped settings file carrying
+        // `permissions.allow` and inject it via `--settings` — deterministic,
+        // scoped to exactly those commands, never a blanket bypass.
+        if crate::capability::is_claude_backend(&command)
+            && !request.frontmatter.allow_commands.is_empty()
+        {
+            if let Some(log_path) = request.session_log_path.as_deref() {
+                match crate::capability::write_claude_run_settings(
+                    Path::new(log_path),
+                    &request.frontmatter.allow_commands,
+                ) {
+                    Ok(Some(settings_path)) => {
+                        args.push("--settings".to_owned());
+                        args.push(settings_path.display().to_string());
+                        let _ = append_session_log(
+                            log_path,
+                            &format!(
+                                "allow_commands={:?}\nrun_settings={}\n",
+                                request.frontmatter.allow_commands,
+                                settings_path.display()
+                            ),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "warning: failed to write run settings for allow_commands: {error:#}"
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "warning: allow_commands declared but no session log path is set; \
+                     the capability allowlist was not injected"
+                );
+            }
+        }
         let working_dir = self
             .working_dir
             .as_deref()
@@ -140,15 +181,18 @@ impl AcpSubprocessClient {
         }
         // Fail loudly if a declared bind-mount source is unreachable on the host
         // (a would-be empty in-VM stub on a VM-backed daemon) before we run.
-        session.validate_mounts().with_context(|| {
-            format!("unusable mount for '{}' sandbox", self.sandbox.name())
-        })?;
+        session
+            .validate_mounts()
+            .with_context(|| format!("unusable mount for '{}' sandbox", self.sandbox.name()))?;
         // Live stores (local) are polled while the agent runs; extracted stores
         // (docker volume + `docker cp`) are only discovered post-exit.
         let store_is_live = session.store_is_live();
-        let spec = session
-            .wrap(spec)
-            .with_context(|| format!("failed to wrap command for '{}' sandbox", self.sandbox.name()))?;
+        let spec = session.wrap(spec).with_context(|| {
+            format!(
+                "failed to wrap command for '{}' sandbox",
+                self.sandbox.name()
+            )
+        })?;
 
         let mut command_builder = Command::new(&spec.program);
         command_builder
@@ -482,8 +526,7 @@ impl AcpSubprocessClient {
         });
 
         // Local-only interactive fallback: store lives under the host's HOME.
-        let record_handle =
-            self.record_external_session(request, started_at, &host_session_root());
+        let record_handle = self.record_external_session(request, started_at, &host_session_root());
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let log_path = request.session_log_path.clone();
@@ -1202,6 +1245,7 @@ mod tests {
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
                     agent_resume_commands: vec![],
+                    allow_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
@@ -1239,6 +1283,7 @@ mod tests {
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo it.".to_owned(),
@@ -1478,6 +1523,7 @@ mod tests {
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
                     agent_resume_commands: vec![],
+                    allow_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task\n\nInterpret it.".to_owned(),
@@ -1545,6 +1591,7 @@ mod tests {
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
                     agent_resume_commands: vec![],
+                    allow_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
@@ -1607,6 +1654,7 @@ mod tests {
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
                     agent_resume_commands: vec![],
+                    allow_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
@@ -1648,6 +1696,7 @@ mod tests {
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task".to_owned(),
@@ -1704,6 +1753,7 @@ mod tests {
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task".to_owned(),
@@ -1926,6 +1976,7 @@ mod tests {
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task".to_owned(),

@@ -9,7 +9,7 @@ use tokio::time;
 use uuid::Uuid;
 
 use crate::agent::{
-    AgentClient, AgentRunRequest, AgentRunResult, parse_files_touched,
+    AgentClient, AgentRunRequest, AgentRunResult, parse_blocked_commands, parse_files_touched,
     recap_requires_user_interaction,
 };
 use crate::config::Config;
@@ -27,6 +27,11 @@ pub struct RunOutcome {
     /// Absolute paths the agent reported under the `Files touched` heading of
     /// its recap. Varda commits these in the project repo; the agent does not.
     pub files_touched: Vec<PathBuf>,
+    /// M12: commands the agent reported under the `Blocked commands` heading of
+    /// its recap — denied by its permission layer because they were not on the
+    /// task's `allow_commands`. Surfaced so an orchestrator can widen the
+    /// allowlist and re-run without an interactive approver.
+    pub blocked_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +221,7 @@ pub async fn run_task(
 
     let requires_user = result.requires_user || recap_requires_user_interaction(&result.recap);
     let files_touched = parse_files_touched(&result.recap);
+    let blocked_commands = parse_blocked_commands(&result.recap);
     let recap_path = write_recap(config, task_path, &result.recap)?;
     task.set_recap(recap_path.display().to_string());
     task.frontmatter.requires_user = requires_user;
@@ -238,6 +244,7 @@ pub async fn run_task(
         recap_path,
         session_log_path,
         files_touched,
+        blocked_commands,
     })
 }
 
@@ -351,6 +358,7 @@ pub async fn resume_interactive_task(
 
     let requires_user = result.requires_user || recap_requires_user_interaction(&result.recap);
     let files_touched = parse_files_touched(&result.recap);
+    let blocked_commands = parse_blocked_commands(&result.recap);
     let recap_path = write_recap(config, task_path, &result.recap)?;
     task.set_recap(recap_path.display().to_string());
     task.frontmatter.requires_user = requires_user;
@@ -372,6 +380,7 @@ pub async fn resume_interactive_task(
         status,
         recap_path,
         session_log_path,
+        blocked_commands,
         files_touched,
     })
 }
@@ -408,7 +417,12 @@ pub async fn plan_task(
         resume_command: None,
     };
 
-    let result = match run_under_ceiling(config.defaults.effective_max_seconds(), client.plan_task(request)).await {
+    let result = match run_under_ceiling(
+        config.defaults.effective_max_seconds(),
+        client.plan_task(request),
+    )
+    .await
+    {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => AgentRunResult {
             recap: format!(
@@ -671,7 +685,10 @@ mod tests {
             7u32
         })
         .await;
-        assert!(elapsed.is_err(), "a 0s ceiling must elapse to the timeout path");
+        assert!(
+            elapsed.is_err(),
+            "a 0s ceiling must elapse to the timeout path"
+        );
     }
 
     use crate::agent::fake::FakeAgentClient;

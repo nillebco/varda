@@ -96,6 +96,8 @@ If no files were changed, write (none) under that heading.
 
 Do NOT run `git add`, `git commit`, or any other git history-modifying command. Leave your changes in the working tree, unstaged. Varda stages and commits exactly the files you list under `Files touched` after the run finishes.
 
+This is a headless run: there is no human to approve commands interactively. If the permission layer blocks a command or tool you needed (for example a shell command that was not pre-authorized), do NOT guess around it. Add a markdown heading called `Blocked commands` and, below it, list each blocked command or tool — one per line, the exact command name or invocation (e.g. `msb` or `docker build`). Varda surfaces this list so the orchestrator can add those commands to the task's `allow_commands` allowlist and re-run automatically. If nothing was blocked, omit the heading (or write `(none)` under it).
+
 At the end of the recap, include exactly one bare machine-readable marker line whose content is either `requires_user: true` or `requires_user: false`.
 
 If you need user input, stop and use the true marker."#
@@ -181,6 +183,62 @@ pub fn parse_files_touched(recap: &str) -> Vec<PathBuf> {
     }
 
     files
+}
+
+/// Parse the `Blocked commands` section of a recap into a list of command
+/// strings the agent reported as denied by its permission layer (M12).
+///
+/// Mirrors [`parse_files_touched`]'s convention: a markdown heading whose text
+/// reads "Blocked commands" (any level), followed by one entry per line until
+/// the next heading or end of input. List markers (`-`, `*`, `•`) and backticks
+/// are stripped; `(none)` and empty lines are ignored. The result feeds the
+/// structured `blocked_commands` field of the run outcome, so an orchestrator
+/// can add the names to the task's `allow_commands` and re-run without guessing.
+pub fn parse_blocked_commands(recap: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut commands = Vec::new();
+
+    for line in recap.lines() {
+        let trimmed = line.trim();
+
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let heading_text = rest.trim_start_matches('#').trim();
+            in_section = heading_text.eq_ignore_ascii_case("blocked commands");
+            continue;
+        }
+
+        if !in_section || trimmed.is_empty() {
+            continue;
+        }
+
+        // The trailing machine-readable `requires_user:` marker may follow the
+        // list within the same section (no intervening heading); it is never a
+        // blocked command, so drop it.
+        if trimmed
+            .trim_start_matches(|c: char| c == '#' || c == '*' || c == ' ')
+            .to_ascii_lowercase()
+            .starts_with("requires_user:")
+        {
+            continue;
+        }
+
+        let command = trimmed
+            .trim_start_matches(|c: char| c == '-' || c == '*' || c == '•')
+            .trim()
+            .trim_matches('`')
+            .trim();
+
+        if command.is_empty() || command.eq_ignore_ascii_case("(none)") {
+            continue;
+        }
+
+        let command = command.to_owned();
+        if !commands.contains(&command) {
+            commands.push(command);
+        }
+    }
+
+    commands
 }
 
 pub fn recap_requires_user_interaction(recap: &str) -> bool {
@@ -306,6 +364,36 @@ mod tests {
     }
 
     #[test]
+    fn agent_instructions_describe_blocked_commands_reporting() {
+        let instructions = build_agent_instructions(Duration::from_secs(600));
+        assert!(instructions.contains("Blocked commands"));
+        assert!(instructions.contains("allow_commands"));
+        assert!(instructions.contains("headless run"));
+    }
+
+    #[test]
+    fn parse_blocked_commands_extracts_and_dedups() {
+        let recap = "# Recap\n\n## Blocked commands\n\n- msb\n- `docker build`\n- msb\n\nrequires_user: true\n";
+        let blocked = parse_blocked_commands(recap);
+        assert_eq!(blocked, vec!["msb".to_owned(), "docker build".to_owned()]);
+    }
+
+    #[test]
+    fn parse_blocked_commands_handles_none_and_stops_at_next_heading() {
+        let none = "## Blocked commands\n\n(none)\n\n## Files touched\n\n/tmp/x\n";
+        assert!(parse_blocked_commands(none).is_empty());
+
+        let stops = "## Blocked commands\n\nmsb\n\n## Other\n\ncargo\n";
+        assert_eq!(parse_blocked_commands(stops), vec!["msb".to_owned()]);
+    }
+
+    #[test]
+    fn parse_blocked_commands_absent_section_is_empty() {
+        let recap = "# Recap\n\nAll good.\n\nrequires_user: false\n";
+        assert!(parse_blocked_commands(recap).is_empty());
+    }
+
+    #[test]
     fn parse_files_touched_stops_at_next_heading() {
         let recap = "## Files touched\n\n/tmp/x\n\n## Other\n\n/tmp/should-not-be-included\n";
         let files = parse_files_touched(recap);
@@ -380,6 +468,7 @@ mod tests {
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
                     agent_resume_commands: vec![],
+                    allow_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task".to_owned(),

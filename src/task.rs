@@ -58,6 +58,17 @@ pub struct TaskFrontmatter {
     /// ends and the agent's own session id has been discovered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_resume_commands: Vec<String>,
+    /// M12 per-task capability allowlist. Each entry is either a bare command
+    /// name (e.g. `"msb"`, `"docker"`, `"cargo"`) or a full agent tool pattern
+    /// (e.g. `"Bash(cargo test:*)"`). Varda translates these into the agent
+    /// backend's permission config for the run (Claude Code
+    /// `permissions.allow`), so a headless run — which has no interactive
+    /// approver — can execute exactly these commands without a prompt. It is
+    /// NOT a blanket bypass: only the declared commands are pre-authorized.
+    /// See the `capability` module and the README "Per-task capability
+    /// allowlist" section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_commands: Vec<String>,
     #[serde(default)]
     pub requires_user: bool,
 }
@@ -184,6 +195,7 @@ pub fn create_task(
             agent_session_ids: vec![],
             agent_session_logs: vec![],
             agent_resume_commands: vec![],
+            allow_commands: vec![],
             requires_user: false,
         },
         body: if let Some(desc) = description {
@@ -594,6 +606,46 @@ Do the work.
         assert!(task.frontmatter.agent_session_ids.is_empty());
         assert!(!task.frontmatter.requires_user);
         assert!(task.body.contains("Do the work."));
+        // A task without the M12 key defaults to an empty allowlist.
+        assert!(task.frontmatter.allow_commands.is_empty());
+    }
+
+    #[test]
+    fn parses_and_round_trips_allow_commands() {
+        let task = parse_task(
+            Path::new(".varda/operations/tasks/claude/example.md"),
+            r#"---
+id: 7
+status: ready
+assignee: claude
+allow_commands:
+  - msb
+  - docker
+requires_user: false
+---
+
+# Task
+
+Verify the sandbox.
+"#,
+        )
+        .expect("task should parse");
+
+        assert_eq!(task.frontmatter.allow_commands, vec!["msb", "docker"]);
+
+        // The declared allowlist survives a serialize round-trip; an empty list
+        // is omitted (skip_serializing_if) so untouched tasks stay clean.
+        let frontmatter =
+            serde_yaml::to_string(&task.frontmatter).expect("frontmatter should serialize");
+        assert!(frontmatter.contains("allow_commands:"));
+        assert!(frontmatter.contains("- msb"));
+
+        let empty = TaskFrontmatter {
+            allow_commands: vec![],
+            ..task.frontmatter.clone()
+        };
+        let empty_yaml = serde_yaml::to_string(&empty).expect("frontmatter should serialize");
+        assert!(!empty_yaml.contains("allow_commands"));
     }
 
     #[test]
@@ -613,6 +665,7 @@ Do the work.
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
@@ -656,6 +709,7 @@ Do the work.
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
