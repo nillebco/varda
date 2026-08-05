@@ -259,7 +259,14 @@ Behavior:
 - `varda task run <id>` reads the definition from the repo and writes state to
   `~/.varda`. A fresh clone/worktree that carries only the definition
   materializes its home state on first run — state is never committed back into
-  the code repo.
+  the code repo. Materialization is portable and runnable:
+  - It binds the runtime `project` to the CURRENT checkout (the repo you run
+    from), not the absolute path the definition was committed with, so a clone
+    or worktree routes against a real repo.
+  - It lands the materialized task in `ready`, so the first `run` of a
+    repo-defined task is accepted instead of stalling in `backlog`.
+  - The lookup walks up to the repo root, so `run <id>` works from any
+    subdirectory of the repo, not just its top level.
 - `varda task list` unions the repo's definitions with the home store, so a
   clone sees every task the code ships even before it has run anything.
 - `.varda/WORKFLOW.md` documents the multi-agent contribution rules

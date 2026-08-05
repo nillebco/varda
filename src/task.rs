@@ -412,13 +412,26 @@ pub fn resolve_task_reference(config: &Config, task_ref: &Path) -> Result<PathBu
     // Clone/worktree flow: the home STATE store has no record of this id, but the
     // current repo may carry its DEFINITION in `.varda/tasks/`. Materialize a home
     // STATE file from that definition and run against it, so state is written to
-    // `~/.varda` and never committed back into the code repo.
+    // `~/.varda` and never committed back into the code repo. Walk up to the repo
+    // root first so a `run` issued from a SUBDIRECTORY still finds `.varda/tasks`.
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    if let Some(path) = materialize_from_repo_definition(config, id, &cwd)? {
+    let repo_root = find_repo_root(&cwd).unwrap_or(cwd);
+    if let Some(path) = materialize_from_repo_definition(config, id, &repo_root)? {
         return Ok(path);
     }
 
     bail!("no task found with id {id}")
+}
+
+/// Nearest ancestor of `start` (inclusive) that opts into the repo-local task
+/// store, i.e. carries a `.varda/` DIRECTORY. This lets `run`/lookups issued from
+/// a subdirectory resolve against the repo root's `.varda/tasks`. Returns `None`
+/// when no ancestor carries a `.varda/` directory.
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|ancestor| ancestor.join(REPO_VARDA_DIRNAME).is_dir())
+        .map(Path::to_path_buf)
 }
 
 /// If `repo_root`'s repo `.varda/tasks/` carries a DEFINITION with `id`, copy it
@@ -429,8 +442,7 @@ fn materialize_from_repo_definition(
     id: u64,
     repo_root: &Path,
 ) -> Result<Option<PathBuf>> {
-    let cwd = repo_root;
-    let Some(store) = repo_task_store(cwd) else {
+    let Some(store) = repo_task_store(repo_root) else {
         return Ok(None);
     };
     if !store.exists() {
@@ -449,11 +461,11 @@ fn materialize_from_repo_definition(
     };
 
     let definition = load_task(&definition_path)?;
-    let project = definition
-        .frontmatter
-        .project
-        .clone()
-        .unwrap_or_else(|| cwd.display().to_string());
+    // Bind the materialized STATE to the CURRENT checkout, never the (possibly
+    // stale) absolute `project` the definition was committed with. A clone or
+    // worktree lives at a different path than the author's machine, so routing
+    // and client-build must target the repo we are actually running from.
+    let project = repo_root.display().to_string();
 
     let task_root = Path::new(&config.defaults.operations_dir).join("tasks");
     let task_dir = task_root.join(project_task_folder(Path::new(&project))?);
@@ -466,12 +478,23 @@ fn materialize_from_repo_definition(
         .unwrap_or_else(|| format!("{id}.md"));
     let state_path = task_dir.join(filename);
 
+    let mut frontmatter = TaskFrontmatter {
+        project: Some(project),
+        ..definition.frontmatter
+    };
+    // Definitions never carry runtime state, so `status` loads as the default
+    // `Backlog`. The runner only accepts `Ready` tasks, so a freshly
+    // materialized repo definition would be rejected on its advertised first
+    // `run`. Promote it to `Ready` here so the first run of a repo-defined task
+    // succeeds; an explicit non-default status (e.g. a hand-authored `pending`)
+    // is left untouched.
+    if frontmatter.status == TaskStatus::Backlog {
+        frontmatter.status = TaskStatus::Ready;
+    }
+
     let state = TaskDocument {
         path: state_path.clone(),
-        frontmatter: TaskFrontmatter {
-            project: Some(project),
-            ..definition.frontmatter
-        },
+        frontmatter,
         body: definition.body,
     };
     write_task(&state)?;
@@ -1181,6 +1204,122 @@ requires_user: false
         assert_eq!(state.frontmatter.id, Some(5));
         assert_eq!(state.frontmatter.assignee.as_deref(), Some("codex"));
         assert!(state.body.contains("Do it."));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn materialized_repo_task_is_runnable_not_backlog() {
+        // Finding #1: a definition omits runtime state, so it loads as `Backlog`;
+        // the runner rejects anything that is not `Ready`. Materializing a fresh
+        // repo definition must land it in a runnable state so its first `run`
+        // (the advertised flow) is accepted rather than bailed out on.
+        let root =
+            std::env::temp_dir().join(format!("varda-repo-runnable-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let project = root.join("clone");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        fs::write(
+            store.join("7-ship-it.md"),
+            "---\nid: 7\nassignee: claude\n---\n\n# Ship It\n\nGo.\n",
+        )
+        .expect("definition should write");
+        // A definition loads with the default status the runner would reject.
+        let definition =
+            load_task(&store.join("7-ship-it.md")).expect("definition should load");
+        assert_eq!(definition.frontmatter.status, TaskStatus::Backlog);
+
+        let config = test_config(&operations_dir);
+        let resolved = materialize_from_repo_definition(&config, 7, &project)
+            .expect("materialization should not fail")
+            .expect("id should resolve via repo definition");
+
+        // The materialized STATE is `Ready` — exactly the precondition
+        // `runner::run_task` enforces before it will start the agent.
+        let state = load_task(&resolved).expect("materialized state should load");
+        assert_eq!(state.frontmatter.status, TaskStatus::Ready);
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn materialization_binds_to_current_checkout_not_stale_path() {
+        // Finding #2: a cloned/worktree definition may carry the AUTHOR's absolute
+        // project path, which does not exist on this machine. Materialization must
+        // bind the runtime project to the checkout we are running from so routing
+        // and client-build target a real repo, not the committed stale path.
+        let root =
+            std::env::temp_dir().join(format!("varda-repo-rebind-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let checkout = root.join("real-checkout");
+        let store = checkout.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        let bogus = "/nonexistent/author/machine/repo";
+        fs::write(
+            store.join("11-portable.md"),
+            format!("---\nid: 11\nproject: {bogus}\nassignee: codex\n---\n\n# Portable\n"),
+        )
+        .expect("definition should write");
+
+        let config = test_config(&operations_dir);
+        let resolved = materialize_from_repo_definition(&config, 11, &checkout)
+            .expect("materialization should not fail")
+            .expect("id should resolve via repo definition");
+
+        let state = load_task(&resolved).expect("materialized state should load");
+        // The runtime project is the checkout, NOT the stale committed path.
+        assert_eq!(
+            state.frontmatter.project.as_deref(),
+            Some(checkout.display().to_string().as_str())
+        );
+        assert_ne!(state.frontmatter.project.as_deref(), Some(bogus));
+        // The state file is filed under the checkout's project folder, so `run`
+        // routes against a repo that actually exists.
+        assert_eq!(
+            resolved.parent(),
+            Some(
+                operations_dir
+                    .join("tasks")
+                    .join(project_task_folder(&checkout).expect("folder should derive"))
+                    .as_path()
+            )
+        );
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn repo_lookup_resolves_from_a_subdirectory() {
+        // Finding #3: a `run` issued from a SUBDIRECTORY of the repo must still
+        // find `.varda/tasks` at the repo root. `find_repo_root` walks up to the
+        // nearest ancestor that opts into the repo-local store.
+        let root =
+            std::env::temp_dir().join(format!("varda-repo-subdir-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let repo = root.join("repo");
+        let store = repo.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        let subdir = repo.join("crates").join("inner").join("src");
+        fs::create_dir_all(&subdir).expect("subdirectory should be created");
+        fs::write(
+            store.join("13-deep.md"),
+            "---\nid: 13\nassignee: claude\n---\n\n# Deep\n",
+        )
+        .expect("definition should write");
+
+        // From deep inside the repo, the walk-up locates the repo root.
+        assert_eq!(find_repo_root(&subdir), Some(repo.clone()));
+
+        // And materialization against that resolved root surfaces the task,
+        // which a naive exact-`current_dir()` lookup from the subdir would miss.
+        let config = test_config(&operations_dir);
+        let repo_root = find_repo_root(&subdir).expect("repo root should resolve");
+        let resolved = materialize_from_repo_definition(&config, 13, &repo_root)
+            .expect("materialization should not fail")
+            .expect("id should resolve via repo definition from a subdirectory");
+        let state = load_task(&resolved).expect("materialized state should load");
+        assert_eq!(state.frontmatter.id, Some(13));
 
         fs::remove_dir_all(root).expect("test directory should be removable");
     }
