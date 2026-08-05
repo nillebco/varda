@@ -180,12 +180,8 @@ pub fn default_primitive() -> String {
 }
 
 /// Filename of the folder-local, repo-committed (UNTRUSTED) sandbox config.
-//
-// M6b seam: parsed + hardened here and unit-tested; the live wiring of
-// [`Config::resolve_sandbox_for`] into the task run path is a follow-up, so the
-// resolution chain carries `#[allow(dead_code)]` like the other sandbox-milestone
-// seams (`SandboxContext`, `DEFAULT_SANDBOX_PROVIDER`).
-#[allow(dead_code)]
+/// Resolved into the live run path by [`Config::resolve_sandbox_for`], which is
+/// invoked from `build_client` when a task carries a project path.
 pub const VARDA_FILE: &str = ".varda";
 
 /// A parsed `.varda` file. It carries a single `sandbox` key that is EITHER a
@@ -193,7 +189,6 @@ pub const VARDA_FILE: &str = ".varda";
 /// `[sandbox]` block (table). UNTRUSTED — always clamped by the M6b hardening
 /// floor via [`resolve_sandbox_for`] before use.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct VardaFile {
     pub sandbox: VardaSandbox,
 }
@@ -201,7 +196,6 @@ pub struct VardaFile {
 /// The two forms a `.varda` `sandbox` value may take.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
-#[allow(dead_code)]
 pub enum VardaSandbox {
     /// `sandbox = "rust"` — select a central `[sandboxes.rust]`.
     Reference(String),
@@ -212,7 +206,6 @@ pub enum VardaSandbox {
 /// The fully-resolved sandbox for a task path, after walk-up + precedence +
 /// (for the untrusted `.varda` origin) the hardening floor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct ResolvedSandbox {
     /// Effective sandbox name: a central name, `"inline"` for an inline `.varda`,
     /// or `"local"`.
@@ -232,7 +225,6 @@ pub struct ResolvedSandbox {
 
 /// Walk UP from `start` (inclusive) to `routing_root` (inclusive) and return the
 /// nearest existing `.varda` file. `None` when none is found in range.
-#[allow(dead_code)]
 pub fn find_nearest_varda(start: &Path, routing_root: &Path) -> Option<PathBuf> {
     let mut dir = if start.is_file() {
         start.parent()?
@@ -254,7 +246,6 @@ pub fn find_nearest_varda(start: &Path, routing_root: &Path) -> Option<PathBuf> 
     }
 }
 
-#[allow(dead_code)]
 impl Config {
     /// Resolve the effective sandbox for a task at `project_path`, honoring the
     /// precedence `nearest .varda → central route (glob) → defaults.sandbox →
@@ -1152,6 +1143,90 @@ mod m6b_tests {
         .unwrap();
         let r = config.resolve_sandbox_for(&proj, &root).unwrap();
         assert!(r.varda_mounts[0].ends_with(":/ctx:rw"), "{:?}", r.varda_mounts);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// M6b-wire: the LIVE run path (resolve → merge origins → build provider), not
+    /// `resolve_sandbox_for` in isolation. A reference `.varda` in a project
+    /// SUBFOLDER selects that central sandbox's provider at run time.
+    #[test]
+    fn run_path_reference_varda_selects_provider() {
+        let root = tmp("runref");
+        let sub = root.join("service");
+        fs::create_dir_all(&sub).unwrap();
+        let mut config = base_config();
+        config.sandboxes.insert(
+            "rust".to_owned(),
+            SandboxConfig {
+                image: Some("rust:latest".to_owned()),
+                primitive: "docker".to_owned(),
+                ..SandboxConfig::default()
+            },
+        );
+        fs::write(sub.join(VARDA_FILE), "sandbox = \"rust\"\n").unwrap();
+
+        let resolved = config.resolve_sandbox_for(&sub, &root).unwrap();
+        let mounts = crate::sandbox::merge_mount_origins(
+            &resolved.config.mounts,
+            &resolved.route_mounts,
+            &resolved.varda_mounts,
+        );
+        let provider =
+            crate::sandbox::provider_from_config(&resolved.name, &resolved.config, mounts).unwrap();
+        assert_eq!(provider.name(), "rust");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// M6b-wire: an inline `.varda` mount flows through the run path as a
+    /// `MountOrigin::Varda` in the merged set handed to the provider (hardened,
+    /// `:ro`), so it is applied rather than dropped.
+    #[test]
+    fn run_path_inline_varda_produces_varda_origin() {
+        let root = tmp("runinline");
+        let proj = root.join("proj");
+        fs::create_dir_all(proj.join("ctx")).unwrap();
+        let config = base_config();
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\nmounts = [\"ctx:/ctx\"]\n",
+        )
+        .unwrap();
+
+        let resolved = config.resolve_sandbox_for(&proj, &root).unwrap();
+        let mounts = crate::sandbox::merge_mount_origins(
+            &resolved.config.mounts,
+            &resolved.route_mounts,
+            &resolved.varda_mounts,
+        );
+        let varda: Vec<_> = mounts
+            .iter()
+            .filter(|(origin, _)| *origin == crate::sandbox::MountOrigin::Varda)
+            .collect();
+        assert_eq!(varda.len(), 1, "expected one Varda-origin mount: {mounts:?}");
+        assert!(varda[0].1.ends_with(":/ctx:ro"), "{:?}", varda[0].1);
+        // The provider builds from the inline config.
+        let provider =
+            crate::sandbox::provider_from_config(&resolved.name, &resolved.config, mounts).unwrap();
+        assert_eq!(provider.name(), "inline");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// M6b-wire: a floor-violating inline `.varda` (primitive = "local", i.e. an
+    /// escape from the box) refuses the run at resolution with a clear error,
+    /// before any provider is built.
+    #[test]
+    fn run_path_floor_violation_refuses_before_provider() {
+        let root = tmp("runfloor");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let config = base_config();
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\nprimitive = \"local\"\n",
+        )
+        .unwrap();
+        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        assert!(err.to_string().contains("primitive"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
 }

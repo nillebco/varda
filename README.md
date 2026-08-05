@@ -654,7 +654,29 @@ These rules are what make the sandbox meaningful; they also gate the future nest
 Current limitations:
 
 - **Non-interactive runs only.** Starting an interactive or resume session under a non-`local` sandbox returns a clear error (interactive-under-sandbox is a later milestone).
-- **`.varda` resolution wiring.** The `.varda` walk-up, precedence, and hardening floor are implemented and unit-tested in `Config::resolve_sandbox_for`; wiring it into the live task-run path (so a resolved `.varda` selects the provider at launch) is the remaining integration step.
+### Per-folder `.varda` overrides
+
+A project subtree can pin its own sandbox by placing a `.varda` file in (or above) the task's project directory. At launch Varda walks up from the project path to the git root and uses the **nearest** `.varda`, with precedence:
+
+```
+nearest .varda  →  central route sandbox  →  defaults.sandbox  →  "local"
+```
+
+A `.varda` is TOML in one of two forms:
+
+```toml
+# reference a central [sandboxes.X]
+sandbox = "rustvm"
+```
+```toml
+# or inline a self-contained sandbox
+[sandbox]
+image     = "rust:1.95"
+primitive = "docker"
+mounts    = ["../docs:/docs:ro"]
+```
+
+Because a `.varda` is repo-committed (attacker-influenceable on untrusted code), the inline form is clamped by a **hardening floor**: it cannot select `primitive = "local"` (unless `defaults.allow_local_varda`), cannot mount sources outside the project or any credential directory (see the invariants below), cannot target `/` or a system dir or shadow the project mount, and cannot widen egress beyond `defaults.egress_ceiling`. A floor violation refuses the run with a clear error. Central `config.toml` mounts are trusted and skip the floor — except the credential denylist, which applies to every origin.
 
 ### Isolation invariants (never violate)
 

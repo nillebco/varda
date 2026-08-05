@@ -939,6 +939,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         agent_config,
         config::DEFAULT_SANDBOX_PROVIDER,
         &[],
+        None,
     )?;
     let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
     let request = agent::AgentRunRequest {
@@ -1149,22 +1150,56 @@ struct ParallelRunReport {
     project: Option<String>,
 }
 
-/// Build an ACP client for `display_name`, injecting the sandbox provider that
-/// `sandbox_name` resolves to. `local` yields the identity provider; any other
-/// name must have a matching `[sandboxes.<name>]` entry.
+/// Build an ACP client for `display_name`, injecting the resolved sandbox
+/// provider.
+///
+/// When `project_path` is `Some`, the sandbox is resolved through the live
+/// `.varda` path ([`config::Config::resolve_sandbox_for`]): the nearest `.varda`
+/// (walked up to the routing root) wins over the central route, the untrusted
+/// `.varda` origin is clamped by the hardening floor, and the three mount origins
+/// (`Sandbox`/`Route`/`Varda`) are merged into the provider. When `project_path`
+/// is `None` (no project context, e.g. plan transformation) the trusted-only
+/// by-name path is used with `sandbox_name`/`route_mounts`. `local` yields the
+/// identity provider; any other name must have a matching `[sandboxes.<name>]`.
 fn build_client(
     config: &config::Config,
     display_name: &str,
     agent_config: &config::AgentConfig,
     sandbox_name: &str,
     route_mounts: &[String],
+    project_path: Option<&Path>,
 ) -> Result<acp::AcpSubprocessClient> {
-    let provider = sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts)?;
+    let provider = match project_path {
+        Some(project_path) => {
+            let routing_root = routing_root_for(project_path);
+            let resolved = config.resolve_sandbox_for(project_path, &routing_root)?;
+            if let Some(varda_file) = &resolved.varda_file {
+                eprintln!(
+                    "sandbox: '{}' selected via {}",
+                    resolved.name,
+                    varda_file.display()
+                );
+            }
+            let mounts = sandbox::merge_mount_origins(
+                &resolved.config.mounts,
+                &resolved.route_mounts,
+                &resolved.varda_mounts,
+            );
+            sandbox::provider_from_config(&resolved.name, &resolved.config, mounts)?
+        }
+        None => sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts)?,
+    };
     Ok(acp::AcpSubprocessClient::with_sandbox(
         display_name,
         agent_config,
         provider,
     ))
+}
+
+/// Bound for the upward `.varda` walk: the git repository root of `project_path`,
+/// falling back to the project path itself when it is not inside a git repo.
+fn routing_root_for(project_path: &Path) -> PathBuf {
+    git::repo_root_for_path(project_path).unwrap_or_else(|_| project_path.to_path_buf())
 }
 
 async fn run_task_path_for_parallel(
@@ -1190,7 +1225,14 @@ async fn run_task_path_for_parallel(
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = build_client(&config, &display_name, agent_config, &route.sandbox, &route.route_mounts)?;
+    let client = build_client(
+        &config,
+        &display_name,
+        agent_config,
+        &route.sandbox,
+        &route.route_mounts,
+        task_document.frontmatter.project.as_deref().map(Path::new),
+    )?;
     let outcome = runner::run_task(
         &config,
         &display_name,
@@ -2251,7 +2293,14 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = build_client(&config, &display_name, agent_config, &route.sandbox, &route.route_mounts)?;
+    let client = build_client(
+        &config,
+        &display_name,
+        agent_config,
+        &route.sandbox,
+        &route.route_mounts,
+        task_document.frontmatter.project.as_deref().map(Path::new),
+    )?;
     if config.git.auto_commit {
         git::commit_task_file(
             &task_path,
@@ -2351,7 +2400,14 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = build_client(&config, &display_name, agent_config, &route.sandbox, &route.route_mounts)?;
+    let client = build_client(
+        &config,
+        &display_name,
+        agent_config,
+        &route.sandbox,
+        &route.route_mounts,
+        task_document.frontmatter.project.as_deref().map(Path::new),
+    )?;
     let outcome = runner::plan_task(
         &config,
         &display_name,
@@ -2435,7 +2491,14 @@ async fn run_captured_resume_command(
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = build_client(&config, &display_name, agent_config, &route.sandbox, &route.route_mounts)?;
+    let client = build_client(
+        &config,
+        &display_name,
+        agent_config,
+        &route.sandbox,
+        &route.route_mounts,
+        task_document.frontmatter.project.as_deref().map(Path::new),
+    )?;
     if config.git.auto_commit {
         git::commit_task_file(
             task_path,

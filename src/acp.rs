@@ -1271,17 +1271,17 @@ mod tests {
             interactive_args: None,
             resume_command_template: None,
         };
-        let provider = std::sync::Arc::new(crate::sandbox::DockerProvider::from_config(
-            "docker",
-            &crate::config::SandboxConfig {
-                image: Some("busybox:latest".to_owned()),
-                mounts,
-                egress,
-                ..Default::default()
-            },
-            &[],
-        )
-        .expect("docker provider"));
+        let sandbox_config = crate::config::SandboxConfig {
+            image: Some("busybox:latest".to_owned()),
+            mounts,
+            egress,
+            ..Default::default()
+        };
+        let merged = crate::sandbox::merge_mount_origins(&sandbox_config.mounts, &[], &[]);
+        let provider = std::sync::Arc::new(
+            crate::sandbox::DockerProvider::from_config("docker", &sandbox_config, merged)
+                .expect("docker provider"),
+        );
         AcpSubprocessClient::with_sandbox("shell", &config, provider)
     }
 
@@ -1311,7 +1311,7 @@ mod tests {
                     build: Some(dockerfile.to_owned()),
                     ..Default::default()
                 },
-                &[],
+                Vec::new(),
             )
             .expect("docker provider from build config"),
         );

@@ -192,7 +192,7 @@ pub fn commit_task_files(task_paths: &[&Path], message: &str) -> Result<()> {
     Ok(())
 }
 
-fn repo_root_for_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn repo_root_for_path(path: &Path) -> Result<PathBuf> {
     let git_dir = if path.is_dir() {
         path
     } else {

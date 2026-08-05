@@ -30,9 +30,28 @@ pub enum MountOrigin {
     Route,
     /// Folder-local, repo-committed `.varda` origin. UNTRUSTED (attacker-
     /// influenceable on untrusted code): every `Varda` mount is clamped by the
-    /// hardening floor ([`harden_varda_mount`]) before it can be applied.
-    #[allow(dead_code)]
+    /// hardening floor ([`harden_varda_mount`]) before it can be applied. Produced
+    /// at run time by [`crate::config::Config::resolve_sandbox_for`] and merged in
+    /// via [`merge_mount_origins`].
     Varda,
+}
+
+/// Compose the three mount origins into a single origin-tagged list for a
+/// provider: image-intrinsic (`Sandbox`), project-context (`Route`), and the
+/// already-hardened untrusted `.varda` mounts (`Varda`). Order is
+/// Sandbox → Route → Varda so an earlier (more trusted) origin wins the
+/// first-declaration-wins de-duplication by target at wrap time.
+pub fn merge_mount_origins(
+    sandbox_mounts: &[String],
+    route_mounts: &[String],
+    varda_mounts: &[String],
+) -> Vec<(MountOrigin, String)> {
+    sandbox_mounts
+        .iter()
+        .map(|m| (MountOrigin::Sandbox, m.clone()))
+        .chain(route_mounts.iter().map(|m| (MountOrigin::Route, m.clone())))
+        .chain(varda_mounts.iter().map(|m| (MountOrigin::Varda, m.clone())))
+        .collect()
 }
 
 /// Known secret/identity store directories, relative to `$HOME`. A mount whose
@@ -74,7 +93,6 @@ pub const CREDENTIAL_FILENAMES: &[&str] = &[
 
 /// System / OS directories a mount TARGET may never be (nor sit under). Shadowing
 /// these inside the container is a sandbox-integrity break.
-#[allow(dead_code)]
 pub const SYSTEM_TARGET_DIRS: &[&str] = &[
     "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev",
     "/proc", "/sys", "/var", "/root",
@@ -154,7 +172,6 @@ pub fn check_identity_context_mount(source: &Path, writable: bool) -> Result<()>
 /// - forced `:ro` unless `allow_writable`.
 /// - TARGET may not be `/`, a system dir, nor collide with / shadow the project
 ///   mount at `project_root`.
-#[allow(dead_code)]
 pub fn harden_varda_mount(
     spec: &MountSpec,
     project_root: &Path,
@@ -471,17 +488,15 @@ pub struct DockerProvider {
 }
 
 impl DockerProvider {
-    /// Build a docker provider named `name` from its `[sandboxes.<name>]` entry.
+    /// Build a docker provider named `name` from its `[sandboxes.<name>]` entry
+    /// and a pre-merged, origin-tagged mount set (see [`merge_mount_origins`]).
     ///
-    /// Either `image` or `build` must be supplied. The effective mount set is
-    /// the union of the image-intrinsic `config.mounts` (origin `Sandbox`) and
-    /// the project-context `route_mounts` (origin `Route`); `egress` is threaded
-    /// through from the config. All are applied by [`DockerSession`] at wrap
-    /// time.
+    /// Either `image` or `build` must be supplied; `egress` is threaded through
+    /// from the config. The mounts are applied by [`DockerSession`] at wrap time.
     pub fn from_config(
         name: &str,
         config: &SandboxConfig,
-        route_mounts: &[String],
+        mounts: Vec<(MountOrigin, String)>,
     ) -> Result<Self> {
         let image = config.image.clone().filter(|image| !image.is_empty());
         let build = config.build.clone().filter(|build| !build.is_empty());
@@ -490,12 +505,6 @@ impl DockerProvider {
                 "sandbox '{name}' needs an `image` or a `build` path (required for the docker provider)"
             );
         }
-        let mounts = config
-            .mounts
-            .iter()
-            .map(|m| (MountOrigin::Sandbox, m.clone()))
-            .chain(route_mounts.iter().map(|m| (MountOrigin::Route, m.clone())))
-            .collect();
         Ok(Self {
             name: name.to_owned(),
             image,
@@ -867,6 +876,9 @@ impl SandboxSession for DockerSession {
             let spec = parse_mount(raw)
                 .with_context(|| format!("invalid mount '{raw}' for sandbox '{}'", self.image))?;
             let source = expand_mount_path(&spec.source, &self.project_root);
+            // Credential/identity-store denylist applies to the FULL merged set
+            // (ALL origins, trusted central config included) at launch time.
+            check_credential_denylist(&source)?;
             if !source.exists() {
                 bail!(
                     "sandbox {origin:?} mount source '{}' does not exist on the host; \
@@ -958,13 +970,13 @@ pub struct MicrosandboxProvider {
 }
 
 impl MicrosandboxProvider {
-    /// Build a microsandbox provider from its `[sandboxes.<name>]` entry. Same
-    /// shape as [`DockerProvider::from_config`]: `image` or `build` is required,
-    /// the mount set is the union of sandbox- and route-origin mounts.
+    /// Build a microsandbox provider from its `[sandboxes.<name>]` entry and a
+    /// pre-merged, origin-tagged mount set. Same shape as
+    /// [`DockerProvider::from_config`]: `image` or `build` is required.
     pub fn from_config(
         name: &str,
         config: &SandboxConfig,
-        route_mounts: &[String],
+        mounts: Vec<(MountOrigin, String)>,
     ) -> Result<Self> {
         let image = config.image.clone().filter(|image| !image.is_empty());
         let build = config.build.clone().filter(|build| !build.is_empty());
@@ -973,12 +985,6 @@ impl MicrosandboxProvider {
                 "sandbox '{name}' needs an `image` or a `build` path (required for the microsandbox provider)"
             );
         }
-        let mounts = config
-            .mounts
-            .iter()
-            .map(|m| (MountOrigin::Sandbox, m.clone()))
-            .chain(route_mounts.iter().map(|m| (MountOrigin::Route, m.clone())))
-            .collect();
         Ok(Self {
             name: name.to_owned(),
             image,
@@ -1172,6 +1178,9 @@ impl SandboxSession for MicrosandboxSession {
             let mspec = parse_mount(raw)
                 .with_context(|| format!("invalid mount '{raw}' for sandbox '{}'", self.image))?;
             let source = expand_mount_path(&mspec.source, &self.project_root);
+            // Credential/identity-store denylist applies to the FULL merged set
+            // (ALL origins, trusted central config included) at launch time.
+            check_credential_denylist(&source)?;
             if !source.exists() {
                 bail!(
                     "sandbox {origin:?} mount source '{}' does not exist on the host (check the path / VM share)",
@@ -1246,28 +1255,43 @@ pub fn provider_for(
     route_mounts: &[String],
 ) -> Result<std::sync::Arc<dyn SandboxProvider>> {
     match sandboxes.get(name) {
-        Some(config) => match config.primitive.as_str() {
-            "local" => Ok(std::sync::Arc::new(LocalProvider)),
-            "docker" => Ok(std::sync::Arc::new(DockerProvider::from_config(
-                name,
-                config,
-                route_mounts,
-            )?)),
-            "microsandbox" => Ok(std::sync::Arc::new(MicrosandboxProvider::from_config(
-                name,
-                config,
-                route_mounts,
-            )?)),
-            "clawk" => Ok(std::sync::Arc::new(StubProvider {
-                name: name.to_owned(),
-                primitive: config.primitive.clone(),
-            })),
-            other => bail!(
-                "sandbox '{name}' has unknown primitive '{other}' (expected local, docker, microsandbox, or clawk)"
-            ),
-        },
+        Some(config) => {
+            // By-name lookup: only the image-intrinsic (`Sandbox`) and
+            // project-context (`Route`) origins apply — an untrusted `.varda`
+            // has no central name, so it never reaches this path.
+            let mounts = merge_mount_origins(&config.mounts, route_mounts, &[]);
+            provider_from_config(name, config, mounts)
+        }
         None if name == "local" => Ok(std::sync::Arc::new(LocalProvider)),
         None => bail!("sandbox '{name}' is not defined under [sandboxes]"),
+    }
+}
+
+/// Build a provider directly from a [`SandboxConfig`] and a pre-merged,
+/// origin-tagged mount set, dispatching on `config.primitive`. This is the
+/// by-config constructor used by the live `.varda` run path (an inline `.varda`
+/// sandbox has no central name, so it cannot go through [`provider_for`]); the
+/// caller composes the three mount origins with [`merge_mount_origins`].
+pub fn provider_from_config(
+    name: &str,
+    config: &SandboxConfig,
+    mounts: Vec<(MountOrigin, String)>,
+) -> Result<std::sync::Arc<dyn SandboxProvider>> {
+    match config.primitive.as_str() {
+        "local" => Ok(std::sync::Arc::new(LocalProvider)),
+        "docker" => Ok(std::sync::Arc::new(DockerProvider::from_config(
+            name, config, mounts,
+        )?)),
+        "microsandbox" => Ok(std::sync::Arc::new(MicrosandboxProvider::from_config(
+            name, config, mounts,
+        )?)),
+        "clawk" => Ok(std::sync::Arc::new(StubProvider {
+            name: name.to_owned(),
+            primitive: config.primitive.clone(),
+        })),
+        other => bail!(
+            "sandbox '{name}' has unknown primitive '{other}' (expected local, docker, microsandbox, or clawk)"
+        ),
     }
 }
 
@@ -1806,7 +1830,7 @@ mod tests {
                 primitive: "microsandbox".to_owned(),
                 ..Default::default()
             },
-            &[],
+            Vec::new(),
         )
         .unwrap();
         let session = provider
@@ -1887,7 +1911,7 @@ mod tests {
                 build: Some("/nonexistent/Dockerfile.does-not-exist".to_owned()),
                 ..Default::default()
             },
-            &[],
+            Vec::new(),
         )
         .unwrap();
         let root = Path::new("/proj");
@@ -2137,26 +2161,85 @@ mod tests {
         assert!(values.contains(&"/extra:/extra:ro".to_owned()));
     }
 
-    /// M6a: `from_config` composes sandbox + route mounts into one origin-tagged
-    /// set (union), in that order.
+    /// M6b: `merge_mount_origins` composes the three origins into one origin-tagged
+    /// set (union), Sandbox → Route → Varda in that order; the provider carries the
+    /// merged set verbatim.
     #[test]
-    fn from_config_unions_sandbox_and_route_mounts() {
+    fn merge_mount_origins_unions_all_three_origins() {
+        let mounts = merge_mount_origins(
+            &["/img/cache".to_owned()],
+            &["~/dev/brain/AsianDevBank:ro".to_owned()],
+            &["/proj/ctx:/ctx:ro".to_owned()],
+        );
+        let expected = vec![
+            (MountOrigin::Sandbox, "/img/cache".to_owned()),
+            (MountOrigin::Route, "~/dev/brain/AsianDevBank:ro".to_owned()),
+            (MountOrigin::Varda, "/proj/ctx:/ctx:ro".to_owned()),
+        ];
+        assert_eq!(mounts, expected);
+
         let provider = DockerProvider::from_config(
             "docker",
             &SandboxConfig {
                 image: Some("img".to_owned()),
-                mounts: vec!["/img/cache".to_owned()],
                 ..Default::default()
             },
-            &["~/dev/brain/AsianDevBank:ro".to_owned()],
+            mounts,
         )
         .unwrap();
-        assert_eq!(
-            provider.mounts,
-            vec![
-                (MountOrigin::Sandbox, "/img/cache".to_owned()),
-                (MountOrigin::Route, "~/dev/brain/AsianDevBank:ro".to_owned()),
-            ]
+        assert_eq!(provider.mounts, expected);
+    }
+
+    /// M6b: an (already-hardened) `.varda` mount carried as a `Varda` origin
+    /// reaches the produced `docker run` argv as a `-v …:ro` entry — the live-wire
+    /// proof that the untrusted origin is applied, not silently dropped.
+    #[test]
+    fn varda_origin_mount_appears_in_docker_argv() {
+        let session = DockerSession::for_test(
+            "img",
+            "/srv/app",
+            vec![(MountOrigin::Varda, "/srv/app/ctx:/ctx:ro".to_owned())],
+            vec![],
+            "/var/varda/sessions/s1",
+        );
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        let values = mount_values(&wrapped);
+        assert!(
+            values.contains(&"/srv/app/ctx:/ctx:ro".to_owned()),
+            "Varda-origin mount missing from argv: {values:?}"
+        );
+    }
+
+    /// M6b: the credential denylist is enforced on the FULL merged set at
+    /// validate time — even a TRUSTED central-config (`Sandbox` origin) mount of a
+    /// credential dir such as `~/.aws` is refused at launch, not only `.varda`.
+    #[test]
+    fn validate_mounts_rejects_credential_source_all_origins() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return; // No HOME in this environment; nothing to assert.
+        };
+        let aws = PathBuf::from(&home).join(".aws");
+        let real_project = std::env::temp_dir().display().to_string();
+        let session = DockerSession::for_test(
+            "img",
+            &real_project,
+            vec![(MountOrigin::Sandbox, format!("{}:/aws:ro", aws.display()))],
+            vec![],
+            "/var/varda/sessions/s1",
+        );
+        let err = session
+            .validate_mounts()
+            .expect_err("a trusted-config mount of ~/.aws must be refused");
+        assert!(
+            err.to_string().contains("credential/identity store"),
+            "unexpected error: {err:#}"
         );
     }
 
@@ -2185,7 +2268,7 @@ mod tests {
                 image: Some("busybox".to_owned()),
                 ..Default::default()
             },
-            &[format!("{ctx_str}:/context:ro")],
+            vec![(MountOrigin::Route, format!("{ctx_str}:/context:ro"))],
         )
         .unwrap();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2243,7 +2326,7 @@ mod tests {
                 image: Some("busybox".to_owned()),
                 ..Default::default()
             },
-            &[],
+            Vec::new(),
         )
         .unwrap();
         let session = provider
