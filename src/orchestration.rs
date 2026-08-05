@@ -30,13 +30,10 @@
 //! Invariants 1 and 2 are enforced at the mount layer (see
 //! [`crate::sandbox::check_control_plane_denylist`]). Invariant 5 is enforced here.
 
-// The pure policy engine ([`SpawnLedger`]/[`OrchestrationPolicy`]) is now consumed
-// by the live [`SpawnBroker`] below, which mediates the `spawn_subtask` MCP tool
-// and hands accepted spawns to a host [`SubtaskLauncher`]. The one remaining piece
-// is the MCP *transport* that carries the broker's JSON-RPC into a running sandbox
-// (a stdio/socket channel reachable only from the box); until that lands, some
-// broker entry points are exercised only by tests, so keep the crate quiet.
-#![allow(dead_code)]
+// The pure policy engine ([`SpawnLedger`]/[`OrchestrationPolicy`]) is consumed by
+// the live [`SpawnBroker`] below, which mediates the `spawn_subtask` MCP tool and
+// hands accepted spawns to a host [`SubtaskLauncher`]. The run path exposes that
+// broker over the sandbox-visible Unix-socket MCP transport in `mcp_transport`.
 
 use std::collections::BTreeMap;
 
@@ -255,6 +252,7 @@ impl SpawnLedger {
     }
 
     /// Total subtasks spawned so far this run.
+    #[cfg(test)]
     pub fn global_spawned(&self) -> u32 {
         self.global_spawned
     }
@@ -486,11 +484,13 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
     }
 
     /// Total subtasks spawned so far this run (for observability/tests).
+    #[cfg(test)]
     pub fn global_spawned(&self) -> u32 {
         self.ledger.global_spawned()
     }
 
     /// Depth of a known task, or `None` if it was never registered.
+    #[cfg(test)]
     pub fn depth_of(&self, id: &str) -> Option<u32> {
         self.depths.get(id).copied()
     }
@@ -602,7 +602,9 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                     approved: false,
                 };
                 match self.spawn_subtask(parent_id, req) {
-                    Ok(child_id) => rpc_result(id, tool_text(&format!("subtask_id: {child_id}"), false)),
+                    Ok(child_id) => {
+                        rpc_result(id, tool_text(&format!("subtask_id: {child_id}"), false))
+                    }
                     Err(e) => rpc_result(id, tool_text(&e.to_string(), true)),
                 }
             }
@@ -853,7 +855,7 @@ mod tests {
     fn record_only_after_authorize_keeps_ledger_truthful() {
         // A denied spawn must not consume budget.
         let policy = base_policy();
-        let mut ledger = SpawnLedger::new();
+        let ledger = SpawnLedger::new();
         let deny_ctx = ctx("deep", 5); // depth-exceeded
         assert!(ledger.authorize(&policy, &deny_ctx, &req()).is_err());
         assert_eq!(ledger.global_spawned(), 0);
@@ -872,10 +874,18 @@ mod tests {
     }
     impl MockLauncher {
         fn new() -> Self {
-            Self { next: 0, launched: Vec::new(), fail: false }
+            Self {
+                next: 0,
+                launched: Vec::new(),
+                fail: false,
+            }
         }
         fn failing() -> Self {
-            Self { next: 0, launched: Vec::new(), fail: true }
+            Self {
+                next: 0,
+                launched: Vec::new(),
+                fail: true,
+            }
         }
     }
     impl SubtaskLauncher for MockLauncher {
@@ -901,7 +911,8 @@ mod tests {
     #[test]
     fn broker_denial_never_reaches_the_launcher() {
         // Disabled policy: the launcher must not be called at all.
-        let mut broker = SpawnBroker::new(OrchestrationPolicy::default(), "root", MockLauncher::new());
+        let mut broker =
+            SpawnBroker::new(OrchestrationPolicy::default(), "root", MockLauncher::new());
         match broker.spawn_subtask("root", req()) {
             Err(BrokerError::Denied(SpawnDenied::Disabled)) => {}
             other => panic!("expected Disabled denial, got {other:?}"),
@@ -919,7 +930,10 @@ mod tests {
         assert_eq!(broker.depth_of(&grand), Some(2));
         // Now a spawn from the depth-2 grandchild would land at depth 3 > max_depth.
         match broker.spawn_subtask(&grand, req()) {
-            Err(BrokerError::Denied(SpawnDenied::DepthExceeded { attempted: 3, max: 2 })) => {}
+            Err(BrokerError::Denied(SpawnDenied::DepthExceeded {
+                attempted: 3,
+                max: 2,
+            })) => {}
             other => panic!("expected DepthExceeded, got {other:?}"),
         }
     }
@@ -949,14 +963,20 @@ mod tests {
     #[test]
     fn rpc_tools_list_exposes_only_the_narrow_spawn_surface() {
         let mut broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
-        let resp = broker.handle_rpc("root", &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
+        let resp = broker.handle_rpc(
+            "root",
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        );
         let names: Vec<String> = resp["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(names, vec![SPAWN_SUBTASK_TOOL, AWAIT_SUBTASK_TOOL, SUBTASK_RESULT_TOOL]);
+        assert_eq!(
+            names,
+            vec![SPAWN_SUBTASK_TOOL, AWAIT_SUBTASK_TOOL, SUBTASK_RESULT_TOOL]
+        );
     }
 
     #[test]
@@ -1009,6 +1029,9 @@ mod tests {
         );
         assert_eq!(resp["result"]["isError"], json!(true));
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("must run in an isolating sibling box"), "got {text}");
+        assert!(
+            text.contains("must run in an isolating sibling box"),
+            "got {text}"
+        );
     }
 }

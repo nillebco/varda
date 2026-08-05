@@ -99,7 +99,10 @@ pub struct Config {
     /// sub-task spawns and the caps that bound them. Safe default: spawning
     /// disabled, `local` sandbox denied. A `[[routes]]` entry may override this
     /// wholesale for the code it matches (see [`Config::resolve_orchestration_for`]).
-    #[serde(default, skip_serializing_if = "crate::orchestration::OrchestrationPolicy::is_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::orchestration::OrchestrationPolicy::is_default"
+    )]
     pub orchestration: crate::orchestration::OrchestrationPolicy,
 }
 
@@ -423,8 +426,12 @@ impl Config {
             VardaSandbox::Inline(config) => {
                 self.enforce_varda_primitive_floor(&config.primitive, &varda_path)?;
                 self.enforce_egress_ceiling(&config.egress, &varda_path)?;
-                let varda_mounts =
-                    self.harden_inline_varda_mounts(&config.mounts, project_path, &varda_dir, &varda_path)?;
+                let varda_mounts = self.harden_inline_varda_mounts(
+                    &config.mounts,
+                    project_path,
+                    &varda_dir,
+                    &varda_path,
+                )?;
                 let config = SandboxConfig {
                     mounts: Vec::new(),
                     ..config
@@ -447,10 +454,6 @@ impl Config {
     /// master, so every live spawn is gated by exactly the policy that governs the
     /// code being worked on.
     ///
-    /// `allow(dead_code)` until the run path stands up the broker per task (the MCP
-    /// transport-into-sandbox step of this milestone); the resolver + policy surface
-    /// are landed and unit-tested ahead of that wiring.
-    #[allow(dead_code)]
     pub fn resolve_orchestration_for(
         &self,
         project_path: &Path,
@@ -512,8 +515,9 @@ impl Config {
     ) -> Result<Vec<String>> {
         let mut out = Vec::with_capacity(mounts.len());
         for raw in mounts {
-            let spec = crate::sandbox::parse_mount(raw)
-                .with_context(|| format!("invalid `.varda` mount '{raw}' in {}", varda_file.display()))?;
+            let spec = crate::sandbox::parse_mount(raw).with_context(|| {
+                format!("invalid `.varda` mount '{raw}' in {}", varda_file.display())
+            })?;
             // `.varda` mount paths are relative to the `.varda` dir, not the
             // project root; make SOURCE absolute against `varda_dir` first.
             let source = if spec.source.is_absolute() {
@@ -699,9 +703,10 @@ fn ensure_git_repo(path: &Path) -> Result<()> {
 
 pub fn varda_home() -> Result<PathBuf> {
     if let Ok(home) = std::env::var(VARDA_HOME_ENV)
-        && !home.trim().is_empty() {
-            return Ok(PathBuf::from(home));
-        }
+        && !home.trim().is_empty()
+    {
+        return Ok(PathBuf::from(home));
+    }
 
     let home = std::env::var("HOME").context("HOME is not set and VARDA_HOME was not provided")?;
     Ok(PathBuf::from(home).join(".varda"))
@@ -835,10 +840,9 @@ fn add_varda_project_dir_to_default_agents(config: &mut Config) {
                 .as_deref()
                 .and_then(|args| args.get(1))
                 .is_some_and(|arg| arg.contains("codex ") || arg.contains("claude "));
-            if is_wrapped_agent
-                && let Some(args) = agent.interactive_args.as_mut() {
-                    add_varda_dirs_to_shell_arg(args);
-                }
+            if is_wrapped_agent && let Some(args) = agent.interactive_args.as_mut() {
+                add_varda_dirs_to_shell_arg(args);
+            }
         }
 
         if let Some(template) = agent.resume_command_template.as_mut() {
@@ -992,7 +996,10 @@ operations_dir = "operations"
         assert_eq!(config.defaults.max_continuations, 0);
         assert_eq!(config.defaults.max_tool_calls, 0);
         // `max_seconds = "none"` ⇒ no soft ceiling, ignoring the deprecated alias.
-        assert_eq!(config.defaults.max_seconds, Some(MaxSeconds::Keyword("none".to_owned())));
+        assert_eq!(
+            config.defaults.max_seconds,
+            Some(MaxSeconds::Keyword("none".to_owned()))
+        );
         assert_eq!(config.defaults.effective_max_seconds(), None);
         assert_eq!(config.routes[0].agents, vec!["codex"]);
         assert_eq!(config.agents["codex"].command, "codex");
@@ -1320,7 +1327,10 @@ mod m6b_tests {
         )
         .unwrap();
         let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
-        assert!(err.to_string().contains("outside the project root"), "{err}");
+        assert!(
+            err.to_string().contains("outside the project root"),
+            "{err}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1364,7 +1374,11 @@ mod m6b_tests {
         )
         .unwrap();
         let r = config.resolve_sandbox_for(&proj, &root).unwrap();
-        assert!(r.varda_mounts[0].ends_with(":/ctx:rw"), "{:?}", r.varda_mounts);
+        assert!(
+            r.varda_mounts[0].ends_with(":/ctx:rw"),
+            "{:?}",
+            r.varda_mounts
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1393,8 +1407,13 @@ mod m6b_tests {
             &resolved.route_mounts,
             &resolved.varda_mounts,
         );
-        let provider =
-            crate::sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &crate::sandbox::SandboxIdentity::default()).unwrap();
+        let provider = crate::sandbox::provider_from_config(
+            &resolved.name,
+            &resolved.config,
+            mounts,
+            &crate::sandbox::SandboxIdentity::default(),
+        )
+        .unwrap();
         assert_eq!(provider.name(), "rust");
         let _ = fs::remove_dir_all(&root);
     }
@@ -1424,11 +1443,20 @@ mod m6b_tests {
             .iter()
             .filter(|(origin, _)| *origin == crate::sandbox::MountOrigin::Varda)
             .collect();
-        assert_eq!(varda.len(), 1, "expected one Varda-origin mount: {mounts:?}");
+        assert_eq!(
+            varda.len(),
+            1,
+            "expected one Varda-origin mount: {mounts:?}"
+        );
         assert!(varda[0].1.ends_with(":/ctx:ro"), "{:?}", varda[0].1);
         // The provider builds from the inline config.
-        let provider =
-            crate::sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &crate::sandbox::SandboxIdentity::default()).unwrap();
+        let provider = crate::sandbox::provider_from_config(
+            &resolved.name,
+            &resolved.config,
+            mounts,
+            &crate::sandbox::SandboxIdentity::default(),
+        )
+        .unwrap();
         assert_eq!(provider.name(), "inline");
         let _ = fs::remove_dir_all(&root);
     }
