@@ -19,7 +19,75 @@ use crate::agent::{
     recap_requires_user_interaction,
 };
 use crate::config::AgentConfig;
-use crate::sandbox::{CommandSpec, LocalProvider, SandboxContext, SandboxProvider};
+use crate::sandbox::{CommandSpec, LocalProvider, SandboxContext, SandboxProvider, SandboxSession};
+
+/// Owns the prepared sandbox [`SandboxSession`] and guarantees `teardown()` runs
+/// on EVERY exit path — including a cancel, where the M10 idle/budget watchdog
+/// drops the in-flight `run_task` future before it reaches the inline teardown.
+///
+/// Rust has no async `Drop`, so the two paths differ:
+/// - **Normal exit** — the caller invokes [`Self::teardown`], which takes the
+///   session and awaits its teardown inline (a leak here would fail the run).
+/// - **Cancel** — the future is dropped with the session still held, so [`Drop`]
+///   detaches the teardown onto the current Tokio runtime. Sandbox teardown is
+///   idempotent `docker rm -f` / `volume rm -f`, so fire-and-forget is enough to
+///   stop `varda-sbx-*` containers/volumes from leaking on an idle/budget kill.
+struct SessionTeardownGuard {
+    session: Option<Box<dyn SandboxSession>>,
+}
+
+impl SessionTeardownGuard {
+    fn new(session: Box<dyn SandboxSession>) -> Self {
+        Self {
+            session: Some(session),
+        }
+    }
+
+    /// Borrow the live session for the `&self` calls (`wrap`, `validate_mounts`,
+    /// `extract_session_store`, …) made while the run is in flight.
+    fn session(&self) -> &dyn SandboxSession {
+        self.session
+            .as_deref()
+            .expect("session is present until teardown() or Drop consumes it")
+    }
+
+    /// Normal-exit teardown: take the session and await its cleanup inline,
+    /// disarming [`Drop`] so it does not double-tear-down.
+    async fn teardown(mut self) -> Result<()> {
+        match self.session.take() {
+            Some(session) => session.teardown().await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for SessionTeardownGuard {
+    fn drop(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        // Cancel path: the future was dropped before the inline teardown ran.
+        // Detach teardown onto the runtime so the container/volume are still
+        // reclaimed. Best-effort — nothing awaits it, but sandbox removal is
+        // idempotent, so a fire-and-forget task is enough to prevent the leak.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(error) = session.teardown().await {
+                        eprintln!(
+                            "warning: failed to tear down sandbox session on cancel: {error:#}"
+                        );
+                    }
+                });
+            }
+            Err(_) => {
+                eprintln!(
+                    "warning: sandbox session dropped outside a Tokio runtime; teardown skipped"
+                );
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AcpSubprocessClient {
@@ -175,6 +243,13 @@ impl AcpSubprocessClient {
             .prepare(&sandbox_ctx)
             .await
             .with_context(|| format!("failed to prepare '{}' sandbox", self.sandbox.name()))?;
+        // Own the session in a guard so `teardown()` runs on EVERY exit path —
+        // including a watchdog/budget cancel that drops this future mid-run
+        // (otherwise the `varda-sbx-*` container/volume leak). All `&self` uses
+        // below go through `guard.session()`; the final `guard.teardown()` awaits
+        // cleanup inline on the normal path.
+        let guard = SessionTeardownGuard::new(session);
+        let session = guard.session();
         let session_store_root = session.session_store_root();
         if session_store_root.is_none() {
             eprintln!("WARN resume-command unavailable under sandbox");
@@ -276,7 +351,7 @@ impl AcpSubprocessClient {
             }
         }
 
-        if let Err(error) = session.teardown().await {
+        if let Err(error) = guard.teardown().await {
             eprintln!("warning: failed to tear down sandbox session: {error:#}");
         }
 
@@ -1203,6 +1278,80 @@ mod tests {
 
     use super::*;
 
+    /// A sandbox session that records whether `teardown()` ran, so tests can
+    /// assert the M10 leak fix fires on the cancel path without spinning docker.
+    struct RecordingSession {
+        torn_down: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl SandboxSession for RecordingSession {
+        fn wrap(&self, spec: CommandSpec) -> Result<CommandSpec> {
+            Ok(spec)
+        }
+        fn session_store_root(&self) -> Option<PathBuf> {
+            None
+        }
+        async fn teardown(self: Box<Self>) -> Result<()> {
+            self.torn_down
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// The guard's normal-exit path awaits teardown inline exactly once.
+    #[tokio::test]
+    async fn teardown_guard_runs_teardown_on_normal_exit() {
+        let torn_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SessionTeardownGuard::new(Box::new(RecordingSession {
+            torn_down: torn_down.clone(),
+        }));
+        guard.teardown().await.expect("teardown should succeed");
+        assert!(
+            torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "normal exit must tear the sandbox session down"
+        );
+    }
+
+    /// LEAK FIX: when the future holding the guard is cancelled (dropped) before
+    /// it can call `teardown()` inline — exactly what the idle/budget watchdog
+    /// does — the guard's `Drop` still reclaims the sandbox. No `varda-sbx-*`
+    /// container/volume is left behind on an idle-kill.
+    #[tokio::test]
+    async fn teardown_guard_runs_teardown_on_cancel() {
+        let torn_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let torn_for_fut = torn_down.clone();
+        let run = async move {
+            let _guard = SessionTeardownGuard::new(Box::new(RecordingSession {
+                torn_down: torn_for_fut,
+            }));
+            // Model an in-flight sandboxed run that never resolves; the watchdog
+            // cancels it by dropping this future, so the inline teardown below is
+            // never reached — only `Drop` can save us.
+            std::future::pending::<()>().await;
+            drop(_guard);
+        };
+
+        // Cancel the run the way `run_session_watched` does: the losing branch of
+        // a `select!` is dropped in place.
+        tokio::select! {
+            _ = run => unreachable!("the pending run cannot complete"),
+            _ = time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        // Drop detaches teardown onto the runtime; yield so it gets polled.
+        for _ in 0..10 {
+            if torn_down.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "a cancelled sandboxed run must still tear the session down (no varda-sbx-* leak)"
+        );
+    }
+
     #[tokio::test]
     async fn subprocess_client_sends_prompt_and_captures_recap() {
         let config = AgentConfig {
@@ -1226,6 +1375,7 @@ mod tests {
                 role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
+                    bounds: crate::task::TaskBounds::default(),
                     id: None,
                     status: TaskStatus::Ready,
                     project: Some("/work/project".to_owned()),
@@ -1264,6 +1414,7 @@ mod tests {
             role_instructions: None,
             task_path: "task.md".to_owned(),
             frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: None,
                 status: TaskStatus::Ready,
                 project: Some(project.to_owned()),
@@ -1504,6 +1655,7 @@ mod tests {
                 role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
+                    bounds: crate::task::TaskBounds::default(),
                     id: None,
                     status: TaskStatus::Ready,
                     project: Some("/work/project".to_owned()),
@@ -1572,6 +1724,7 @@ mod tests {
                 role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
+                    bounds: crate::task::TaskBounds::default(),
                     id: None,
                     status: TaskStatus::Ready,
                     project: Some("/work/project".to_owned()),
@@ -1635,6 +1788,7 @@ mod tests {
                 role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
+                    bounds: crate::task::TaskBounds::default(),
                     id: None,
                     status: TaskStatus::Ready,
                     project: Some(root.display().to_string()),
@@ -1677,6 +1831,7 @@ mod tests {
             role_instructions: None,
             task_path: "/home/user/.varda/operations/tasks/task.md".to_owned(),
             frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: None,
                 status: TaskStatus::Ready,
                 project: Some("/work/project".to_owned()),
@@ -1734,6 +1889,7 @@ mod tests {
             role_instructions: None,
             task_path: "/home/user/.varda/operations/tasks/task.md".to_owned(),
             frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: None,
                 status: TaskStatus::Ready,
                 project: Some("/work/project".to_owned()),
@@ -1957,6 +2113,7 @@ mod tests {
             role_instructions: None,
             task_path: "task.md".to_owned(),
             frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: None,
                 status: TaskStatus::Ready,
                 project: Some(project.to_owned()),

@@ -601,6 +601,7 @@ mod tests {
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),
             frontmatter: crate::task::TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: Some(1),
                 status: crate::task::TaskStatus::Ready,
                 project: Some("/work/project".to_owned()),
@@ -682,6 +683,7 @@ mod tests {
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),
             frontmatter: crate::task::TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: Some(1),
                 status: crate::task::TaskStatus::Ready,
                 project: Some("/work/project".to_owned()),

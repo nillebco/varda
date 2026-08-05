@@ -135,23 +135,261 @@ where
     }
 }
 
-/// The M10 cooperative bounds resolved from config defaults, read once per run so
-/// the idle watchdog and the soft total ceiling share a single source of truth.
+/// The M10 cooperative bounds resolved once per run so the idle watchdog, the
+/// soft total ceiling, the auto-resume loop, and the tool-call budget share a
+/// single source of truth.
 ///
-/// Per-task frontmatter overrides for these bounds are a follow-up increment
-/// (they require adding optional fields to `TaskFrontmatter` and updating its
-/// construction sites); today the values come straight from `defaults.*`.
+/// Precedence: a per-task frontmatter override wins over the corresponding
+/// `defaults.*` value; an unset override falls back to the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OperationBounds {
     idle_timeout: Duration,
     max_seconds: Option<u64>,
+    /// Max auto-resume hops (fresh continuation sessions) before stopping with
+    /// `needs_user`. `0` disables auto-resume (a single session only).
+    max_continuations: u32,
+    /// Tool-call budget across the whole task. `0` = unlimited.
+    max_tool_calls: u64,
 }
 
 impl OperationBounds {
-    fn resolve(config: &Config) -> Self {
+    /// Resolve the bounds for this run, letting the task frontmatter override any
+    /// of the four defaults. `frontmatter` is the task being run.
+    fn resolve(config: &Config, frontmatter: &crate::task::TaskFrontmatter) -> Self {
+        let bounds = &frontmatter.bounds;
+        let idle_timeout = Duration::from_secs(
+            bounds
+                .idle_timeout
+                .unwrap_or(config.defaults.idle_timeout_seconds),
+        );
+        let max_seconds = match &bounds.max_seconds {
+            Some(over) => crate::config::effective_max_seconds(over, config.defaults.timeout_seconds),
+            None => config.defaults.effective_max_seconds(),
+        };
         Self {
-            idle_timeout: Duration::from_secs(config.defaults.idle_timeout_seconds),
-            max_seconds: config.defaults.effective_max_seconds(),
+            idle_timeout,
+            max_seconds,
+            max_continuations: bounds
+                .max_continuations
+                .unwrap_or(config.defaults.max_continuations),
+            max_tool_calls: bounds.max_tool_calls.unwrap_or(config.defaults.max_tool_calls),
+        }
+    }
+}
+
+/// Normalize one watched session's raw result into the run's `session_outcome`:
+/// `Ok(result)` on a natural end (carrying any resume command), or `Err(recap)`
+/// for the idle-kill / budget-stop / agent-error terminal paths. Extracted so
+/// the interactive single-shot and the headless auto-resume loop share the exact
+/// same recap wording and downstream status semantics.
+fn single_session_outcome(
+    agent_result: Result<Result<AgentRunResult>, SessionKill>,
+    session_id: &str,
+    session_log_path: &Path,
+    task_path: &Path,
+) -> Result<Result<AgentRunResult, AgentRunResult>> {
+    Ok(match agent_result {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            append_session_log(session_log_path, &format!("\nerror:\n{error:#}\n"))?;
+            Err(AgentRunResult {
+                recap: format!(
+                    "# Agent Run Failed\n\nThe agent failed while processing `{}`.\n\nError: {error}\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
+                    task_path.display(),
+                    session_log_path.display(),
+                    session_log_path.display()
+                ),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            })
+        }
+        Err(SessionKill::Idle { idle_secs }) => {
+            append_session_log(
+                session_log_path,
+                &format!(
+                    "\nidle_watchdog:\nno output for {idle_secs} seconds; session cancelled\nlong_running_task_requested=true\n"
+                ),
+            )?;
+            Err(AgentRunResult {
+                recap: format!(
+                    "# Agent Run Timed Out\n\nThe agent produced no output for {idle_secs} seconds while processing `{}`, so Varda's idle watchdog cancelled the wedged session.\n\nWhat completed: the session log was preserved for inspection.\n\nWhat remains: delegate the unfinished work to a Varda long-running runner task, then resume the agent after the complete runner output is available.\n\nBlockers: the session stalled with no output.\n\nUser interaction required: no.\n\nSuggested next agent: runner.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
+                    task_path.display(),
+                    session_log_path.display(),
+                    session_log_path.display()
+                ),
+                requires_user: false,
+                suggested_agent: Some("runner".to_owned()),
+                resume_command: None,
+            })
+        }
+        Err(SessionKill::Budget { max_secs }) => {
+            append_session_log(
+                session_log_path,
+                &format!(
+                    "\nbudget:\nsoft ceiling of {max_secs} seconds reached; stopping gracefully for user review\n"
+                ),
+            )?;
+            // A graceful checkpoint, NOT a failure: mark the task needs_user with the
+            // accumulated recap rather than killing it mid-work.
+            Err(AgentRunResult {
+                recap: format!(
+                    "# Operation Budget Reached\n\nThe agent reached the configured {max_secs} second soft ceiling while processing `{}`. Varda stopped the run gracefully so no edit was interrupted mid-flight.\n\nWhat remains: review the partial progress in the session log and re-run to continue.\n\nUser interaction required: yes.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
+                    task_path.display(),
+                    session_log_path.display(),
+                    session_log_path.display()
+                ),
+                requires_user: true,
+                suggested_agent: None,
+                resume_command: None,
+            })
+        }
+    })
+}
+
+/// Join accumulated hop recaps in order, then the final hop's recap last.
+fn combine_recaps(prior: &[String], last: &str) -> String {
+    let mut parts: Vec<&str> = prior.iter().map(String::as_str).collect();
+    parts.push(last);
+    parts.join("\n\n---\n\n")
+}
+
+/// M10 multi-hop auto-resume loop (headless runs only).
+///
+/// Runs the first (already-built) watched session, then — while the agent hands
+/// back a resume command AND does not ask for the user AND the `max_continuations`
+/// ceiling is not yet reached — dispatches a FRESH continuation session seeded
+/// with that command, looping until the agent reports done or a bound stops it.
+///
+/// Semantics preserved for the single-hop case: with no resume command the very
+/// first session's outcome is returned verbatim, so pre-M10 behavior (and every
+/// existing test) is unchanged. Recaps from each hop are preserved in order;
+/// hitting `max_continuations` with work still remaining stops gracefully with
+/// `needs_user` rather than silently dropping the tail.
+#[allow(clippy::too_many_arguments)]
+async fn run_auto_resume_loop(
+    config: &Config,
+    client: &impl AgentClient,
+    agent_name: &str,
+    role_instructions: Option<&str>,
+    task_path: &Path,
+    task: &mut TaskDocument,
+    bounds: OperationBounds,
+    timeout: Duration,
+    stream: bool,
+    first_session_id: String,
+    first_session_log: PathBuf,
+    first_request: AgentRunRequest,
+) -> Result<Result<AgentRunResult, AgentRunResult>> {
+    let mut prior_recaps: Vec<String> = Vec::new();
+    let mut sid = first_session_id;
+    let mut log_path = first_session_log;
+    let mut request = first_request;
+    let mut hop: u32 = 0;
+
+    loop {
+        let agent_result = run_session_watched(
+            bounds.idle_timeout,
+            bounds.max_seconds,
+            &log_path,
+            client.run_task(request),
+        )
+        .await;
+
+        match single_session_outcome(agent_result, &sid, &log_path, task_path)? {
+            Ok(result) => {
+                let more_work = result.resume_command.is_some() && !result.requires_user;
+                if more_work && hop < bounds.max_continuations {
+                    // Continue: dispatch a FRESH continuation seeded with the
+                    // captured resume command; preserve this hop's recap in order.
+                    let resume = result
+                        .resume_command
+                        .clone()
+                        .expect("more_work implies a resume command");
+                    prior_recaps.push(result.recap);
+                    hop += 1;
+                    sid = Uuid::new_v4().to_string();
+                    log_path = session_log_path(config, &sid);
+                    task.frontmatter.agent_session_ids.push(sid.clone());
+                    task.frontmatter
+                        .agent_session_logs
+                        .push(log_path.display().to_string());
+                    write_task(task)?;
+                    write_session_log(
+                        &log_path,
+                        &format!(
+                            "session_id={sid}\nagent={agent_name}\ntask={}\nresume_command={resume}\n[auto_resume hop={hop}/{}]\n",
+                            task_path.display(),
+                            bounds.max_continuations,
+                        ),
+                    )?;
+                    request = AgentRunRequest {
+                        agent_name: agent_name.to_owned(),
+                        role_instructions: role_instructions.map(str::to_owned),
+                        task_path: task_path.display().to_string(),
+                        frontmatter: task.frontmatter.clone(),
+                        body: String::new(),
+                        timeout,
+                        session_id: sid.clone(),
+                        session_log_path: Some(log_path.display().to_string()),
+                        interactive: false,
+                        interpret: false,
+                        stream,
+                        resume_command: Some(resume),
+                    };
+                    continue;
+                }
+
+                if more_work {
+                    // Hit the max_continuations ceiling with work still remaining:
+                    // stop gracefully for the user rather than dropping the tail.
+                    append_session_log(
+                        &log_path,
+                        &format!(
+                            "\nauto_resume:\nreached max_continuations={} with work remaining; stopping for user review\n",
+                            bounds.max_continuations
+                        ),
+                    )?;
+                    let combined = combine_recaps(&prior_recaps, &result.recap);
+                    return Ok(Err(AgentRunResult {
+                        recap: format!(
+                            "# Auto-Resume Limit Reached\n\nVarda stitched {} continuation session(s) for `{}` but the agent still reported more work after the max_continuations={} ceiling. Stopping for user review.\n\nUser interaction required: yes.\n\n## Accumulated recaps\n\n{combined}",
+                            hop + 1,
+                            task_path.display(),
+                            bounds.max_continuations,
+                        ),
+                        requires_user: true,
+                        suggested_agent: result.suggested_agent,
+                        resume_command: result.resume_command,
+                    }));
+                }
+
+                // Done. Single-hop returns verbatim (pre-M10 behavior); a
+                // multi-hop run stitches every hop's recap in order.
+                if prior_recaps.is_empty() {
+                    return Ok(Ok(result));
+                }
+                let combined = combine_recaps(&prior_recaps, &result.recap);
+                return Ok(Ok(AgentRunResult {
+                    recap: combined,
+                    requires_user: result.requires_user,
+                    suggested_agent: result.suggested_agent,
+                    resume_command: None,
+                }));
+            }
+            Err(failure) => {
+                // Terminal kill/error. Single-hop returns verbatim so the status
+                // mapping is unchanged; a multi-hop run keeps the failure recap's
+                // marker PREFIX (so Failed/needs_user still resolves) and appends
+                // the earlier hops for context.
+                if prior_recaps.is_empty() {
+                    return Ok(Err(failure));
+                }
+                let earlier = prior_recaps.join("\n\n---\n\n");
+                let recap =
+                    format!("{}\n\n## Earlier continuation recaps\n\n{earlier}", failure.recap);
+                return Ok(Err(AgentRunResult { recap, ..failure }));
+            }
         }
     }
 }
@@ -215,82 +453,33 @@ pub async fn run_task(
     };
 
     // M10 cooperative model: an interactive run stays fully user-driven (no
-    // watchdog); a headless run is guarded by the idle watchdog + soft ceiling.
-    let bounds = OperationBounds::resolve(config);
-    let agent_result: Result<Result<AgentRunResult>, SessionKill> = if interactive {
-        Ok(client.run_task(request).await)
-    } else {
-        run_session_watched(
-            bounds.idle_timeout,
-            bounds.max_seconds,
-            &session_log_path,
-            client.run_task(request),
+    // watchdog); a headless run is guarded by the idle watchdog + soft ceiling
+    // and may stitch multiple auto-resume continuations into one task.
+    let bounds = OperationBounds::resolve(config, &task.frontmatter);
+    let (session_outcome, _interactive_finalization_guard) = if interactive {
+        let agent_result = Ok(client.run_task(request).await);
+        let guard = InteractiveFinalizationGuard::activate()?;
+        (
+            single_session_outcome(agent_result, &session_id, &session_log_path, task_path)?,
+            Some(guard),
         )
-        .await
-    };
-
-    let _interactive_finalization_guard = if interactive {
-        Some(InteractiveFinalizationGuard::activate()?)
     } else {
-        None
-    };
-
-    let session_outcome = match agent_result {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(error)) => {
-            append_session_log(&session_log_path, &format!("\nerror:\n{error:#}\n"))?;
-            Err(AgentRunResult {
-                recap: format!(
-                    "# Agent Run Failed\n\nThe agent failed while processing `{}`.\n\nError: {error}\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
-                    task_path.display(),
-                    session_log_path.display(),
-                    session_log_path.display()
-                ),
-                requires_user: false,
-                suggested_agent: None,
-                resume_command: None,
-            })
-        }
-        Err(SessionKill::Idle { idle_secs }) => {
-            append_session_log(
-                &session_log_path,
-                &format!(
-                    "\nidle_watchdog:\nno output for {idle_secs} seconds; session cancelled\nlong_running_task_requested=true\n"
-                ),
-            )?;
-            Err(AgentRunResult {
-                recap: format!(
-                    "# Agent Run Timed Out\n\nThe agent produced no output for {idle_secs} seconds while processing `{}`, so Varda's idle watchdog cancelled the wedged session.\n\nWhat completed: the session log was preserved for inspection.\n\nWhat remains: delegate the unfinished work to a Varda long-running runner task, then resume the agent after the complete runner output is available.\n\nBlockers: the session stalled with no output.\n\nUser interaction required: no.\n\nSuggested next agent: runner.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
-                    task_path.display(),
-                    session_log_path.display(),
-                    session_log_path.display()
-                ),
-                requires_user: false,
-                suggested_agent: Some("runner".to_owned()),
-                resume_command: None,
-            })
-        }
-        Err(SessionKill::Budget { max_secs }) => {
-            append_session_log(
-                &session_log_path,
-                &format!(
-                    "\nbudget:\nsoft ceiling of {max_secs} seconds reached; stopping gracefully for user review\n"
-                ),
-            )?;
-            // A graceful checkpoint, NOT a failure: mark the task needs_user with the
-            // accumulated recap rather than killing it mid-work.
-            Err(AgentRunResult {
-                recap: format!(
-                    "# Operation Budget Reached\n\nThe agent reached the configured {max_secs} second soft ceiling while processing `{}`. Varda stopped the run gracefully so no edit was interrupted mid-flight.\n\nWhat remains: review the partial progress in the session log and re-run to continue.\n\nUser interaction required: yes.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
-                    task_path.display(),
-                    session_log_path.display(),
-                    session_log_path.display()
-                ),
-                requires_user: true,
-                suggested_agent: None,
-                resume_command: None,
-            })
-        }
+        let outcome = run_auto_resume_loop(
+            config,
+            client,
+            agent_name,
+            role_instructions,
+            task_path,
+            &mut task,
+            bounds,
+            timeout,
+            stream,
+            session_id.clone(),
+            session_log_path.clone(),
+            request,
+        )
+        .await?;
+        (outcome, None)
     };
 
     let result = match session_outcome {
@@ -1287,6 +1476,182 @@ Help interactively.
         assert!(recorded[1].interpret);
         assert!(recorded[1].body.contains("Session log"));
         assert_eq!(outcome.status, TaskStatus::Pending);
+    }
+
+    /// A client that replays a scripted list of responses, one per session call,
+    /// recording each request. Used to drive the multi-hop auto-resume loop:
+    /// early responses carry a `resume_command` ("more work"), the last does not.
+    #[derive(Clone)]
+    struct ScriptedResumeClient {
+        requests: std::sync::Arc<std::sync::Mutex<Vec<AgentRunRequest>>>,
+        responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<AgentRunResult>>>,
+        /// Response handed back once the scripted queue is exhausted.
+        fallback: AgentRunResult,
+    }
+
+    #[async_trait]
+    impl AgentClient for ScriptedResumeClient {
+        async fn run_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
+            self.requests.lock().unwrap().push(request);
+            let next = self.responses.lock().unwrap().pop_front();
+            Ok(next.unwrap_or_else(|| self.fallback.clone()))
+        }
+    }
+
+    fn ready_task(dir_tag: &str) -> (PathBuf, Config) {
+        let root = std::env::temp_dir().join(format!("varda-{dir_tag}-{}", Uuid::new_v4()));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            "---\nstatus: ready\nproject: /work/project\nassignee: codex\nrequires_user: false\n---\n\n# Task\n\nDo it.\n",
+        )
+        .expect("task should be written");
+        let config = test_config(operations_dir.display().to_string());
+        (task_path, config)
+    }
+
+    /// M10 auto-resume: a resume-command-then-done script stitches ≥2 sessions
+    /// into one COMPLETED task, preserving each hop's recap in order.
+    #[tokio::test]
+    async fn auto_resume_stitches_resume_then_done_into_completed_task() {
+        let (task_path, mut config) = ready_task("run-autoresume");
+        config.defaults.max_continuations = 8;
+        let client = ScriptedResumeClient {
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                vec![
+                    AgentRunResult {
+                        recap: "# Hop one\n\nStarted the work.".to_owned(),
+                        requires_user: false,
+                        suggested_agent: None,
+                        resume_command: Some("codex resume hop-1".to_owned()),
+                    },
+                    AgentRunResult {
+                        recap: "# Hop two\n\nFinished the work.".to_owned(),
+                        requires_user: false,
+                        suggested_agent: None,
+                        resume_command: None,
+                    },
+                ],
+            ))),
+            fallback: AgentRunResult {
+                recap: "unexpected extra call".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+        };
+
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
+            .await
+            .expect("auto-resume task should run");
+
+        let recorded = client.requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2, "expected two stitched sessions");
+        assert!(recorded[0].resume_command.is_none(), "first hop is fresh");
+        assert_eq!(
+            recorded[1].resume_command.as_deref(),
+            Some("codex resume hop-1"),
+            "second hop must be seeded with the captured resume command"
+        );
+
+        let recap = fs::read_to_string(&outcome.recap_path).expect("recap readable");
+        let hop_one = recap.find("Hop one").expect("hop one recap preserved");
+        let hop_two = recap.find("Hop two").expect("hop two recap preserved");
+        assert!(hop_one < hop_two, "recaps must be preserved in hop order");
+
+        assert_eq!(outcome.status, TaskStatus::Pending, "a stitched run completes");
+        let task = crate::task::load_task(&task_path).expect("task loads");
+        assert_eq!(
+            task.frontmatter.agent_session_ids.len(),
+            2,
+            "each hop records its own session id"
+        );
+    }
+
+    /// M10 auto-resume cap: an agent that never reports done is stopped after
+    /// `max_continuations` hops and marked `needs_user` (never an infinite loop).
+    #[tokio::test]
+    async fn auto_resume_is_capped_by_max_continuations() {
+        let (task_path, mut config) = ready_task("run-autoresume-cap");
+        config.defaults.max_continuations = 2;
+        let client = ScriptedResumeClient {
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            // Every call reports more work: the loop must stop on the cap, not here.
+            fallback: AgentRunResult {
+                recap: "# Still working\n\nMore to do.".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: Some("codex resume again".to_owned()),
+            },
+        };
+
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
+            .await
+            .expect("capped auto-resume should stop cleanly");
+
+        let recorded = client.requests.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            3,
+            "first session + max_continuations(2) continuations = 3 calls"
+        );
+        assert_eq!(
+            outcome.status,
+            TaskStatus::NeedsUser,
+            "hitting the continuation cap with work remaining is a graceful checkpoint"
+        );
+        let recap = fs::read_to_string(&outcome.recap_path).expect("recap readable");
+        assert!(recap.contains("Auto-Resume Limit Reached"));
+    }
+
+    /// M10 per-task overrides: a task frontmatter bound wins over the config default.
+    #[test]
+    fn per_task_frontmatter_overrides_bounds() {
+        let config = test_config("/tmp/unused".to_owned());
+        let mut fm = crate::task::TaskFrontmatter {
+            bounds: crate::task::TaskBounds::default(),
+            ..default_frontmatter()
+        };
+        // Defaults come from config first.
+        let base = OperationBounds::resolve(&config, &fm);
+        assert_eq!(base.idle_timeout.as_secs(), config.defaults.idle_timeout_seconds);
+        assert_eq!(base.max_continuations, config.defaults.max_continuations);
+
+        // A per-task override wins for each of the four bounds.
+        fm.bounds.idle_timeout = Some(7);
+        fm.bounds.max_continuations = Some(1);
+        fm.bounds.max_tool_calls = Some(42);
+        fm.bounds.max_seconds = Some(crate::config::MaxSeconds::Seconds(123));
+        let over = OperationBounds::resolve(&config, &fm);
+        assert_eq!(over.idle_timeout.as_secs(), 7);
+        assert_eq!(over.max_continuations, 1);
+        assert_eq!(over.max_tool_calls, 42);
+        assert_eq!(over.max_seconds, Some(123));
+    }
+
+    fn default_frontmatter() -> crate::task::TaskFrontmatter {
+        crate::task::TaskFrontmatter {
+            id: None,
+            status: TaskStatus::Ready,
+            project: None,
+            assignee: None,
+            recap: None,
+            recaps: vec![],
+            plan: None,
+            agent_session_id: None,
+            agent_session_log: None,
+            agent_session_ids: vec![],
+            agent_session_logs: vec![],
+            agent_resume_commands: vec![],
+            allow_commands: vec![],
+            bounds: crate::task::TaskBounds::default(),
+            requires_user: false,
+        }
     }
 
     fn test_config(operations_dir: String) -> Config {

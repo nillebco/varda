@@ -456,6 +456,7 @@ mod tests {
                 role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
+                    bounds: crate::task::TaskBounds::default(),
                     id: None,
                     status: TaskStatus::Ready,
                     project: Some("/work/project".to_owned()),

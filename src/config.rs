@@ -208,15 +208,31 @@ impl Defaults {
     #[allow(dead_code)]
     pub fn effective_max_seconds(&self) -> Option<u64> {
         match &self.max_seconds {
-            Some(MaxSeconds::Seconds(secs)) => Some(*secs),
-            Some(MaxSeconds::Keyword(word)) if word.eq_ignore_ascii_case("none") => None,
-            // Any other keyword is treated as "no explicit ceiling" → fall through
-            // to the deprecated alias so a typo never silently zeroes the budget.
-            Some(MaxSeconds::Keyword(_)) | None => match self.timeout_seconds {
+            Some(over) => effective_max_seconds(over, self.timeout_seconds),
+            // No explicit ceiling ⇒ fall back to the deprecated alias (0 ⇒ none).
+            None => match self.timeout_seconds {
                 0 => None,
                 secs => Some(secs),
             },
         }
+    }
+}
+
+/// Resolve a [`MaxSeconds`] soft ceiling into seconds, given the deprecated
+/// `timeout_seconds` alias to fall back on. `None` means "no ceiling".
+///
+/// Shared by [`Defaults::effective_max_seconds`] and the per-task frontmatter
+/// override path so both interpret the keyword/typo/`0` rules identically.
+pub fn effective_max_seconds(max_seconds: &MaxSeconds, timeout_seconds: u64) -> Option<u64> {
+    match max_seconds {
+        MaxSeconds::Seconds(secs) => Some(*secs),
+        MaxSeconds::Keyword(word) if word.eq_ignore_ascii_case("none") => None,
+        // Any other keyword is treated as "no explicit ceiling" → fall through
+        // to the deprecated alias so a typo never silently zeroes the budget.
+        MaxSeconds::Keyword(_) => match timeout_seconds {
+            0 => None,
+            secs => Some(secs),
+        },
     }
 }
 

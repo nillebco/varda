@@ -949,6 +949,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         role_instructions: None,
         task_path: plan_path.display().to_string(),
         frontmatter: task::TaskFrontmatter {
+            bounds: crate::task::TaskBounds::default(),
             id: None,
             status: task::TaskStatus::Ready,
             project: None,
@@ -3146,6 +3147,7 @@ planner_agent: codex
         task::TaskDocument {
             path: PathBuf::from("task.md"),
             frontmatter: task::TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: None,
                 status: task::TaskStatus::Ready,
                 project: None,

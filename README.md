@@ -512,10 +512,14 @@ work and, under a sandbox, leaking containers/volumes. Varda is moving to a
 - **Idle watchdog** (`idle_timeout_seconds`, default 180) — cancels a session only
   after that many seconds of *total silence* (no stdout/stderr activity). Productive
   long runs never trip it; a wedged or hung child does.
-- **Auto-resume loop** (`max_continuations`, default 8) — when a session ends with
-  work remaining, Varda captures the resume command and dispatches a fresh
-  continuation session (fresh context each hop) until the agent reports done or a
-  bound is hit.
+- **Auto-resume loop** (`max_continuations`, default 8) — when a non-interactive
+  session ends with work remaining, Varda captures the agent's resume command and
+  dispatches a **fresh continuation session** (new session id + log each hop),
+  seeded with that command, looping until the agent reports done. Each hop's recap
+  is preserved in order and stitched into the final recap. Reaching
+  `max_continuations` with work still remaining stops gracefully as `needs_user`
+  (never an infinite loop, never a silently dropped tail); `0` disables auto-resume
+  (single session only).
 - **Operation budget** (`max_seconds`, `max_tool_calls`) — soft ceilings tracked
   across the whole task. `max_seconds` accepts an integer or `"none"`; `max_tool_calls`
   of `0` means unlimited. On exceed, the run **stops and marks the task
@@ -531,16 +535,28 @@ soft `max_seconds` ceiling stops the run gracefully as `needs_user`; a silent st
 past `idle_timeout_seconds` cancels the wedged session and suggests a long-running
 runner follow-up.
 
-> Rollout note: the config layer (parsing, back-compat alias, `effective_max_seconds`
-> resolver) and — as of this increment — the runner-side **idle watchdog** and the
-> **soft `max_seconds` budget** are wired and tested in `src/runner.rs`, replacing
-> the old `time::timeout` hard kill for non-interactive runs. Still landing in
-> follow-up increments of this milestone: the multi-hop **auto-resume loop**
-> (`max_continuations`) with accumulated recaps, the **`max_tool_calls`** budget,
-> **per-task frontmatter overrides** for the four bounds, and guaranteed **sandbox
-> teardown on the idle/budget cancel paths** (today teardown runs on a natural
-> session end; a watchdog cancel drops the child via `kill_on_drop` but does not yet
-> run `session.teardown()`).
+**Per-task overrides.** Any of the four bounds can be overridden per task via its
+frontmatter — the keys `idle_timeout`, `max_seconds`, `max_continuations`, and
+`max_tool_calls` sit at the top level of the task's YAML and win over the matching
+`defaults.*` config value (an unset key falls back to the default). For example, a
+task that legitimately needs a longer quiet window:
+
+```yaml
+---
+status: ready
+project: /work/project
+assignee: claude
+idle_timeout: 600          # override defaults.idle_timeout_seconds for this task
+max_continuations: 2       # cap auto-resume hops for this task
+---
+```
+
+**Sandbox teardown on cancel.** A watchdog/budget cancel drops the in-flight agent
+future to stop the child (`kill_on_drop`). Because Rust has no async `Drop`, the acp
+run owns the sandbox session in a guard (`SessionTeardownGuard`) that runs
+`session.teardown()` on **every** exit path: inline on a natural end, and detached
+onto the runtime on a cancel — so an idle/budget kill of a sandboxed run no longer
+leaks its `varda-sbx-*` container/volume.
 
 ## Configuration
 

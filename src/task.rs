@@ -69,8 +69,32 @@ pub struct TaskFrontmatter {
     /// allowlist" section.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_commands: Vec<String>,
+    /// M10 per-task overrides for the four cooperative-execution bounds. Each is
+    /// optional and, when set, wins over the corresponding `defaults.*` value
+    /// (see `runner::OperationBounds::resolve`). Flattened so the keys appear at
+    /// the top level of the task frontmatter (e.g. `idle_timeout: 300`).
+    #[serde(flatten)]
+    pub bounds: TaskBounds,
     #[serde(default)]
     pub requires_user: bool,
+}
+
+/// M10 per-task overrides for the cooperative-execution bounds. An unset field
+/// falls back to the matching `defaults.*` config value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskBounds {
+    /// Override `defaults.idle_timeout_seconds` for this task (seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<u64>,
+    /// Override `defaults.max_seconds` (soft total ceiling) for this task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seconds: Option<crate::config::MaxSeconds>,
+    /// Override `defaults.max_continuations` (auto-resume hop cap) for this task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_continuations: Option<u32>,
+    /// Override `defaults.max_tool_calls` (tool-call budget) for this task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,6 +207,7 @@ pub fn create_task(
     let task = TaskDocument {
         path: path.clone(),
         frontmatter: TaskFrontmatter {
+            bounds: crate::task::TaskBounds::default(),
             id: Some(id),
             status: TaskStatus::Backlog,
             project: Some(project_path.display().to_string()),
@@ -635,6 +660,7 @@ Verify the sandbox.
         assert!(frontmatter.contains("- msb"));
 
         let empty = TaskFrontmatter {
+            bounds: crate::task::TaskBounds::default(),
             allow_commands: vec![],
             ..task.frontmatter.clone()
         };
@@ -647,6 +673,7 @@ Verify the sandbox.
         let mut task = TaskDocument {
             path: PathBuf::from("task.md"),
             frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: None,
                 status: TaskStatus::Running,
                 project: None,
@@ -691,6 +718,7 @@ Verify the sandbox.
         let task = TaskDocument {
             path: path.clone(),
             frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: Some(7),
                 status: TaskStatus::Pending,
                 project: None,
