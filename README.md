@@ -130,6 +130,8 @@ max_prompt_tokens = 32000
 
 Before Varda allocates a task, it estimates the full agent prompt, including project instructions and task plan content. If the default agent is over budget, Varda uses the first allowed agent with enough budget. If an explicitly assigned agent is over budget, Varda stops and reports which allowed agents can fit the task.
 
+Agents that stream stdout/stderr while working can set `streams_output = true`. Leave it unset, or set it to `false`, for buffered agents such as print-mode CLIs that only write output when the process exits; Varda will then rely on process exit plus `max_seconds` instead of killing solely because the session log is quiet.
+
 ## Create Your First Task
 
 From inside the project you want to track, run:

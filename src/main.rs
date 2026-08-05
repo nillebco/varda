@@ -3371,6 +3371,7 @@ planner_agent: codex
             auth_token_target: Some("SANDBOX_TOKEN".to_owned()),
             interactive_command: None,
             interactive_args: None,
+            streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
         };
