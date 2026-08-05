@@ -96,6 +96,7 @@ pub struct AcpSubprocessClient {
     args: Vec<String>,
     working_dir: Option<String>,
     env: BTreeMap<String, String>,
+    static_env: BTreeMap<String, String>,
     interactive_command: Option<String>,
     interactive_args: Option<Vec<String>>,
     resume_command_template: Option<String>,
@@ -115,12 +116,22 @@ impl AcpSubprocessClient {
         config: &AgentConfig,
         sandbox: Arc<dyn SandboxProvider>,
     ) -> Self {
+        Self::with_sandbox_env(agent_name, config, sandbox, BTreeMap::new())
+    }
+
+    pub fn with_sandbox_env(
+        agent_name: impl Into<String>,
+        config: &AgentConfig,
+        sandbox: Arc<dyn SandboxProvider>,
+        static_env: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             agent_name: agent_name.into(),
             command: config.command.clone(),
             args: config.args.clone(),
             working_dir: config.working_dir.clone(),
             env: config.env.clone(),
+            static_env,
             interactive_command: config.interactive_command.clone(),
             interactive_args: config.interactive_args.clone(),
             resume_command_template: config.resume_command_template.clone(),
@@ -201,7 +212,7 @@ impl AcpSubprocessClient {
             .working_dir
             .as_deref()
             .map(|dir| expand_request_value(dir, request));
-        let env = env_for_request(&self.env, request);
+        let env = env_for_request(&self.env, &self.static_env, request);
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(
                 log_path,
@@ -422,7 +433,7 @@ impl AcpSubprocessClient {
             .working_dir
             .as_deref()
             .map(|dir| expand_request_value(dir, request));
-        let mut env = env_for_request(&self.env, request);
+        let mut env = env_for_request(&self.env, &self.static_env, request);
 
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(
@@ -1177,11 +1188,35 @@ fn default_varda_home() -> String {
 
 fn env_for_request(
     env: &BTreeMap<String, String>,
+    static_env: &BTreeMap<String, String>,
     request: &AgentRunRequest,
 ) -> BTreeMap<String, String> {
-    env.iter()
-        .map(|(key, value)| (key.clone(), expand_request_value(value, request)))
-        .collect()
+    let mut out: BTreeMap<String, String> = env
+        .iter()
+        .map(|(key, value)| (key.clone(), expand_env_value(value, request)))
+        .collect();
+    out.extend(
+        static_env
+            .iter()
+            .map(|(key, value)| (key.clone(), expand_env_value(value, request))),
+    );
+    out
+}
+
+fn expand_env_value(value: &str, request: &AgentRunRequest) -> String {
+    let expanded = expand_request_value(value, request);
+    expand_leading_tilde(&expanded)
+}
+
+fn expand_leading_tilde(value: &str) -> String {
+    if value == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| value.to_owned());
+    }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    value.to_owned()
 }
 
 fn find_claude_transcript(
@@ -1485,6 +1520,32 @@ mod tests {
         AcpSubprocessClient::with_sandbox("shell", &config, provider)
     }
 
+    #[test]
+    fn env_for_request_merges_static_env_after_agent_env_and_expands_values() {
+        let mut agent_env = BTreeMap::new();
+        agent_env.insert("SHARED".to_owned(), "agent".to_owned());
+        agent_env.insert("AGENT_ONLY".to_owned(), "{project}/agent".to_owned());
+        let mut static_env = BTreeMap::new();
+        static_env.insert("SHARED".to_owned(), "static".to_owned());
+        static_env.insert("GCLOUD_PROJECT".to_owned(), "healthy-silo-31898".to_owned());
+        static_env.insert("PROJECT_PATH".to_owned(), "{project}".to_owned());
+        static_env.insert("CACHE_DIR".to_owned(), "~/cache".to_owned());
+
+        let env = env_for_request(
+            &agent_env,
+            &static_env,
+            &docker_request("/srv/app", "env-unit"),
+        );
+
+        assert_eq!(env["SHARED"], "static");
+        assert_eq!(env["AGENT_ONLY"], "/srv/app/agent");
+        assert_eq!(env["GCLOUD_PROJECT"], "healthy-silo-31898");
+        assert_eq!(env["PROJECT_PATH"], "/srv/app");
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(env["CACHE_DIR"], format!("{home}/cache"));
+        }
+    }
+
     /// M5: build a sandbox image from `testdata/Dockerfile.rust` (a trivial
     /// `FROM busybox` — installs nothing heavy) and run a shell agent under it,
     /// asserting the recap is parsed. Proves the `build` knob is honoured end to
@@ -1633,6 +1694,50 @@ mod tests {
             "non-allow-listed host must be unreachable; recap was: {}",
             result.recap
         );
+    }
+
+    /// M15 static-env exit criterion: a static env map merged before wrapping is
+    /// visible in the guest as a regular container env var. Run with
+    /// `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon"]
+    async fn docker_agent_static_env_visible_in_guest() {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf 'GCLOUD_PROJECT=%s\\n\\nrequires_user: false\\n' \"$GCLOUD_PROJECT\""
+                    .to_owned(),
+            ],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            resume_command_template: None,
+        };
+        let sandbox_config = crate::config::SandboxConfig {
+            image: Some("busybox:latest".to_owned()),
+            ..Default::default()
+        };
+        let provider = std::sync::Arc::new(
+            crate::sandbox::DockerProvider::from_config("docker", &sandbox_config, Vec::new())
+                .expect("docker provider"),
+        );
+        let client = AcpSubprocessClient::with_sandbox_env(
+            "shell",
+            &config,
+            provider,
+            BTreeMap::from([("GCLOUD_PROJECT".to_owned(), "healthy-silo-31898".to_owned())]),
+        );
+        let result = client
+            .run_task(docker_request("/tmp", "docker-static-env"))
+            .await
+            .expect("docker agent should receive static env");
+        assert!(result.recap.contains("GCLOUD_PROJECT=healthy-silo-31898"));
     }
 
     #[cfg(unix)]

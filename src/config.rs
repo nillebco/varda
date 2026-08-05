@@ -99,7 +99,10 @@ pub struct Config {
     /// sub-task spawns and the caps that bound them. Safe default: spawning
     /// disabled, `local` sandbox denied. A `[[routes]]` entry may override this
     /// wholesale for the code it matches (see [`Config::resolve_orchestration_for`]).
-    #[serde(default, skip_serializing_if = "crate::orchestration::OrchestrationPolicy::is_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::orchestration::OrchestrationPolicy::is_default"
+    )]
     pub orchestration: crate::orchestration::OrchestrationPolicy,
 }
 
@@ -269,6 +272,10 @@ pub struct Route {
     /// `.varda` origin in M6b).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<String>,
+    /// Trusted per-route static, non-secret environment variables. These are
+    /// injected into sandboxed runs after expansion; more-specific origins win.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     /// Per-route nested-orchestration policy. When set, it REPLACES the top-level
     /// `[orchestration]` defaults for tasks this route matches (so untrusted code
     /// can be pinned to a stricter — or, deliberately, a looser — spawn policy than
@@ -293,6 +300,9 @@ pub struct SandboxConfig {
     pub primitive: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<String>,
+    /// Trusted image-intrinsic static, non-secret environment variables.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<String>,
 }
@@ -342,6 +352,12 @@ pub struct ResolvedSandbox {
     /// `source:target:mode` string ready to apply (source made absolute, forced
     /// `:ro` unless allowed).
     pub varda_mounts: Vec<String>,
+    /// Merged static env from trusted sandbox/route origins plus the hardened
+    /// `.varda` origin. Agent env is merged later by `AcpSubprocessClient`.
+    pub env: BTreeMap<String, String>,
+    /// Keys supplied by the untrusted `.varda` origin, retained so the run path
+    /// can reject collisions with agent-specific credential injection targets.
+    pub varda_env_keys: Vec<String>,
     /// Path of the `.varda` that supplied the config, when one was used.
     pub varda_file: Option<PathBuf>,
 }
@@ -383,6 +399,7 @@ impl Config {
         // and project-context mounts. Used directly when no `.varda` applies.
         let route = crate::routing::find_route_public(self, project_path).ok();
         let route_mounts = route.map(|r| r.mounts.clone()).unwrap_or_default();
+        let route_env = route.map(|r| r.env.clone()).unwrap_or_default();
         let central_name = route
             .and_then(|r| r.sandbox.clone())
             .or_else(|| self.defaults.sandbox.clone())
@@ -390,11 +407,14 @@ impl Config {
 
         let Some(varda_path) = find_nearest_varda(project_path, routing_root) else {
             let config = self.sandbox_config_by_name(&central_name);
+            let env = merge_static_env(&config.env, &route_env, &BTreeMap::new());
             return Ok(ResolvedSandbox {
                 name: central_name,
                 config,
                 route_mounts,
                 varda_mounts: Vec::new(),
+                env,
+                varda_env_keys: Vec::new(),
                 varda_file: None,
             });
         };
@@ -412,21 +432,32 @@ impl Config {
             VardaSandbox::Reference(name) => {
                 let config = self.sandbox_config_by_name(&name);
                 self.enforce_varda_primitive_floor(&config.primitive, &varda_path)?;
+                let env = merge_static_env(&config.env, &route_env, &BTreeMap::new());
                 Ok(ResolvedSandbox {
                     name,
                     config,
                     route_mounts,
                     varda_mounts: Vec::new(),
+                    env,
+                    varda_env_keys: Vec::new(),
                     varda_file: Some(varda_path),
                 })
             }
             VardaSandbox::Inline(config) => {
                 self.enforce_varda_primitive_floor(&config.primitive, &varda_path)?;
                 self.enforce_egress_ceiling(&config.egress, &varda_path)?;
-                let varda_mounts =
-                    self.harden_inline_varda_mounts(&config.mounts, project_path, &varda_dir, &varda_path)?;
+                self.enforce_varda_env_floor(&config.env, &route_env, &varda_path)?;
+                let varda_mounts = self.harden_inline_varda_mounts(
+                    &config.mounts,
+                    project_path,
+                    &varda_dir,
+                    &varda_path,
+                )?;
+                let env = merge_static_env(&BTreeMap::new(), &route_env, &config.env);
+                let varda_env_keys = config.env.keys().cloned().collect();
                 let config = SandboxConfig {
                     mounts: Vec::new(),
+                    env: BTreeMap::new(),
                     ..config
                 };
                 Ok(ResolvedSandbox {
@@ -434,6 +465,8 @@ impl Config {
                     config,
                     route_mounts,
                     varda_mounts,
+                    env,
+                    varda_env_keys,
                     varda_file: Some(varda_path),
                 })
             }
@@ -500,6 +533,32 @@ impl Config {
         Ok(())
     }
 
+    /// Floor: an untrusted `.varda` env map may not set reserved process-control
+    /// keys or override any trusted central route key. Agent-specific credential
+    /// targets are checked later in the run path, where the selected agent is known.
+    fn enforce_varda_env_floor(
+        &self,
+        env: &BTreeMap<String, String>,
+        route_env: &BTreeMap<String, String>,
+        varda_file: &Path,
+    ) -> Result<()> {
+        for key in env.keys() {
+            if is_reserved_varda_env_key(key) {
+                bail!(
+                    "`.varda` at {} declares env key '{key}', which is reserved and may not be set by `.varda`",
+                    varda_file.display()
+                );
+            }
+            if route_env.contains_key(key) {
+                bail!(
+                    "`.varda` at {} declares env key '{key}', which would override trusted route env",
+                    varda_file.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Floor: harden each inline `.varda` mount (in-tree SOURCE, credential
     /// denylist, forced `:ro` unless allowed, safe TARGET) and return them as
     /// ready-to-apply `source:target:mode` strings.
@@ -512,8 +571,9 @@ impl Config {
     ) -> Result<Vec<String>> {
         let mut out = Vec::with_capacity(mounts.len());
         for raw in mounts {
-            let spec = crate::sandbox::parse_mount(raw)
-                .with_context(|| format!("invalid `.varda` mount '{raw}' in {}", varda_file.display()))?;
+            let spec = crate::sandbox::parse_mount(raw).with_context(|| {
+                format!("invalid `.varda` mount '{raw}' in {}", varda_file.display())
+            })?;
             // `.varda` mount paths are relative to the `.varda` dir, not the
             // project root; make SOURCE absolute against `varda_dir` first.
             let source = if spec.source.is_absolute() {
@@ -551,9 +611,30 @@ impl Default for SandboxConfig {
             build: None,
             primitive: default_primitive(),
             mounts: Vec::new(),
+            env: BTreeMap::new(),
             egress: Vec::new(),
         }
     }
+}
+
+fn merge_static_env(
+    sandbox_env: &BTreeMap<String, String>,
+    route_env: &BTreeMap<String, String>,
+    varda_env: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.extend(sandbox_env.clone());
+    env.extend(route_env.clone());
+    env.extend(varda_env.clone());
+    env
+}
+
+pub fn is_reserved_varda_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "PATH" | "HOME" | "LD_PRELOAD" | "LD_LIBRARY_PATH" | "SSH_AUTH_SOCK"
+    ) || key.starts_with("DYLD_")
+        || key.starts_with("VARDA_")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -699,9 +780,10 @@ fn ensure_git_repo(path: &Path) -> Result<()> {
 
 pub fn varda_home() -> Result<PathBuf> {
     if let Ok(home) = std::env::var(VARDA_HOME_ENV)
-        && !home.trim().is_empty() {
-            return Ok(PathBuf::from(home));
-        }
+        && !home.trim().is_empty()
+    {
+        return Ok(PathBuf::from(home));
+    }
 
     let home = std::env::var("HOME").context("HOME is not set and VARDA_HOME was not provided")?;
     Ok(PathBuf::from(home).join(".varda"))
@@ -753,6 +835,7 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
             agents,
             sandbox: None,
             mounts: Vec::new(),
+            env: BTreeMap::new(),
             orchestration: None,
         },
     );
@@ -835,10 +918,9 @@ fn add_varda_project_dir_to_default_agents(config: &mut Config) {
                 .as_deref()
                 .and_then(|args| args.get(1))
                 .is_some_and(|arg| arg.contains("codex ") || arg.contains("claude "));
-            if is_wrapped_agent
-                && let Some(args) = agent.interactive_args.as_mut() {
-                    add_varda_dirs_to_shell_arg(args);
-                }
+            if is_wrapped_agent && let Some(args) = agent.interactive_args.as_mut() {
+                add_varda_dirs_to_shell_arg(args);
+            }
         }
 
         if let Some(template) = agent.resume_command_template.as_mut() {
@@ -992,7 +1074,10 @@ operations_dir = "operations"
         assert_eq!(config.defaults.max_continuations, 0);
         assert_eq!(config.defaults.max_tool_calls, 0);
         // `max_seconds = "none"` ⇒ no soft ceiling, ignoring the deprecated alias.
-        assert_eq!(config.defaults.max_seconds, Some(MaxSeconds::Keyword("none".to_owned())));
+        assert_eq!(
+            config.defaults.max_seconds,
+            Some(MaxSeconds::Keyword("none".to_owned()))
+        );
         assert_eq!(config.defaults.effective_max_seconds(), None);
         assert_eq!(config.routes[0].agents, vec!["codex"]);
         assert_eq!(config.agents["codex"].command, "codex");
@@ -1145,6 +1230,7 @@ operations_dir = "operations"
             agents: vec!["codex".to_owned()],
             sandbox: Some("firejail".to_owned()),
             mounts: Vec::new(),
+            env: BTreeMap::new(),
             orchestration: None,
         };
         assert_eq!(config.effective_sandbox(&route_with_sandbox), "firejail");
@@ -1220,6 +1306,7 @@ mod m6b_tests {
             sandbox: None,
             mounts: vec![],
             orchestration: None,
+            env: BTreeMap::new(),
         }];
         c
     }
@@ -1293,6 +1380,77 @@ mod m6b_tests {
     }
 
     #[test]
+    fn static_env_merges_agent_sandbox_route_varda_precedence_inputs() {
+        let root = tmp("envmerge");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let mut config = base_config();
+        config.routes[0].sandbox = Some("rust".to_owned());
+        config.routes[0]
+            .env
+            .insert("FROM_ROUTE".to_owned(), "route".to_owned());
+        config.routes[0]
+            .env
+            .insert("SHARED".to_owned(), "route".to_owned());
+        config.sandboxes.insert(
+            "rust".to_owned(),
+            SandboxConfig {
+                env: BTreeMap::from([
+                    ("FROM_SANDBOX".to_owned(), "sandbox".to_owned()),
+                    ("SHARED".to_owned(), "sandbox".to_owned()),
+                ]),
+                ..SandboxConfig::default()
+            },
+        );
+
+        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        assert_eq!(r.env["FROM_SANDBOX"], "sandbox");
+        assert_eq!(r.env["FROM_ROUTE"], "route");
+        assert_eq!(r.env["SHARED"], "route");
+
+        // A normal .varda env key is allowed and wins over the sandbox origin.
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\nenv = { FROM_VARDA = \"varda\", FROM_SANDBOX = \"varda\" }\n",
+        )
+        .unwrap();
+        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        assert_eq!(r.env["FROM_SANDBOX"], "varda");
+        assert_eq!(r.env["FROM_ROUTE"], "route");
+        assert_eq!(r.env["FROM_VARDA"], "varda");
+        assert_eq!(r.varda_env_keys, vec!["FROM_SANDBOX", "FROM_VARDA"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn varda_env_rejects_reserved_key_and_trusted_override() {
+        let root = tmp("envfloor");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let mut config = base_config();
+        config.routes[0]
+            .env
+            .insert("TRUSTED".to_owned(), "route".to_owned());
+
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\nenv = { PATH = \"/tmp\" }\n",
+        )
+        .unwrap();
+        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        assert!(err.to_string().contains("PATH"), "{err}");
+
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\nenv = { TRUSTED = \"override\" }\n",
+        )
+        .unwrap();
+        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        assert!(err.to_string().contains("TRUSTED"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn floor_rejects_local_primitive() {
         let root = tmp("local");
         let proj = root.join("proj");
@@ -1320,7 +1478,10 @@ mod m6b_tests {
         )
         .unwrap();
         let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
-        assert!(err.to_string().contains("outside the project root"), "{err}");
+        assert!(
+            err.to_string().contains("outside the project root"),
+            "{err}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1364,7 +1525,11 @@ mod m6b_tests {
         )
         .unwrap();
         let r = config.resolve_sandbox_for(&proj, &root).unwrap();
-        assert!(r.varda_mounts[0].ends_with(":/ctx:rw"), "{:?}", r.varda_mounts);
+        assert!(
+            r.varda_mounts[0].ends_with(":/ctx:rw"),
+            "{:?}",
+            r.varda_mounts
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1393,8 +1558,13 @@ mod m6b_tests {
             &resolved.route_mounts,
             &resolved.varda_mounts,
         );
-        let provider =
-            crate::sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &crate::sandbox::SandboxIdentity::default()).unwrap();
+        let provider = crate::sandbox::provider_from_config(
+            &resolved.name,
+            &resolved.config,
+            mounts,
+            &crate::sandbox::SandboxIdentity::default(),
+        )
+        .unwrap();
         assert_eq!(provider.name(), "rust");
         let _ = fs::remove_dir_all(&root);
     }
@@ -1424,11 +1594,20 @@ mod m6b_tests {
             .iter()
             .filter(|(origin, _)| *origin == crate::sandbox::MountOrigin::Varda)
             .collect();
-        assert_eq!(varda.len(), 1, "expected one Varda-origin mount: {mounts:?}");
+        assert_eq!(
+            varda.len(),
+            1,
+            "expected one Varda-origin mount: {mounts:?}"
+        );
         assert!(varda[0].1.ends_with(":/ctx:ro"), "{:?}", varda[0].1);
         // The provider builds from the inline config.
-        let provider =
-            crate::sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &crate::sandbox::SandboxIdentity::default()).unwrap();
+        let provider = crate::sandbox::provider_from_config(
+            &resolved.name,
+            &resolved.config,
+            mounts,
+            &crate::sandbox::SandboxIdentity::default(),
+        )
+        .unwrap();
         assert_eq!(provider.name(), "inline");
         let _ = fs::remove_dir_all(&root);
     }
@@ -1508,6 +1687,7 @@ agents = ["claude"]
                 agents: vec!["claude".to_owned()],
                 sandbox: None,
                 mounts: vec![],
+                env: BTreeMap::new(),
                 orchestration: Some(strict.clone()),
             },
             Route {
@@ -1515,6 +1695,7 @@ agents = ["claude"]
                 agents: vec!["claude".to_owned()],
                 sandbox: None,
                 mounts: vec![],
+                env: BTreeMap::new(),
                 orchestration: None,
             },
         ];

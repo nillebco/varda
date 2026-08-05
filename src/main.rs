@@ -941,6 +941,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         agent_config,
         config::DEFAULT_SANDBOX_PROVIDER,
         &[],
+        &std::collections::BTreeMap::new(),
         None,
     )?;
     let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
@@ -1171,16 +1172,19 @@ fn build_client(
     agent_config: &config::AgentConfig,
     sandbox_name: &str,
     route_mounts: &[String],
+    route_env: &std::collections::BTreeMap<String, String>,
     project_path: Option<&Path>,
 ) -> Result<acp::AcpSubprocessClient> {
     // M11 — resolve the three identity/auth channels (curated identity files,
     // SSH-agent + git identity, scoped auth token) once and inject them into
     // whichever provider is selected. `local` ignores them (no boundary to cross).
     let identity = resolve_sandbox_identity(config, agent_config);
+    let mut static_env = std::collections::BTreeMap::new();
     let provider = match project_path {
         Some(project_path) => {
             let routing_root = routing_root_for(project_path);
             let resolved = config.resolve_sandbox_for(project_path, &routing_root)?;
+            enforce_varda_env_credential_floor(agent_config, &resolved)?;
             if let Some(varda_file) = &resolved.varda_file {
                 eprintln!(
                     "sandbox: '{}' selected via {}",
@@ -1193,15 +1197,57 @@ fn build_client(
                 &resolved.route_mounts,
                 &resolved.varda_mounts,
             );
+            static_env = resolved.env;
             sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &identity)?
         }
-        None => sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?,
+        None => {
+            if let Some(sandbox_config) = config.sandboxes.get(sandbox_name) {
+                static_env.extend(sandbox_config.env.clone());
+            }
+            static_env.extend(route_env.clone());
+            sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?
+        }
     };
-    Ok(acp::AcpSubprocessClient::with_sandbox(
+    Ok(acp::AcpSubprocessClient::with_sandbox_env(
         display_name,
         agent_config,
         provider,
+        static_env,
     ))
+}
+
+fn enforce_varda_env_credential_floor(
+    agent_config: &config::AgentConfig,
+    resolved: &config::ResolvedSandbox,
+) -> Result<()> {
+    if let Some(target) = agent_config
+        .auth_token_target
+        .as_ref()
+        .or(agent_config.auth_token_env.as_ref())
+        && resolved.varda_env_keys.iter().any(|key| key == target)
+    {
+        let origin = resolved
+            .varda_file
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| ".varda".to_owned());
+        anyhow::bail!(
+            "`.varda` at {origin} declares env key '{target}', which would override credential injection"
+        );
+    }
+    for key in &resolved.varda_env_keys {
+        if agent_config.env.contains_key(key) {
+            let origin = resolved
+                .varda_file
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| ".varda".to_owned());
+            anyhow::bail!(
+                "`.varda` at {origin} declares env key '{key}', which would override trusted agent env"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// M11 — assemble the sandbox identity/auth bundle from central config + the host
@@ -1310,6 +1356,7 @@ async fn run_task_path_for_parallel(
         agent_config,
         &route.sandbox,
         &route.route_mounts,
+        &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
     )?;
     let outcome = runner::run_task(
@@ -2376,6 +2423,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         agent_config,
         &route.sandbox,
         &route.route_mounts,
+        &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
     )?;
     if config.git.auto_commit {
@@ -2491,6 +2539,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         agent_config,
         &route.sandbox,
         &route.route_mounts,
+        &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
     )?;
     let outcome = runner::plan_task(
@@ -2582,6 +2631,7 @@ async fn run_captured_resume_command(
         agent_config,
         &route.sandbox,
         &route.route_mounts,
+        &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
     )?;
     if config.git.auto_commit {
@@ -3141,6 +3191,40 @@ planner_agent: codex
         task.frontmatter.agent_resume_commands = vec!["".to_owned(), "  ".to_owned()];
 
         assert_eq!(latest_agent_resume_command(&task), None);
+    }
+
+    #[test]
+    fn varda_env_floor_rejects_agent_env_and_credential_target_collisions() {
+        let mut agent = config::AgentConfig {
+            kind: config::AgentKind::Acp,
+            command: "codex".to_owned(),
+            args: Vec::new(),
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: std::collections::BTreeMap::from([("TRUSTED_AGENT".to_owned(), "x".to_owned())]),
+            auth_token_env: Some("HOST_TOKEN".to_owned()),
+            auth_token_target: Some("SANDBOX_TOKEN".to_owned()),
+            interactive_command: None,
+            interactive_args: None,
+            resume_command_template: None,
+        };
+        let mut resolved = config::ResolvedSandbox {
+            name: "inline".to_owned(),
+            config: config::SandboxConfig::default(),
+            route_mounts: Vec::new(),
+            varda_mounts: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            varda_env_keys: vec!["TRUSTED_AGENT".to_owned()],
+            varda_file: Some(PathBuf::from("/repo/.varda")),
+        };
+
+        let err = enforce_varda_env_credential_floor(&agent, &resolved).unwrap_err();
+        assert!(err.to_string().contains("TRUSTED_AGENT"), "{err}");
+
+        agent.env.clear();
+        resolved.varda_env_keys = vec!["SANDBOX_TOKEN".to_owned()];
+        let err = enforce_varda_env_credential_floor(&agent, &resolved).unwrap_err();
+        assert!(err.to_string().contains("SANDBOX_TOKEN"), "{err}");
     }
 
     fn test_task_document() -> task::TaskDocument {
