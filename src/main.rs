@@ -1087,7 +1087,7 @@ async fn run_task_paths_in_parallel(
     let mut runs = JoinSet::new();
     for task_path in task_paths {
         let config = config.clone();
-        runs.spawn(async move { run_task_path_for_parallel(config, task_path).await });
+        runs.spawn(async move { run_task_path_for_parallel(config, task_path, None).await });
     }
 
     let mut failures = 0usize;
@@ -1162,13 +1162,14 @@ struct VardaSubtaskLauncher {
     config: config::Config,
     project_path: PathBuf,
     fallback_agent: String,
+    spawn_state: orchestration::SharedSpawnState,
 }
 
 impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
     fn launch(
         &mut self,
         req: &orchestration::SpawnRequest,
-        _grant: &orchestration::SpawnGrant,
+        grant: &orchestration::SpawnGrant,
     ) -> anyhow::Result<orchestration::SubtaskId> {
         let project = req
             .route
@@ -1195,11 +1196,22 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
             .map(|id| id.to_string())
             .unwrap_or_else(|| task_path.display().to_string());
 
+        let lineage = SpawnLineage {
+            root_id: subtask_id.clone(),
+            root_depth: grant.child_depth,
+            state: self.spawn_state.clone(),
+        };
         let config = self.config.clone();
         let path = task_path.clone();
+        if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::CurrentThread
+        {
+            anyhow::bail!("synchronous spawn_subtask launch requires Tokio's multi-thread runtime");
+        }
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { run_task_path_for_parallel(config, path).await })
+            tokio::runtime::Handle::current().block_on(async move {
+                run_task_path_for_parallel(config, path, Some(lineage)).await
+            })
         })
         .context("failed to run spawned subtask")?;
 
@@ -1213,6 +1225,14 @@ struct OrchestratedAgentClient {
     policy: orchestration::OrchestrationPolicy,
     project_path: PathBuf,
     fallback_agent: String,
+    lineage: Option<SpawnLineage>,
+}
+
+#[derive(Clone)]
+struct SpawnLineage {
+    root_id: orchestration::SubtaskId,
+    root_depth: u32,
+    state: orchestration::SharedSpawnState,
 }
 
 #[async_trait]
@@ -1224,21 +1244,34 @@ impl AgentClient for OrchestratedAgentClient {
 
         let socket_dir = self.project_path.join(".varda-mcp");
         let socket_path = socket_dir.join(format!("{}.sock", request.session_id));
-        let launcher = VardaSubtaskLauncher {
-            config: self.config.clone(),
-            project_path: self.project_path.clone(),
-            fallback_agent: self.fallback_agent.clone(),
-        };
-        let root_id = request
+        let default_root_id = request
             .frontmatter
             .id
             .map(|id| id.to_string())
             .unwrap_or_else(|| request.session_id.clone());
-        let broker = std::sync::Arc::new(std::sync::Mutex::new(orchestration::SpawnBroker::new(
+        let (root_id, root_depth, spawn_state) = self.lineage.as_ref().map_or_else(
+            || (default_root_id, 0, orchestration::SharedSpawnState::new()),
+            |lineage| {
+                (
+                    lineage.root_id.clone(),
+                    lineage.root_depth,
+                    lineage.state.clone(),
+                )
+            },
+        );
+        let launcher = VardaSubtaskLauncher {
+            config: self.config.clone(),
+            project_path: self.project_path.clone(),
+            fallback_agent: self.fallback_agent.clone(),
+            spawn_state: spawn_state.clone(),
+        };
+        let broker = std::sync::Arc::new(orchestration::SpawnBroker::with_shared_state(
             self.policy.clone(),
             root_id.clone(),
+            root_depth,
+            spawn_state,
             launcher,
-        )));
+        ));
         let server_path = socket_path.clone();
         let server = tokio::spawn(async move {
             if let Err(error) =
@@ -1387,6 +1420,7 @@ fn routing_root_for(project_path: &Path) -> PathBuf {
 async fn run_task_path_for_parallel(
     config: config::Config,
     task_path: PathBuf,
+    lineage: Option<SpawnLineage>,
 ) -> Result<ParallelRunReport> {
     let task_path = task::resolve_task_reference(&config, &task_path)?;
     let task_document = task::load_task(&task_path)?;
@@ -1434,6 +1468,7 @@ async fn run_task_path_for_parallel(
             policy,
             project_path,
             fallback_agent: route.agent.clone(),
+            lineage,
         });
     let outcome = runner::run_task(
         &config,

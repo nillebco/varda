@@ -8,7 +8,7 @@
 //! process capability.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16,7 +16,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::orchestration::{SpawnBroker, SubtaskLauncher};
 
-pub type SharedSpawnBroker<L> = Arc<Mutex<SpawnBroker<L>>>;
+pub type SharedSpawnBroker<L> = Arc<SpawnBroker<L>>;
 
 pub async fn serve_unix_socket<L>(
     socket_path: &Path,
@@ -77,10 +77,7 @@ where
         }
         let request: serde_json::Value =
             serde_json::from_str(&line).context("MCP request was not valid JSON")?;
-        let response = {
-            let mut broker = broker.lock().expect("spawn broker mutex poisoned");
-            broker.handle_rpc(&parent_id, &request)
-        };
+        let response = broker.handle_rpc(&parent_id, &request);
         let response = serde_json::to_vec(&response).context("failed to encode MCP response")?;
         write
             .write_all(&response)
@@ -96,7 +93,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -131,11 +128,11 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let broker = Arc::new(Mutex::new(crate::orchestration::SpawnBroker::new(
+        let broker = Arc::new(crate::orchestration::SpawnBroker::new(
             policy,
             "root",
             MockLauncher,
-        )));
+        ));
         let server_socket = socket.clone();
         let server = tokio::spawn(async move {
             let _ = serve_unix_socket(&server_socket, "root".to_owned(), broker).await;
