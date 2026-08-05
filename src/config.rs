@@ -26,7 +26,7 @@ operations_dir = "operations"
 # M10 cooperative execution bounds (replace the old hard wall-clock kill):
 idle_timeout_seconds = 180  # cancel only after this many seconds of total silence
 max_seconds = "none"        # soft total ceiling across all continuations; "none" = no ceiling
-max_continuations = 8       # max auto-resume hops before stopping with needs_user
+max_continuations = 0       # auto-resume hops; 0 = OFF (default). See note: only enable for agents that signal "done" by omitting a resume command
 max_tool_calls = 0          # tool-call budget across the task; 0 = unlimited
 
 [[routes]]
@@ -131,7 +131,11 @@ pub struct Defaults {
     /// never a mid-work kill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_seconds: Option<MaxSeconds>,
-    /// M10 max auto-resume hops (fresh continuation sessions) for one task. Default 8.
+    /// M10 max auto-resume hops (fresh continuation sessions) for one task.
+    /// Default 0 = auto-resume OFF: `resume_command.is_some()` is not a reliable
+    /// "more work" signal (a real agent's session is always resumable), so it is an
+    /// explicit opt-in for workflows whose agent signals "done" by omitting a resume
+    /// command.
     #[serde(default = "default_max_continuations")]
     pub max_continuations: u32,
     /// M10 tool-call budget across the whole task. `0` = unlimited; otherwise, on
@@ -199,7 +203,13 @@ fn default_idle_timeout_seconds() -> u64 {
 }
 
 fn default_max_continuations() -> u32 {
-    8
+    // Auto-resume is OFF by default. The loop's "more work" trigger is
+    // `resume_command.is_some()`, but real headless agents (codex/copilot with a
+    // resume template) produce a resume command on EVERY natural completion — a
+    // session is always resumable — so a non-zero default would loop every task up
+    // to the cap. It is an explicit opt-in for workflows whose agent signals "done"
+    // by OMITTING a resume command.
+    0
 }
 
 impl Defaults {
@@ -935,7 +945,7 @@ args = []
 "#;
         let config: Config = toml::from_str(legacy).expect("legacy config should parse");
         assert_eq!(config.defaults.idle_timeout_seconds, 180);
-        assert_eq!(config.defaults.max_continuations, 8);
+        assert_eq!(config.defaults.max_continuations, 0);
         assert_eq!(config.defaults.max_tool_calls, 0);
         assert_eq!(config.defaults.max_seconds, None);
         // With no explicit `max_seconds`, the deprecated `timeout_seconds` alias
@@ -978,7 +988,7 @@ operations_dir = "operations"
 
         assert_eq!(config.defaults.timeout_seconds, 600);
         assert_eq!(config.defaults.idle_timeout_seconds, 180);
-        assert_eq!(config.defaults.max_continuations, 8);
+        assert_eq!(config.defaults.max_continuations, 0);
         assert_eq!(config.defaults.max_tool_calls, 0);
         // `max_seconds = "none"` ⇒ no soft ceiling, ignoring the deprecated alias.
         assert_eq!(config.defaults.max_seconds, Some(MaxSeconds::Keyword("none".to_owned())));

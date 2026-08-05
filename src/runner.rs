@@ -308,7 +308,13 @@ async fn run_auto_resume_loop(
 
         match single_session_outcome(agent_result, &sid, &log_path, task_path)? {
             Ok(result) => {
-                let more_work = result.resume_command.is_some() && !result.requires_user;
+                // Auto-resume only when explicitly enabled (max_continuations > 0).
+                // A resume command exists after EVERY natural completion (the session
+                // is resumable), so without this gate a normally-finished codex/copilot
+                // run would be treated as "more work" and looped up to the cap.
+                let more_work = bounds.max_continuations > 0
+                    && result.resume_command.is_some()
+                    && !result.requires_user;
                 if more_work && hop < bounds.max_continuations {
                     // Continue: dispatch a FRESH continuation seeded with the
                     // captured resume command; preserve this hop's recap in order.
@@ -1638,6 +1644,37 @@ Help interactively.
             task.frontmatter.agent_session_ids.len() < 20,
             "cumulative budget must stop well before max_continuations; ran {} sessions",
             task.frontmatter.agent_session_ids.len()
+        );
+    }
+
+    /// Regression: with auto-resume OFF (the default `max_continuations = 0`), a
+    /// normally-completed agent whose session is RESUMABLE (`resume_command = Some`,
+    /// exactly what real codex/copilot produce on every completion) is DONE — one
+    /// session marked `pending`, NOT looped to a cap or marked `needs_user`. Guards
+    /// against the resume-capture fix un-masking a spurious multi-hop loop.
+    #[tokio::test]
+    async fn completed_resumable_agent_does_not_loop_when_autoresume_off() {
+        let (task_path, config) = ready_task("run-no-autoresume");
+        assert_eq!(
+            config.defaults.max_continuations, 0,
+            "auto-resume must be off by default"
+        );
+        // Always returns a resume command with requires_user=false — a completed,
+        // resumable session, indistinguishable from "never done" to the old trigger.
+        let client = SleepyMoreWorkClient { hop_ms: 0 };
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
+            .await
+            .expect("single completed run");
+        assert_eq!(
+            outcome.status,
+            TaskStatus::Pending,
+            "a completed resumable session must NOT loop or become needs_user when auto-resume is off"
+        );
+        let task = crate::task::load_task(&task_path).expect("task loads");
+        assert_eq!(
+            task.frontmatter.agent_session_ids.len(),
+            1,
+            "exactly one session — no auto-resume"
         );
     }
 
