@@ -597,9 +597,74 @@ Two knobs are deliberately separate. **`image`/`build`** decides *what tools are
 
 **`microsandbox`** shells to the `msb` CLI (install with the microsandbox project; expects `msb` on `PATH`) and runs the agent inside an **own-kernel microVM** — a stronger inward boundary than docker's shared kernel, plus Windows coverage. It mirrors the docker provider: the same `image`/`build` inputs (a `build` Dockerfile is built via docker into a tag `msb` runs), the same project-only + opt-in merged mounts (`msb --mount HOST:GUEST`, read-only by default), the same resume-capture model (the guest `HOME` lives in VM storage and is `msb cp`-ed out to `~/.varda/sessions/{session_id}` after the run, so the host `$HOME`/credentials are never exposed), and default-deny egress (fully offline with no `egress`; `egress` hosts become per-host `msb` net allow-rules — enforced in-guest, so hostnames/CIDRs are passed directly rather than pre-resolved to IPs as docker requires). The keys never enter the VM, and an OCI image can bake in the agent CLI (e.g. the copilot CLI for the Windows path). *The `msb` argv spellings are centralized in `MicrosandboxSession::wrap`/`extract_session_store`; confirm them against your installed `msb --help` — see the M4 task notes on live verification.*
 
+#### Per-folder `.varda` (untrusted origin) and the hardening floor
+
+A folder can commit its own sandbox choice in a **`.varda`** file. When resolving the sandbox for a task, Varda walks **up** from the task's project/target path to the routing root and uses the **nearest `.varda`**. Precedence:
+
+```
+nearest .varda  →  central route (glob)  →  defaults.sandbox  →  "local"
+```
+
+`.varda` is TOML in one of two forms:
+
+```toml
+# Reference form — select a central [sandboxes.X]:
+sandbox = "rust"
+```
+
+```toml
+# Inline form — a self-contained sandbox:
+[sandbox]
+image = "rust:latest"
+primitive = "docker"
+mounts = ["ctx:/ctx"]        # relative to the .varda dir
+egress = ["crates.io"]
+```
+
+Inline `mounts` join the docker/microsandbox mount merge as a **third origin** (`MountOrigin::Varda`), unioned with the trusted `Sandbox`- and `Route`-origin mounts.
+
+**Hardening floor (security).** Central `config.toml` (routes and `[sandboxes]`) stays **trusted**; a `.varda` is committed alongside possibly-untrusted code, so it is **clamped** — the floor applies **only** to the `.varda` origin (trust-by-origin: the same mount from a `Route` is allowed):
+
+- **No escaping the box.** A `.varda` cannot select `primitive = "local"` unless `defaults.allow_local_varda = true` (default false).
+- **In-tree, read-only mounts.** A `.varda` mount SOURCE must resolve **inside the project root** (out-of-tree / host paths are rejected), and is forced `:ro` unless `defaults.allow_varda_writable_mounts = true`.
+- **Safe target.** A mount TARGET may not be `/`, a system dir (`/etc`, `/usr`, …), nor collide with / shadow the project mount.
+- **Egress ceiling.** If `defaults.egress_ceiling` is set, a `.varda` may not widen egress beyond it.
+- On any violation Varda **refuses to run** with an error naming the offending `.varda` and key.
+
+**Credential-directory denylist (ALL origins, trusted config included).** Any mount whose SOURCE resolves (symlinks followed) into a known secret/identity store is refused regardless of origin: `~/.claude`, `~/.codex`, `~/.copilot`, `~/.aws`, `~/.ssh`, `~/.config/gcloud`, `~/.config/fnox`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.git-credentials`. These carry live LLM tokens **and** cross-project history; mounting one defeats the sandbox and leaks other clients' data.
+
+**Curated identity/context mount (opt-in).** Instead of the denied credential dirs, `defaults.identity_context` lets you mount specific, **read-only FILES** so the agent learns "who the user is" without secrets:
+
+```toml
+[defaults]
+identity_context = ["~/.claude/CLAUDE.md:/root/CLAUDE.md:ro"]
+```
+
+Files only (never a whole dotdir, never `projects/` transcripts); the credential-**filename** denylist still applies, so a `.credentials.json` can never sneak in. This is the identity half only — an auth **token** to actually run the LLM is a separate concern (token-injection + SSH-agent forwarding), never a mounted credential.
+
+#### Isolation invariants (never violate these)
+
+These rules are what make the sandbox meaningful; they also gate the future nested-orchestration broker:
+
+1. **Never mount the docker socket** (`/var/run/docker.sock`) into an agent container — it is equivalent to host root.
+2. **Never mount `~/.varda`** or install the `varda` binary into an agent container — it hands the agent the control plane.
+3. **No `--privileged` and no docker-in-docker** for agent containers.
+4. **Extra mounts default `:ro`; the host `$HOME` is never mounted** — the session store uses a dedicated per-session volume/dir, not a host `$HOME` bind.
+
 Current limitations:
 
 - **Non-interactive runs only.** Starting an interactive or resume session under a non-`local` sandbox returns a clear error (interactive-under-sandbox is a later milestone).
+- **`.varda` resolution wiring.** The `.varda` walk-up, precedence, and hardening floor are implemented and unit-tested in `Config::resolve_sandbox_for`; wiring it into the live task-run path (so a resolved `.varda` selects the provider at launch) is the remaining integration step.
+
+### Isolation invariants (never violate)
+
+These rules are what make the sandbox meaningful; breaking any turns it into theatre:
+
+1. **Never mount the docker socket** (`/var/run/docker.sock`) into an agent container — it is equivalent to host root.
+2. **Never mount `~/.varda`** (the control-plane root: tasks, config, routes, all sessions) or install the `varda` binary into an agent container — it hands the agent the control plane. A single per-session scratch dir is not the root; the docker/microVM providers use a per-session volume + `cp`, not a host bind of `~/.varda`.
+3. **No `--privileged` / no docker-in-docker** for agent containers. Sub-sandboxes are siblings spawned by the host, never nested.
+4. **Never mount credential/identity directories** (`~/.claude`, `~/.codex`, `~/.copilot`, `~/.aws`, `~/.ssh`, `~/.config/gcloud`, `~/.config/fnox`, …) to "authenticate the agent" — they hold live tokens and cross-project history. Pass identity via an injected scoped token + SSH-agent forwarding + a curated read-only profile file instead. Enforced by `CREDENTIAL_DENYLIST` / `check_credential_denylist` across **all** mount origins.
+5. Extra mounts default to read-only; the host `$HOME` is never mounted.
 
 ### Roles
 

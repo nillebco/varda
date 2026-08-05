@@ -3047,6 +3047,7 @@ planner_agent: codex
                 timeout_seconds: 600,
                 operations_dir: operations_dir.display().to_string(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),

@@ -679,6 +679,7 @@ Do the work.
                 timeout_seconds: 600,
                 operations_dir: operations_dir.display().to_string(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![crate::config::Route {
                 glob: "**".to_owned(),
@@ -738,6 +739,7 @@ requires_user: false
                 timeout_seconds: 600,
                 operations_dir: root.join("operations").display().to_string(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
@@ -771,6 +773,7 @@ requires_user: false
                 timeout_seconds: 600,
                 operations_dir: operations_dir.display().to_string(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
@@ -848,6 +851,7 @@ requires_user: false
                 timeout_seconds: 600,
                 operations_dir: root.join("operations").display().to_string(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
@@ -890,6 +894,7 @@ requires_user: false
                 timeout_seconds: 600,
                 operations_dir: root.join("operations").display().to_string(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),

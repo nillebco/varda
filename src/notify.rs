@@ -124,6 +124,7 @@ mod tests {
                 timeout_seconds: 600,
                 operations_dir: root.display().to_string(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![],
             agents: BTreeMap::new(),

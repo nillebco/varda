@@ -28,7 +28,179 @@ pub enum MountOrigin {
     Sandbox,
     /// Project-context `Route.mounts` — tied to the code↔context mapping.
     Route,
-    // M6b: Varda — untrusted `.varda` origin; will be clamped by a floor.
+    /// Folder-local, repo-committed `.varda` origin. UNTRUSTED (attacker-
+    /// influenceable on untrusted code): every `Varda` mount is clamped by the
+    /// hardening floor ([`harden_varda_mount`]) before it can be applied.
+    #[allow(dead_code)]
+    Varda,
+}
+
+/// Known secret/identity store directories, relative to `$HOME`. A mount whose
+/// SOURCE resolves into any of these is refused **regardless of origin** (the
+/// trusted central config included): they carry live LLM tokens AND cross-project
+/// history, so mounting one defeats the sandbox and leaks other clients' data.
+/// The sanctioned alternative is a curated identity FILE mount (see
+/// `defaults.identity_context`).
+pub const CREDENTIAL_DENYLIST: &[&str] = &[
+    ".claude",
+    ".codex",
+    ".copilot",
+    ".aws",
+    ".ssh",
+    ".config/gcloud",
+    ".config/fnox",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".netrc",
+    ".git-credentials",
+];
+
+/// Credential FILENAMES that may never be mounted even as a "curated identity"
+/// file — the escape hatch that lets `identity_context` point at a specific file
+/// inside an otherwise-denylisted dir (e.g. `~/.claude/CLAUDE.md`) must not become
+/// a way to smuggle live tokens out.
+#[allow(dead_code)]
+pub const CREDENTIAL_FILENAMES: &[&str] = &[
+    ".credentials.json",
+    "credentials",
+    ".netrc",
+    ".git-credentials",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+];
+
+/// System / OS directories a mount TARGET may never be (nor sit under). Shadowing
+/// these inside the container is a sandbox-integrity break.
+#[allow(dead_code)]
+pub const SYSTEM_TARGET_DIRS: &[&str] = &[
+    "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev",
+    "/proc", "/sys", "/var", "/root",
+];
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Best-effort symlink resolution for prefix matching; falls back to the path as
+/// written when it does not yet exist on the host.
+fn resolve_symlinks(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Refuse a mount whose SOURCE resolves into a known credential/identity store.
+/// Applies to ALL origins (trust-independent). Symlink-resolved prefix match.
+pub fn check_credential_denylist(source: &Path) -> Result<()> {
+    let Some(home) = home_dir() else {
+        return Ok(());
+    };
+    let resolved = resolve_symlinks(source);
+    for entry in CREDENTIAL_DENYLIST {
+        let denied = resolve_symlinks(&home.join(entry));
+        if resolved == denied || resolved.starts_with(&denied) {
+            bail!(
+                "refusing mount source '{}': it resolves into the credential/identity store '{}' \
+                 (denylisted for ALL origins — mounting it leaks live tokens and cross-project history; \
+                 use `defaults.identity_context` for a curated read-only identity file instead)",
+                source.display(),
+                home.join(entry).display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate a single curated identity mount (`defaults.identity_context` entry):
+/// it must be a specific FILE (never a directory), read-only, and never a known
+/// credential filename — even though it is allowed to live inside an otherwise
+/// denylisted dir (e.g. `~/.claude/CLAUDE.md`).
+#[allow(dead_code)]
+pub fn check_identity_context_mount(source: &Path, writable: bool) -> Result<()> {
+    if writable {
+        bail!(
+            "identity_context mount '{}' must be read-only (:ro)",
+            source.display()
+        );
+    }
+    if source.is_dir() {
+        bail!(
+            "identity_context mount '{}' must be a specific FILE, never a directory \
+             (a whole dotdir/`projects/` transcript tree is forbidden)",
+            source.display()
+        );
+    }
+    if let Some(name) = source.file_name().and_then(|n| n.to_str())
+        && CREDENTIAL_FILENAMES.contains(&name)
+    {
+        bail!(
+            "identity_context mount '{}' is a credential file and may never be mounted",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+/// Clamp a single UNTRUSTED `.varda` mount against the hardening floor. Returns the
+/// (possibly mode-adjusted) [`MountSpec`] to apply, or an error naming the offending
+/// key. `varda_file` is the path of the offending `.varda` for the error message.
+///
+/// Enforced (only for the `.varda` origin — trusted `Route`/`Sandbox` mounts skip
+/// this, trust-by-origin):
+/// - SOURCE must resolve INSIDE `project_root` (no out-of-tree / host paths).
+/// - SOURCE is also subject to the credential denylist (checked by the caller for
+///   all origins).
+/// - forced `:ro` unless `allow_writable`.
+/// - TARGET may not be `/`, a system dir, nor collide with / shadow the project
+///   mount at `project_root`.
+#[allow(dead_code)]
+pub fn harden_varda_mount(
+    spec: &MountSpec,
+    project_root: &Path,
+    allow_writable: bool,
+    varda_file: &Path,
+) -> Result<MountSpec> {
+    let source = expand_mount_path(&spec.source, project_root);
+    let resolved_source = resolve_symlinks(&source);
+    let resolved_root = resolve_symlinks(project_root);
+    if !resolved_source.starts_with(&resolved_root) {
+        bail!(
+            "`.varda` at {} declares mount source '{}' outside the project root {} \
+             (untrusted `.varda` mounts must stay in-tree)",
+            varda_file.display(),
+            source.display(),
+            project_root.display()
+        );
+    }
+
+    let target = expand_mount_path(&spec.target, project_root);
+    let target_str = target.to_string_lossy();
+    for sysdir in SYSTEM_TARGET_DIRS {
+        let sysdir_path = Path::new(sysdir);
+        if target.as_path() == sysdir_path || (*sysdir != "/" && target.starts_with(sysdir_path)) {
+            bail!(
+                "`.varda` at {} declares mount target '{target_str}' which is (or is under) the \
+                 system dir '{sysdir}' — forbidden",
+                varda_file.display()
+            );
+        }
+    }
+    if target == resolved_root || target == project_root {
+        bail!(
+            "`.varda` at {} declares mount target '{target_str}' that collides with the project \
+             mount {} — forbidden (it would shadow the project)",
+            varda_file.display(),
+            project_root.display()
+        );
+    }
+
+    let writable = spec.writable && allow_writable;
+    Ok(MountSpec {
+        source: spec.source.clone(),
+        target: spec.target.clone(),
+        writable,
+    })
 }
 
 /// A parsed mount request: a host `source` bind-mounted at `target` inside the
@@ -625,6 +797,9 @@ impl SandboxSession for DockerSession {
                 .with_context(|| format!("invalid mount '{raw}' for sandbox '{}'", self.image))?;
             let source = expand_mount_path(&spec.source, &self.project_root);
             let target = expand_mount_path(&spec.target, &self.project_root);
+            // Credential/identity-store denylist applies to ALL origins (trusted
+            // config included): these carry live tokens and cross-project history.
+            check_credential_denylist(&source)?;
             if !seen_targets.insert(target.clone()) {
                 continue;
             }
@@ -2116,5 +2291,54 @@ mod tests {
             "hi",
             "the session store must round-trip container→host via the volume + docker cp"
         );
+    }
+
+    #[test]
+    fn credential_denylist_rejects_secret_dirs_all_origins() {
+        let home = std::env::var("HOME").expect("HOME set in tests");
+        for entry in ["/.aws", "/.ssh", "/.claude", "/.config/gcloud"] {
+            let src = PathBuf::from(format!("{home}{entry}"));
+            assert!(
+                check_credential_denylist(&src).is_err(),
+                "expected {entry} to be denied"
+            );
+        }
+        // A neutral path is allowed.
+        assert!(check_credential_denylist(Path::new("/tmp/somewhere")).is_ok());
+    }
+
+    #[test]
+    fn identity_context_requires_readonly_file_and_no_creds() {
+        // A credential filename is refused even as a curated identity mount.
+        assert!(
+            check_identity_context_mount(Path::new("/home/u/.claude/.credentials.json"), false)
+                .is_err()
+        );
+        // Writable is refused.
+        assert!(check_identity_context_mount(Path::new("/tmp/CLAUDE.md"), true).is_err());
+        // A read-only non-credential file is accepted (path need not exist here).
+        assert!(check_identity_context_mount(Path::new("/tmp/CLAUDE.md"), false).is_ok());
+    }
+
+    #[test]
+    fn harden_rejects_project_collision_and_forces_ro() {
+        let root = std::env::temp_dir().join(format!("varda-harden-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(root.join("ctx"));
+        // TARGET colliding with the project root is refused.
+        let colliding = MountSpec {
+            source: root.join("ctx"),
+            target: root.clone(),
+            writable: false,
+        };
+        assert!(harden_varda_mount(&colliding, &root, false, Path::new("/x/.varda")).is_err());
+        // Writable clamped to read-only when not allowed.
+        let ok = MountSpec {
+            source: root.join("ctx"),
+            target: PathBuf::from("/ctx"),
+            writable: true,
+        };
+        let out = harden_varda_mount(&ok, &root, false, Path::new("/x/.varda")).unwrap();
+        assert!(!out.writable);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

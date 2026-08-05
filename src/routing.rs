@@ -101,6 +101,13 @@ pub fn match_route_for_task(
     })
 }
 
+/// Public glob-route lookup used by [`crate::config::Config::resolve_sandbox_for`]
+/// to read the central (trusted) route's sandbox name and mounts.
+#[allow(dead_code)]
+pub fn find_route_public<'a>(config: &'a Config, project_path: &Path) -> Result<&'a Route> {
+    find_route(config, project_path)
+}
+
 fn find_route<'a>(config: &'a Config, project_path: &Path) -> Result<&'a Route> {
     let mut builder = GlobSetBuilder::new();
 
@@ -348,6 +355,7 @@ mod tests {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![
                 Route {
@@ -411,6 +419,7 @@ mod tests {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![
                 Route {
@@ -495,6 +504,7 @@ mod tests {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![Route {
                 glob: "**".to_owned(),
@@ -534,6 +544,7 @@ mod tests {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![Route {
                 glob: "**".to_owned(),
@@ -609,6 +620,7 @@ mod tests {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![Route {
                 glob: "**".to_owned(),

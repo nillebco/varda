@@ -991,6 +991,7 @@ Help interactively.
                 timeout_seconds: 600,
                 operations_dir,
                 sandbox: None,
+                ..Default::default()
             },
             routes: vec![Route {
                 glob: "**".to_owned(),

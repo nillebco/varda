@@ -99,13 +99,41 @@ pub struct RoleConfig {
     pub instructions: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Defaults {
     pub timeout_seconds: u64,
     pub operations_dir: String,
     /// Default sandbox provider applied to routes that do not set their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
+    /// M6b hardening floor knobs — all clamp the UNTRUSTED `.varda` origin only;
+    /// the central `config.toml` (routes/sandboxes) stays trusted.
+    ///
+    /// Allow a `.varda` to select `primitive = "local"` (escape the box). Default
+    /// false: an attacker-influenceable `.varda` must never opt out of isolation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_local_varda: bool,
+    /// Allow a `.varda` mount to be writable. Default false: `.varda` mounts are
+    /// forced `:ro`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_varda_writable_mounts: bool,
+    /// Egress ceiling: if set, a `.varda` may not widen egress beyond this host
+    /// allow-list. `None` ⇒ no ceiling clamp (still bounded by the trusted route).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_ceiling: Option<Vec<String>>,
+    /// Curated, READ-ONLY identity/context mounts — the sanctioned way to tell the
+    /// agent "who the user is" WITHOUT mounting credential dirs. Each entry is a
+    /// specific FILE (never a dir) following the `source[:target][:mode]` grammar,
+    /// e.g. `"~/.claude/CLAUDE.md:/root/CLAUDE.md:ro"`. The credential-file denylist
+    /// still applies so a `.credentials.json` can never sneak in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_context: Vec<String>,
+}
+
+/// serde `skip_serializing_if` helper: omit `false` booleans so the default
+/// config round-trips without emitting the new hardening keys.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +177,236 @@ pub struct SandboxConfig {
 /// Default isolation primitive when a `[sandboxes.<name>]` entry omits one.
 pub fn default_primitive() -> String {
     "docker".to_owned()
+}
+
+/// Filename of the folder-local, repo-committed (UNTRUSTED) sandbox config.
+//
+// M6b seam: parsed + hardened here and unit-tested; the live wiring of
+// [`Config::resolve_sandbox_for`] into the task run path is a follow-up, so the
+// resolution chain carries `#[allow(dead_code)]` like the other sandbox-milestone
+// seams (`SandboxContext`, `DEFAULT_SANDBOX_PROVIDER`).
+#[allow(dead_code)]
+pub const VARDA_FILE: &str = ".varda";
+
+/// A parsed `.varda` file. It carries a single `sandbox` key that is EITHER a
+/// reference to a central `[sandboxes.X]` (string) OR an inline, self-contained
+/// `[sandbox]` block (table). UNTRUSTED — always clamped by the M6b hardening
+/// floor via [`resolve_sandbox_for`] before use.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct VardaFile {
+    pub sandbox: VardaSandbox,
+}
+
+/// The two forms a `.varda` `sandbox` value may take.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+#[allow(dead_code)]
+pub enum VardaSandbox {
+    /// `sandbox = "rust"` — select a central `[sandboxes.rust]`.
+    Reference(String),
+    /// `[sandbox]` block — a self-contained sandbox definition.
+    Inline(SandboxConfig),
+}
+
+/// The fully-resolved sandbox for a task path, after walk-up + precedence +
+/// (for the untrusted `.varda` origin) the hardening floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ResolvedSandbox {
+    /// Effective sandbox name: a central name, `"inline"` for an inline `.varda`,
+    /// or `"local"`.
+    pub name: String,
+    /// Effective sandbox config (central table entry, inline `.varda`, or a
+    /// synthetic `local`).
+    pub config: SandboxConfig,
+    /// Trusted project-context route mounts (origin `Route`).
+    pub route_mounts: Vec<String>,
+    /// UNTRUSTED, already-hardened `.varda` inline mounts (origin `Varda`), each a
+    /// `source:target:mode` string ready to apply (source made absolute, forced
+    /// `:ro` unless allowed).
+    pub varda_mounts: Vec<String>,
+    /// Path of the `.varda` that supplied the config, when one was used.
+    pub varda_file: Option<PathBuf>,
+}
+
+/// Walk UP from `start` (inclusive) to `routing_root` (inclusive) and return the
+/// nearest existing `.varda` file. `None` when none is found in range.
+#[allow(dead_code)]
+pub fn find_nearest_varda(start: &Path, routing_root: &Path) -> Option<PathBuf> {
+    let mut dir = if start.is_file() {
+        start.parent()?
+    } else {
+        start
+    };
+    loop {
+        let candidate = dir.join(VARDA_FILE);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir == routing_root {
+            return None;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return None,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl Config {
+    /// Resolve the effective sandbox for a task at `project_path`, honoring the
+    /// precedence `nearest .varda → central route (glob) → defaults.sandbox →
+    /// "local"` and clamping the untrusted `.varda` origin with the M6b hardening
+    /// floor. `routing_root` bounds the upward `.varda` walk.
+    pub fn resolve_sandbox_for(
+        &self,
+        project_path: &Path,
+        routing_root: &Path,
+    ) -> Result<ResolvedSandbox> {
+        // Trusted baseline from the central route: its glob-selected sandbox name
+        // and project-context mounts. Used directly when no `.varda` applies.
+        let route = crate::routing::find_route_public(self, project_path).ok();
+        let route_mounts = route.map(|r| r.mounts.clone()).unwrap_or_default();
+        let central_name = route
+            .and_then(|r| r.sandbox.clone())
+            .or_else(|| self.defaults.sandbox.clone())
+            .unwrap_or_else(|| DEFAULT_SANDBOX_PROVIDER.to_owned());
+
+        let Some(varda_path) = find_nearest_varda(project_path, routing_root) else {
+            let config = self.sandbox_config_by_name(&central_name);
+            return Ok(ResolvedSandbox {
+                name: central_name,
+                config,
+                route_mounts,
+                varda_mounts: Vec::new(),
+                varda_file: None,
+            });
+        };
+
+        let text = fs::read_to_string(&varda_path)
+            .with_context(|| format!("failed to read `.varda` at {}", varda_path.display()))?;
+        let parsed: VardaFile = toml::from_str(&text)
+            .with_context(|| format!("failed to parse `.varda` at {}", varda_path.display()))?;
+        let varda_dir = varda_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        match parsed.sandbox {
+            VardaSandbox::Reference(name) => {
+                let config = self.sandbox_config_by_name(&name);
+                self.enforce_varda_primitive_floor(&config.primitive, &varda_path)?;
+                Ok(ResolvedSandbox {
+                    name,
+                    config,
+                    route_mounts,
+                    varda_mounts: Vec::new(),
+                    varda_file: Some(varda_path),
+                })
+            }
+            VardaSandbox::Inline(config) => {
+                self.enforce_varda_primitive_floor(&config.primitive, &varda_path)?;
+                self.enforce_egress_ceiling(&config.egress, &varda_path)?;
+                let varda_mounts =
+                    self.harden_inline_varda_mounts(&config.mounts, project_path, &varda_dir, &varda_path)?;
+                let config = SandboxConfig {
+                    mounts: Vec::new(),
+                    ..config
+                };
+                Ok(ResolvedSandbox {
+                    name: "inline".to_owned(),
+                    config,
+                    route_mounts,
+                    varda_mounts,
+                    varda_file: Some(varda_path),
+                })
+            }
+        }
+    }
+
+    fn sandbox_config_by_name(&self, name: &str) -> SandboxConfig {
+        if name == DEFAULT_SANDBOX_PROVIDER {
+            return SandboxConfig {
+                primitive: DEFAULT_SANDBOX_PROVIDER.to_owned(),
+                ..SandboxConfig::default()
+            };
+        }
+        self.sandboxes.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Floor: an untrusted `.varda` may not select `primitive = "local"` (escape
+    /// the box) unless `defaults.allow_local_varda`.
+    fn enforce_varda_primitive_floor(&self, primitive: &str, varda_file: &Path) -> Result<()> {
+        if primitive == "local" && !self.defaults.allow_local_varda {
+            bail!(
+                "`.varda` at {} selects `primitive = \"local\"` (escapes the sandbox); \
+                 refused unless `defaults.allow_local_varda = true`",
+                varda_file.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Floor: an untrusted `.varda` may not widen egress beyond
+    /// `defaults.egress_ceiling` (when set).
+    fn enforce_egress_ceiling(&self, egress: &[String], varda_file: &Path) -> Result<()> {
+        if let Some(ceiling) = &self.defaults.egress_ceiling {
+            for host in egress {
+                if !ceiling.iter().any(|allowed| allowed == host) {
+                    bail!(
+                        "`.varda` at {} requests egress host '{host}' beyond `defaults.egress_ceiling`",
+                        varda_file.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Floor: harden each inline `.varda` mount (in-tree SOURCE, credential
+    /// denylist, forced `:ro` unless allowed, safe TARGET) and return them as
+    /// ready-to-apply `source:target:mode` strings.
+    fn harden_inline_varda_mounts(
+        &self,
+        mounts: &[String],
+        project_root: &Path,
+        varda_dir: &Path,
+        varda_file: &Path,
+    ) -> Result<Vec<String>> {
+        let mut out = Vec::with_capacity(mounts.len());
+        for raw in mounts {
+            let spec = crate::sandbox::parse_mount(raw)
+                .with_context(|| format!("invalid `.varda` mount '{raw}' in {}", varda_file.display()))?;
+            // `.varda` mount paths are relative to the `.varda` dir, not the
+            // project root; make SOURCE absolute against `varda_dir` first.
+            let source = if spec.source.is_absolute() {
+                spec.source.clone()
+            } else {
+                varda_dir.join(&spec.source)
+            };
+            crate::sandbox::check_credential_denylist(&source)?;
+            let abs_spec = crate::sandbox::MountSpec {
+                source,
+                target: spec.target.clone(),
+                writable: spec.writable,
+            };
+            let hardened = crate::sandbox::harden_varda_mount(
+                &abs_spec,
+                project_root,
+                self.defaults.allow_varda_writable_mounts,
+                varda_file,
+            )?;
+            let mode = if hardened.writable { "rw" } else { "ro" };
+            out.push(format!(
+                "{}:{}:{mode}",
+                hardened.source.display(),
+                hardened.target.display()
+            ));
+        }
+        Ok(out)
+    }
 }
 
 impl Default for SandboxConfig {
@@ -728,5 +986,172 @@ mod tests {
 
         assert!(root.join(".git").exists());
         fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+}
+
+#[cfg(test)]
+mod m6b_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("varda-m6b-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn base_config() -> Config {
+        let mut c: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        c.routes = vec![Route {
+            glob: "**".to_owned(),
+            agents: vec!["codex".to_owned()],
+            sandbox: None,
+            mounts: vec![],
+        }];
+        c
+    }
+
+    #[test]
+    fn walk_up_finds_nearest_varda() {
+        let root = tmp("walkup");
+        let nested = root.join("a/b/c");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("a").join(VARDA_FILE), "sandbox = \"rust\"\n").unwrap();
+        fs::write(nested.join(VARDA_FILE), "sandbox = \"go\"\n").unwrap();
+
+        let found = find_nearest_varda(&nested, &root).unwrap();
+        assert_eq!(found, nested.join(VARDA_FILE));
+
+        // From the middle dir the higher `.varda` is the nearest.
+        let mid = root.join("a/b");
+        assert_eq!(
+            find_nearest_varda(&mid, &root).unwrap(),
+            root.join("a").join(VARDA_FILE)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reference_and_central_precedence() {
+        let root = tmp("ref");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let mut config = base_config();
+        config.sandboxes.insert(
+            "rust".to_owned(),
+            SandboxConfig {
+                image: Some("rust:latest".to_owned()),
+                ..SandboxConfig::default()
+            },
+        );
+
+        // No `.varda` ⇒ central route/defaults ⇒ "local".
+        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        assert_eq!(r.name, "local");
+        assert!(r.varda_file.is_none());
+
+        // Reference `.varda` selects the central sandbox by name.
+        fs::write(proj.join(VARDA_FILE), "sandbox = \"rust\"\n").unwrap();
+        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        assert_eq!(r.name, "rust");
+        assert_eq!(r.config.image.as_deref(), Some("rust:latest"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inline_varda_mount_is_hardened_and_ro() {
+        let root = tmp("inline");
+        let proj = root.join("proj");
+        fs::create_dir_all(proj.join("ctx")).unwrap();
+        let config = base_config();
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\nmounts = [\"ctx:/ctx\"]\n",
+        )
+        .unwrap();
+
+        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        assert_eq!(r.name, "inline");
+        assert_eq!(r.varda_mounts.len(), 1);
+        // Forced :ro (writable not allowed by default) and source made absolute.
+        assert!(r.varda_mounts[0].ends_with(":/ctx:ro"));
+        assert!(r.varda_mounts[0].starts_with(proj.join("ctx").to_str().unwrap()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn floor_rejects_local_primitive() {
+        let root = tmp("local");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let config = base_config();
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\nprimitive = \"local\"\n",
+        )
+        .unwrap();
+        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        assert!(err.to_string().contains("primitive"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn floor_rejects_out_of_tree_source() {
+        let root = tmp("outoftree");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let config = base_config();
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\nmounts = [\"/etc:/data\"]\n",
+        )
+        .unwrap();
+        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        assert!(err.to_string().contains("outside the project root"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn floor_rejects_system_target_and_egress_over_ceiling() {
+        let root = tmp("systgt");
+        let proj = root.join("proj");
+        fs::create_dir_all(proj.join("ctx")).unwrap();
+        let config = base_config();
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\nmounts = [\"ctx:/etc\"]\n",
+        )
+        .unwrap();
+        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        assert!(err.to_string().contains("system dir"), "{err}");
+
+        // Egress ceiling clamp.
+        let mut config = base_config();
+        config.defaults.egress_ceiling = Some(vec!["api.ok.com".to_owned()]);
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\negress = [\"evil.example.com\"]\n",
+        )
+        .unwrap();
+        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        assert!(err.to_string().contains("egress_ceiling"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn writable_varda_mount_allowed_when_opted_in() {
+        let root = tmp("writable");
+        let proj = root.join("proj");
+        fs::create_dir_all(proj.join("ctx")).unwrap();
+        let mut config = base_config();
+        config.defaults.allow_varda_writable_mounts = true;
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\nmounts = [\"ctx:/ctx:rw\"]\n",
+        )
+        .unwrap();
+        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        assert!(r.varda_mounts[0].ends_with(":/ctx:rw"), "{:?}", r.varda_mounts);
+        let _ = fs::remove_dir_all(&root);
     }
 }
