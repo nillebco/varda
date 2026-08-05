@@ -515,6 +515,22 @@ pub struct CommandSpec {
     pub cwd: Option<PathBuf>,
 }
 
+/// How an agent subprocess is launched (M13a §1). This is *how you launch*, not
+/// part of the command data, so it is a `wrap()` parameter rather than a
+/// [`CommandSpec`] field.
+///
+/// - [`Batch`](LaunchMode::Batch): the prompt is fed on stdin, stdout is captured
+///   for the recap, and there is no TTY. This is the pre-M13a behavior.
+/// - [`Interactive`](LaunchMode::Interactive): a TTY is attached to the user's
+///   terminal (docker `-it`, `msb -t`). For docker this is a DIFFERENT LIFECYCLE
+///   (`create` → `docker cp` → `start -ai`), driven via
+///   [`SandboxSession::begin_interactive`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    Batch,
+    Interactive,
+}
+
 /// Read-only context describing the task being launched.
 ///
 /// `route_glob`, `agent_kind`, and `session_id` are threaded through for
@@ -537,7 +553,39 @@ pub trait SandboxProvider: Send + Sync {
 #[async_trait]
 pub trait SandboxSession: Send + Sync {
     /// Rewrite a resolved command for execution inside this sandbox.
-    fn wrap(&self, spec: CommandSpec) -> Result<CommandSpec>;
+    ///
+    /// `mode` selects the launch contract (M13a §1): [`LaunchMode::Batch`] keeps
+    /// the pre-M13a stdin/stdout pipe form; [`LaunchMode::Interactive`] emits the
+    /// TTY form (docker `-it` + `create`, `msb -t`). For docker, Interactive
+    /// returns the `docker create …` invocation; the actual TTY-attached process
+    /// is produced by [`begin_interactive`](Self::begin_interactive).
+    fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec>;
+    /// Stage a host-provided file so it is visible INSIDE the guest before the
+    /// interactive process starts (M13a §3, §5). Returns the guest-visible path
+    /// the caller should advertise (e.g. via `VARDA_PROMPT_FILE`).
+    ///
+    /// Providers differ in *when* the copy lands: msb records it for a pre-boot
+    /// `--copy-file` (emitted by [`wrap`](Self::wrap)); docker records it for a
+    /// `docker cp` performed between `create` and `start` (in
+    /// [`begin_interactive`](Self::begin_interactive)); local just writes a host
+    /// temp whose path is already guest-visible. The default implements the local
+    /// behavior.
+    fn stage_file(&self, content: &str, _guest_path: &str) -> Result<String> {
+        let name = format!("varda-stage-{}", staged_temp_suffix(content));
+        let tmp = std::env::temp_dir().join(name);
+        std::fs::write(&tmp, content)
+            .with_context(|| format!("failed to stage file {}", tmp.display()))?;
+        Ok(tmp.display().to_string())
+    }
+    /// Drive a provider-specific interactive launch lifecycle and return the FINAL
+    /// command the caller spawns with the user's TTY inherited (M13a §2). `wrapped`
+    /// is the output of `wrap(.., Interactive)`. The default returns it unchanged
+    /// (local / msb, whose interactive command is spawned directly). Docker
+    /// overrides this to run `docker create`, `docker cp` the staged files, and
+    /// return `docker start -ai <container>`.
+    async fn begin_interactive(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
+        Ok(wrapped)
+    }
     /// Filesystem root under which the agent's own session store lives, when it
     /// is reachable from the host. `None` degrades resume-capture (M1 docker).
     ///
@@ -586,7 +634,11 @@ pub struct LocalSession;
 
 #[async_trait]
 impl SandboxSession for LocalSession {
-    fn wrap(&self, spec: CommandSpec) -> Result<CommandSpec> {
+    fn wrap(&self, spec: CommandSpec, _mode: LaunchMode) -> Result<CommandSpec> {
+        // Identity provider: the invocation is unchanged for BOTH modes, so the
+        // un-sandboxed interactive path is byte-for-byte the pre-M13a host
+        // behavior (M13a §2 local requirement). The host temp staged by the
+        // default `stage_file` is already guest-visible, so no rewrite is needed.
         Ok(spec)
     }
 
@@ -813,6 +865,7 @@ impl SandboxProvider for DockerProvider {
             container: format!("varda-sbx-{handle}"),
             home: "/home/agent".to_owned(),
             identity: self.identity.clone(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         }))
     }
 }
@@ -828,6 +881,18 @@ fn varda_sessions_root() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".varda")))
         .unwrap_or_else(|| PathBuf::from(".varda"));
     base.join("sessions")
+}
+
+/// Deterministic-per-content filename suffix for a staged temp file. Avoids
+/// `rand`/time (unavailable in some contexts) while keeping distinct contents in
+/// distinct files: a short FNV-1a hash of the content.
+fn staged_temp_suffix(content: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in content.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x00000100000001B3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Sanitize a session id into a docker-safe name/volume component.
@@ -889,11 +954,15 @@ pub struct DockerSession {
     /// M11 identity/auth channels applied at wrap time (curated identity file
     /// mounts, SSH-agent socket forward, git identity + scoped auth token env).
     identity: SandboxIdentity,
+    /// Interactive prompt/identity files staged via [`stage_file`], as
+    /// `(host_temp, guest_path)`. `docker cp`-ed into the container between
+    /// `create` and `start` by [`begin_interactive`] (M13a §2/§3). Empty for batch.
+    staged_files: std::sync::Mutex<Vec<(PathBuf, String)>>,
 }
 
 #[async_trait]
 impl SandboxSession for DockerSession {
-    fn wrap(&self, spec: CommandSpec) -> Result<CommandSpec> {
+    fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec> {
         // Mount the project at the SAME absolute path inside the container so
         // that `{project}`-style path expansions stay valid, and run there.
         let proj = self.project_root.display().to_string();
@@ -903,8 +972,19 @@ impl SandboxSession for DockerSession {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| proj.clone());
 
+        // Interactive is a DIFFERENT LIFECYCLE, not just `-it` (M13a §2): the
+        // run-time HOME is a named volume the host session store is only populated
+        // from AFTER the run, and a host bind of `~/.varda` hits the Colima-
+        // visibility trap. So Interactive builds `docker create … -it …` (NOT
+        // `run`): the container is created, the prompt is `docker cp`-ed in, and
+        // `begin_interactive` attaches the user's TTY via `docker start -ai`.
+        // Batch keeps the streaming `docker run -i` form unchanged.
+        let (verb, tty_flag) = match mode {
+            LaunchMode::Batch => ("run", "-i"),
+            LaunchMode::Interactive => ("create", "-it"),
+        };
         let mut args = vec![
-            "run".to_owned(),
+            verb.to_owned(),
             // A stable per-session name so we can `docker cp` the session store
             // out and `docker rm` the container in teardown. NOTE: we deliberately
             // do NOT pass `--rm` — the container must outlive its process exit so
@@ -914,8 +994,9 @@ impl SandboxSession for DockerSession {
             // `--init` reaps the container's PID 1 so a killed/dropped `docker`
             // client (timeout, kill_on_drop) still stops the container cleanly.
             "--init".to_owned(),
-            // `-i` keeps stdin open so the prompt-then-EOF still reaches the agent.
-            "-i".to_owned(),
+            // Batch: `-i` keeps stdin open so the prompt-then-EOF still reaches the
+            // agent. Interactive: `-it` also allocates a TTY for the attached shell.
+            tty_flag.to_owned(),
             "--network".to_owned(),
         ];
         if self.egress_pins.is_empty() {
@@ -1029,6 +1110,65 @@ impl SandboxSession for DockerSession {
             args,
             // The docker CLI itself inherits the host env (needs PATH, DOCKER_HOST…);
             // the container env is fully specified by the `-e` flags above.
+            env: BTreeMap::new(),
+            cwd: None,
+        })
+    }
+
+    fn stage_file(&self, content: &str, guest_path: &str) -> Result<String> {
+        // Write the content to a host temp now, but DEFER the copy: the container
+        // does not exist until `begin_interactive` runs `docker create`. Record
+        // the (host_temp, guest_path) pair so `begin_interactive` can `docker cp`
+        // it between `create` and `start`. Return the guest path for VARDA_PROMPT_FILE.
+        let tmp = std::env::temp_dir().join(format!("varda-stage-{}", staged_temp_suffix(content)));
+        std::fs::write(&tmp, content)
+            .with_context(|| format!("failed to stage file {}", tmp.display()))?;
+        self.staged_files
+            .lock()
+            .expect("staged_files mutex poisoned")
+            .push((tmp, guest_path.to_owned()));
+        Ok(guest_path.to_owned())
+    }
+
+    async fn begin_interactive(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
+        // `wrapped` is `docker create … -it …`. Run it to create (but not start)
+        // the container, then `docker cp` every staged file into it, then return
+        // the `docker start -ai <container>` command whose TTY the caller attaches
+        // to the user's terminal. Teardown/extract reuse the batch container/volume.
+        let output = tokio::process::Command::new(&wrapped.program)
+            .args(&wrapped.args)
+            .output()
+            .await
+            .with_context(|| format!("failed to run `docker create` for '{}'", self.container))?;
+        if !output.status.success() {
+            bail!(
+                "`docker create` for '{}' failed with status {}; stderr: {}",
+                self.container,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let staged = std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"));
+        for (host_temp, guest_path) in staged {
+            let src = host_temp.display().to_string();
+            let dst = format!("{}:{guest_path}", self.container);
+            let output = tokio::process::Command::new("docker")
+                .args(["cp", &src, &dst])
+                .output()
+                .await
+                .with_context(|| format!("failed to `docker cp {src} {dst}`"))?;
+            if !output.status.success() {
+                bail!(
+                    "`docker cp {src} {dst}` failed with status {}; stderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let _ = std::fs::remove_file(&host_temp);
+        }
+        Ok(CommandSpec {
+            program: "docker".to_owned(),
+            args: vec!["start".to_owned(), "-ai".to_owned(), self.container.clone()],
             env: BTreeMap::new(),
             cwd: None,
         })
@@ -1239,6 +1379,7 @@ impl SandboxProvider for MicrosandboxProvider {
             sandbox: format!("varda-sbx-{handle}"),
             home: "/home/agent".to_owned(),
             identity: self.identity.clone(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         }))
     }
 }
@@ -1258,11 +1399,15 @@ pub struct MicrosandboxSession {
     home: String,
     /// M11 identity/auth channels applied at wrap time.
     identity: SandboxIdentity,
+    /// Interactive files staged via [`stage_file`], as `(host_temp, guest_path)`.
+    /// Emitted as pre-boot `--copy-file host:guest` flags by [`wrap`] in
+    /// Interactive mode (M13a §2/§3). Empty for batch.
+    staged_files: std::sync::Mutex<Vec<(PathBuf, String)>>,
 }
 
 #[async_trait]
 impl SandboxSession for MicrosandboxSession {
-    fn wrap(&self, spec: CommandSpec) -> Result<CommandSpec> {
+    fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec> {
         // Mount the project at the SAME absolute path inside the guest so
         // `{project}`-style expansions stay valid, and run there.
         let proj = self.project_root.display().to_string();
@@ -1275,12 +1420,23 @@ impl SandboxSession for MicrosandboxSession {
         // `msb run` creates a sandbox from an image and runs a command in it,
         // streaming stdio like `docker run -i` (stdin reaches the guest, stdout
         // is captured, exit code propagates). A stable `--name` lets teardown
-        // `msb cp`/`stop`/`rm` the same sandbox.
+        // `msb cp`/`stop`/`rm` the same sandbox. Interactive adds `-t` (allocate a
+        // TTY) and pre-boot `--copy-file` flags for any staged prompt/identity
+        // files (M13a §2/§3) — msb has a native pre-boot copy, so unlike docker no
+        // create/cp/start dance is needed.
         let mut args = vec![
             "run".to_owned(),
             "--name".to_owned(),
             self.sandbox.clone(),
         ];
+        if matches!(mode, LaunchMode::Interactive) {
+            args.push("-t".to_owned());
+            let staged = self.staged_files.lock().expect("staged_files mutex poisoned");
+            for (host_temp, guest_path) in staged.iter() {
+                args.push("--copy-file".to_owned());
+                args.push(format!("{}:{guest_path}", host_temp.display()));
+            }
+        }
 
         // Egress: empty ⇒ fully offline; non-empty ⇒ default-deny plus an allow
         // rule per host. `msb` enforces net policy in-guest (own-kernel), so
@@ -1384,6 +1540,20 @@ impl SandboxSession for MicrosandboxSession {
             env: BTreeMap::new(),
             cwd: None,
         })
+    }
+
+    fn stage_file(&self, content: &str, guest_path: &str) -> Result<String> {
+        // Write the content to a host temp and record it so `wrap(.., Interactive)`
+        // can emit a pre-boot `--copy-file host:guest` flag (msb copies it in
+        // before the guest boots). Return the guest path for VARDA_PROMPT_FILE.
+        let tmp = std::env::temp_dir().join(format!("varda-stage-{}", staged_temp_suffix(content)));
+        std::fs::write(&tmp, content)
+            .with_context(|| format!("failed to stage file {}", tmp.display()))?;
+        self.staged_files
+            .lock()
+            .expect("staged_files mutex poisoned")
+            .push((tmp, guest_path.to_owned()));
+        Ok(guest_path.to_owned())
     }
 
     fn session_store_root(&self) -> Option<PathBuf> {
@@ -1570,6 +1740,7 @@ impl DockerSession {
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1643,7 +1814,7 @@ mod tests {
             env: env.clone(),
             cwd: Some(PathBuf::from("/proj")),
         };
-        let wrapped = session.wrap(spec.clone()).unwrap();
+        let wrapped = session.wrap(spec.clone(), LaunchMode::Batch).unwrap();
         assert_eq!(wrapped, spec);
     }
 
@@ -1663,7 +1834,7 @@ mod tests {
             cwd: Some(PathBuf::from("/home/me/project")),
         };
 
-        let wrapped = session.wrap(spec).unwrap();
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
         // HOME is a per-session named volume mounted at a fixed in-container path;
         // its name derives from the (sanitized) session id "session-1".
         assert_eq!(wrapped.program, "docker");
@@ -1711,7 +1882,7 @@ mod tests {
             env: BTreeMap::new(),
             cwd: None,
         };
-        let wrapped = session.wrap(spec).unwrap();
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
         // `-w` should fall back to the project root when no cwd is set.
         let w = wrapped.args.iter().position(|a| a == "-w").unwrap();
         assert_eq!(wrapped.args[w + 1], "/srv/app");
@@ -1731,6 +1902,7 @@ mod tests {
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
         assert_eq!(
             session.session_store_root(),
@@ -1820,6 +1992,7 @@ mod tests {
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1827,7 +2000,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         let mounts: Vec<&String> = wrapped
             .args
@@ -1859,6 +2032,7 @@ mod tests {
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1866,7 +2040,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         let mounts: Vec<&String> = wrapped
             .args
@@ -1920,7 +2094,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         assert_eq!(
             docker_v_flags(&wrapped.args),
@@ -1947,7 +2121,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         assert!(
             docker_env_flags(&wrapped.args)
@@ -1988,7 +2162,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         // Socket forwarded as a bind mount to the fixed in-guest path.
         assert!(
@@ -2038,7 +2212,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         assert!(
             docker_v_flags(&wrapped.args)
@@ -2064,7 +2238,7 @@ mod tests {
                     args: vec![],
                     env: BTreeMap::new(),
                     cwd: None,
-                })
+}, LaunchMode::Batch)
                 .is_err(),
             "a credential file must never mount as curated identity"
         );
@@ -2132,6 +2306,7 @@ mod tests {
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -2139,7 +2314,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         let n = wrapped.args.iter().position(|a| a == "--network").unwrap();
         assert_eq!(wrapped.args[n + 1], "none");
@@ -2164,6 +2339,7 @@ mod tests {
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -2171,7 +2347,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         let n = wrapped.args.iter().position(|a| a == "--network").unwrap();
         assert_eq!(wrapped.args[n + 1], "bridge");
@@ -2277,6 +2453,7 @@ mod tests {
             sandbox: "varda-sbx-abc".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let spec = CommandSpec {
             program: "claude".to_owned(),
@@ -2284,7 +2461,7 @@ mod tests {
             env: BTreeMap::new(),
             cwd: None,
         };
-        let wrapped = session.wrap(spec).unwrap();
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
         assert_eq!(wrapped.program, "msb");
         assert_eq!(
             wrapped.args,
@@ -2314,6 +2491,145 @@ mod tests {
             session.session_store_root(),
             Some(PathBuf::from("/host/store/agent"))
         );
+    }
+
+    // ---- M13a: interactive launch contract (deterministic argv) ----
+
+    /// M13a §2: docker Interactive uses the create/cp/start lifecycle — the argv
+    /// is `docker create … -it …` (NOT `run`, NOT `-i`), so `begin_interactive`
+    /// can `docker cp` the prompt in before `docker start -ai` attaches the TTY.
+    #[test]
+    fn docker_interactive_wrap_uses_create_and_it() {
+        let session =
+            DockerSession::for_test("img", "/proj", vec![], vec![], "/var/varda/sessions/s1");
+        let spec = CommandSpec {
+            program: "sh".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Interactive).unwrap();
+        assert_eq!(wrapped.program, "docker");
+        assert_eq!(wrapped.args[0], "create", "interactive must create, not run");
+        assert!(wrapped.args.iter().any(|a| a == "-it"), "must allocate a TTY");
+        assert!(!wrapped.args.iter().any(|a| a == "-i" && a != "-it"));
+    }
+
+    /// M13a §2: docker Batch keeps the pre-M13a `run -i` streaming form unchanged.
+    #[test]
+    fn docker_batch_wrap_keeps_run_and_i() {
+        let session =
+            DockerSession::for_test("img", "/proj", vec![], vec![], "/var/varda/sessions/s1");
+        let spec = CommandSpec {
+            program: "sh".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+        assert_eq!(wrapped.args[0], "run");
+        assert!(wrapped.args.iter().any(|a| a == "-i"));
+        assert!(!wrapped.args.iter().any(|a| a == "-it"));
+    }
+
+    /// M13a §3/§5: docker `stage_file` records the prompt for a deferred
+    /// `docker cp` and returns the GUEST path (used for `VARDA_PROMPT_FILE`).
+    #[test]
+    fn docker_stage_file_returns_guest_path_and_records() {
+        let session =
+            DockerSession::for_test("img", "/proj", vec![], vec![], "/var/varda/sessions/s1");
+        let guest = session
+            .stage_file("hello prompt", "/home/agent/.varda-prompt.txt")
+            .unwrap();
+        assert_eq!(guest, "/home/agent/.varda-prompt.txt");
+        let staged = session.staged_files.lock().unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].1, "/home/agent/.varda-prompt.txt");
+        // The host temp actually holds the content, ready for `docker cp`.
+        assert_eq!(std::fs::read_to_string(&staged[0].0).unwrap(), "hello prompt");
+        let _ = std::fs::remove_file(&staged[0].0);
+    }
+
+    /// M13a §2/§3: msb Interactive adds `-t` and a pre-boot `--copy-file` per
+    /// staged file (native copy — no docker-style create/cp/start dance).
+    #[test]
+    fn microsandbox_interactive_wrap_adds_tty_and_copy_file() {
+        let session = MicrosandboxSession {
+            image: "busybox".to_owned(),
+            project_root: PathBuf::from("/proj"),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-abc".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let guest = session
+            .stage_file("task text", "/home/agent/.varda-prompt.txt")
+            .unwrap();
+        assert_eq!(guest, "/home/agent/.varda-prompt.txt");
+        let spec = CommandSpec {
+            program: "sh".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Interactive).unwrap();
+        assert!(wrapped.args.iter().any(|a| a == "-t"), "must allocate a TTY");
+        let copy_idx = wrapped
+            .args
+            .iter()
+            .position(|a| a == "--copy-file")
+            .expect("interactive msb must stage the prompt via --copy-file");
+        assert!(
+            wrapped.args[copy_idx + 1].ends_with(":/home/agent/.varda-prompt.txt"),
+            "copy-file target must be the guest prompt path, got {}",
+            wrapped.args[copy_idx + 1]
+        );
+        let staged = session.staged_files.lock().unwrap();
+        let _ = std::fs::remove_file(&staged[0].0);
+    }
+
+    /// M13a §2: msb Batch does not allocate a TTY or stage files.
+    #[test]
+    fn microsandbox_batch_wrap_has_no_tty() {
+        let session = MicrosandboxSession {
+            image: "busybox".to_owned(),
+            project_root: PathBuf::from("/proj"),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-abc".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let spec = CommandSpec {
+            program: "sh".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+        assert!(!wrapped.args.iter().any(|a| a == "-t"));
+        assert!(!wrapped.args.iter().any(|a| a == "--copy-file"));
+    }
+
+    /// M13a §1/§2: the `local` identity provider is unchanged for BOTH modes, so
+    /// the un-sandboxed interactive argv is byte-for-byte the pre-M13a command.
+    #[test]
+    fn local_interactive_wrap_is_identity() {
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec!["--foo".to_owned()],
+            env: BTreeMap::new(),
+            cwd: Some(PathBuf::from("/work")),
+        };
+        let batch = LocalSession.wrap(spec.clone(), LaunchMode::Batch).unwrap();
+        let interactive = LocalSession.wrap(spec.clone(), LaunchMode::Interactive).unwrap();
+        assert_eq!(batch, spec);
+        assert_eq!(interactive, spec);
     }
 
     /// M4 live exit criteria — verified against a real `msb` microVM: a
@@ -2357,7 +2673,7 @@ mod tests {
                 ],
                 env: BTreeMap::new(),
                 cwd: Some(root.clone()),
-            })
+}, LaunchMode::Batch)
             .unwrap();
         let out = TokioCommand::new(&spec.program)
             .args(&spec.args)
@@ -2542,6 +2858,7 @@ mod tests {
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -2549,7 +2866,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         assert_eq!(
             mount_values(&wrapped),
@@ -2575,6 +2892,7 @@ mod tests {
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -2582,7 +2900,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         assert!(
             mount_values(&wrapped).contains(&"/host/adb:/context/adb:ro".to_owned()),
@@ -2609,6 +2927,7 @@ mod tests {
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -2616,7 +2935,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         let values = mount_values(&wrapped);
         assert!(values.contains(&"/srv/app/vendor:/vendor:ro".to_owned()));
@@ -2654,6 +2973,7 @@ mod tests {
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
             identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -2661,7 +2981,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         let values = mount_values(&wrapped);
         // Same target `/context` de-duped to the sandbox origin's ro mount.
@@ -2718,7 +3038,7 @@ mod tests {
                 args: vec![],
                 env: BTreeMap::new(),
                 cwd: None,
-            })
+}, LaunchMode::Batch)
             .unwrap();
         let values = mount_values(&wrapped);
         assert!(
@@ -2798,7 +3118,7 @@ mod tests {
                 ],
                 env: BTreeMap::new(),
                 cwd: Some(root.clone()),
-            })
+}, LaunchMode::Batch)
             .unwrap();
         let status = TokioCommand::new(&spec.program)
             .args(&spec.args)
@@ -2857,7 +3177,7 @@ mod tests {
                 ],
                 env: BTreeMap::new(),
                 cwd: Some(root.clone()),
-            })
+}, LaunchMode::Batch)
             .unwrap();
         let status = TokioCommand::new(&spec.program)
             .args(&spec.args)

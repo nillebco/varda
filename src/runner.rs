@@ -1807,6 +1807,7 @@ Help interactively.
                     auth_token_env: None,
                     auth_token_target: None,
                     resume_command_template: None,
+                    interpreter_agent: None,
                 },
             )]),
             roles: std::collections::BTreeMap::new(),
