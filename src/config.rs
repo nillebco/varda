@@ -27,7 +27,7 @@ operations_dir = "operations"
 idle_timeout_seconds = 180  # cancel only after this many seconds of total silence
 max_seconds = "none"        # soft total ceiling across all continuations; "none" = no ceiling
 max_continuations = 0       # auto-resume hops; 0 = OFF (default). See note: only enable for agents that signal "done" by omitting a resume command
-max_tool_calls = 0          # tool-call budget across the task; 0 = unlimited
+max_tool_calls = 0          # reserved; non-zero warns but is not enforced yet
 
 [[routes]]
 glob = "**"
@@ -138,8 +138,9 @@ pub struct Defaults {
     /// command.
     #[serde(default = "default_max_continuations")]
     pub max_continuations: u32,
-    /// M10 tool-call budget across the whole task. `0` = unlimited; otherwise, on
-    /// exceed the loop stops and the task is marked `needs_user`. Default 0.
+    /// Reserved M10 tool-call budget across the whole task. `0` = unlimited.
+    /// Non-zero values warn at run time but are not enforced yet because the
+    /// current agent stream does not expose a reliable tool-call count.
     #[serde(default)]
     pub max_tool_calls: u64,
     /// Default sandbox provider applied to routes that do not set their own.

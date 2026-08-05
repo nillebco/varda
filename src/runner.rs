@@ -557,6 +557,16 @@ pub async fn run_task(
         Ok(session_result) => session_result,
     };
 
+    // Headless runs can also capture an agent-native resume command (local live
+    // session stores, or sandbox stores extracted after exit). Persist it so
+    // `varda task resume` has the same direct resume surface as interactive runs.
+    if !interactive && let Some(resume) = result.resume_command.as_deref() {
+        task.frontmatter
+            .agent_resume_commands
+            .push(resume.to_owned());
+        eprintln!("captured resume command: {resume}");
+    }
+
     let requires_user = result.requires_user || recap_requires_user_interaction(&result.recap);
     let files_touched = parse_files_touched(&result.recap);
     let blocked_commands = parse_blocked_commands(&result.recap);
@@ -1675,6 +1685,11 @@ Help interactively.
             task.frontmatter.agent_session_ids.len(),
             1,
             "exactly one session — no auto-resume"
+        );
+        assert_eq!(
+            task.frontmatter.agent_resume_commands,
+            vec!["codex resume".to_owned()],
+            "headless resume commands must be persisted for `varda task resume`"
         );
     }
 

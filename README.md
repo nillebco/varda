@@ -512,18 +512,23 @@ work and, under a sandbox, leaking containers/volumes. Varda is moving to a
 - **Idle watchdog** (`idle_timeout_seconds`, default 180) — cancels a session only
   after that many seconds of *total silence* (no stdout/stderr activity). Productive
   long runs never trip it; a wedged or hung child does.
-- **Auto-resume loop** (`max_continuations`, default 8) — when a non-interactive
-  session ends with work remaining, Varda captures the agent's resume command and
-  dispatches a **fresh continuation session** (new session id + log each hop),
-  seeded with that command, looping until the agent reports done. Each hop's recap
-  is preserved in order and stitched into the final recap. Reaching
-  `max_continuations` with work still remaining stops gracefully as `needs_user`
-  (never an infinite loop, never a silently dropped tail); `0` disables auto-resume
-  (single session only).
-- **Operation budget** (`max_seconds`, `max_tool_calls`) — soft ceilings tracked
-  across the whole task. `max_seconds` accepts an integer or `"none"`; `max_tool_calls`
-  of `0` means unlimited. On exceed, the run **stops and marks the task
-  `needs_user`** with the accumulated recap — a graceful checkpoint, never a kill.
+- **Auto-resume loop** (`max_continuations`, default 0) — off by default. When
+  explicitly enabled for an agent/workflow that signals "done" by omitting a
+  resume command, Varda captures the agent's resume command and dispatches a
+  **fresh continuation session** (new session id + log each hop), seeded with that
+  command. Each hop's recap is preserved in order and stitched into the final
+  recap. Reaching `max_continuations` with work still remaining stops gracefully as
+  `needs_user` (never an infinite loop, never a silently dropped tail). Do not
+  enable this for agents that emit a resume command on every successful completion
+  unless they have a separate completion signal.
+- **Operation budget** (`max_seconds`) — soft ceiling tracked across the whole
+  task. `max_seconds` accepts an integer or `"none"`. On exceed, the run **stops
+  and marks the task `needs_user`** with the accumulated recap — a graceful
+  checkpoint, never a kill.
+- **Reserved tool-call budget** (`max_tool_calls`) — parsed from config/frontmatter
+  for forward compatibility, but not enforced yet because the current agent stream
+  does not expose a reliable per-run tool-call count. Non-zero values print a
+  warning and are otherwise ignored.
 
 `timeout_seconds` remains as a **deprecated alias**: when `max_seconds` is unset it
 supplies the soft ceiling, so existing configs behave unchanged.
@@ -568,8 +573,8 @@ timeout_seconds = 600      # DEPRECATED alias for max_seconds (see below)
 operations_dir = "operations"
 idle_timeout_seconds = 180 # cancel a session only after this many seconds of total silence
 max_seconds = "none"       # soft total ceiling across all continuations; "none" = no ceiling
-max_continuations = 8      # max auto-resume hops before stopping with needs_user
-max_tool_calls = 0         # tool-call budget across the whole task; 0 = unlimited
+max_continuations = 0      # auto-resume hops; 0 = OFF
+max_tool_calls = 0         # reserved; non-zero warns but is not enforced yet
 
 [[routes]]
 glob = "**"

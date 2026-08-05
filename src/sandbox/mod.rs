@@ -212,10 +212,10 @@ pub fn check_identity_context_mount(source: &Path, writable: bool) -> Result<()>
             source.display()
         );
     }
-    if source.is_dir() {
+    if !source.is_file() {
         bail!(
-            "identity_context mount '{}' must be a specific FILE, never a directory \
-             (a whole dotdir/`projects/` transcript tree is forbidden)",
+            "identity_context mount '{}' must be an existing specific FILE, never a directory \
+             or missing path (a whole dotdir/`projects/` transcript tree is forbidden)",
             source.display()
         );
     }
@@ -1074,6 +1074,14 @@ impl SandboxSession for DockerSession {
                 );
             }
         }
+        for raw in &self.identity.identity_context {
+            let spec = parse_mount(raw).with_context(|| {
+                format!("invalid identity_context mount '{raw}' for sandbox '{}'", self.image)
+            })?;
+            let source = expand_mount_path(&spec.source, &self.project_root);
+            check_control_plane_denylist(&source)?;
+            check_identity_context_mount(&source, spec.writable)?;
+        }
         Ok(())
     }
 
@@ -1419,6 +1427,14 @@ impl SandboxSession for MicrosandboxSession {
                     source.display()
                 );
             }
+        }
+        for raw in &self.identity.identity_context {
+            let ispec = parse_mount(raw).with_context(|| {
+                format!("invalid identity_context mount '{raw}' for sandbox '{}'", self.image)
+            })?;
+            let source = expand_mount_path(&ispec.source, &self.project_root);
+            check_control_plane_denylist(&source)?;
+            check_identity_context_mount(&source, ispec.writable)?;
         }
         Ok(())
     }
@@ -2071,15 +2087,25 @@ mod tests {
             check_credential_denylist(&curated).is_err(),
             "the blanket credential denylist should reject a ~/.claude path for normal mounts"
         );
-        // ...but the identity_context path allows a curated file inside it.
+        // ...but the identity_context path allows a curated file inside it when
+        // the configured file really exists. If this developer environment does
+        // not have that file, the same path must fail as a missing file rather
+        // than slipping through to an empty bind mount.
         assert!(
             check_control_plane_denylist(&curated).is_ok(),
             "control-plane floor must not reject a curated identity file under ~/.claude"
         );
-        assert!(
-            check_identity_context_mount(&curated, false).is_ok(),
-            "a curated read-only file inside ~/.claude must be allowed as identity_context"
-        );
+        if curated.is_file() {
+            assert!(
+                check_identity_context_mount(&curated, false).is_ok(),
+                "a curated read-only file inside ~/.claude must be allowed as identity_context"
+            );
+        } else {
+            assert!(
+                check_identity_context_mount(&curated, false).is_err(),
+                "a missing curated identity_context path must be rejected"
+            );
+        }
         // The credential file itself is still refused by identity validation.
         assert!(
             check_identity_context_mount(&home.join(".claude/.credentials.json"), false).is_err(),
@@ -2909,15 +2935,48 @@ mod tests {
 
     #[test]
     fn identity_context_requires_readonly_file_and_no_creds() {
+        let dir = std::env::temp_dir().join(format!("varda-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profile = dir.join("CLAUDE.md");
+        std::fs::write(&profile, "# profile\n").unwrap();
+
         // A credential filename is refused even as a curated identity mount.
-        assert!(
-            check_identity_context_mount(Path::new("/home/u/.claude/.credentials.json"), false)
-                .is_err()
-        );
+        let credential = dir.join(".credentials.json");
+        std::fs::write(&credential, "{}").unwrap();
+        assert!(check_identity_context_mount(&credential, false).is_err());
         // Writable is refused.
-        assert!(check_identity_context_mount(Path::new("/tmp/CLAUDE.md"), true).is_err());
-        // A read-only non-credential file is accepted (path need not exist here).
-        assert!(check_identity_context_mount(Path::new("/tmp/CLAUDE.md"), false).is_ok());
+        assert!(check_identity_context_mount(&profile, true).is_err());
+        // Missing paths are refused so docker/msb do not create empty bind stubs.
+        assert!(check_identity_context_mount(&dir.join("missing.md"), false).is_err());
+        // A read-only existing non-credential file is accepted.
+        assert!(check_identity_context_mount(&profile, false).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_mounts_rejects_missing_identity_context_file() {
+        let project = std::env::temp_dir();
+        let session = DockerSession::for_test_with_identity(
+            "img",
+            &project.display().to_string(),
+            "/var/varda/sessions/s1",
+            SandboxIdentity {
+                identity_context: vec![
+                    project
+                        .join("definitely-missing-identity.md")
+                        .display()
+                        .to_string(),
+                ],
+                ..Default::default()
+            },
+        );
+        let err = session
+            .validate_mounts()
+            .expect_err("missing identity_context file must fail validation");
+        assert!(
+            err.to_string().contains("existing specific FILE"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
