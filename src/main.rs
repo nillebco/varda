@@ -3,6 +3,7 @@ mod agent;
 mod config;
 mod git;
 mod notify;
+mod orchestration;
 mod routing;
 mod runner;
 mod sandbox;

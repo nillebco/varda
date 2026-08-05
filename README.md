@@ -749,6 +749,35 @@ These rules are what make the sandbox meaningful; breaking any turns it into the
 4. **Never mount credential/identity directories** (`~/.claude`, `~/.codex`, `~/.copilot`, `~/.aws`, `~/.ssh`, `~/.config/gcloud`, `~/.config/fnox`, …) to "authenticate the agent" — they hold live tokens and cross-project history. Pass identity via an injected scoped token + SSH-agent forwarding + a curated read-only profile file instead. Enforced by `CREDENTIAL_DENYLIST` / `check_credential_denylist` across **all** mount origins.
 5. Extra mounts default to read-only; the host `$HOME` is never mounted.
 
+### Nested orchestration (gated sub-task spawning)
+
+A "master" agent task running inside a sandbox may need to **decompose work** and have sub-agents complete subtasks. It must not gain host access to do so — that would defeat the sandbox. The model is *control-plane orchestrates, agent only requests*:
+
+- The master gets exactly **one** narrow capability across the boundary: an MCP tool `spawn_subtask(brief, route?, sandbox?, agent?) -> {subtask_id}` (plus optional `await_subtask` / `subtask_result`). Nothing else crosses.
+- Host-side Varda (outside every sandbox) receives the request and, before launching anything:
+  - validates it against **policy** — which routes/agents/sandboxes the master may spawn (allow/deny lists);
+  - enforces **depth**, **fan-out**, and a **global child budget** so a master cannot recursively fork-bomb;
+  - optionally requires **human approval** for a given spawn depth (e.g. the first level);
+  - runs each subtask in its **own sibling sandbox** — spawned by the host, never nested/DinD inside the master;
+  - returns results back through the broker.
+- Even a fully compromised master can only *ask* the broker; it never holds the capability to spawn host processes. The sandbox covers the inward radius; the broker covers the outward radius.
+
+The host-side policy engine lives in `src/orchestration.rs` (`OrchestrationPolicy`, `SpawnLedger::authorize`). Every cap is a **hard error** (`SpawnDenied`), never a silent truncation. Safe defaults: spawning is **disabled**, and the `local` (no-isolation) sandbox is denied so a spawned subtask cannot escape the box.
+
+#### Orchestration isolation invariants (MANDATORY — never violate)
+
+These must hold for the broker **and** the base sandbox; violating any makes the sandbox theatre:
+
+1. **Never mount the docker socket** (`/var/run/docker.sock`, `docker.sock`/`podman.sock` by any path) into any agent container — it is equivalent to host root. Enforced by `DOCKER_SOCKET_BASENAMES` / `DOCKER_SOCKET_PATHS` in `check_control_plane_denylist`, across all mount origins.
+2. **Never mount `~/.varda`** (or install the `varda` binary) into an agent container — it hands the agent the control plane. Enforced by `CONTROL_PLANE_DENYLIST` in `check_control_plane_denylist`, across all mount origins.
+3. **No `--privileged` / no docker-in-docker** for agent containers. Sub-sandboxes are **siblings spawned by the host**, never nested inside the master.
+4. Spawning is reachable **only** through the gated `spawn_subtask` MCP tool mediated by host-side Varda — never via host process access, the docker socket, or a mounted control plane.
+5. Every spawn is bounded by **depth + fan-out + global child budget**; exceeding a bound is a hard error, not a silent cap.
+
+Invariants 1 and 2 are enforced at the mount layer (folded into `check_credential_denylist`, so every mount call site is covered); invariant 5 is enforced by the `src/orchestration.rs` policy engine.
+
+> **Status:** the host-side policy engine (allow/deny, depth, fan-out, budget, approval gate) and the invariant-1/2 mount floor are implemented and unit-tested. Wiring the live `spawn_subtask` MCP tool into a running sandbox and launching the sibling box end-to-end is the remaining step of this milestone.
+
 ### Roles
 
 Roles are prompt personas that layer on top of an agent backend. They let you assign a different behavioral mode (e.g. verification, planning, review) without changing the underlying executable.

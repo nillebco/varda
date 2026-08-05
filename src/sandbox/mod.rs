@@ -107,9 +107,81 @@ fn resolve_symlinks(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Control-plane paths (relative to `$HOME`) that may never be mounted into ANY
+/// agent box — Orchestration M8 invariant 2. `~/.varda` holds every task, config,
+/// session log and recap: mounting it hands a (possibly compromised) agent the
+/// control plane, letting it edit tasks, read other clients' data, or drive spawns
+/// outside the gated broker. Refused for ALL origins, like the credential store.
+pub const CONTROL_PLANE_DENYLIST: &[&str] = &[".varda"];
+
+/// Container-daemon socket basenames that may never be mounted into any agent box
+/// — Orchestration M8 invariant 1. A mounted docker/podman socket is equivalent to
+/// host root: the agent can start privileged containers, mount the host FS, and
+/// escape the sandbox. Matched by basename so a re-targeted mount can't dodge the
+/// well-known path.
+pub const DOCKER_SOCKET_BASENAMES: &[&str] = &["docker.sock", "podman.sock"];
+
+/// Canonical absolute container-daemon socket paths, refused regardless of basename
+/// matching (belt and braces for invariant 1).
+pub const DOCKER_SOCKET_PATHS: &[&str] = &[
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/var/run/podman/podman.sock",
+    "/run/podman/podman.sock",
+];
+
+/// Refuse a mount whose SOURCE is the control plane (`~/.varda`) or a container
+/// daemon socket — Orchestration M8 invariants 1 & 2. Trust-independent (applies to
+/// every origin, central config included): a mounted control plane or docker socket
+/// defeats the sandbox regardless of who declared it.
+pub fn check_control_plane_denylist(source: &Path) -> Result<()> {
+    let resolved = resolve_symlinks(source);
+
+    // Invariant 1 — never mount a container daemon socket.
+    if let Some(name) = resolved.file_name().and_then(|n| n.to_str())
+        && DOCKER_SOCKET_BASENAMES.contains(&name)
+    {
+        bail!(
+            "refusing mount source '{}': it is a container daemon socket ('{name}') — mounting it \
+             into an agent box is equivalent to host root and lets the agent escape the sandbox \
+             (Orchestration M8 invariant 1: never mount the docker socket)",
+            source.display()
+        );
+    }
+    for sock in DOCKER_SOCKET_PATHS {
+        if resolved == resolve_symlinks(Path::new(sock)) {
+            bail!(
+                "refusing mount source '{}': it is the container daemon socket '{sock}' — \
+                 equivalent to host root (Orchestration M8 invariant 1: never mount the docker socket)",
+                source.display()
+            );
+        }
+    }
+
+    // Invariant 2 — never mount the varda control plane (`~/.varda`).
+    if let Some(home) = home_dir() {
+        for entry in CONTROL_PLANE_DENYLIST {
+            let denied = resolve_symlinks(&home.join(entry));
+            if resolved == denied || resolved.starts_with(&denied) {
+                bail!(
+                    "refusing mount source '{}': it resolves into the varda control plane '{}' \
+                     — mounting it hands the agent every task, session and the ability to drive \
+                     spawns outside the gated broker (Orchestration M8 invariant 2: never mount `~/.varda`)",
+                    source.display(),
+                    home.join(entry).display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a mount whose SOURCE resolves into a known credential/identity store.
-/// Applies to ALL origins (trust-independent). Symlink-resolved prefix match.
+/// Applies to ALL origins (trust-independent). Symlink-resolved prefix match. Also
+/// enforces the Orchestration M8 control-plane / docker-socket floor
+/// (see [`check_control_plane_denylist`]) so every mount call site is covered.
 pub fn check_credential_denylist(source: &Path) -> Result<()> {
+    check_control_plane_denylist(source)?;
     let Some(home) = home_dir() else {
         return Ok(());
     };
@@ -2753,6 +2825,39 @@ mod tests {
         }
         // A neutral path is allowed.
         assert!(check_credential_denylist(Path::new("/tmp/somewhere")).is_ok());
+    }
+
+    #[test]
+    fn control_plane_denylist_rejects_docker_socket_all_paths_and_basenames() {
+        // Invariant 1: the well-known daemon sockets are refused.
+        for sock in DOCKER_SOCKET_PATHS {
+            assert!(
+                check_control_plane_denylist(Path::new(sock)).is_err(),
+                "expected docker socket {sock} to be denied"
+            );
+        }
+        // A re-targeted mount of the socket by any path is caught by basename.
+        assert!(
+            check_control_plane_denylist(Path::new("/tmp/sneaky/docker.sock")).is_err(),
+            "docker.sock by any path must be denied"
+        );
+        // Folded into the general credential check too (covers every call site).
+        assert!(check_credential_denylist(Path::new("/var/run/docker.sock")).is_err());
+    }
+
+    #[test]
+    fn control_plane_denylist_rejects_varda_control_plane_all_origins() {
+        let home = std::env::var("HOME").expect("HOME set in tests");
+        // Invariant 2: `~/.varda` and anything under it is refused.
+        assert!(check_control_plane_denylist(&PathBuf::from(format!("{home}/.varda"))).is_err());
+        assert!(
+            check_control_plane_denylist(&PathBuf::from(format!("{home}/.varda/operations")))
+                .is_err()
+        );
+        // And via the general credential check used at every mount call site.
+        assert!(check_credential_denylist(&PathBuf::from(format!("{home}/.varda"))).is_err());
+        // A neutral path is still allowed.
+        assert!(check_control_plane_denylist(Path::new("/tmp/somewhere")).is_ok());
     }
 
     #[test]
