@@ -860,7 +860,7 @@ fn append_session_log(path: &Path, content: &str) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 async fn interpret_interactive_session(
-    _config: &Config,
+    config: &Config,
     client: &impl AgentClient,
     agent_name: &str,
     role_instructions: Option<&str>,
@@ -870,6 +870,30 @@ async fn interpret_interactive_session(
     session_log_path: &Path,
     timeout: Duration,
 ) -> Result<AgentRunResult> {
+    // M13a §7: the post-session interpreter pass may be routed to a DIFFERENT
+    // agent than the one that drove the interactive session. The canonical case
+    // is a bare `sh` interactive command, which cannot produce a Varda recap on
+    // its own, so a real LLM agent is configured via `interpreter_agent` to read
+    // the session log and emit the recap. Resolve that agent from the running
+    // agent's config, falling back to the same `agent_name` when it is unset or
+    // names an unknown agent. This pass always runs LOCAL/unsandboxed, as designed.
+    let interpreter_agent = config
+        .agents
+        .get(agent_name)
+        .and_then(|agent| agent.interpreter_agent.as_deref())
+        .map(|name| {
+            if config.agents.contains_key(name) {
+                name
+            } else {
+                eprintln!(
+                    "warning: interpreter_agent '{name}' configured for agent '{agent_name}' is \
+                     not a known agent; falling back to '{agent_name}' for the interpretation pass"
+                );
+                agent_name
+            }
+        })
+        .unwrap_or(agent_name);
+
     let log_excerpt = read_session_log_excerpt(session_log_path)?;
     let body = format!(
         "An interactive Varda session for this task just finished. Read the session log content below \
@@ -883,7 +907,7 @@ async fn interpret_interactive_session(
     );
 
     let request = AgentRunRequest {
-        agent_name: agent_name.to_owned(),
+        agent_name: interpreter_agent.to_owned(),
         role_instructions: role_instructions.map(str::to_owned),
         task_path: task_path.display().to_string(),
         frontmatter: task.frontmatter.clone(),
@@ -899,7 +923,7 @@ async fn interpret_interactive_session(
 
     eprintln!();
     eprintln!(
-        "Interactive session ended. Varda is now running the {agent_name} interpreter pass to produce the recap and Files touched list."
+        "Interactive session ended. Varda is now running the {interpreter_agent} interpreter pass to produce the recap and Files touched list."
     );
     eprintln!(
         "This non-interactive agent run may take up to {} seconds — please wait, do not kill the process.",
@@ -1376,11 +1400,104 @@ Help interactively.
             recorded[1].interpret,
             "second call should be the interpretation pass"
         );
+        assert_eq!(
+            recorded[1].agent_name, "codex",
+            "with no interpreter_agent configured, the interpretation pass must run via the same agent"
+        );
         assert!(recorded[1].body.contains("Session log"));
         assert!(recorded[1].body.contains("interactive Varda session"));
         assert_eq!(outcome.status, TaskStatus::Pending);
         assert!(recap.contains("Interpreted Recap"));
         assert!(recap.contains("Did the work."));
+    }
+
+    #[tokio::test]
+    async fn interpreter_pass_routes_to_configured_interpreter_agent() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-run-interpreter-routing-{}",
+            std::process::id()
+        ));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/shell");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: shell
+requires_user: false
+---
+
+# Task
+
+Help interactively.
+"#,
+        )
+        .expect("task should be written");
+
+        let mut config = test_config(operations_dir.display().to_string());
+        config.git.auto_commit = false;
+        // The `shell` agent drives the interactive session with a bare `sh` command
+        // that cannot write a Varda recap, so it delegates the interpretation pass
+        // to the real `claude` agent via `interpreter_agent`.
+        let base = config.agents.get("codex").cloned().expect("codex agent");
+        config.agents.insert(
+            "claude".to_owned(),
+            AgentConfig {
+                command: "claude".to_owned(),
+                ..base.clone()
+            },
+        );
+        config.agents.insert(
+            "shell".to_owned(),
+            AgentConfig {
+                command: "sh".to_owned(),
+                interpreter_agent: Some("claude".to_owned()),
+                ..base
+            },
+        );
+
+        let client = RecordingAgentClient {
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            session_response: AgentRunResult {
+                recap: "Interactive session completed.".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+            interpretation_response: AgentRunResult {
+                recap: "# Interpreted Recap\n\nDid the work.\n\nrequires_user: false".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+        };
+
+        run_task(&config, "shell", None, &task_path, &client, true, false)
+            .await
+            .expect("interactive task should run and be interpreted");
+
+        let recorded = client.requests.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "expected one session call and one interpretation call"
+        );
+        assert_eq!(
+            recorded[0].agent_name, "shell",
+            "the interactive session must run via the driving agent"
+        );
+        assert!(recorded[0].interactive);
+        assert!(
+            recorded[1].interpret,
+            "second call should be the interpretation pass"
+        );
+        assert_eq!(
+            recorded[1].agent_name, "claude",
+            "the interpretation pass must route to the configured interpreter_agent's backend"
+        );
     }
 
     #[tokio::test]
