@@ -19,7 +19,14 @@ use crate::agent::{
     recap_requires_user_interaction,
 };
 use crate::config::AgentConfig;
-use crate::sandbox::{CommandSpec, LocalProvider, SandboxContext, SandboxProvider, SandboxSession};
+use crate::sandbox::{
+    CommandSpec, LaunchMode, LocalProvider, SandboxContext, SandboxProvider, SandboxSession,
+};
+
+/// Guest-visible path the staged task prompt lands at inside a non-`local`
+/// sandbox (matches the providers' `/home/agent` HOME). Advertised to the agent
+/// via `VARDA_PROMPT_FILE` (M13a §5).
+const GUEST_PROMPT_FILE: &str = "/home/agent/.varda-prompt.txt";
 
 /// Owns the prepared sandbox [`SandboxSession`] and guarantees `teardown()` runs
 /// on EVERY exit path — including a cancel, where the M10 idle/budget watchdog
@@ -273,7 +280,7 @@ impl AcpSubprocessClient {
         // Live stores (local) are polled while the agent runs; extracted stores
         // (docker volume + `docker cp`) are only discovered post-exit.
         let store_is_live = session.store_is_live();
-        let spec = session.wrap(spec).with_context(|| {
+        let spec = session.wrap(spec, LaunchMode::Batch).with_context(|| {
             format!(
                 "failed to wrap command for '{}' sandbox",
                 self.sandbox.name()
@@ -418,14 +425,10 @@ impl AcpSubprocessClient {
         args: Vec<String>,
         request: &AgentRunRequest,
     ) -> Result<AgentRunResult> {
-        // Interactive execution under a non-identity sandbox is deferred to M5.
-        if self.sandbox.name() != "local" {
-            bail!(
-                "interactive runs are not supported under the '{}' sandbox yet; \
-                 run non-interactively or use sandbox=\"local\"",
-                self.sandbox.name()
-            );
-        }
+        // M13a: the interactive SHELL path (an `interactive_command` is set) now
+        // runs inside docker/microsandbox too — see the sandboxed branch below.
+        // The resume and pipe-fallback sub-paths remain local-only (guarded at
+        // their own sites); `local` keeps its byte-for-byte pre-M13a behavior.
         let command = expand_request_value(&self.command, request);
         let working_dir = self
             .working_dir
@@ -449,6 +452,16 @@ impl AcpSubprocessClient {
         }
 
         if let Some(resume_command) = request.resume_command.as_deref() {
+            // Resuming an interactive session under a non-identity sandbox is not
+            // part of M13a (the fresh-shell launch is); fail clearly rather than
+            // silently resuming on the host.
+            if self.sandbox.name() != "local" {
+                bail!(
+                    "resuming an interactive session under the '{}' sandbox is not supported yet; \
+                     use sandbox=\"local\"",
+                    self.sandbox.name()
+                );
+            }
             let interactive_cmd = self
                 .interactive_command
                 .as_deref()
@@ -505,6 +518,22 @@ impl AcpSubprocessClient {
                 suggested_agent: None,
                 resume_command: None,
             });
+        }
+
+        // M13a: route the interactive SHELL (an `interactive_command` is set)
+        // through the sandbox provider when it isn't `local`. The prompt is staged
+        // INTO the guest and the user's TTY is attached; teardown is guaranteed.
+        if self.sandbox.name() != "local" {
+            if let Some(interactive_cmd) = self.interactive_command.clone() {
+                return self
+                    .execute_interactive_sandboxed(request, &interactive_cmd, &prompt, working_dir, env)
+                    .await;
+            }
+            bail!(
+                "the pipe-based interactive fallback is not supported under the '{}' sandbox; \
+                 set `interactive_command` (e.g. \"sh\") or use sandbox=\"local\"",
+                self.sandbox.name()
+            );
         }
 
         // Write the task prompt to a temp file so truly-interactive agents can read it.
@@ -651,6 +680,183 @@ impl AcpSubprocessClient {
 
         Ok(AgentRunResult {
             recap: "Interactive session completed.".to_owned(),
+            requires_user: false,
+            suggested_agent: None,
+            resume_command,
+        })
+    }
+
+    /// Interactive SHELL launch inside a non-`local` sandbox (M13a §4–§6).
+    ///
+    /// Stages the task prompt INTO the guest, wraps the interactive command in
+    /// [`LaunchMode::Interactive`] (docker `-it`/create-cp-start, `msb -t`),
+    /// attaches the user's TTY with inherited stdio, then — mirroring the batch
+    /// extracted-store path — extracts the session store, records the external
+    /// session, and builds a resume command. Teardown is guaranteed via
+    /// [`SessionTeardownGuard`] on every exit path.
+    async fn execute_interactive_sandboxed(
+        &self,
+        request: &AgentRunRequest,
+        interactive_cmd: &str,
+        prompt: &str,
+        working_dir: Option<String>,
+        mut env: BTreeMap<String, String>,
+    ) -> Result<AgentRunResult> {
+        // A sandboxed interactive launch needs a real TTY: `docker -it` / `msb -t`
+        // error out otherwise. Fail clearly BEFORE we prepare the box.
+        use std::io::IsTerminal as _;
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "an interactive sandboxed run needs a terminal on stdin; \
+                 `{}` interactive requires a TTY (are you piping input or running headless?)",
+                self.sandbox.name()
+            );
+        }
+
+        let interactive_cmd = expand_request_value(interactive_cmd, request);
+        let interactive_args =
+            args_for_request(self.interactive_args.as_deref().unwrap_or(&[]), request);
+
+        let spec = CommandSpec {
+            program: interactive_cmd.clone(),
+            args: interactive_args,
+            env: env.clone(),
+            cwd: working_dir.as_deref().map(PathBuf::from),
+        };
+        let sandbox_ctx = SandboxContext {
+            project_root: Path::new(
+                request
+                    .frontmatter
+                    .project
+                    .as_deref()
+                    .unwrap_or_else(|| working_dir.as_deref().unwrap_or(".")),
+            ),
+            route_glob: "",
+            agent_kind: crate::config::AgentKind::Acp,
+            session_id: &request.session_id,
+        };
+        let session = self
+            .sandbox
+            .prepare(&sandbox_ctx)
+            .await
+            .with_context(|| format!("failed to prepare '{}' sandbox", self.sandbox.name()))?;
+        let guard = SessionTeardownGuard::new(session);
+        let session = guard.session();
+        session
+            .validate_mounts()
+            .with_context(|| format!("unusable mount for '{}' sandbox", self.sandbox.name()))?;
+
+        // Stage the prompt into a GUEST-visible file and advertise its guest path,
+        // so the interactive shell/agent can read the task without the host temp
+        // (invisible in-guest) — M13a §5. env must carry VARDA_PROMPT_FILE BEFORE
+        // wrap(), since providers bake env into the wrapped argv.
+        let guest_prompt = session
+            .stage_file(prompt, GUEST_PROMPT_FILE)
+            .context("failed to stage the task prompt into the sandbox")?;
+        env.insert("VARDA_PROMPT_FILE".to_owned(), guest_prompt.clone());
+        let spec = CommandSpec {
+            env: env.clone(),
+            ..spec
+        };
+
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let _ = append_session_log(
+                log_path,
+                &format!(
+                    "[interactive-sandboxed]\nsandbox={}\nVARDA_PROMPT_FILE={}\n",
+                    self.sandbox.name(),
+                    guest_prompt
+                ),
+            );
+        }
+
+        let started_at = SystemTime::now();
+        let session_store_root = session.session_store_root();
+        let store_is_live = session.store_is_live();
+
+        let wrapped = session.wrap(spec, LaunchMode::Interactive).with_context(|| {
+            format!(
+                "failed to wrap interactive command for '{}' sandbox",
+                self.sandbox.name()
+            )
+        })?;
+        // Provider-specific interactive lifecycle: docker create → cp → start -ai;
+        // msb/local return the wrapped command directly.
+        let launch = session.begin_interactive(wrapped).await.with_context(|| {
+            format!(
+                "failed to begin interactive session for '{}' sandbox",
+                self.sandbox.name()
+            )
+        })?;
+
+        // Live stores (would be local; not this path) poll during the run; the
+        // extracted docker/msb store is discovered post-exit.
+        let mut record_handle = None;
+        if store_is_live
+            && let Some(session_root) = session_store_root.as_deref()
+        {
+            record_handle = self.record_external_session(request, started_at, session_root);
+        }
+
+        let mut command_builder = Command::new(&launch.program);
+        command_builder
+            .args(&launch.args)
+            .envs(&launch.env)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if let Some(cwd) = launch.cwd.as_deref() {
+            command_builder.current_dir(cwd);
+        }
+
+        set_terminal_title_for_agent(&self.agent_name);
+
+        let mut child = command_builder.spawn().with_context(|| {
+            format!(
+                "failed to start interactive sandboxed agent '{}' with command '{}'",
+                self.agent_name, launch.program
+            )
+        })?;
+        let status = child
+            .wait()
+            .await
+            .context("failed to wait for interactive sandboxed agent subprocess")?;
+
+        // Extracted stores: materialize the guest session store on the host, THEN
+        // discover once (mirrors the batch extracted-store path).
+        if !store_is_live {
+            match session.extract_session_store().await {
+                Ok(()) => {
+                    if let Some(session_root) = session_store_root.as_deref() {
+                        record_handle =
+                            self.record_external_session(request, started_at, session_root);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("warning: failed to extract sandbox session store: {error:#}");
+                }
+            }
+        }
+
+        if let Err(error) = guard.teardown().await {
+            eprintln!("warning: failed to tear down sandbox session: {error:#}");
+        }
+
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
+        }
+        if !status.success() {
+            bail!("agent '{}' exited with status {}", self.agent_name, status);
+        }
+
+        let external_session_id = match record_handle {
+            Some(handle) => handle.await.ok().flatten(),
+            None => None,
+        };
+        let resume_command = self.build_resume_command(request, external_session_id.as_deref());
+
+        Ok(AgentRunResult {
+            recap: "Interactive sandboxed session completed.\n\nrequires_user: false".to_owned(),
             requires_user: false,
             suggested_agent: None,
             resume_command,
@@ -1341,7 +1547,7 @@ mod tests {
 
     #[async_trait]
     impl SandboxSession for RecordingSession {
-        fn wrap(&self, spec: CommandSpec) -> Result<CommandSpec> {
+        fn wrap(&self, spec: CommandSpec, _mode: LaunchMode) -> Result<CommandSpec> {
             Ok(spec)
         }
         fn session_store_root(&self) -> Option<PathBuf> {
@@ -1421,6 +1627,7 @@ mod tests {
             auth_token_env: None,
             auth_token_target: None,
             resume_command_template: None,
+            interpreter_agent: None,
         };
         let client = AcpSubprocessClient::new("echo", &config);
 
@@ -1520,6 +1727,7 @@ mod tests {
             auth_token_env: None,
             auth_token_target: None,
             resume_command_template: None,
+            interpreter_agent: None,
         };
         let sandbox_config = crate::config::SandboxConfig {
             image: Some("busybox:latest".to_owned()),
@@ -1581,6 +1789,7 @@ mod tests {
             auth_token_env: None,
             auth_token_target: None,
             resume_command_template: None,
+            interpreter_agent: None,
         };
         let provider = std::sync::Arc::new(
             crate::sandbox::DockerProvider::from_config(
@@ -1733,6 +1942,7 @@ mod tests {
             auth_token_env: None,
             auth_token_target: None,
             resume_command_template: None,
+            interpreter_agent: None,
         };
         let sandbox_config = crate::config::SandboxConfig {
             image: Some("busybox:latest".to_owned()),
@@ -1773,6 +1983,7 @@ mod tests {
             auth_token_env: None,
             auth_token_target: None,
             resume_command_template: None,
+            interpreter_agent: None,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -1843,6 +2054,7 @@ mod tests {
             auth_token_env: None,
             auth_token_target: None,
             resume_command_template: None,
+            interpreter_agent: None,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -1908,6 +2120,7 @@ mod tests {
             auth_token_env: None,
             auth_token_target: None,
             resume_command_template: None,
+            interpreter_agent: None,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -2119,6 +2332,7 @@ mod tests {
             resume_command_template: Some(
                 "claude --resume {external_session_id} --add-dir {project}".to_owned(),
             ),
+            interpreter_agent: None,
         };
         let client = AcpSubprocessClient::new("claude", &config);
         let request = sample_request("claude", "/work/project");
@@ -2146,6 +2360,7 @@ mod tests {
             auth_token_env: None,
             auth_token_target: None,
             resume_command_template: None,
+            interpreter_agent: None,
         };
         let client = AcpSubprocessClient::new("claude", &config);
         let request = sample_request("claude", "/work/project");
@@ -2271,5 +2486,59 @@ mod tests {
             resume_command: None,
             orchestration_socket_path: None,
         }
+    }
+
+    /// A non-`local` provider stub for the TTY-guard test. `prepare` is never
+    /// reached — the guard fires first — so it just bails.
+    struct FakeSandboxProvider;
+    #[async_trait]
+    impl SandboxProvider for FakeSandboxProvider {
+        fn name(&self) -> &str {
+            "docker"
+        }
+        async fn prepare(
+            &self,
+            _ctx: &SandboxContext<'_>,
+        ) -> Result<Box<dyn SandboxSession>> {
+            bail!("prepare should not be reached in the TTY-guard test")
+        }
+    }
+
+    fn interactive_shell_config() -> AgentConfig {
+        AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: Some("sh".to_owned()),
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+        }
+    }
+
+    /// M13a §4 TTY guard: a sandboxed interactive launch requires a real terminal
+    /// on stdin (`docker -it`/`msb -t` fail otherwise). Under `cargo test` stdin is
+    /// not a TTY, so the guard must bail with a clear message BEFORE preparing the
+    /// box (the stub provider's `prepare` would otherwise panic).
+    #[tokio::test]
+    async fn sandboxed_interactive_requires_a_tty() {
+        let config = interactive_shell_config();
+        let client =
+            AcpSubprocessClient::with_sandbox("sh", &config, Arc::new(FakeSandboxProvider));
+        let request = sample_request("sh", "/work/project");
+        let err = client
+            .execute_interactive_sandboxed(&request, "sh", "prompt text", None, BTreeMap::new())
+            .await
+            .expect_err("must refuse to launch without a TTY");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("needs a terminal on stdin"),
+            "unexpected error: {msg}"
+        );
     }
 }

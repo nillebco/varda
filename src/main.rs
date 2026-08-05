@@ -3372,6 +3372,7 @@ planner_agent: codex
             interactive_command: None,
             interactive_args: None,
             resume_command_template: None,
+            interpreter_agent: None,
         };
         let mut resolved = config::ResolvedSandbox {
             name: "inline".to_owned(),

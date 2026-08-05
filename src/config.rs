@@ -671,6 +671,14 @@ pub struct AgentConfig {
     /// from the agent's session storage), and `{project}` with the task's project path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_command_template: Option<String>,
+    /// Agent used for the post-session interpretation/finalization pass over an
+    /// interactive run's session log (M13a §7). That pass only reads the host
+    /// session log and emits a recap — no untrusted exec — so it always runs
+    /// UN-sandboxed and local. A bare `sh` interactive command cannot produce a
+    /// Varda recap on its own, so when this is unset it defaults to the SAME agent
+    /// that drove the interactive session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

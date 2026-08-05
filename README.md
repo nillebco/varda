@@ -665,6 +665,25 @@ Two knobs are deliberately separate. **`image`/`build`** decides *what tools are
 
 **`microsandbox`** shells to the `msb` CLI (install with the microsandbox project; expects `msb` on `PATH`) and runs the agent inside an **own-kernel microVM** — a stronger inward boundary than docker's shared kernel, plus Windows coverage. It mirrors the docker provider: the same `image`/`build` inputs (a `build` Dockerfile is built via docker into a tag `msb` runs), the same project-only + opt-in merged mounts (`msb --mount HOST:GUEST`, read-only by default), the same resume-capture model (the guest `HOME` lives in VM storage and is `msb cp`-ed out to `~/.varda/sessions/{session_id}` after the run, so the host `$HOME`/credentials are never exposed), and default-deny egress (fully offline with no `egress`; `egress` hosts become per-host `msb` net allow-rules — enforced in-guest, so hostnames/CIDRs are passed directly rather than pre-resolved to IPs as docker requires). The keys never enter the VM, and an OCI image can bake in the agent CLI (e.g. the copilot CLI for the Windows path). *The `msb` argv spellings are centralized in `MicrosandboxSession::wrap`/`extract_session_store`; confirm them against your installed `msb --help` — see the M4 task notes on live verification.*
 
+#### Interactive sandbox (shell): TTY, prompt staging, and the docker lifecycle
+
+`--interactive` runs now work under `docker` and `microsandbox`, not just `local`. When an agent's `interactive_command` (e.g. `sh`) is set and the resolved sandbox is not `local`, Varda attaches **your terminal** to a shell *inside the box* — the project is mounted, but `~/.aws`/`~/.claude`/etc. stay invisible (the same isolation as a batch run), and teardown removes the container/microVM and its volume on every exit path.
+
+- **A real terminal is required.** A sandboxed interactive launch needs a TTY on stdin (`docker -it` / `msb -t` fail without one). Varda checks `stdin` up front and fails clearly if you pipe input or run headless — use a batch run (no `--interactive`) or `sandbox = "local"` in that case.
+- **The prompt is staged *into* the guest.** The task prompt is copied to `/home/agent/.varda-prompt.txt` inside the box and exposed as `$VARDA_PROMPT_FILE`, so the in-guest shell can read the task even though the host temp file is not visible in the guest. (Under `local`, `$VARDA_PROMPT_FILE` points at a host temp, exactly as before.)
+- **Docker interactive is a different lifecycle, not just `-it`.** Because the container `HOME` is a per-session named volume and a host bind of `~/.varda` hits the VM-visibility trap, Varda cannot `docker run` an interactive session directly. Instead it:
+  1. `docker create … -it …` — create the container (do **not** run it),
+  2. `docker cp` the staged prompt into it,
+  3. `docker start -ai <container>` — attach *your* TTY,
+  4. `docker cp <container>:/home/agent/. <host session store>` — extract the session store after you exit,
+  5. `docker rm -f` the container and `docker volume rm -f` its volume.
+
+  `microsandbox` needs no such dance: it stages the prompt with a native pre-boot `--copy-file` and runs `msb run -t`. Session capture and the `resume_command` are produced exactly like a batch run.
+- **Ctrl-C** under `-it` propagates to the guest process; the `SessionTeardownGuard` still fires on the way out, so no `varda-sbx-*` container or volume leaks.
+- **The interpretation pass stays local.** After the interactive session ends, Varda's post-session interpretation pass only reads the host session log to produce the recap (no untrusted exec), so it runs **un-sandboxed**. An optional `interpreter_agent` on the agent config selects which agent runs that pass; when unset it defaults to the same agent that drove the session (a bare `sh` shell can't emit a Varda recap on its own).
+
+> Resuming an interactive session under a sandbox is not yet supported (the fresh-shell launch is); resume runs remain `local`-only.
+
 #### Per-folder `.varda` (untrusted origin) and the hardening floor
 
 A folder can commit its own sandbox choice in a **`.varda`** file. When resolving the sandbox for a task, Varda walks **up** from the task's project/target path to the routing root and uses the **nearest `.varda`**. Precedence:
