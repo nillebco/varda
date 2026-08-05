@@ -34,6 +34,27 @@ pub struct PlanOutcome {
     pub plan_path: PathBuf,
 }
 
+/// Run `fut` under the resolved execution ceiling. `Some(secs)` enforces a hard
+/// `time::timeout`; `None` (`max_seconds = "none"`, or `timeout_seconds = 0`)
+/// runs it unbounded. `Err(Elapsed)` is returned only when a finite ceiling is
+/// hit, so callers keep treating that as the timeout path.
+///
+/// M10 increment: this makes `defaults.effective_max_seconds()` actually honored
+/// so a run can opt out of the hard kill. The full cooperative model (idle
+/// watchdog, auto-resume loop, operation budget) builds on top of this seam.
+async fn run_under_ceiling<F, T>(
+    max_seconds: Option<u64>,
+    fut: F,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: std::future::Future<Output = T>,
+{
+    match max_seconds {
+        Some(secs) => time::timeout(Duration::from_secs(secs), fut).await,
+        None => Ok(fut.await),
+    }
+}
+
 pub async fn run_task(
     config: &Config,
     agent_name: &str,
@@ -85,10 +106,11 @@ pub async fn run_task(
         resume_command: None,
     };
 
+    let ceiling = config.defaults.effective_max_seconds();
     let agent_result = if interactive {
         Ok(client.run_task(request).await)
     } else {
-        time::timeout(timeout, client.run_task(request)).await
+        run_under_ceiling(ceiling, client.run_task(request)).await
     };
 
     let _interactive_finalization_guard = if interactive {
@@ -118,13 +140,13 @@ pub async fn run_task(
                 &session_log_path,
                 &format!(
                     "\ntimeout:\nexceeded {} second limit\nlong_running_task_requested=true\n",
-                    config.defaults.timeout_seconds
+                    ceiling.unwrap_or(config.defaults.timeout_seconds)
                 ),
             )?;
             Err(AgentRunResult {
                 recap: format!(
                     "# Agent Run Timed Out\n\nThe agent exceeded the configured {} second limit while processing `{}`.\n\nWhat completed: the session log was preserved for inspection.\n\nWhat remains: delegate the unfinished work to a Varda long-running runner task, then resume the agent after the complete runner output is available.\n\nBlockers: the single-session time limit was reached.\n\nUser interaction required: no.\n\nSuggested next agent: runner.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
-                    config.defaults.timeout_seconds,
+                    ceiling.unwrap_or(config.defaults.timeout_seconds),
                     task_path.display(),
                     session_log_path.display(),
                     session_log_path.display()
@@ -365,7 +387,7 @@ pub async fn plan_task(
         resume_command: None,
     };
 
-    let result = match time::timeout(timeout, client.plan_task(request)).await {
+    let result = match run_under_ceiling(config.defaults.effective_max_seconds(), client.plan_task(request)).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => AgentRunResult {
             recap: format!(
@@ -609,6 +631,28 @@ mod tests {
 
     use async_trait::async_trait;
 
+    /// M10: `None` ceiling (`max_seconds = "none"`) runs unbounded — no hard kill;
+    /// a finite ceiling that elapses returns `Err`, the timeout path.
+    #[tokio::test]
+    async fn run_under_ceiling_none_is_unbounded_and_finite_elapses() {
+        // No ceiling: the future runs to completion even though it out-waits any
+        // small limit; returns Ok.
+        let out = super::run_under_ceiling(None, async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            7u32
+        })
+        .await;
+        assert_eq!(out, Ok(7));
+
+        // Finite ceiling that elapses before the future completes: Err (timeout).
+        let elapsed = super::run_under_ceiling(Some(0), async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            7u32
+        })
+        .await;
+        assert!(elapsed.is_err(), "a 0s ceiling must elapse to the timeout path");
+    }
+
     use crate::agent::fake::FakeAgentClient;
     use crate::agent::{AgentRunRequest, AgentRunResult};
     use crate::config::{AgentConfig, AgentKind, Defaults, GitConfig, Route};
@@ -732,7 +776,10 @@ Do it.
         .expect("task should be written");
 
         let mut config = test_config(operations_dir.display().to_string());
-        config.defaults.timeout_seconds = 0;
+        // A finite 1s ceiling forces the timeout path against a never-returning
+        // client. NB: since M10, `timeout_seconds = 0` means *unbounded* (like
+        // `max_seconds = "none"`), so it can no longer be used to force a timeout.
+        config.defaults.timeout_seconds = 1;
         let client = PendingAgentClient;
 
         let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
