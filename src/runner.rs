@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio::time;
@@ -57,6 +57,103 @@ where
     match max_seconds {
         Some(secs) => time::timeout(Duration::from_secs(secs), fut).await,
         None => Ok(fut.await),
+    }
+}
+
+/// How often the idle watchdog samples the session log for growth. Small enough
+/// that sub-second-precision tests observe a cancel promptly; the sampled work
+/// is a single `stat`, so the cadence is cheap.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Why a watched session stopped early (i.e. before the agent future resolved).
+/// Both variants cancel the in-flight session, but they carry different intent:
+/// an idle stall is a wedged/hung child (hard cancel), while a budget stop is a
+/// graceful checkpoint against the soft total ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionKill {
+    /// The session produced no output for `idle_secs` seconds — the M10 idle
+    /// watchdog fired. This is what catches `PendingAgentClient`-style hangs
+    /// cheaply, where the old duration kill would have waited out the full ceiling.
+    Idle { idle_secs: u64 },
+    /// The soft total ceiling (`effective_max_seconds`) was reached. A graceful
+    /// checkpoint: the loop stops and the task is marked `needs_user`, never killed
+    /// mid-edit.
+    Budget { max_secs: u64 },
+}
+
+/// Run an agent session `fut` under the M10 idle watchdog.
+///
+/// The agent's acp streaming path appends every stdout/stderr chunk to the
+/// session log, so a growing log is a direct proxy for a productive run. This
+/// polls the log's size on [`IDLE_POLL_INTERVAL`]; a run is cancelled ONLY after
+/// `idle_timeout` of no growth — a productive long run never trips it, a wedged
+/// loop/hung process does. `max_seconds` layers the soft total ceiling on top:
+/// on reaching it the session stops with [`SessionKill::Budget`] (a graceful
+/// checkpoint), distinct from the idle stall.
+async fn run_session_watched<F>(
+    idle_timeout: Duration,
+    max_seconds: Option<u64>,
+    log_path: &Path,
+    fut: F,
+) -> Result<Result<AgentRunResult>, SessionKill>
+where
+    F: std::future::Future<Output = Result<AgentRunResult>>,
+{
+    tokio::pin!(fut);
+
+    let log_size = || fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+    let deadline = max_seconds.map(|secs| Instant::now() + Duration::from_secs(secs));
+    let mut last_size = log_size();
+    let mut last_activity = Instant::now();
+    let mut ticker = time::interval(IDLE_POLL_INTERVAL);
+    // The first tick fires immediately; consume it so the loop paces on real waits.
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            output = &mut fut => return Ok(output),
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                let size = log_size();
+                if size != last_size {
+                    last_size = size;
+                    last_activity = now;
+                }
+                if let Some(deadline) = deadline {
+                    if now >= deadline {
+                        return Err(SessionKill::Budget {
+                            max_secs: max_seconds.unwrap_or_default(),
+                        });
+                    }
+                }
+                if now.duration_since(last_activity) >= idle_timeout {
+                    return Err(SessionKill::Idle {
+                        idle_secs: idle_timeout.as_secs(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The M10 cooperative bounds resolved from config defaults, read once per run so
+/// the idle watchdog and the soft total ceiling share a single source of truth.
+///
+/// Per-task frontmatter overrides for these bounds are a follow-up increment
+/// (they require adding optional fields to `TaskFrontmatter` and updating its
+/// construction sites); today the values come straight from `defaults.*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OperationBounds {
+    idle_timeout: Duration,
+    max_seconds: Option<u64>,
+}
+
+impl OperationBounds {
+    fn resolve(config: &Config) -> Self {
+        Self {
+            idle_timeout: Duration::from_secs(config.defaults.idle_timeout_seconds),
+            max_seconds: config.defaults.effective_max_seconds(),
+        }
     }
 }
 
@@ -118,11 +215,19 @@ pub async fn run_task(
         resume_command: None,
     };
 
-    let ceiling = config.defaults.effective_max_seconds();
-    let agent_result = if interactive {
+    // M10 cooperative model: an interactive run stays fully user-driven (no
+    // watchdog); a headless run is guarded by the idle watchdog + soft ceiling.
+    let bounds = OperationBounds::resolve(config);
+    let agent_result: Result<Result<AgentRunResult>, SessionKill> = if interactive {
         Ok(client.run_task(request).await)
     } else {
-        run_under_ceiling(ceiling, client.run_task(request)).await
+        run_session_watched(
+            bounds.idle_timeout,
+            bounds.max_seconds,
+            &session_log_path,
+            client.run_task(request),
+        )
+        .await
     };
 
     let _interactive_finalization_guard = if interactive {
@@ -147,24 +252,43 @@ pub async fn run_task(
                 resume_command: None,
             })
         }
-        Err(_) => {
+        Err(SessionKill::Idle { idle_secs }) => {
             append_session_log(
                 &session_log_path,
                 &format!(
-                    "\ntimeout:\nexceeded {} second limit\nlong_running_task_requested=true\n",
-                    ceiling.unwrap_or(config.defaults.timeout_seconds)
+                    "\nidle_watchdog:\nno output for {idle_secs} seconds; session cancelled\nlong_running_task_requested=true\n"
                 ),
             )?;
             Err(AgentRunResult {
                 recap: format!(
-                    "# Agent Run Timed Out\n\nThe agent exceeded the configured {} second limit while processing `{}`.\n\nWhat completed: the session log was preserved for inspection.\n\nWhat remains: delegate the unfinished work to a Varda long-running runner task, then resume the agent after the complete runner output is available.\n\nBlockers: the single-session time limit was reached.\n\nUser interaction required: no.\n\nSuggested next agent: runner.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
-                    ceiling.unwrap_or(config.defaults.timeout_seconds),
+                    "# Agent Run Timed Out\n\nThe agent produced no output for {idle_secs} seconds while processing `{}`, so Varda's idle watchdog cancelled the wedged session.\n\nWhat completed: the session log was preserved for inspection.\n\nWhat remains: delegate the unfinished work to a Varda long-running runner task, then resume the agent after the complete runner output is available.\n\nBlockers: the session stalled with no output.\n\nUser interaction required: no.\n\nSuggested next agent: runner.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
                     task_path.display(),
                     session_log_path.display(),
                     session_log_path.display()
                 ),
                 requires_user: false,
                 suggested_agent: Some("runner".to_owned()),
+                resume_command: None,
+            })
+        }
+        Err(SessionKill::Budget { max_secs }) => {
+            append_session_log(
+                &session_log_path,
+                &format!(
+                    "\nbudget:\nsoft ceiling of {max_secs} seconds reached; stopping gracefully for user review\n"
+                ),
+            )?;
+            // A graceful checkpoint, NOT a failure: mark the task needs_user with the
+            // accumulated recap rather than killing it mid-work.
+            Err(AgentRunResult {
+                recap: format!(
+                    "# Operation Budget Reached\n\nThe agent reached the configured {max_secs} second soft ceiling while processing `{}`. Varda stopped the run gracefully so no edit was interrupted mid-flight.\n\nWhat remains: review the partial progress in the session log and re-run to continue.\n\nUser interaction required: yes.\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})",
+                    task_path.display(),
+                    session_log_path.display(),
+                    session_log_path.display()
+                ),
+                requires_user: true,
+                suggested_agent: None,
                 resume_command: None,
             })
         }
@@ -693,9 +817,55 @@ mod tests {
 
     use crate::agent::fake::FakeAgentClient;
     use crate::agent::{AgentRunRequest, AgentRunResult};
-    use crate::config::{AgentConfig, AgentKind, Defaults, GitConfig, Route};
+    use crate::config::{AgentConfig, AgentKind, Defaults, GitConfig, MaxSeconds, Route};
 
     use super::*;
+
+    /// M10 idle watchdog: a session that appends to its log within the idle window
+    /// survives, while a silent one is cancelled after the window elapses. These
+    /// exercise the primitive directly (no agent client) so they stay fast and
+    /// self-bounding.
+    #[tokio::test]
+    async fn idle_watchdog_cancels_silent_session_but_not_a_chatty_one() {
+        let dir = std::env::temp_dir().join(format!("varda-idle-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let log_path = dir.join("session.log");
+        fs::write(&log_path, "header\n").expect("seed log");
+
+        // Silent: the future never resolves and the log never grows → Idle kill.
+        let silent = run_session_watched(
+            Duration::from_millis(250),
+            None,
+            &log_path,
+            std::future::pending::<Result<AgentRunResult>>(),
+        )
+        .await;
+        assert!(
+            matches!(silent, Err(SessionKill::Idle { .. })),
+            "a silent session must be idle-cancelled, got {silent:?}"
+        );
+
+        // Chatty: a background task grows the log every 50ms for ~600ms, out-living
+        // the 250ms idle window, then the session future resolves normally.
+        let chatty_log = log_path.clone();
+        let fut = async move {
+            for i in 0..12u32 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = append_session_log(&chatty_log, &format!("chunk {i}\n"));
+            }
+            Ok(AgentRunResult {
+                recap: "# Recap\n\nDone.".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            })
+        };
+        let chatty = run_session_watched(Duration::from_millis(250), None, &log_path, fut).await;
+        assert!(
+            matches!(chatty, Ok(Ok(_))),
+            "a session that keeps emitting output must not be idle-cancelled, got {chatty:?}"
+        );
+    }
 
     #[tokio::test]
     async fn run_task_marks_successful_task_pending_and_writes_recap() {
@@ -814,24 +984,74 @@ Do it.
         .expect("task should be written");
 
         let mut config = test_config(operations_dir.display().to_string());
-        // A finite 1s ceiling forces the timeout path against a never-returning
-        // client. NB: since M10, `timeout_seconds = 0` means *unbounded* (like
-        // `max_seconds = "none"`), so it can no longer be used to force a timeout.
-        config.defaults.timeout_seconds = 1;
+        // Disambiguate the idle path from the soft ceiling: no budget deadline
+        // (`max_seconds = "none"`) and a 1s idle window. A never-returning client
+        // that writes nothing trips the idle watchdog, not the budget.
+        config.defaults.idle_timeout_seconds = 1;
+        config.defaults.max_seconds = Some(MaxSeconds::Keyword("none".to_owned()));
         let client = PendingAgentClient;
 
         let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
             .await
-            .expect("task should time out cleanly");
+            .expect("task should idle-cancel cleanly");
 
         let recap = fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
         let log = fs::read_to_string(&outcome.session_log_path).expect("log should be readable");
 
         assert_eq!(outcome.status, TaskStatus::Failed);
         assert!(recap.contains("Agent Run Timed Out"));
+        assert!(recap.contains("idle watchdog"));
         assert!(recap.contains("long-running runner task"));
         assert!(recap.contains("Suggested next agent: runner"));
         assert!(log.contains("long_running_task_requested=true"));
+    }
+
+    /// M10 operation budget: reaching the soft total ceiling (`max_seconds`) is a
+    /// graceful checkpoint — the task is marked `needs_user` with the accumulated
+    /// recap, never `failed` and never a mid-work kill.
+    #[tokio::test]
+    async fn run_task_budget_ceiling_marks_needs_user_not_failed() {
+        let root =
+            std::env::temp_dir().join(format!("varda-run-budget-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: codex
+requires_user: false
+---
+
+# Task
+
+Do it.
+"#,
+        )
+        .expect("task should be written");
+
+        let mut config = test_config(operations_dir.display().to_string());
+        // A 1s soft ceiling with a large idle window: the budget fires first.
+        config.defaults.max_seconds = Some(MaxSeconds::Seconds(1));
+        config.defaults.idle_timeout_seconds = 60;
+        let client = PendingAgentClient;
+
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
+            .await
+            .expect("task should stop at the budget cleanly");
+
+        let recap = fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
+
+        assert_eq!(
+            outcome.status,
+            TaskStatus::NeedsUser,
+            "a budget stop is a graceful checkpoint, not a failure"
+        );
+        assert!(recap.contains("Operation Budget Reached"));
+        assert!(recap.contains("soft ceiling"));
     }
 
     struct PendingAgentClient;
@@ -1076,6 +1296,9 @@ Help interactively.
                 timeout_seconds: 600,
                 operations_dir,
                 sandbox: None,
+                // A generous idle window so the instant fake clients used by most
+                // tests are never idle-limited; stall/budget tests set their own.
+                idle_timeout_seconds: 30,
                 ..Default::default()
             },
             routes: vec![Route {

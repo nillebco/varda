@@ -518,18 +518,29 @@ work and, under a sandbox, leaking containers/volumes. Varda is moving to a
   bound is hit.
 - **Operation budget** (`max_seconds`, `max_tool_calls`) — soft ceilings tracked
   across the whole task. `max_seconds` accepts an integer or `"none"`; `max_tool_calls`
-  of `0` means unlimited. On exceed, the loop **stops and marks the task
+  of `0` means unlimited. On exceed, the run **stops and marks the task
   `needs_user`** with the accumulated recap — a graceful checkpoint, never a kill.
 
 `timeout_seconds` remains as a **deprecated alias**: when `max_seconds` is unset it
-supplies the soft ceiling, so existing configs behave unchanged. Each bound can be
-overridden per-task in the task frontmatter (`idle_timeout`, `max_seconds`,
-`max_continuations`, `max_tool_calls`).
+supplies the soft ceiling, so existing configs behave unchanged.
 
-> Rollout note: the configuration layer above (parsing, back-compat alias, and the
-> `Defaults::effective_max_seconds` resolver) is wired and tested. The runner-side
-> idle watchdog + auto-resume loop replacing the `time::timeout` hard kill in
-> `src/runner.rs` lands as the next increment of this milestone.
+The idle watchdog observes the session log's growth as its activity signal: the acp
+streaming path appends every stdout/stderr chunk to the log, so a growing log is a
+direct proxy for a productive run and a stalled log is a wedged child. Reaching the
+soft `max_seconds` ceiling stops the run gracefully as `needs_user`; a silent stall
+past `idle_timeout_seconds` cancels the wedged session and suggests a long-running
+runner follow-up.
+
+> Rollout note: the config layer (parsing, back-compat alias, `effective_max_seconds`
+> resolver) and — as of this increment — the runner-side **idle watchdog** and the
+> **soft `max_seconds` budget** are wired and tested in `src/runner.rs`, replacing
+> the old `time::timeout` hard kill for non-interactive runs. Still landing in
+> follow-up increments of this milestone: the multi-hop **auto-resume loop**
+> (`max_continuations`) with accumulated recaps, the **`max_tool_calls`** budget,
+> **per-task frontmatter overrides** for the four bounds, and guaranteed **sandbox
+> teardown on the idle/budget cancel paths** (today teardown runs on a natural
+> session end; a watchdog cancel drops the child via `kill_on_drop` but does not yet
+> run `session.teardown()`).
 
 ## Configuration
 
