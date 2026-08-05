@@ -95,6 +95,12 @@ pub struct Config {
     pub git: GitConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sandboxes: BTreeMap<String, SandboxConfig>,
+    /// Nested-orchestration (M8) defaults: whether a sandboxed master may request
+    /// sub-task spawns and the caps that bound them. Safe default: spawning
+    /// disabled, `local` sandbox denied. A `[[routes]]` entry may override this
+    /// wholesale for the code it matches (see [`Config::resolve_orchestration_for`]).
+    #[serde(default, skip_serializing_if = "crate::orchestration::OrchestrationPolicy::is_default")]
+    pub orchestration: crate::orchestration::OrchestrationPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -252,6 +258,12 @@ pub struct Route {
     /// `.varda` origin in M6b).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<String>,
+    /// Per-route nested-orchestration policy. When set, it REPLACES the top-level
+    /// `[orchestration]` defaults for tasks this route matches (so untrusted code
+    /// can be pinned to a stricter — or, deliberately, a looser — spawn policy than
+    /// the global default). Unset ⇒ inherit `Config::orchestration`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<crate::orchestration::OrchestrationPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,6 +427,27 @@ impl Config {
                 })
             }
         }
+    }
+
+    /// Resolve the effective nested-orchestration policy for a task at
+    /// `project_path`: the glob-matched route's `orchestration` override when it
+    /// sets one, otherwise the top-level `[orchestration]` defaults. Consulted by
+    /// the run path when standing up the `spawn_subtask` broker for a sandboxed
+    /// master, so every live spawn is gated by exactly the policy that governs the
+    /// code being worked on.
+    ///
+    /// `allow(dead_code)` until the run path stands up the broker per task (the MCP
+    /// transport-into-sandbox step of this milestone); the resolver + policy surface
+    /// are landed and unit-tested ahead of that wiring.
+    #[allow(dead_code)]
+    pub fn resolve_orchestration_for(
+        &self,
+        project_path: &Path,
+    ) -> crate::orchestration::OrchestrationPolicy {
+        crate::routing::find_route_public(self, project_path)
+            .ok()
+            .and_then(|route| route.orchestration.clone())
+            .unwrap_or_else(|| self.orchestration.clone())
     }
 
     fn sandbox_config_by_name(&self, name: &str) -> SandboxConfig {
@@ -709,6 +742,7 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
             agents,
             sandbox: None,
             mounts: Vec::new(),
+            orchestration: None,
         },
     );
     save_config(path, &config)
@@ -1100,6 +1134,7 @@ operations_dir = "operations"
             agents: vec!["codex".to_owned()],
             sandbox: Some("firejail".to_owned()),
             mounts: Vec::new(),
+            orchestration: None,
         };
         assert_eq!(config.effective_sandbox(&route_with_sandbox), "firejail");
     }
@@ -1173,6 +1208,7 @@ mod m6b_tests {
             agents: vec!["codex".to_owned()],
             sandbox: None,
             mounts: vec![],
+            orchestration: None,
         }];
         c
     }
@@ -1403,5 +1439,80 @@ mod m6b_tests {
         let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
         assert!(err.to_string().contains("primitive"), "{err}");
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod orchestration_config_tests {
+    use super::*;
+    use crate::orchestration::OrchestrationPolicy;
+
+    #[test]
+    fn default_config_leaves_orchestration_locked_down() {
+        // The shipped default config must not enable spawning.
+        let c: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert!(!c.orchestration.enabled);
+        assert!(c.orchestration.is_default());
+    }
+
+    #[test]
+    fn orchestration_table_parses_from_toml() {
+        let toml_src = r#"
+[defaults]
+timeout_seconds = 0
+operations_dir = "ops"
+
+[orchestration]
+enabled = true
+max_depth = 3
+max_fanout = 5
+allow_agents = ["claude"]
+
+[[routes]]
+glob = "**"
+agents = ["claude"]
+"#;
+        let c: Config = toml::from_str(toml_src).unwrap();
+        assert!(c.orchestration.enabled);
+        assert_eq!(c.orchestration.max_depth, 3);
+        assert_eq!(c.orchestration.max_fanout, 5);
+        assert_eq!(c.orchestration.allow_agents, vec!["claude".to_owned()]);
+        // deny_sandboxes still defaults to ["local"] even when only some keys are set.
+        assert!(c.orchestration.deny_sandboxes.contains(&"local".to_owned()));
+    }
+
+    #[test]
+    fn resolve_prefers_route_override_then_falls_back_to_defaults() {
+        let strict = OrchestrationPolicy::default(); // disabled
+        let permissive = OrchestrationPolicy {
+            enabled: true,
+            max_fanout: 9,
+            ..OrchestrationPolicy::default()
+        };
+        let mut c: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        c.orchestration = permissive.clone();
+        c.routes = vec![
+            Route {
+                glob: "**/locked/**".to_owned(),
+                agents: vec!["claude".to_owned()],
+                sandbox: None,
+                mounts: vec![],
+                orchestration: Some(strict.clone()),
+            },
+            Route {
+                glob: "**".to_owned(),
+                agents: vec!["claude".to_owned()],
+                sandbox: None,
+                mounts: vec![],
+                orchestration: None,
+            },
+        ];
+
+        // A path matching the override route gets the stricter policy.
+        let locked = c.resolve_orchestration_for(Path::new("/work/locked/proj"));
+        assert_eq!(locked, strict);
+        // A path without an override inherits the top-level defaults.
+        let other = c.resolve_orchestration_for(Path::new("/work/other/proj"));
+        assert_eq!(other, permissive);
     }
 }

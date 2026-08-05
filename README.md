@@ -789,7 +789,27 @@ A "master" agent task running inside a sandbox may need to **decompose work** an
   - returns results back through the broker.
 - Even a fully compromised master can only *ask* the broker; it never holds the capability to spawn host processes. The sandbox covers the inward radius; the broker covers the outward radius.
 
-The host-side policy engine lives in `src/orchestration.rs` (`OrchestrationPolicy`, `SpawnLedger::authorize`). Every cap is a **hard error** (`SpawnDenied`), never a silent truncation. Safe defaults: spawning is **disabled**, and the `local` (no-isolation) sandbox is denied so a spawned subtask cannot escape the box.
+The host-side policy engine and the live broker both live in `src/orchestration.rs`:
+
+- **Policy engine** — `OrchestrationPolicy` + `SpawnLedger::authorize`/`authorize_and_record`. Every cap is a **hard error** (`SpawnDenied`), never a silent truncation. Safe defaults: spawning is **disabled**, and the `local` (no-isolation) sandbox is denied so a spawned subtask cannot escape the box.
+- **Broker** — `SpawnBroker` owns the ledger plus a **lineage registry** (task id → tree depth) and a host `SubtaskLauncher` seam. It speaks MCP JSON-RPC (`handle_rpc`): `tools/list` advertises exactly `spawn_subtask` (+ optional `await_subtask` / `subtask_result`), and each `spawn_subtask` call is gated through `authorize_and_record` **before** the host is asked to launch. A denial comes back as an MCP tool error (`isError: true`) carrying the `SpawnDenied` reason. The caller **never supplies its own depth** — the broker looks it up from the lineage registry, so a compromised master cannot claim a shallow depth to dodge the recursion cap, and an unknown caller cannot spawn at all. If the host launch fails after authorization, the ledger is rolled back (`SpawnLedger::unrecord`) so a failed attempt consumes no budget.
+
+**Config surface.** `OrchestrationPolicy` is exposed through `config.toml` as a top-level `[orchestration]` table (defaults) and an optional per-`[[routes]]` `orchestration` override; `Config::resolve_orchestration_for(path)` returns the route override when the matched route sets one, else the global defaults, so untrusted code can be pinned to a stricter (or deliberately looser) spawn policy than the default:
+
+```toml
+[orchestration]          # global defaults (omitted table ⇒ locked-down default)
+enabled       = true
+max_depth     = 2
+max_fanout    = 4
+global_child_budget = 16
+deny_sandboxes = ["local"]
+
+[[routes]]
+glob = "**/untrusted/**"
+agents = ["claude"]
+[routes.orchestration]   # stricter policy just for this route
+enabled = false
+```
 
 #### Orchestration isolation invariants (MANDATORY — never violate)
 
@@ -801,9 +821,9 @@ These must hold for the broker **and** the base sandbox; violating any makes the
 4. Spawning is reachable **only** through the gated `spawn_subtask` MCP tool mediated by host-side Varda — never via host process access, the docker socket, or a mounted control plane.
 5. Every spawn is bounded by **depth + fan-out + global child budget**; exceeding a bound is a hard error, not a silent cap.
 
-Invariants 1 and 2 are enforced at the mount layer (folded into `check_credential_denylist`, so every mount call site is covered); invariant 5 is enforced by the `src/orchestration.rs` policy engine.
+Invariants 1 and 2 are enforced at the mount layer (folded into `check_credential_denylist`, so every mount call site is covered); invariant 5 is enforced by the `src/orchestration.rs` policy engine and re-checked on every `SpawnBroker` tool call.
 
-> **Status:** the host-side policy engine (allow/deny, depth, fan-out, budget, approval gate) and the invariant-1/2 mount floor are implemented and unit-tested. Wiring the live `spawn_subtask` MCP tool into a running sandbox and launching the sibling box end-to-end is the remaining step of this milestone.
+> **Status:** the host-side policy engine (allow/deny, depth, fan-out, budget, approval gate), the invariant-1/2 mount floor, the live `SpawnBroker` (MCP `spawn_subtask` dispatch → `authorize_and_record` → host `SubtaskLauncher`, with lineage-depth tracking and budget roll-back on launch failure), and the `[orchestration]` config surface (defaults + per-route override) are implemented and unit-tested. **Remaining:** the MCP *transport* that carries the broker's JSON-RPC channel into a running sandbox (a stdio/socket reachable only from inside the box), a concrete `SubtaskLauncher` that reuses the run path to boot the sibling box, and the docker-backed negative-isolation integration test (`--ignored`).
 
 ### Per-task capability allowlist (headless permission grants)
 

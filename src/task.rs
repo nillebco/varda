@@ -762,11 +762,13 @@ Verify the sandbox.
                 agents: vec!["codex".to_owned()],
                 sandbox: None,
                 mounts: Vec::new(),
+                orchestration: None,
             }],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let project_path = Path::new("/work/project");
@@ -822,6 +824,7 @@ requires_user: false
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let path = create_task(&config, "Next Task", Path::new("/work/project"), None, None)
@@ -856,6 +859,7 @@ requires_user: false
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let first = create_task(&config, "Project Task", &first_project, None, None)
@@ -934,6 +938,7 @@ requires_user: false
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let tasks = list_tasks(&config, &project_path).expect("tasks should list");
@@ -977,6 +982,7 @@ requires_user: false
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let resolved =

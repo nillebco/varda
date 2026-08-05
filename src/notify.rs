@@ -131,6 +131,7 @@ mod tests {
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let notification = notify_user_interaction(

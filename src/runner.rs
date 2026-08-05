@@ -1670,6 +1670,7 @@ Help interactively.
                 agents: vec!["codex".to_owned()],
                 sandbox: None,
                 mounts: Vec::new(),
+                orchestration: None,
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),
@@ -1690,6 +1691,7 @@ Help interactively.
             roles: std::collections::BTreeMap::new(),
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         }
     }
 }

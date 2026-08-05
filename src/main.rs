@@ -3203,6 +3203,7 @@ planner_agent: codex
             roles: std::collections::BTreeMap::new(),
             git: config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let sessions = task_sessions(&config, &task_path).expect("sessions should be found");

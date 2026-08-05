@@ -30,16 +30,19 @@
 //! Invariants 1 and 2 are enforced at the mount layer (see
 //! [`crate::sandbox::check_control_plane_denylist`]). Invariant 5 is enforced here.
 
-// The policy engine is fully unit-tested but not yet consulted by the run path:
-// the live `spawn_subtask` MCP tool that will call `SpawnLedger::authorize` before
-// launching a sibling sandbox is the remaining step of this milestone. Silence
-// dead-code warnings until that wiring lands rather than leave the crate noisy.
+// The pure policy engine ([`SpawnLedger`]/[`OrchestrationPolicy`]) is now consumed
+// by the live [`SpawnBroker`] below, which mediates the `spawn_subtask` MCP tool
+// and hands accepted spawns to a host [`SubtaskLauncher`]. The one remaining piece
+// is the MCP *transport* that carries the broker's JSON-RPC into a running sandbox
+// (a stdio/socket channel reachable only from the box); until that lands, some
+// broker entry points are exercised only by tests, so keep the crate quiet.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
 use globset::Glob;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 /// Identifier of a task in the spawn tree. The root master task has some id; each
 /// accepted subtask gets its own. Used to attribute fan-out and depth.
@@ -107,6 +110,15 @@ fn default_global_child_budget() -> u32 {
 }
 fn default_deny_sandboxes() -> Vec<String> {
     vec!["local".to_owned()]
+}
+
+impl OrchestrationPolicy {
+    /// True when this policy equals the safe default (spawning disabled, `local`
+    /// denied). Used by config serde to omit the `[orchestration]` table when it
+    /// carries nothing but defaults, so a plain `config.toml` round-trips clean.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 impl Default for OrchestrationPolicy {
@@ -332,6 +344,19 @@ impl SpawnLedger {
         self.global_spawned += 1;
     }
 
+    /// Roll back one recorded spawn for `parent` (both its fan-out tally and the
+    /// global budget). Used by the live broker when an authorized spawn is
+    /// recorded but the host then fails to launch the sibling box, so a failed
+    /// attempt never permanently consumes budget. Saturates at zero.
+    pub fn unrecord(&mut self, parent: &str) {
+        if let Some(count) = self.children.get_mut(parent)
+            && *count > 0
+        {
+            *count -= 1;
+            self.global_spawned = self.global_spawned.saturating_sub(1);
+        }
+    }
+
     /// Convenience: authorize and, on success, record in one step. Returns the
     /// grant so the caller knows the child depth.
     pub fn authorize_and_record(
@@ -369,6 +394,247 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
         Ok(g) => g.compile_matcher().is_match(value),
         Err(_) => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live broker — the `spawn_subtask` MCP tool + host-mediated sibling launch.
+//
+// The broker is the ONLY thing a sandboxed master can reach across the boundary
+// (invariant 4). It owns the [`SpawnLedger`] and a depth registry (lineage), and
+// on every tool call it consults [`SpawnLedger::authorize_and_record`] BEFORE it
+// asks the host to launch anything. The actual launch is delegated to a host
+// [`SubtaskLauncher`], which reuses the normal run path to start each subtask in
+// its OWN sibling sandbox — never nested, never with the docker socket or
+// `~/.varda` in reach (invariants 1–3). This module never spawns a process
+// itself; it decides, records lineage, and calls the launcher.
+// ---------------------------------------------------------------------------
+
+/// Name of the single spawn tool exposed into the sandbox. Nothing else crosses.
+pub const SPAWN_SUBTASK_TOOL: &str = "spawn_subtask";
+/// Optional read-back tools (result plumbing). Present in the manifest so a master
+/// can discover them; the live wiring for results flows through varda memory.
+pub const AWAIT_SUBTASK_TOOL: &str = "await_subtask";
+pub const SUBTASK_RESULT_TOOL: &str = "subtask_result";
+
+/// The host-side seam that actually launches an AUTHORIZED subtask in its own
+/// sibling sandbox. The broker calls this ONLY after
+/// [`SpawnLedger::authorize_and_record`] has succeeded, passing the re-validated
+/// request and the assigned child depth. Implementations reuse the normal run
+/// path (materialize a task + run it in a fresh box); they MUST NOT nest inside
+/// the caller's sandbox (invariant 3). Returns the new subtask id.
+pub trait SubtaskLauncher {
+    fn launch(&mut self, req: &SpawnRequest, grant: &SpawnGrant) -> anyhow::Result<SubtaskId>;
+}
+
+/// Why a `spawn_subtask` call failed, distinguishing a policy denial (a hard
+/// [`SpawnDenied`], surfaced verbatim to the master) from an unknown-lineage
+/// spoof attempt and a host-side launch failure.
+#[derive(Debug)]
+pub enum BrokerError {
+    /// The policy engine rejected the spawn. Surfaced to the caller unchanged.
+    Denied(SpawnDenied),
+    /// The calling task id is not in the lineage registry — it was never spawned
+    /// through this broker, so its depth is unknown and it may not spawn. Closes
+    /// the "claim a shallow depth to dodge the recursion cap" spoof: the caller
+    /// never supplies its own depth, the broker looks it up.
+    UnknownParent(SubtaskId),
+    /// The policy allowed the spawn but the host failed to launch the sibling box.
+    /// The ledger is rolled back so the failed attempt does not consume budget.
+    Launch(String),
+}
+
+impl std::fmt::Display for BrokerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BrokerError::Denied(d) => write!(f, "{d}"),
+            BrokerError::UnknownParent(id) => write!(
+                f,
+                "spawn denied: caller '{id}' was not spawned through this broker (unknown lineage)"
+            ),
+            BrokerError::Launch(msg) => write!(f, "subtask launch failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for BrokerError {}
+
+/// The live broker: policy + ledger + lineage registry + a host launcher. One
+/// broker instance backs one root run; its lineage map is the real spawn tree the
+/// `max_depth` cap is enforced against.
+pub struct SpawnBroker<L: SubtaskLauncher> {
+    policy: OrchestrationPolicy,
+    ledger: SpawnLedger,
+    /// Task id → depth in the tree. The root master is registered at depth 0 by
+    /// [`SpawnBroker::new`]; each accepted child is registered at its granted depth
+    /// so its own future spawns resolve their depth correctly.
+    depths: BTreeMap<SubtaskId, u32>,
+    launcher: L,
+}
+
+impl<L: SubtaskLauncher> SpawnBroker<L> {
+    /// Create a broker for a root run. `root_id` is the master task id; it is
+    /// registered at depth 0 so its spawns land at depth 1.
+    pub fn new(policy: OrchestrationPolicy, root_id: impl Into<SubtaskId>, launcher: L) -> Self {
+        let mut depths = BTreeMap::new();
+        depths.insert(root_id.into(), 0);
+        Self {
+            policy,
+            ledger: SpawnLedger::new(),
+            depths,
+            launcher,
+        }
+    }
+
+    /// Total subtasks spawned so far this run (for observability/tests).
+    pub fn global_spawned(&self) -> u32 {
+        self.ledger.global_spawned()
+    }
+
+    /// Depth of a known task, or `None` if it was never registered.
+    pub fn depth_of(&self, id: &str) -> Option<u32> {
+        self.depths.get(id).copied()
+    }
+
+    /// Handle one `spawn_subtask` request from `parent_id` (the id of the sandbox
+    /// that owns the broker channel — the host knows this; it is NOT attacker
+    /// supplied). Gates on policy, launches a sibling on success, and records
+    /// lineage for the new child. Every denial is a hard error (invariant 5).
+    pub fn spawn_subtask(
+        &mut self,
+        parent_id: &str,
+        req: SpawnRequest,
+    ) -> Result<SubtaskId, BrokerError> {
+        let parent_depth = self
+            .depths
+            .get(parent_id)
+            .copied()
+            .ok_or_else(|| BrokerError::UnknownParent(parent_id.to_owned()))?;
+
+        let ctx = SpawnContext {
+            parent_id: parent_id.to_owned(),
+            parent_depth,
+        };
+
+        let grant = self
+            .ledger
+            .authorize_and_record(&self.policy, &ctx, &req)
+            .map_err(BrokerError::Denied)?;
+
+        match self.launcher.launch(&req, &grant) {
+            Ok(child_id) => {
+                self.depths.insert(child_id.clone(), grant.child_depth);
+                Ok(child_id)
+            }
+            Err(e) => {
+                // The host failed to launch: undo the ledger record so the failed
+                // attempt does not consume fan-out / global budget.
+                self.ledger.unrecord(parent_id);
+                Err(BrokerError::Launch(e.to_string()))
+            }
+        }
+    }
+
+    /// The MCP `tools/list` manifest: exactly the narrow spawn tool plus the
+    /// optional read-backs. Nothing else is advertised across the boundary.
+    pub fn tool_manifest() -> Value {
+        json!({
+            "tools": [
+                {
+                    "name": SPAWN_SUBTASK_TOOL,
+                    "description": "Request the host to run a sub-task in its own sibling sandbox. Host-mediated and policy-gated; returns the assigned subtask id or a denial reason.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["brief"],
+                        "properties": {
+                            "brief": {"type": "string", "description": "What the sub-task should accomplish (becomes its task body)."},
+                            "route": {"type": "string", "description": "Optional requested route glob (host re-validates)."},
+                            "agent": {"type": "string", "description": "Optional requested agent (host re-validates)."},
+                            "sandbox": {"type": "string", "description": "Optional requested sandbox name; must isolate (never `local`)."}
+                        }
+                    }
+                },
+                {"name": AWAIT_SUBTASK_TOOL, "description": "Block until a spawned sub-task finishes (result flows via varda memory).", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
+                {"name": SUBTASK_RESULT_TOOL, "description": "Fetch the recap/result of a finished sub-task.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}}
+            ]
+        })
+    }
+
+    /// Dispatch one MCP JSON-RPC request arriving on the broker channel owned by
+    /// `parent_id`. Handles `initialize`, `tools/list`, and `tools/call`; a
+    /// `spawn_subtask` call is gated through [`SpawnBroker::spawn_subtask`] and a
+    /// denial is returned as an MCP tool error (`isError: true`) carrying the
+    /// [`SpawnDenied`] reason — never a silent cap. Returns the JSON-RPC response.
+    pub fn handle_rpc(&mut self, parent_id: &str, request: &Value) -> Value {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+        match method {
+            "initialize" => rpc_result(
+                id,
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {"name": "varda-spawn-broker", "version": env!("CARGO_PKG_VERSION")},
+                    "capabilities": {"tools": {}}
+                }),
+            ),
+            "tools/list" => rpc_result(id, Self::tool_manifest()),
+            "tools/call" => self.handle_tool_call(id, parent_id, request.get("params")),
+            other => rpc_error(id, -32601, &format!("method not found: {other}")),
+        }
+    }
+
+    fn handle_tool_call(&mut self, id: Value, parent_id: &str, params: Option<&Value>) -> Value {
+        let Some(params) = params else {
+            return rpc_error(id, -32602, "missing params");
+        };
+        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let args = params.get("arguments").cloned().unwrap_or(json!({}));
+        match name {
+            SPAWN_SUBTASK_TOOL => {
+                let Some(brief) = args.get("brief").and_then(Value::as_str) else {
+                    return rpc_error(id, -32602, "spawn_subtask requires a `brief`");
+                };
+                let req = SpawnRequest {
+                    brief: brief.to_owned(),
+                    route: str_arg(&args, "route"),
+                    agent: str_arg(&args, "agent"),
+                    sandbox: str_arg(&args, "sandbox"),
+                    // Approval is a host-side decision, never asserted by the box.
+                    approved: false,
+                };
+                match self.spawn_subtask(parent_id, req) {
+                    Ok(child_id) => rpc_result(id, tool_text(&format!("subtask_id: {child_id}"), false)),
+                    Err(e) => rpc_result(id, tool_text(&e.to_string(), true)),
+                }
+            }
+            AWAIT_SUBTASK_TOOL | SUBTASK_RESULT_TOOL => rpc_result(
+                id,
+                tool_text(
+                    "not available on this channel: sub-task results flow back through varda memory",
+                    true,
+                ),
+            ),
+            other => rpc_error(id, -32601, &format!("unknown tool: {other}")),
+        }
+    }
+}
+
+fn str_arg(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty())
+}
+
+fn tool_text(text: &str, is_error: bool) -> Value {
+    json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+}
+
+fn rpc_result(id: Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
 #[cfg(test)]
@@ -592,5 +858,157 @@ mod tests {
         assert!(ledger.authorize(&policy, &deny_ctx, &req()).is_err());
         assert_eq!(ledger.global_spawned(), 0);
         assert_eq!(ledger.children_of("deep"), 0);
+    }
+
+    // --- Live broker -------------------------------------------------------
+
+    /// Deterministic launcher for tests: hands back sequential child ids and
+    /// records every spawn it was asked to launch, so tests can assert the host
+    /// only ever launches AUTHORIZED spawns (never one the policy denied).
+    struct MockLauncher {
+        next: u32,
+        launched: Vec<(SpawnRequest, u32)>,
+        fail: bool,
+    }
+    impl MockLauncher {
+        fn new() -> Self {
+            Self { next: 0, launched: Vec::new(), fail: false }
+        }
+        fn failing() -> Self {
+            Self { next: 0, launched: Vec::new(), fail: true }
+        }
+    }
+    impl SubtaskLauncher for MockLauncher {
+        fn launch(&mut self, req: &SpawnRequest, grant: &SpawnGrant) -> anyhow::Result<SubtaskId> {
+            if self.fail {
+                anyhow::bail!("simulated host launch failure");
+            }
+            self.launched.push((req.clone(), grant.child_depth));
+            self.next += 1;
+            Ok(format!("sub-{}", self.next))
+        }
+    }
+
+    #[test]
+    fn broker_launches_authorized_spawn_and_returns_child_id() {
+        let mut broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
+        let id = broker.spawn_subtask("root", req()).expect("should launch");
+        assert_eq!(id, "sub-1");
+        assert_eq!(broker.depth_of("sub-1"), Some(1));
+        assert_eq!(broker.global_spawned(), 1);
+    }
+
+    #[test]
+    fn broker_denial_never_reaches_the_launcher() {
+        // Disabled policy: the launcher must not be called at all.
+        let mut broker = SpawnBroker::new(OrchestrationPolicy::default(), "root", MockLauncher::new());
+        match broker.spawn_subtask("root", req()) {
+            Err(BrokerError::Denied(SpawnDenied::Disabled)) => {}
+            other => panic!("expected Disabled denial, got {other:?}"),
+        }
+        assert_eq!(broker.global_spawned(), 0);
+    }
+
+    #[test]
+    fn broker_tracks_lineage_depth_across_the_real_tree() {
+        // max_depth = 2: root(0) → child(1) → grandchild(2) ok; great-grandchild(3) denied.
+        let mut broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
+        let child = broker.spawn_subtask("root", req()).unwrap();
+        assert_eq!(broker.depth_of(&child), Some(1));
+        let grand = broker.spawn_subtask(&child, req()).unwrap();
+        assert_eq!(broker.depth_of(&grand), Some(2));
+        // Now a spawn from the depth-2 grandchild would land at depth 3 > max_depth.
+        match broker.spawn_subtask(&grand, req()) {
+            Err(BrokerError::Denied(SpawnDenied::DepthExceeded { attempted: 3, max: 2 })) => {}
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn broker_rejects_unknown_parent_lineage_spoof() {
+        // A caller the broker never spawned cannot spawn (can't fake a shallow depth).
+        let mut broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
+        match broker.spawn_subtask("ghost", req()) {
+            Err(BrokerError::UnknownParent(id)) => assert_eq!(id, "ghost"),
+            other => panic!("expected UnknownParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn broker_rolls_back_budget_when_host_launch_fails() {
+        let mut broker = SpawnBroker::new(base_policy(), "root", MockLauncher::failing());
+        match broker.spawn_subtask("root", req()) {
+            Err(BrokerError::Launch(_)) => {}
+            other => panic!("expected Launch error, got {other:?}"),
+        }
+        // A failed launch must not consume budget/fan-out.
+        assert_eq!(broker.global_spawned(), 0);
+        assert_eq!(broker.depth_of("sub-1"), None);
+    }
+
+    #[test]
+    fn rpc_tools_list_exposes_only_the_narrow_spawn_surface() {
+        let mut broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
+        let resp = broker.handle_rpc("root", &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
+        let names: Vec<String> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, vec![SPAWN_SUBTASK_TOOL, AWAIT_SUBTASK_TOOL, SUBTASK_RESULT_TOOL]);
+    }
+
+    #[test]
+    fn rpc_spawn_call_returns_subtask_id_on_success() {
+        let mut broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
+        let resp = broker.handle_rpc(
+            "root",
+            &json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": {"name": SPAWN_SUBTASK_TOOL, "arguments": {"brief": "do it"}}}),
+        );
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("subtask_id: sub-1"), "got {text}");
+    }
+
+    #[test]
+    fn rpc_denied_spawn_surfaces_reason_as_tool_error_not_silent_cap() {
+        // budget = 3 across distinct parents, then the 4th trips BudgetExceeded and
+        // the RPC layer must surface it as isError:true with the reason text.
+        let mut policy = base_policy();
+        policy.max_fanout = 10; // don't let fan-out trip first
+        let mut broker = SpawnBroker::new(policy, "root", MockLauncher::new());
+        for _ in 0..3 {
+            let r = broker.handle_rpc(
+                "root",
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": SPAWN_SUBTASK_TOOL, "arguments": {"brief": "x"}}}),
+            );
+            assert_eq!(r["result"]["isError"], json!(false));
+        }
+        let denied = broker.handle_rpc(
+            "root",
+            &json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                    "params": {"name": SPAWN_SUBTASK_TOOL, "arguments": {"brief": "x"}}}),
+        );
+        assert_eq!(denied["result"]["isError"], json!(true));
+        let text = denied["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("global child budget exhausted"), "got {text}");
+    }
+
+    #[test]
+    fn rpc_local_sandbox_request_is_refused() {
+        // A master asking to place its subtask in the escape-hatch `local` box is
+        // refused (deny_sandboxes defaults to ["local"]).
+        let mut broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
+        let resp = broker.handle_rpc(
+            "root",
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": SPAWN_SUBTASK_TOOL, "arguments": {"brief": "x", "sandbox": "local"}}}),
+        );
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("must run in an isolating sibling box"), "got {text}");
     }
 }
