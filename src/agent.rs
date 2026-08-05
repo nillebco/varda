@@ -167,7 +167,7 @@ pub fn parse_files_touched(recap: &str) -> Vec<PathBuf> {
         }
 
         let path_str = trimmed
-            .trim_start_matches(|c: char| c == '-' || c == '*' || c == '•')
+            .trim_start_matches(['-', '*', '•'])
             .trim()
             .trim_matches('`')
             .trim();
@@ -215,7 +215,7 @@ pub fn parse_blocked_commands(recap: &str) -> Vec<String> {
         // list within the same section (no intervening heading); it is never a
         // blocked command, so drop it.
         if trimmed
-            .trim_start_matches(|c: char| c == '#' || c == '*' || c == ' ')
+            .trim_start_matches(['#', '*', ' '])
             .to_ascii_lowercase()
             .starts_with("requires_user:")
         {
@@ -223,7 +223,7 @@ pub fn parse_blocked_commands(recap: &str) -> Vec<String> {
         }
 
         let command = trimmed
-            .trim_start_matches(|c: char| c == '-' || c == '*' || c == '•')
+            .trim_start_matches(['-', '*', '•'])
             .trim()
             .trim_matches('`')
             .trim();

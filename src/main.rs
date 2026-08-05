@@ -936,7 +936,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         .get(&planner_agent)
         .with_context(|| format!("plan transformer agent '{planner_agent}' is not configured"))?;
     let client = build_client(
-        &config,
+        config,
         &planner_agent,
         agent_config,
         config::DEFAULT_SANDBOX_PROVIDER,
@@ -1755,11 +1755,10 @@ fn load_dashboard_payload(
     let mut projects = Vec::new();
     let mut tasks = Vec::new();
     for summary in summaries {
-        if let Some(project) = summary.project.as_ref() {
-            if !projects.contains(project) {
+        if let Some(project) = summary.project.as_ref()
+            && !projects.contains(project) {
                 projects.push(project.clone());
             }
-        }
 
         let completed_at = file_mtime_seconds(&summary.path);
 
@@ -1843,13 +1842,12 @@ fn percent_decode(input: &[u8]) -> String {
     let mut output = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {
-        if input[i] == b'%' && i + 2 < input.len() {
-            if let (Some(high), Some(low)) = (hex_value(input[i + 1]), hex_value(input[i + 2])) {
+        if input[i] == b'%' && i + 2 < input.len()
+            && let (Some(high), Some(low)) = (hex_value(input[i + 1]), hex_value(input[i + 2])) {
                 output.push((high << 4) | low);
                 i += 3;
                 continue;
             }
-        }
         output.push(input[i]);
         i += 1;
     }
@@ -2578,7 +2576,7 @@ async fn run_captured_resume_command(
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
     let client = build_client(
-        &config,
+        config,
         &display_name,
         agent_config,
         &route.sandbox,
@@ -2661,11 +2659,10 @@ fn update_tasks_command(
                 if !filter_statuses.is_empty() && !filter_statuses.contains(&t.status) {
                     return false;
                 }
-                if let Some(agent) = filter_agent {
-                    if t.assignee.as_deref() != Some(agent) {
+                if let Some(agent) = filter_agent
+                    && t.assignee.as_deref() != Some(agent) {
                         return false;
                     }
-                }
                 true
             })
             .map(|t| t.path)

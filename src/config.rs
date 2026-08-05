@@ -638,11 +638,10 @@ fn ensure_git_repo(path: &Path) -> Result<()> {
 }
 
 pub fn varda_home() -> Result<PathBuf> {
-    if let Ok(home) = std::env::var(VARDA_HOME_ENV) {
-        if !home.trim().is_empty() {
+    if let Ok(home) = std::env::var(VARDA_HOME_ENV)
+        && !home.trim().is_empty() {
             return Ok(PathBuf::from(home));
         }
-    }
 
     let home = std::env::var("HOME").context("HOME is not set and VARDA_HOME was not provided")?;
     Ok(PathBuf::from(home).join(".varda"))
@@ -775,11 +774,10 @@ fn add_varda_project_dir_to_default_agents(config: &mut Config) {
                 .as_deref()
                 .and_then(|args| args.get(1))
                 .is_some_and(|arg| arg.contains("codex ") || arg.contains("claude "));
-            if is_wrapped_agent {
-                if let Some(args) = agent.interactive_args.as_mut() {
+            if is_wrapped_agent
+                && let Some(args) = agent.interactive_args.as_mut() {
                     add_varda_dirs_to_shell_arg(args);
                 }
-            }
         }
 
         if let Some(template) = agent.resume_command_template.as_mut() {

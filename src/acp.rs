@@ -226,11 +226,10 @@ impl AcpSubprocessClient {
         // the agent runs, exactly where it writes. For an EXTRACTED store
         // (`docker` volume) the store is not host-visible yet, so we defer
         // discovery until after the run has been `docker cp`-ed out (below).
-        if store_is_live {
-            if let Some(session_root) = session_store_root.as_deref() {
+        if store_is_live
+            && let Some(session_root) = session_store_root.as_deref() {
                 self.record_external_session(request, started_at, session_root);
             }
-        }
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let stderr = child.stderr.take().context("failed to open agent stderr")?;
@@ -707,8 +706,8 @@ async fn record_copilot_external_session(
     started_at: SystemTime,
 ) -> Option<String> {
     for _ in 0..20 {
-        if let Some(process_log) = find_copilot_process_log(&session_root, started_at) {
-            if let Some(workspace_id) = extract_copilot_workspace_id(&process_log) {
+        if let Some(process_log) = find_copilot_process_log(&session_root, started_at)
+            && let Some(workspace_id) = extract_copilot_workspace_id(&process_log) {
                 let events_path = session_root
                     .join(".copilot/session-state")
                     .join(&workspace_id)
@@ -722,7 +721,6 @@ async fn record_copilot_external_session(
                 );
                 return Some(workspace_id);
             }
-        }
         time::sleep(Duration::from_millis(500)).await;
     }
     None
@@ -767,10 +765,10 @@ fn find_codex_session(
                     if modified < started_at {
                         continue;
                     }
-                    if let Some(project) = project {
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            if let Some(first_line) = content.lines().next() {
-                                if let Ok(event) =
+                    if let Some(project) = project
+                        && let Ok(content) = std::fs::read_to_string(&path)
+                            && let Some(first_line) = content.lines().next()
+                                && let Ok(event) =
                                     serde_json::from_str::<serde_json::Value>(first_line)
                                 {
                                     let cwd = event["payload"]["cwd"].as_str().unwrap_or_default();
@@ -778,9 +776,6 @@ fn find_codex_session(
                                         continue;
                                     }
                                 }
-                            }
-                        }
-                    }
                     matches.push((modified, path));
                 }
             }
@@ -1019,8 +1014,8 @@ fn args_for_request(args: &[String], request: &AgentRunRequest) -> Vec<String> {
         let arg = &args[index];
         resolved.push(expand_arg(arg, request, project));
 
-        if arg == "--cd" {
-            if let Some(value) = args.get(index + 1) {
+        if arg == "--cd"
+            && let Some(value) = args.get(index + 1) {
                 resolved.push(if value == "." {
                     project.to_owned()
                 } else {
@@ -1029,7 +1024,6 @@ fn args_for_request(args: &[String], request: &AgentRunRequest) -> Vec<String> {
                 index += 2;
                 continue;
             }
-        }
 
         index += 1;
     }
@@ -1088,11 +1082,10 @@ fn host_session_root() -> PathBuf {
 }
 
 fn default_varda_home() -> String {
-    if let Ok(home) = std::env::var("VARDA_HOME") {
-        if !home.trim().is_empty() {
+    if let Ok(home) = std::env::var("VARDA_HOME")
+        && !home.trim().is_empty() {
             return home;
         }
-    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     std::path::Path::new(&home)
         .join(".varda")

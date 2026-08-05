@@ -119,13 +119,12 @@ where
                     last_size = size;
                     last_activity = now;
                 }
-                if let Some(deadline) = deadline {
-                    if now >= deadline {
+                if let Some(deadline) = deadline
+                    && now >= deadline {
                         return Err(SessionKill::Budget {
                             max_secs: max_seconds.unwrap_or_default(),
                         });
                     }
-                }
                 if now.duration_since(last_activity) >= idle_timeout {
                     return Err(SessionKill::Idle {
                         idle_secs: idle_timeout.as_secs(),

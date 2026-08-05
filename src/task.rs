@@ -294,9 +294,8 @@ fn collect_task_id_matches(path: &Path, id: u64, matches: &mut Vec<PathBuf>) -> 
             continue;
         }
 
-        if !entry_path
-            .extension()
-            .is_some_and(|extension| extension == "md")
+        if entry_path
+            .extension().is_none_or(|extension| extension != "md")
         {
             continue;
         }
@@ -333,9 +332,8 @@ fn collect_tasks(path: &Path, project_path: &Path, tasks: &mut Vec<TaskSummary>)
             continue;
         }
 
-        if !entry_path
-            .extension()
-            .is_some_and(|extension| extension == "md")
+        if entry_path
+            .extension().is_none_or(|extension| extension != "md")
         {
             continue;
         }
@@ -383,9 +381,8 @@ fn collect_all_tasks(path: &Path, tasks: &mut Vec<TaskSummary>) -> Result<()> {
             continue;
         }
 
-        if !entry_path
-            .extension()
-            .is_some_and(|extension| extension == "md")
+        if entry_path
+            .extension().is_none_or(|extension| extension != "md")
         {
             continue;
         }
@@ -497,23 +494,20 @@ fn parse_task(path: &Path, content: &str) -> Result<TaskDocument> {
         .with_context(|| format!("missing or invalid frontmatter in {}", path.display()))?;
 
     // Migrate legacy single-recap field to the recaps list.
-    if let Some(recap) = frontmatter.recap.take() {
-        if frontmatter.recaps.is_empty() {
+    if let Some(recap) = frontmatter.recap.take()
+        && frontmatter.recaps.is_empty() {
             frontmatter.recaps.push(recap);
         }
-    }
 
     // Migrate legacy single agent_session fields to the list variants.
-    if let Some(id) = frontmatter.agent_session_id.take() {
-        if frontmatter.agent_session_ids.is_empty() {
+    if let Some(id) = frontmatter.agent_session_id.take()
+        && frontmatter.agent_session_ids.is_empty() {
             frontmatter.agent_session_ids.push(id);
         }
-    }
-    if let Some(log) = frontmatter.agent_session_log.take() {
-        if frontmatter.agent_session_logs.is_empty() {
+    if let Some(log) = frontmatter.agent_session_log.take()
+        && frontmatter.agent_session_logs.is_empty() {
             frontmatter.agent_session_logs.push(log);
         }
-    }
 
     Ok(TaskDocument {
         path: path.to_path_buf(),
