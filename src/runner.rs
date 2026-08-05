@@ -1792,6 +1792,7 @@ Help interactively.
                 sandbox: None,
                 mounts: Vec::new(),
                 orchestration: None,
+                env: BTreeMap::new(),
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),

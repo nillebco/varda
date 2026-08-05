@@ -630,12 +630,14 @@ sandbox = "local"          # default provider for routes that don't override it
 glob = "/work/project/**"
 agents = ["codex"]
 sandbox = "docker"         # per-route override
+env = { GCLOUD_PROJECT = "healthy-silo-31898" }  # per-project static, non-secret env
 
 [sandboxes.docker]
 image = "varda:latest"        # image/rootfs, or use `build` below instead
 primitive = "docker"          # isolation kind; defaults to "docker" when omitted
 egress = ["api.example.com"]  # optional egress allow-list (default-deny)
 mounts = ["/opt/cache"]       # optional extra read-only host mounts
+env = { TOOLCHAIN_HOME = "/opt/toolchain" }  # image-intrinsic static env
 
 [sandboxes.rustvm]
 build = "./testdata/Dockerfile.rust"  # build the image from a Dockerfile at prepare()
@@ -654,6 +656,7 @@ Two knobs are deliberately separate. **`image`/`build`** decides *what tools are
 **`docker`** wraps the agent invocation in `docker run --rm --init -i` and executes it inside the resolved `image` (or the image built from `build`). The container's environment is built solely from the agent's configured `env` (passed as `-e K=V`); the host environment is not inherited.
 
 - **Project-only mounts, plus opt-in context mounts.** Only the task's **project directory** is bind-mounted by default, at the same absolute path, so host secrets outside the project (e.g. `~/.aws`) are not reachable. Extra mounts may be declared at two trusted origins that **merge** (union, de-duplicated by target): `[sandboxes.X].mounts` (image-intrinsic, same for every project using that image) and `Route.mounts` (project context, e.g. a route for `**/dev/AsianDevBank/**` also mounting `~/dev/brain/AsianDevBank:ro`). Extra mounts are **read-only by default**.
+- **Static env maps.** Non-secret static values may be declared at `[agents.X].env`, `[sandboxes.X].env`, `[[routes]].env`, and inline `.varda` `[sandbox].env`. They merge as `agent.env` → `sandbox.env` → `route.env` → `.varda` env, so the more-specific origin wins. Values support the same `{project}` and `~` expansion as agent env and mount paths. Use this for project constants such as `GCLOUD_PROJECT`; secrets and tokens belong in `auth_token_env`/credential injection, not static env.
 - **Mount grammar (`source:target:mode`, docker-style).** `SOURCE` (target = same absolute path, `:ro`) · `SOURCE:ro|:w` · `SOURCE:TARGET` (absolute TARGET, `:ro`) · `SOURCE:TARGET:ro|:w`; a TOML table form `{ source, target, mode }` is also accepted. `~` and `{project}` expand; relative sources resolve against the project root.
 - **Host mount visibility (VM-backed docker).** With a VM-backed daemon (Colima/Lima/Docker Desktop) only paths the VM actually shares are visible; a bind-mount whose **source is outside the VM's shared tree binds as an empty stub** (docker creates the mount point inside the VM). Keep mount sources — including the project and any context dirs — under a VM-mounted root (e.g. Colima's configured mount). See "Resume-capture" for how this affects the session store.
 - **Default-deny egress with an allow-list.** With no `egress` hosts the container gets `--network none` — it is fully offline. Declaring `egress` hosts attaches the container to the bridge network, disables ambient DNS (`--dns 0.0.0.0`), and pins **only** the allow-listed hostnames to their host-resolved IPs via `--add-host`. A non-allow-listed hostname cannot resolve and is therefore unreachable, while allow-listed hosts stay reachable. (This is a name-resolution allow-list; IP-level firewalling of raw egress is a later milestone.)
@@ -684,6 +687,7 @@ image = "rust:latest"
 primitive = "docker"
 mounts = ["ctx:/ctx"]        # relative to the .varda dir
 egress = ["crates.io"]
+env = { GCLOUD_PROJECT = "healthy-silo-31898" }
 ```
 
 Inline `mounts` join the docker/microsandbox mount merge as a **third origin** (`MountOrigin::Varda`), unioned with the trusted `Sandbox`- and `Route`-origin mounts.
@@ -694,6 +698,7 @@ Inline `mounts` join the docker/microsandbox mount merge as a **third origin** (
 - **In-tree, read-only mounts.** A `.varda` mount SOURCE must resolve **inside the project root** (out-of-tree / host paths are rejected), and is forced `:ro` unless `defaults.allow_varda_writable_mounts = true`.
 - **Safe target.** A mount TARGET may not be `/`, a system dir (`/etc`, `/usr`, …), nor collide with / shadow the project mount.
 - **Egress ceiling.** If `defaults.egress_ceiling` is set, a `.varda` may not widen egress beyond it.
+- **Env key floor.** A `.varda` env map cannot set reserved process/control keys (`PATH`, `HOME`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_*`, `VARDA_*`, `SSH_AUTH_SOCK`) and cannot override trusted agent/route env or a credential injection target.
 - On any violation Varda **refuses to run** with an error naming the offending `.varda` and key.
 
 **Credential-directory denylist (ALL origins, trusted config included).** Any mount whose SOURCE resolves (symlinks followed) into a known secret/identity store is refused regardless of origin: `~/.claude`, `~/.codex`, `~/.copilot`, `~/.aws`, `~/.ssh`, `~/.config/gcloud`, `~/.config/fnox`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.git-credentials`. These carry live LLM tokens **and** cross-project history; mounting one defeats the sandbox and leaks other clients' data.
@@ -767,9 +772,10 @@ sandbox = "rustvm"
 image     = "rust:1.95"
 primitive = "docker"
 mounts    = ["../docs:/docs:ro"]
+env       = { GCLOUD_PROJECT = "healthy-silo-31898" }
 ```
 
-Because a `.varda` is repo-committed (attacker-influenceable on untrusted code), the inline form is clamped by a **hardening floor**: it cannot select `primitive = "local"` (unless `defaults.allow_local_varda`), cannot mount sources outside the project or any credential directory (see the invariants below), cannot target `/` or a system dir or shadow the project mount, and cannot widen egress beyond `defaults.egress_ceiling`. A floor violation refuses the run with a clear error. Central `config.toml` mounts are trusted and skip the floor — except the credential denylist, which applies to every origin.
+Because a `.varda` is repo-committed (attacker-influenceable on untrusted code), the inline form is clamped by a **hardening floor**: it cannot select `primitive = "local"` (unless `defaults.allow_local_varda`), cannot mount sources outside the project or any credential directory (see the invariants below), cannot target `/` or a system dir or shadow the project mount, cannot widen egress beyond `defaults.egress_ceiling`, and cannot set reserved env keys or override trusted agent/route env or credential injection targets. A floor violation refuses the run with a clear error. Central `config.toml` mounts and env are trusted and skip the `.varda` floor — except the credential denylist, which applies to every mount origin.
 
 ### Isolation invariants (never violate)
 

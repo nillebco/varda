@@ -763,6 +763,7 @@ Verify the sandbox.
                 sandbox: None,
                 mounts: Vec::new(),
                 orchestration: None,
+                env: std::collections::BTreeMap::new(),
             }],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),

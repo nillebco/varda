@@ -24,6 +24,8 @@ pub struct RouteMatch {
     /// Project-context mounts declared on the matched route (M6a). Composed with
     /// the sandbox's image-intrinsic mounts by the docker provider.
     pub route_mounts: Vec<String>,
+    /// Trusted static env declared on the matched route.
+    pub route_env: std::collections::BTreeMap<String, String>,
 }
 
 impl RouteMatch {
@@ -64,6 +66,7 @@ pub fn match_route(
         estimated_prompt_tokens: 0,
         sandbox: config.effective_sandbox(route).to_owned(),
         route_mounts: route.mounts.clone(),
+        route_env: route.env.clone(),
     })
 }
 
@@ -98,6 +101,7 @@ pub fn match_route_for_task(
         estimated_prompt_tokens,
         sandbox: config.effective_sandbox(route).to_owned(),
         route_mounts: route.mounts.clone(),
+        route_env: route.env.clone(),
     })
 }
 
@@ -359,6 +363,7 @@ mod tests {
                     agents: vec!["codex".to_owned()],
                     sandbox: None,
                     mounts: Vec::new(),
+                    env: BTreeMap::new(),
                     orchestration: None,
                 },
                 Route {
@@ -366,6 +371,7 @@ mod tests {
                     agents: vec!["fallback".to_owned()],
                     sandbox: None,
                     mounts: Vec::new(),
+                    env: BTreeMap::new(),
                     orchestration: None,
                 },
             ],
@@ -431,6 +437,7 @@ mod tests {
                     sandbox: None,
                     mounts: Vec::new(),
                     orchestration: None,
+                    env: BTreeMap::new(),
                 },
                 Route {
                     glob: "**".to_owned(),
@@ -438,6 +445,7 @@ mod tests {
                     sandbox: None,
                     mounts: Vec::new(),
                     orchestration: None,
+                    env: BTreeMap::new(),
                 },
             ],
             agents: BTreeMap::from([
@@ -524,6 +532,7 @@ mod tests {
                 sandbox: None,
                 mounts: Vec::new(),
                 orchestration: None,
+                env: BTreeMap::new(),
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),
@@ -568,6 +577,7 @@ mod tests {
                 sandbox: None,
                 mounts: Vec::new(),
                 orchestration: None,
+                env: BTreeMap::new(),
             }],
             agents: BTreeMap::from([
                 (
@@ -652,6 +662,7 @@ mod tests {
                 sandbox: None,
                 mounts: Vec::new(),
                 orchestration: None,
+                env: BTreeMap::new(),
             }],
             agents: BTreeMap::from([
                 (
