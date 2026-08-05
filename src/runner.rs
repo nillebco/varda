@@ -1057,6 +1057,8 @@ Help interactively.
                     env: BTreeMap::new(),
                     interactive_command: None,
                     interactive_args: None,
+                    auth_token_env: None,
+                    auth_token_target: None,
                     resume_command_template: None,
                 },
             )]),

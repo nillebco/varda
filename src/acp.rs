@@ -1178,6 +1178,8 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
             resume_command_template: None,
         };
         let client = AcpSubprocessClient::new("echo", &config);
@@ -1269,6 +1271,8 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
             resume_command_template: None,
         };
         let sandbox_config = crate::config::SandboxConfig {
@@ -1302,6 +1306,8 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
             resume_command_template: None,
         };
         let provider = std::sync::Arc::new(
@@ -1448,6 +1454,8 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
             resume_command_template: None,
         };
         let client = AcpSubprocessClient::new("shell", &config);
@@ -1513,6 +1521,8 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
             resume_command_template: None,
         };
         let client = AcpSubprocessClient::new("shell", &config);
@@ -1573,6 +1583,8 @@ mod tests {
             env: BTreeMap::from([("VARDA_TEST_PROJECT".to_owned(), "{project}".to_owned())]),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
             resume_command_template: None,
         };
         let client = AcpSubprocessClient::new("shell", &config);
@@ -1771,6 +1783,8 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
             resume_command_template: Some(
                 "claude --resume {external_session_id} --add-dir {project}".to_owned(),
             ),
@@ -1798,6 +1812,8 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
             resume_command_template: None,
         };
         let client = AcpSubprocessClient::new("claude", &config);

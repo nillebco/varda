@@ -1169,6 +1169,10 @@ fn build_client(
     route_mounts: &[String],
     project_path: Option<&Path>,
 ) -> Result<acp::AcpSubprocessClient> {
+    // M11 — resolve the three identity/auth channels (curated identity files,
+    // SSH-agent + git identity, scoped auth token) once and inject them into
+    // whichever provider is selected. `local` ignores them (no boundary to cross).
+    let identity = resolve_sandbox_identity(config, agent_config);
     let provider = match project_path {
         Some(project_path) => {
             let routing_root = routing_root_for(project_path);
@@ -1185,15 +1189,85 @@ fn build_client(
                 &resolved.route_mounts,
                 &resolved.varda_mounts,
             );
-            sandbox::provider_from_config(&resolved.name, &resolved.config, mounts)?
+            sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &identity)?
         }
-        None => sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts)?,
+        None => {
+            sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?
+        }
     };
     Ok(acp::AcpSubprocessClient::with_sandbox(
         display_name,
         agent_config,
         provider,
     ))
+}
+
+/// M11 — assemble the sandbox identity/auth bundle from central config + the host
+/// environment. Three separable, opt-in channels; nothing is forwarded by default.
+///
+/// - **Auth token** (`[agents.X].auth_token_env`): the NAME of a host env var
+///   holding a dedicated, scoped, rotatable sandbox token. Its value is read from
+///   the environment (never a repo secret) and re-exported into the box as
+///   `auth_token_target` (defaulting to the same name). Missing/empty ⇒ skipped
+///   with a warning, so the sandbox still boots (it just won't be authenticated).
+/// - **SSH-agent + git identity** (`defaults.forward_ssh_agent`,
+///   `defaults.git_user_name`/`git_user_email`): forward `$SSH_AUTH_SOCK` (only
+///   when a live socket exists) and the read-only git identity.
+/// - **Curated identity files** (`defaults.identity_context`): passed through
+///   verbatim; validated read-only + credential-denylisted at wrap time.
+fn resolve_sandbox_identity(
+    config: &config::Config,
+    agent_config: &config::AgentConfig,
+) -> sandbox::SandboxIdentity {
+    let defaults = &config.defaults;
+    let mut auth_env = std::collections::BTreeMap::new();
+    if let Some(src) = &agent_config.auth_token_env {
+        match std::env::var(src) {
+            Ok(value) if !value.is_empty() => {
+                let target = agent_config.auth_token_target.clone().unwrap_or_else(|| src.clone());
+                auth_env.insert(target, value);
+            }
+            _ => eprintln!(
+                "sandbox: auth_token_env '{src}' is unset/empty on the host; the sandboxed agent \
+                 will not be authenticated (set a dedicated, scoped sandbox token)"
+            ),
+        }
+    }
+
+    // Forward the SSH agent socket only when forwarding is enabled AND a live
+    // socket exists on the host; otherwise the mount source would be missing.
+    let ssh_auth_sock = if defaults.forward_ssh_agent {
+        match std::env::var("SSH_AUTH_SOCK") {
+            Ok(sock) if !sock.is_empty() && Path::new(&sock).exists() => Some(sock),
+            _ => {
+                eprintln!(
+                    "sandbox: forward_ssh_agent is set but no live $SSH_AUTH_SOCK on the host; \
+                     git push over SSH will not work in the box"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let identity = sandbox::SandboxIdentity {
+        identity_context: defaults.identity_context.clone(),
+        ssh_auth_sock,
+        git_name: defaults.git_user_name.clone(),
+        git_email: defaults.git_user_email.clone(),
+        auth_env,
+    };
+    if !identity.is_empty() {
+        eprintln!(
+            "sandbox: identity channels active — auth_token:{} ssh_agent:{} git_identity:{} identity_files:{}",
+            !identity.auth_env.is_empty(),
+            identity.ssh_auth_sock.is_some(),
+            identity.git_name.is_some() || identity.git_email.is_some(),
+            identity.identity_context.len(),
+        );
+    }
+    identity
 }
 
 /// Bound for the upward `.varda` walk: the git repository root of `project_path`,

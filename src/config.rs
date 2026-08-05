@@ -157,6 +157,18 @@ pub struct Defaults {
     /// still applies so a `.credentials.json` can never sneak in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub identity_context: Vec<String>,
+    /// M11 git-identity forwarding. When true, forward the host SSH agent SOCKET
+    /// (`$SSH_AUTH_SOCK`) into the box so `git push` signs/authenticates on the
+    /// host and private keys never enter it (clawk-style). Off by default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forward_ssh_agent: bool,
+    /// M11 git-identity forwarding: read-only `user.name` / `user.email` handed to
+    /// the box as `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env so commits are attributed
+    /// correctly without mounting `~/.gitconfig`. Unset ⇒ not forwarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_user_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_user_email: Option<String>,
 }
 
 /// serde `skip_serializing_if` helper: omit `false` booleans so the default
@@ -496,6 +508,20 @@ pub struct AgentConfig {
     pub working_dir: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// M11 auth-token injection. Name of a HOST env var (resolved from the
+    /// environment / a secret store like `fnox`, NEVER a raw secret in the repo)
+    /// holding a DEDICATED, scoped, rotatable sandbox token — not the user's
+    /// primary credential. At `prepare` its value is read and injected into the
+    /// box as a scoped env var so the agent boots already authenticated, without
+    /// mounting `~/.claude`/`~/.codex`/etc. Cross-ref: the stronger "agent never
+    /// holds the key" form is the M8 capability-broker (out of scope here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_env: Option<String>,
+    /// In-box env var name the agent reads its token from (e.g.
+    /// `ANTHROPIC_API_KEY`). Defaults to `auth_token_env` when unset, so the same
+    /// name can be re-exported into the box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_target: Option<String>,
     /// Command to use when running interactively (inherits terminal stdio).
     /// When set, the agent is spawned with all streams inherited from the terminal
     /// and $VARDA_PROMPT_FILE points to a file containing the task prompt.
@@ -1307,7 +1333,7 @@ mod m6b_tests {
             &resolved.varda_mounts,
         );
         let provider =
-            crate::sandbox::provider_from_config(&resolved.name, &resolved.config, mounts).unwrap();
+            crate::sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &crate::sandbox::SandboxIdentity::default()).unwrap();
         assert_eq!(provider.name(), "rust");
         let _ = fs::remove_dir_all(&root);
     }
@@ -1341,7 +1367,7 @@ mod m6b_tests {
         assert!(varda[0].1.ends_with(":/ctx:ro"), "{:?}", varda[0].1);
         // The provider builds from the inline config.
         let provider =
-            crate::sandbox::provider_from_config(&resolved.name, &resolved.config, mounts).unwrap();
+            crate::sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &crate::sandbox::SandboxIdentity::default()).unwrap();
         assert_eq!(provider.name(), "inline");
         let _ = fs::remove_dir_all(&root);
     }

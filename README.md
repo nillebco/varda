@@ -666,14 +666,42 @@ Inline `mounts` join the docker/microsandbox mount merge as a **third origin** (
 
 **Credential-directory denylist (ALL origins, trusted config included).** Any mount whose SOURCE resolves (symlinks followed) into a known secret/identity store is refused regardless of origin: `~/.claude`, `~/.codex`, `~/.copilot`, `~/.aws`, `~/.ssh`, `~/.config/gcloud`, `~/.config/fnox`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.git-credentials`. These carry live LLM tokens **and** cross-project history; mounting one defeats the sandbox and leaks other clients' data.
 
-**Curated identity/context mount (opt-in).** Instead of the denied credential dirs, `defaults.identity_context` lets you mount specific, **read-only FILES** so the agent learns "who the user is" without secrets:
+#### Passing identity & auth into the box (three channels)
+
+A sandboxed agent must be authenticated to run the LLM **and** "know who the user is" — but it must get there **without** mounting `~/.claude`/`~/.codex`/`~/.copilot`/`~/.aws`/`~/.ssh` (those carry live tokens + cross-project history; see the credential denylist above). Modeled on how [clawk](https://github.com/) does it, Varda forwards identity through **three separable, opt-in channels**. Guiding principle: **share the minimum**.
+
+**1. Auth-token injection (channel 1).** Instead of mounting a credential dir, inject a **dedicated, scoped, rotatable sandbox token** as an env var so the agent boots already signed in. The token is resolved from a **host env var / secret store at run time — never a raw secret in the repo or the task**. Prefer a purpose-provisioned token (own spend limit, lower privilege) over the user's primary credential.
+
+```toml
+[agents.claude]
+# Name of a HOST env var holding the scoped sandbox token (resolved from the
+# environment / a secret store like fnox — NOT a literal secret here).
+auth_token_env = "CLAUDE_SANDBOX_TOKEN"
+# In-box env var the agent reads its token from (defaults to auth_token_env).
+auth_token_target = "ANTHROPIC_API_KEY"
+```
+
+At `prepare`, Varda reads `$CLAUDE_SANDBOX_TOKEN` on the host and re-exports its value into the box as `-e ANTHROPIC_API_KEY=…`. If the host var is unset/empty the run still boots (with a warning) — it just isn't authenticated. The stronger form — the agent never holds the key, LLM calls proxied through a broker — is the **M8 capability-broker** pattern (out of scope here).
+
+**2. Git identity via SSH-agent forwarding (channel 2).** Forward the host **SSH agent socket** so `git push` signs/authenticates on the host and **private keys never enter the box** (`ls ~/.ssh` in-guest stays empty). The read-only git identity is forwarded as `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env so commits are attributed correctly without mounting `~/.gitconfig`.
 
 ```toml
 [defaults]
-identity_context = ["~/.claude/CLAUDE.md:/root/CLAUDE.md:ro"]
+forward_ssh_agent = true            # bind $SSH_AUTH_SOCK → /ssh-agent, set SSH_AUTH_SOCK
+git_user_name  = "Ada Lovelace"
+git_user_email = "ada@example.com"
 ```
 
-Files only (never a whole dotdir, never `projects/` transcripts); the credential-**filename** denylist still applies, so a `.credentials.json` can never sneak in. This is the identity half only — an auth **token** to actually run the LLM is a separate concern (token-injection + SSH-agent forwarding), never a mounted credential.
+(docker binds the socket file directly; on the own-kernel microVM the socket bind is best-effort at directory granularity.)
+
+**3. Curated identity/context (channel 3).** `defaults.identity_context` mounts specific, **read-only FILES** so the agent learns "who the user is" without secrets:
+
+```toml
+[defaults]
+identity_context = ["~/.claude/CLAUDE.md:/root/CLAUDE.md:ro", "~/profile.md:/root/profile.md:ro"]
+```
+
+Files only (never a whole dotdir, never `projects/` transcripts); the credential-**filename** denylist still applies, so a `.credentials.json` can never sneak in even when the file lives inside an otherwise-denylisted dir. All three channels are off by default — nothing is forwarded unless you opt in.
 
 #### Isolation invariants (never violate these)
 

@@ -79,7 +79,6 @@ pub const CREDENTIAL_DENYLIST: &[&str] = &[
 /// file — the escape hatch that lets `identity_context` point at a specific file
 /// inside an otherwise-denylisted dir (e.g. `~/.claude/CLAUDE.md`) must not become
 /// a way to smuggle live tokens out.
-#[allow(dead_code)]
 pub const CREDENTIAL_FILENAMES: &[&str] = &[
     ".credentials.json",
     "credentials",
@@ -134,7 +133,6 @@ pub fn check_credential_denylist(source: &Path) -> Result<()> {
 /// it must be a specific FILE (never a directory), read-only, and never a known
 /// credential filename — even though it is allowed to live inside an otherwise
 /// denylisted dir (e.g. `~/.claude/CLAUDE.md`).
-#[allow(dead_code)]
 pub fn check_identity_context_mount(source: &Path, writable: bool) -> Result<()> {
     if writable {
         bail!(
@@ -158,6 +156,69 @@ pub fn check_identity_context_mount(source: &Path, writable: bool) -> Result<()>
         );
     }
     Ok(())
+}
+
+/// In-guest path the forwarded host SSH agent socket is mounted at. `git push`
+/// over SSH signs on the host via this socket; no private key ever enters the box.
+pub const SSH_AGENT_GUEST_SOCK: &str = "/ssh-agent";
+
+/// M11 — the three "who is the user / how does the agent authenticate" channels,
+/// threaded into a sandbox provider WITHOUT ever mounting a credential dir
+/// (`~/.claude`/`.codex`/`.copilot`/`.aws`/`.ssh`). Each channel is separable and
+/// opt-in; an empty value means "not forwarded". Principle: share the minimum.
+///
+/// 1. `auth_env` — a scoped, rotatable token injected as an env var so the agent
+///    boots authenticated (resolved from a host env var / secret store, never a
+///    repo secret; a DEDICATED sandbox token, not the primary credential).
+/// 2. SSH-agent forwarding (`ssh_auth_sock`) + read-only git identity
+///    (`git_name`/`git_email`) so `git push`/commit work with keys staying on the host.
+/// 3. `identity_context` — curated READ-ONLY identity FILE mounts (M6b mechanism)
+///    telling the agent "who the user is"; the credential denylist still applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxIdentity {
+    /// Curated read-only identity FILE mounts (`defaults.identity_context`), each a
+    /// `source[:target][:mode]` string. Applied read-only, credential-denylisted.
+    pub identity_context: Vec<String>,
+    /// Host `$SSH_AUTH_SOCK` to forward, when SSH-agent forwarding is enabled and a
+    /// live agent socket exists on the host. `None` ⇒ not forwarded.
+    pub ssh_auth_sock: Option<String>,
+    /// Read-only git identity forwarded as `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env.
+    pub git_name: Option<String>,
+    pub git_email: Option<String>,
+    /// Scoped auth token(s) injected as in-box env vars (`target_name → value`).
+    /// The value is resolved from the host env / a secret store at prepare time.
+    pub auth_env: BTreeMap<String, String>,
+}
+
+impl SandboxIdentity {
+    /// `true` when no channel is active (fast-path: providers skip all identity
+    /// wiring and the argv is byte-for-byte the pre-M11 one).
+    pub fn is_empty(&self) -> bool {
+        self.identity_context.is_empty()
+            && self.ssh_auth_sock.is_none()
+            && self.git_name.is_none()
+            && self.git_email.is_none()
+            && self.auth_env.is_empty()
+    }
+
+    /// Guest env additions from channels 1 & 2: the scoped auth token(s), the
+    /// forwarded git identity, and (when the agent socket is forwarded) the in-guest
+    /// `SSH_AUTH_SOCK`. Merged into the box env alongside the resolved command env.
+    pub fn guest_env(&self) -> BTreeMap<String, String> {
+        let mut env = self.auth_env.clone();
+        if let Some(name) = &self.git_name {
+            env.insert("GIT_AUTHOR_NAME".to_owned(), name.clone());
+            env.insert("GIT_COMMITTER_NAME".to_owned(), name.clone());
+        }
+        if let Some(email) = &self.git_email {
+            env.insert("GIT_AUTHOR_EMAIL".to_owned(), email.clone());
+            env.insert("GIT_COMMITTER_EMAIL".to_owned(), email.clone());
+        }
+        if self.ssh_auth_sock.is_some() {
+            env.insert("SSH_AUTH_SOCK".to_owned(), SSH_AGENT_GUEST_SOCK.to_owned());
+        }
+        env
+    }
 }
 
 /// Clamp a single UNTRUSTED `.varda` mount against the hardening floor. Returns the
@@ -485,9 +546,20 @@ pub struct DockerProvider {
     /// (`--network none`); non-empty ⇒ default-deny with only these hosts
     /// resolvable inside the container.
     egress: Vec<String>,
+    /// M11 identity/auth channels forwarded into the box (curated identity files,
+    /// SSH-agent socket, git identity, scoped auth token). Empty ⇒ pre-M11 argv.
+    identity: SandboxIdentity,
 }
 
 impl DockerProvider {
+    /// Attach the M11 identity/auth bundle to a provider (builder). Kept separate
+    /// from [`from_config`](Self::from_config) so the many `from_config` call sites
+    /// (and tests) stay unchanged; the live run path composes it in `build_client`.
+    pub fn with_identity(mut self, identity: SandboxIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
     /// Build a docker provider named `name` from its `[sandboxes.<name>]` entry
     /// and a pre-merged, origin-tagged mount set (see [`merge_mount_origins`]).
     ///
@@ -511,6 +583,7 @@ impl DockerProvider {
             build,
             mounts,
             egress: config.egress.clone(),
+            identity: SandboxIdentity::default(),
         })
     }
 
@@ -536,6 +609,7 @@ impl DockerProvider {
                 .map(|m| (MountOrigin::Sandbox, m.to_string()))
                 .collect(),
             egress: egress.iter().map(|e| e.to_string()).collect(),
+            identity: SandboxIdentity::default(),
         }
     }
 }
@@ -666,6 +740,7 @@ impl SandboxProvider for DockerProvider {
             volume: format!("varda-sbx-{handle}"),
             container: format!("varda-sbx-{handle}"),
             home: "/home/agent".to_owned(),
+            identity: self.identity.clone(),
         }))
     }
 }
@@ -739,6 +814,9 @@ pub struct DockerSession {
     container: String,
     /// In-container mount point for `volume`, used as the agent's `HOME`.
     home: String,
+    /// M11 identity/auth channels applied at wrap time (curated identity file
+    /// mounts, SSH-agent socket forward, git identity + scoped auth token env).
+    identity: SandboxIdentity,
 }
 
 #[async_trait]
@@ -821,13 +899,44 @@ impl SandboxSession for DockerSession {
                 args.push(format!("{source}:{target}:ro"));
             }
         }
+        // M11 channel 3 — curated identity FILES (defaults.identity_context), each a
+        // READ-ONLY bind of a SPECIFIC FILE (never a dotdir/transcript tree). The
+        // credential denylist + identity-file validation still apply, so a
+        // `.credentials.json` can never sneak in this way. Shares `seen_targets` with
+        // the mounts above (first declaration wins).
+        for raw in &self.identity.identity_context {
+            let spec = parse_mount(raw).with_context(|| {
+                format!("invalid identity_context mount '{raw}' for sandbox '{}'", self.image)
+            })?;
+            let source = expand_mount_path(&spec.source, &self.project_root);
+            let target = expand_mount_path(&spec.target, &self.project_root);
+            check_credential_denylist(&source)?;
+            check_identity_context_mount(&source, spec.writable)?;
+            if !seen_targets.insert(target.clone()) {
+                continue;
+            }
+            let source = source.display().to_string();
+            let target = target.display().to_string();
+            args.push("-v".to_owned());
+            args.push(format!("{source}:{target}:ro"));
+        }
+        // M11 channel 2 — forward the host SSH agent SOCKET so `git push` signs on
+        // the host; no private key ever enters the box. The in-guest SSH_AUTH_SOCK
+        // env is set below via `identity.guest_env()`.
+        if let Some(sock) = &self.identity.ssh_auth_sock {
+            args.push("-v".to_owned());
+            args.push(format!("{sock}:{SSH_AGENT_GUEST_SOCK}"));
+        }
         args.push("-w".to_owned());
         args.push(cwd);
         // Move the resolved env into `-e K=V`; the container starts with a clean
         // base env, so host secrets are never inherited implicitly. Force HOME to
         // the mounted per-session store so the agent writes its session there.
+        // M11 channels 1 & 2 fold in via `guest_env()`: the scoped auth token, the
+        // read-only git identity, and the forwarded SSH_AUTH_SOCK path.
         // BTreeMap iteration is sorted, keeping the produced argv deterministic.
         let mut env = spec.env;
+        env.extend(self.identity.guest_env());
         env.insert("HOME".to_owned(), self.home.clone());
         for (key, value) in &env {
             args.push("-e".to_owned());
@@ -967,9 +1076,18 @@ pub struct MicrosandboxProvider {
     /// Egress allow-list of hostnames. Empty ⇒ fully offline; non-empty ⇒
     /// default-deny with only these hosts permitted outbound.
     egress: Vec<String>,
+    /// M11 identity/auth channels forwarded into the microVM. Empty ⇒ pre-M11 argv.
+    identity: SandboxIdentity,
 }
 
 impl MicrosandboxProvider {
+    /// Attach the M11 identity/auth bundle (builder). See
+    /// [`DockerProvider::with_identity`].
+    pub fn with_identity(mut self, identity: SandboxIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
     /// Build a microsandbox provider from its `[sandboxes.<name>]` entry and a
     /// pre-merged, origin-tagged mount set. Same shape as
     /// [`DockerProvider::from_config`]: `image` or `build` is required.
@@ -991,6 +1109,7 @@ impl MicrosandboxProvider {
             build,
             mounts,
             egress: config.egress.clone(),
+            identity: SandboxIdentity::default(),
         })
     }
 
@@ -1033,6 +1152,7 @@ impl SandboxProvider for MicrosandboxProvider {
             session_store,
             sandbox: format!("varda-sbx-{handle}"),
             home: "/home/agent".to_owned(),
+            identity: self.identity.clone(),
         }))
     }
 }
@@ -1050,6 +1170,8 @@ pub struct MicrosandboxSession {
     sandbox: String,
     /// In-guest HOME path; the agent writes its session store here.
     home: String,
+    /// M11 identity/auth channels applied at wrap time.
+    identity: SandboxIdentity,
 }
 
 #[async_trait]
@@ -1117,12 +1239,40 @@ impl SandboxSession for MicrosandboxSession {
                 args.push(format!("{source}:{target}:ro"));
             }
         }
+        // M11 channel 3 — curated identity FILES, read-only, credential-denylisted.
+        // NB: `msb --mount-dir` is directory-granularity; a file-level bind is
+        // best-effort (documented in the README). The validation still refuses a
+        // whole dotdir / credential file, so we never widen the exposure.
+        for raw in &self.identity.identity_context {
+            let ispec = parse_mount(raw).with_context(|| {
+                format!("invalid identity_context mount '{raw}' for sandbox '{}'", self.image)
+            })?;
+            let source = expand_mount_path(&ispec.source, &self.project_root);
+            let target = expand_mount_path(&ispec.target, &self.project_root);
+            check_credential_denylist(&source)?;
+            check_identity_context_mount(&source, ispec.writable)?;
+            if !seen_targets.insert(target.clone()) {
+                continue;
+            }
+            let source = source.display().to_string();
+            let target = target.display().to_string();
+            args.push("--mount-dir".to_owned());
+            args.push(format!("{source}:{target}:ro"));
+        }
+        // M11 channel 2 — forward the host SSH agent socket (best-effort in a
+        // microVM; see README) so `git push` signs on the host, keys never enter.
+        if let Some(sock) = &self.identity.ssh_auth_sock {
+            args.push("--mount-dir".to_owned());
+            args.push(format!("{sock}:{SSH_AGENT_GUEST_SOCK}:ro"));
+        }
 
         args.push("--workdir".to_owned());
         args.push(cwd);
         // Clean base env in the guest; force HOME to the guest session store so
-        // the agent writes its resume state there. Sorted for a deterministic argv.
+        // the agent writes its resume state there. M11 channels 1 & 2 fold in via
+        // `guest_env()`. Sorted for a deterministic argv.
         let mut env = spec.env;
+        env.extend(self.identity.guest_env());
         env.insert("HOME".to_owned(), self.home.clone());
         for (key, value) in &env {
             args.push("--env".to_owned());
@@ -1253,6 +1403,7 @@ pub fn provider_for(
     name: &str,
     sandboxes: &BTreeMap<String, SandboxConfig>,
     route_mounts: &[String],
+    identity: &SandboxIdentity,
 ) -> Result<std::sync::Arc<dyn SandboxProvider>> {
     match sandboxes.get(name) {
         Some(config) => {
@@ -1260,7 +1411,7 @@ pub fn provider_for(
             // project-context (`Route`) origins apply — an untrusted `.varda`
             // has no central name, so it never reaches this path.
             let mounts = merge_mount_origins(&config.mounts, route_mounts, &[]);
-            provider_from_config(name, config, mounts)
+            provider_from_config(name, config, mounts, identity)
         }
         None if name == "local" => Ok(std::sync::Arc::new(LocalProvider)),
         None => bail!("sandbox '{name}' is not defined under [sandboxes]"),
@@ -1276,15 +1427,19 @@ pub fn provider_from_config(
     name: &str,
     config: &SandboxConfig,
     mounts: Vec<(MountOrigin, String)>,
+    identity: &SandboxIdentity,
 ) -> Result<std::sync::Arc<dyn SandboxProvider>> {
     match config.primitive.as_str() {
+        // `local` is the identity provider (no isolation); the M11 identity/auth
+        // channels are a sandbox-boundary concern, so nothing to inject here.
         "local" => Ok(std::sync::Arc::new(LocalProvider)),
-        "docker" => Ok(std::sync::Arc::new(DockerProvider::from_config(
-            name, config, mounts,
-        )?)),
-        "microsandbox" => Ok(std::sync::Arc::new(MicrosandboxProvider::from_config(
-            name, config, mounts,
-        )?)),
+        "docker" => Ok(std::sync::Arc::new(
+            DockerProvider::from_config(name, config, mounts)?.with_identity(identity.clone()),
+        )),
+        "microsandbox" => Ok(std::sync::Arc::new(
+            MicrosandboxProvider::from_config(name, config, mounts)?
+                .with_identity(identity.clone()),
+        )),
         "clawk" => Ok(std::sync::Arc::new(StubProvider {
             name: name.to_owned(),
             primitive: config.primitive.clone(),
@@ -1316,6 +1471,21 @@ impl DockerSession {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+        }
+    }
+
+    /// Same as [`for_test`](Self::for_test) but with an M11 identity bundle attached,
+    /// for asserting the identity/auth channels land in the docker argv.
+    fn for_test_with_identity(
+        image: &str,
+        project_root: &str,
+        session_store: &str,
+        identity: SandboxIdentity,
+    ) -> Self {
+        Self {
+            identity,
+            ..Self::for_test(image, project_root, vec![], vec![], session_store)
         }
     }
 }
@@ -1462,6 +1632,7 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
         };
         assert_eq!(
             session.session_store_root(),
@@ -1550,6 +1721,7 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1588,6 +1760,7 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1615,6 +1788,191 @@ mod tests {
         );
     }
 
+    /// Helper: collect the `-e K=V` env flags out of a docker argv.
+    #[cfg(test)]
+    fn docker_env_flags(args: &[String]) -> Vec<&String> {
+        args.iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && args[i - 1] == "-e")
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    /// Helper: collect the `-v` bind mounts out of a docker argv.
+    #[cfg(test)]
+    fn docker_v_flags(args: &[String]) -> Vec<&String> {
+        args.iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && args[i - 1] == "-v")
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    /// M11 empty bundle is a no-op: the argv is byte-for-byte the pre-M11 one
+    /// (only the project + per-session HOME mounts, no extra env beyond HOME).
+    #[test]
+    fn m11_empty_identity_is_a_noop() {
+        let id = SandboxIdentity::default();
+        assert!(id.is_empty());
+        let session =
+            DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        assert_eq!(
+            docker_v_flags(&wrapped.args),
+            vec!["/srv/app:/srv/app", "varda-sbx-s1:/home/agent"]
+        );
+        assert_eq!(docker_env_flags(&wrapped.args), vec!["HOME=/home/agent"]);
+    }
+
+    /// M11 channel 1 (auth token): a resolved scoped token lands as an in-box `-e`
+    /// env var and NO credential dir is ever bind-mounted.
+    #[test]
+    fn m11_auth_token_injected_as_scoped_env_no_creds_mount() {
+        let mut auth_env = BTreeMap::new();
+        auth_env.insert("ANTHROPIC_API_KEY".to_owned(), "sk-scoped-sandbox".to_owned());
+        let id = SandboxIdentity {
+            auth_env,
+            ..Default::default()
+        };
+        let session =
+            DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "claude".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        assert!(
+            docker_env_flags(&wrapped.args)
+                .iter()
+                .any(|e| *e == "ANTHROPIC_API_KEY=sk-scoped-sandbox"),
+            "auth token must be injected as a scoped -e env var: {:?}",
+            wrapped.args
+        );
+        // Exit criterion: no `.claude`/`.aws`/`.ssh` bind mount anywhere in the argv.
+        for v in docker_v_flags(&wrapped.args) {
+            assert!(
+                !v.contains("/.claude")
+                    && !v.contains("/.aws")
+                    && !v.contains("/.ssh")
+                    && !v.contains("/.codex")
+                    && !v.contains("/.copilot"),
+                "no credential dir may be mounted: {v}"
+            );
+        }
+    }
+
+    /// M11 channel 2 (git identity): SSH_AUTH_SOCK is forwarded as a bind + env, and
+    /// the read-only git identity is forwarded as GIT_AUTHOR_*/GIT_COMMITTER_* env —
+    /// no private key ever enters the box.
+    #[test]
+    fn m11_ssh_agent_and_git_identity_forwarded() {
+        let id = SandboxIdentity {
+            ssh_auth_sock: Some("/tmp/agent.sock".to_owned()),
+            git_name: Some("Ada Lovelace".to_owned()),
+            git_email: Some("ada@example.com".to_owned()),
+            ..Default::default()
+        };
+        let session =
+            DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        // Socket forwarded as a bind mount to the fixed in-guest path.
+        assert!(
+            docker_v_flags(&wrapped.args)
+                .iter()
+                .any(|v| *v == "/tmp/agent.sock:/ssh-agent"),
+            "ssh agent socket must be forwarded: {:?}",
+            wrapped.args
+        );
+        let env = docker_env_flags(&wrapped.args);
+        for expected in [
+            "SSH_AUTH_SOCK=/ssh-agent",
+            "GIT_AUTHOR_NAME=Ada Lovelace",
+            "GIT_COMMITTER_NAME=Ada Lovelace",
+            "GIT_AUTHOR_EMAIL=ada@example.com",
+            "GIT_COMMITTER_EMAIL=ada@example.com",
+        ] {
+            assert!(
+                env.iter().any(|e| e.as_str() == expected),
+                "missing env {expected}: {env:?}"
+            );
+        }
+        // No private key material is ever a mount source.
+        for v in docker_v_flags(&wrapped.args) {
+            assert!(!v.contains("id_rsa") && !v.contains("/.ssh"), "no key mount: {v}");
+        }
+    }
+
+    /// M11 channel 3 (curated identity file): a specific read-only FILE is mounted;
+    /// a credential file under the same denylisted dir is refused.
+    #[test]
+    fn m11_curated_identity_file_mounts_ro_but_credential_file_refused() {
+        // Curated file lives inside a tmp dir (a real FILE, not a dir).
+        let dir = std::env::temp_dir().join("varda-m11-identity");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("PROFILE.md");
+        std::fs::write(&file, "# who I am\n").unwrap();
+        let id = SandboxIdentity {
+            identity_context: vec![format!("{}:/root/PROFILE.md:ro", file.display())],
+            ..Default::default()
+        };
+        let session =
+            DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
+        let wrapped = session
+            .wrap(CommandSpec {
+                program: "sh".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            })
+            .unwrap();
+        assert!(
+            docker_v_flags(&wrapped.args)
+                .iter()
+                .any(|v| v.ends_with(":/root/PROFILE.md:ro")),
+            "curated identity file must be mounted read-only: {:?}",
+            wrapped.args
+        );
+
+        // A credential file (even if named explicitly) is refused at wrap time.
+        let creds = dir.join(".credentials.json");
+        std::fs::write(&creds, "{}").unwrap();
+        let bad = SandboxIdentity {
+            identity_context: vec![format!("{}:/root/.credentials.json:ro", creds.display())],
+            ..Default::default()
+        };
+        let bad_session =
+            DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", bad);
+        assert!(
+            bad_session
+                .wrap(CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                })
+                .is_err(),
+            "a credential file must never mount as curated identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// M2 egress: no allow-list ⇒ fully offline (`--network none`, no DNS/host
     /// overrides).
     #[test]
@@ -1628,6 +1986,7 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1659,6 +2018,7 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -1688,10 +2048,10 @@ mod tests {
     #[test]
     fn provider_for_local_and_docker() {
         let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
-        assert_eq!(provider_for("local", &sandboxes, &[]).unwrap().name(), "local");
+        assert_eq!(provider_for("local", &sandboxes, &[], &SandboxIdentity::default()).unwrap().name(), "local");
 
         // Unknown sandbox errors.
-        assert!(provider_for("docker", &sandboxes, &[]).is_err());
+        assert!(provider_for("docker", &sandboxes, &[], &SandboxIdentity::default()).is_err());
 
         sandboxes.insert(
             "docker".to_owned(),
@@ -1700,7 +2060,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(provider_for("docker", &sandboxes, &[]).unwrap().name(), "docker");
+        assert_eq!(provider_for("docker", &sandboxes, &[], &SandboxIdentity::default()).unwrap().name(), "docker");
 
         // Missing image AND build errors under the docker primitive.
         sandboxes.insert(
@@ -1710,7 +2070,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(provider_for("broken", &sandboxes, &[]).is_err());
+        assert!(provider_for("broken", &sandboxes, &[], &SandboxIdentity::default()).is_err());
     }
 
     /// M5: `primitive` selects the boundary kind independently of the image.
@@ -1728,7 +2088,7 @@ mod tests {
             },
         );
         assert_eq!(
-            provider_for("isolated", &sandboxes, &[]).unwrap().name(),
+            provider_for("isolated", &sandboxes, &[], &SandboxIdentity::default()).unwrap().name(),
             "local"
         );
 
@@ -1742,7 +2102,7 @@ mod tests {
                 },
             );
             // The stub resolves at provider_for time but errors at prepare().
-            let provider = provider_for("vm", &sandboxes, &[]).unwrap();
+            let provider = provider_for("vm", &sandboxes, &[], &SandboxIdentity::default()).unwrap();
             assert_eq!(provider.name(), "vm");
         }
 
@@ -1755,7 +2115,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(provider_for("weird", &sandboxes, &[]).is_err());
+        assert!(provider_for("weird", &sandboxes, &[], &SandboxIdentity::default()).is_err());
     }
 
     /// M4: `msb run` argv shape — image positional after flags, command after
@@ -1771,6 +2131,7 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-abc".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
         };
         let spec = CommandSpec {
             program: "claude".to_owned(),
@@ -2035,6 +2396,7 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -2067,6 +2429,7 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -2100,6 +2463,7 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
         };
         let wrapped = session
             .wrap(CommandSpec {
@@ -2144,6 +2508,7 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
         };
         let wrapped = session
             .wrap(CommandSpec {
