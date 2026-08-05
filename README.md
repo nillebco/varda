@@ -641,6 +641,9 @@ env = { TOOLCHAIN_HOME = "/opt/toolchain" }  # image-intrinsic static env
 
 [sandboxes.rustvm]
 build = "./testdata/Dockerfile.rust"  # build the image from a Dockerfile at prepare()
+
+[sandboxes.devc]
+image_from = "devcontainer"   # take the image from the project's .devcontainer/
 ```
 
 The effective provider for a route resolves as `route.sandbox` → `defaults.sandbox` → `"local"`. All keys are optional, so existing `config.toml` files parse and re-serialize unchanged. These keys are orthogonal to Codex's own `--sandbox workspace-write` CLI flag in the agent `args`.
@@ -649,6 +652,8 @@ Two knobs are deliberately separate. **`image`/`build`** decides *what tools are
 
 - **`image`** names a pre-existing image tag/reference.
 - **`build`** points at a Dockerfile; the docker provider builds it at run time and uses the resulting content-addressed tag (an unchanged Dockerfile reuses the cached image). When both are set, `build` wins.
+- **`image_from = "devcontainer"`** sources the image from the project's own [`.devcontainer/devcontainer.json`](https://containers.dev/) (falling back to a top-level `.devcontainer.json`) so Varda doesn't duplicate the environment definition. At `prepare()` it reads the devcontainer's `image` (used verbatim) or its `build.dockerfile` + `build.context` (built via docker, content-addressed like `build`), resolved relative to the `.devcontainer/` dir. The JSONC form (comments, trailing commas) is tolerated. `image_from` takes precedence over `image`/`build` when several are set.
+  - **Isolation invariant (image source only).** A `devcontainer.json` may declare host `mounts` (`~/.aws`/SSH), docker-socket forwarding, access-widening `runArgs`, or lifecycle hooks (`postCreateCommand`, …). Varda takes **only the image/build** and **nothing else** — those fields are not even deserialized, so they can never leak into the run. Varda keeps sole control of mounts, egress, and credentials (the same project-only-mount, default-deny-egress, no-`$HOME` hardening as any other docker sandbox). A devcontainer that tries to bind-mount host `$HOME` does **not** make the host `$HOME`/`~/.aws` visible in the container.
 - **`primitive`** is one of `"docker"` (default), `"local"`, `"microsandbox"`, or `"clawk"`. `microsandbox` is an own-kernel microVM runtime backed by the `msb` CLI (see below); `clawk` stays reserved for a later milestone and launching one fails fast with `sandbox primitive 'clawk' not yet available: runtime not installed`.
 
 **`local`** (the default provider name) runs the agent exactly as before — no isolation. Setting `primitive = "local"` on a named sandbox does the same, even if an `image` is present.

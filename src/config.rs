@@ -293,6 +293,18 @@ pub struct SandboxConfig {
     /// Mutually exclusive-ish with `image` (build wins when both are set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
+    /// External image source. Currently only `"devcontainer"`: the docker
+    /// provider discovers the project's `.devcontainer/devcontainer.json` (or
+    /// `.devcontainer.json`) at `prepare()` and derives the run image from its
+    /// `image` field (used verbatim) or its `build.dockerfile` + `build.context`
+    /// (`docker build`-ed). This is an IMAGE SOURCE only — varda takes the
+    /// image/build and NOTHING else: a devcontainer's `mounts`, `runArgs`,
+    /// docker-socket forwarding, and lifecycle hooks (`postCreateCommand`, …) are
+    /// deliberately ignored so varda keeps sole control of mounts, egress, and
+    /// creds (the M2/M3 isolation invariant). `image_from` wins over an explicit
+    /// `image`/`build` when both are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_from: Option<String>,
     /// Isolation primitive: `"docker"` | `"microsandbox"` | `"clawk"` | `"local"`.
     /// Orthogonal to the image/rootfs: the same OCI image can run under docker
     /// (shared kernel) or an own-kernel microVM.
@@ -605,6 +617,7 @@ impl Default for SandboxConfig {
         Self {
             image: None,
             build: None,
+            image_from: None,
             primitive: default_primitive(),
             mounts: Vec::new(),
             env: BTreeMap::new(),
