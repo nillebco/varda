@@ -23,6 +23,11 @@ pub const DEFAULT_SANDBOX_PROVIDER: &str = "local";
 const DEFAULT_CONFIG: &str = r#"[defaults]
 timeout_seconds = 600
 operations_dir = "operations"
+# M10 cooperative execution bounds (replace the old hard wall-clock kill):
+idle_timeout_seconds = 180  # cancel only after this many seconds of total silence
+max_seconds = "none"        # soft total ceiling across all continuations; "none" = no ceiling
+max_continuations = 8       # max auto-resume hops before stopping with needs_user
+max_tool_calls = 0          # tool-call budget across the task; 0 = unlimited
 
 [[routes]]
 glob = "**"
@@ -101,8 +106,32 @@ pub struct RoleConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Defaults {
+    /// DEPRECATED single-session wall-clock ceiling. Retained as a back-compat
+    /// alias: when `max_seconds` is unset, this feeds [`Defaults::effective_max_seconds`].
+    /// The M10 cooperative-bounds model replaces the old hard-kill with an idle
+    /// watchdog + auto-resume loop + soft budget, so this value no longer hard-kills
+    /// a productive session mid-work.
     pub timeout_seconds: u64,
     pub operations_dir: String,
+    /// M10 idle watchdog: cancel a session only after this many seconds of total
+    /// silence (no stdout/stderr activity). Productive long runs never trip it; a
+    /// wedged/hung child does. Default 180.
+    #[serde(default = "default_idle_timeout_seconds")]
+    pub idle_timeout_seconds: u64,
+    /// M10 soft total ceiling across the WHOLE task (all auto-resume continuations).
+    /// Accepts an integer number of seconds or the string `"none"` (no ceiling).
+    /// Unset ⇒ fall back to the deprecated `timeout_seconds` alias. On exceed, the
+    /// loop STOPS and the task is marked `needs_user` with the accumulated recap —
+    /// never a mid-work kill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seconds: Option<MaxSeconds>,
+    /// M10 max auto-resume hops (fresh continuation sessions) for one task. Default 8.
+    #[serde(default = "default_max_continuations")]
+    pub max_continuations: u32,
+    /// M10 tool-call budget across the whole task. `0` = unlimited; otherwise, on
+    /// exceed the loop stops and the task is marked `needs_user`. Default 0.
+    #[serde(default)]
+    pub max_tool_calls: u64,
     /// Default sandbox provider applied to routes that do not set their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
@@ -134,6 +163,49 @@ pub struct Defaults {
 /// config round-trips without emitting the new hardening keys.
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// The two forms the M10 `max_seconds` soft ceiling may take in config/frontmatter:
+/// an explicit integer number of seconds, or the keyword `"none"` (no ceiling).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MaxSeconds {
+    /// `max_seconds = 1200`
+    Seconds(u64),
+    /// `max_seconds = "none"` — no soft total ceiling (loop until other bounds hit).
+    Keyword(String),
+}
+
+fn default_idle_timeout_seconds() -> u64 {
+    180
+}
+
+fn default_max_continuations() -> u32 {
+    8
+}
+
+impl Defaults {
+    /// Resolve the M10 soft total ceiling in seconds. `None` means "no ceiling"
+    /// (the loop is bounded only by `max_continuations` / `max_tool_calls`).
+    ///
+    /// Precedence: an explicit `max_seconds` wins; when unset, fall back to the
+    /// deprecated `timeout_seconds` alias (treating `0` as "no ceiling").
+    ///
+    /// Consumed by the M10 runner auto-resume loop (landing as the next increment)
+    /// and by the config tests; `allow(dead_code)` until the runner side is wired.
+    #[allow(dead_code)]
+    pub fn effective_max_seconds(&self) -> Option<u64> {
+        match &self.max_seconds {
+            Some(MaxSeconds::Seconds(secs)) => Some(*secs),
+            Some(MaxSeconds::Keyword(word)) if word.eq_ignore_ascii_case("none") => None,
+            // Any other keyword is treated as "no explicit ceiling" → fall through
+            // to the deprecated alias so a typo never silently zeroes the budget.
+            Some(MaxSeconds::Keyword(_)) | None => match self.timeout_seconds {
+                0 => None,
+                secs => Some(secs),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -770,10 +842,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_config_without_m10_bounds_parses_with_defaults() {
+        // A pre-M10 config sets only `timeout_seconds`; the new bounds must fall
+        // back to their serde defaults and the deprecated alias must feed the
+        // soft ceiling unchanged.
+        let legacy = r#"[defaults]
+timeout_seconds = 600
+operations_dir = "operations"
+
+[[routes]]
+glob = "**"
+agents = ["codex"]
+
+[agents.codex]
+kind = "acp"
+command = "codex"
+args = []
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config should parse");
+        assert_eq!(config.defaults.idle_timeout_seconds, 180);
+        assert_eq!(config.defaults.max_continuations, 8);
+        assert_eq!(config.defaults.max_tool_calls, 0);
+        assert_eq!(config.defaults.max_seconds, None);
+        // With no explicit `max_seconds`, the deprecated `timeout_seconds` alias
+        // supplies the soft ceiling — existing configs behave unchanged.
+        assert_eq!(config.defaults.effective_max_seconds(), Some(600));
+    }
+
+    #[test]
+    fn max_seconds_accepts_integer_and_none_keyword() {
+        let with_int = r#"[defaults]
+timeout_seconds = 600
+operations_dir = "operations"
+max_seconds = 1200
+"#;
+        let config: Config = toml::from_str(with_int).expect("integer max_seconds should parse");
+        assert_eq!(config.defaults.max_seconds, Some(MaxSeconds::Seconds(1200)));
+        assert_eq!(config.defaults.effective_max_seconds(), Some(1200));
+
+        // Explicit "none" overrides the alias with "no ceiling".
+        let none = r#"[defaults]
+timeout_seconds = 600
+operations_dir = "operations"
+max_seconds = "none"
+"#;
+        let config: Config = toml::from_str(none).expect("none max_seconds should parse");
+        assert_eq!(config.defaults.effective_max_seconds(), None);
+
+        // `timeout_seconds = 0` with no explicit ceiling ⇒ no ceiling.
+        let zero = r#"[defaults]
+timeout_seconds = 0
+operations_dir = "operations"
+"#;
+        let config: Config = toml::from_str(zero).expect("zero timeout should parse");
+        assert_eq!(config.defaults.effective_max_seconds(), None);
+    }
+
+    #[test]
     fn parses_default_config() {
         let config: Config = toml::from_str(DEFAULT_CONFIG).expect("default config should parse");
 
         assert_eq!(config.defaults.timeout_seconds, 600);
+        assert_eq!(config.defaults.idle_timeout_seconds, 180);
+        assert_eq!(config.defaults.max_continuations, 8);
+        assert_eq!(config.defaults.max_tool_calls, 0);
+        // `max_seconds = "none"` ⇒ no soft ceiling, ignoring the deprecated alias.
+        assert_eq!(config.defaults.max_seconds, Some(MaxSeconds::Keyword("none".to_owned())));
+        assert_eq!(config.defaults.effective_max_seconds(), None);
         assert_eq!(config.routes[0].agents, vec!["codex"]);
         assert_eq!(config.agents["codex"].command, "codex");
         assert!(!config.agents.contains_key("tester"));

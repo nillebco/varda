@@ -502,14 +502,47 @@ agent_session_log: /home/user/.varda/operations/runs/2f6f0f2c-7ad9-4d78-b5b6-66a
 
 Varda writes these fields before launching the agent, so an interrupted runner still leaves a resumable run pointer on the task. For Claude Code runs, Varda also records the discovered Claude transcript as `external_session_id` and `external_session_log` inside the session log when it can match the generated Claude JSONL file. While the agent runs, stdout and stderr are streamed into the session log instead of being buffered until process exit. If the agent process fails or times out, the synthetic failure recap includes the session ID and a link to that log file. Timeout recaps also ask for the unfinished work to be delegated to a Varda long-running runner task and record `long_running_task_requested=true` in the session log.
 
+## Execution bounds (cooperative, not a hard kill)
+
+Older Varda wrapped each non-interactive run in a single `timeout_seconds` (600 s)
+wall-clock limit and hard-killed the child on expiry — losing uncommitted partial
+work and, under a sandbox, leaking containers/volumes. Varda is moving to a
+**cooperative bounds** model that never kills a productive session mid-work:
+
+- **Idle watchdog** (`idle_timeout_seconds`, default 180) — cancels a session only
+  after that many seconds of *total silence* (no stdout/stderr activity). Productive
+  long runs never trip it; a wedged or hung child does.
+- **Auto-resume loop** (`max_continuations`, default 8) — when a session ends with
+  work remaining, Varda captures the resume command and dispatches a fresh
+  continuation session (fresh context each hop) until the agent reports done or a
+  bound is hit.
+- **Operation budget** (`max_seconds`, `max_tool_calls`) — soft ceilings tracked
+  across the whole task. `max_seconds` accepts an integer or `"none"`; `max_tool_calls`
+  of `0` means unlimited. On exceed, the loop **stops and marks the task
+  `needs_user`** with the accumulated recap — a graceful checkpoint, never a kill.
+
+`timeout_seconds` remains as a **deprecated alias**: when `max_seconds` is unset it
+supplies the soft ceiling, so existing configs behave unchanged. Each bound can be
+overridden per-task in the task frontmatter (`idle_timeout`, `max_seconds`,
+`max_continuations`, `max_tool_calls`).
+
+> Rollout note: the configuration layer above (parsing, back-compat alias, and the
+> `Defaults::effective_max_seconds` resolver) is wired and tested. The runner-side
+> idle watchdog + auto-resume loop replacing the `time::timeout` hard kill in
+> `src/runner.rs` lands as the next increment of this milestone.
+
 ## Configuration
 
 The default global config looks like this:
 
 ```toml
 [defaults]
-timeout_seconds = 600
+timeout_seconds = 600      # DEPRECATED alias for max_seconds (see below)
 operations_dir = "operations"
+idle_timeout_seconds = 180 # cancel a session only after this many seconds of total silence
+max_seconds = "none"       # soft total ceiling across all continuations; "none" = no ceiling
+max_continuations = 8      # max auto-resume hops before stopping with needs_user
+max_tool_calls = 0         # tool-call budget across the whole task; 0 = unlimited
 
 [[routes]]
 glob = "**"
