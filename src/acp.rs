@@ -301,9 +301,16 @@ impl AcpSubprocessClient {
         // the agent runs, exactly where it writes. For an EXTRACTED store
         // (`docker` volume) the store is not host-visible yet, so we defer
         // discovery until after the run has been `docker cp`-ed out (below).
+        // Handle for the async session-store discovery task; awaited after the run
+        // to build the resume command. Set for BOTH a live store (local: polled
+        // while the agent runs, below) and an extracted store (docker: recorded
+        // after `docker cp`). Previously the live handle was discarded, so `local`
+        // headless runs never produced a resume_command and auto-resume never fired.
+        let mut record_handle = None;
         if store_is_live
             && let Some(session_root) = session_store_root.as_deref() {
-                self.record_external_session(request, started_at, session_root);
+                record_handle =
+                    self.record_external_session(request, started_at, session_root);
             }
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
@@ -336,12 +343,11 @@ impl AcpSubprocessClient {
         // single discovery pass — the files already exist, so the first poll hits
         // immediately. This is the container→host round-trip that makes
         // resume-capture work on a VM-backed daemon with a narrow share.
-        let mut extracted_record_handle = None;
         if !store_is_live {
             match session.extract_session_store().await {
                 Ok(()) => {
                     if let Some(session_root) = session_store_root.as_deref() {
-                        extracted_record_handle =
+                        record_handle =
                             self.record_external_session(request, started_at, session_root);
                     }
                 }
@@ -355,9 +361,10 @@ impl AcpSubprocessClient {
             eprintln!("warning: failed to tear down sandbox session: {error:#}");
         }
 
-        // For an extracted store the external session id (hence resume command)
-        // is only known after discovery ran against the copied-out store above.
-        let resume_command = match extracted_record_handle {
+        // The external session id (hence resume command) comes from the discovery
+        // task: for a live store it polled during the run; for an extracted store it
+        // ran against the copied-out store above.
+        let resume_command = match record_handle {
             Some(handle) => {
                 let external_session_id = handle.await.ok().flatten();
                 self.build_resume_command(request, external_session_id.as_deref())

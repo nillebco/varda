@@ -148,7 +148,9 @@ struct OperationBounds {
     /// Max auto-resume hops (fresh continuation sessions) before stopping with
     /// `needs_user`. `0` disables auto-resume (a single session only).
     max_continuations: u32,
-    /// Tool-call budget across the whole task. `0` = unlimited.
+    /// Tool-call budget across the whole task. `0` = unlimited. RESERVED — NOT yet
+    /// enforced: there is no per-run tool-call signal from the agent stream to count
+    /// against it; a non-zero value is surfaced as a warning and otherwise ignored.
     max_tool_calls: u64,
 }
 
@@ -286,11 +288,19 @@ async fn run_auto_resume_loop(
     let mut log_path = first_session_log;
     let mut request = first_request;
     let mut hop: u32 = 0;
+    // `max_seconds` is a TOTAL budget across ALL continuation hops, so each hop gets
+    // the budget MINUS the time already spent — not the full budget again (which would
+    // let a task run max_seconds * (hops + 1)). When it reaches 0 the next session
+    // stops immediately on the budget path.
+    let loop_started = Instant::now();
 
     loop {
+        let remaining_secs = bounds
+            .max_seconds
+            .map(|total| total.saturating_sub(loop_started.elapsed().as_secs()));
         let agent_result = run_session_watched(
             bounds.idle_timeout,
-            bounds.max_seconds,
+            remaining_secs,
             &log_path,
             client.run_task(request),
         )
@@ -456,6 +466,16 @@ pub async fn run_task(
     // watchdog); a headless run is guarded by the idle watchdog + soft ceiling
     // and may stitch multiple auto-resume continuations into one task.
     let bounds = OperationBounds::resolve(config, &task.frontmatter);
+    if bounds.max_tool_calls > 0 {
+        // Surfaced loudly rather than silently ignored: enforcement needs a per-run
+        // tool-call count from the agent stream, which does not exist yet (tracked as
+        // a follow-up). Time bounds (idle watchdog + max_seconds) still apply.
+        eprintln!(
+            "warning: max_tool_calls={} is configured but NOT yet enforced (no tool-call \
+             signal from the agent run); ignoring it. Time bounds still apply.",
+            bounds.max_tool_calls
+        );
+    }
     let (session_outcome, _interactive_finalization_guard) = if interactive {
         let agent_result = Ok(client.run_task(request).await);
         let guard = InteractiveFinalizationGuard::activate()?;
@@ -1569,6 +1589,55 @@ Help interactively.
             task.frontmatter.agent_session_ids.len(),
             2,
             "each hop records its own session id"
+        );
+    }
+
+    /// A client that always reports more work, sleeping a fixed time per hop so the
+    /// auto-resume loop's cumulative wall-clock advances between continuations.
+    struct SleepyMoreWorkClient {
+        hop_ms: u64,
+    }
+
+    #[async_trait]
+    impl AgentClient for SleepyMoreWorkClient {
+        async fn run_task(&self, _request: AgentRunRequest) -> Result<AgentRunResult> {
+            tokio::time::sleep(Duration::from_millis(self.hop_ms)).await;
+            Ok(AgentRunResult {
+                recap: "# more work".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: Some("codex resume".to_owned()),
+            })
+        }
+    }
+
+    /// P2 regression: `max_seconds` is a TOTAL budget across auto-resume hops, not a
+    /// per-hop one. With a 1s ceiling, 400ms/hop, and max_continuations=20, the loop
+    /// must stop on the CUMULATIVE budget after ~2-3 hops ("Operation Budget Reached")
+    /// — not run 20 * ~400ms because each hop was handed the full 1s again.
+    #[tokio::test]
+    async fn auto_resume_max_seconds_is_a_total_budget_across_hops() {
+        let (task_path, mut config) = ready_task("run-autoresume-budget");
+        config.defaults.max_seconds = Some(MaxSeconds::Seconds(1));
+        config.defaults.idle_timeout_seconds = 60;
+        config.defaults.max_continuations = 20;
+        let client = SleepyMoreWorkClient { hop_ms: 400 };
+
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
+            .await
+            .expect("budgeted auto-resume runs");
+
+        let recap = fs::read_to_string(&outcome.recap_path).expect("recap readable");
+        assert_eq!(outcome.status, TaskStatus::NeedsUser);
+        assert!(
+            recap.contains("Operation Budget Reached"),
+            "must stop on the cumulative time budget, not the continuation cap: {recap}"
+        );
+        let task = crate::task::load_task(&task_path).expect("task loads");
+        assert!(
+            task.frontmatter.agent_session_ids.len() < 20,
+            "cumulative budget must stop well before max_continuations; ran {} sessions",
+            task.frontmatter.agent_session_ids.len()
         );
     }
 

@@ -982,7 +982,13 @@ impl SandboxSession for DockerSession {
             })?;
             let source = expand_mount_path(&spec.source, &self.project_root);
             let target = expand_mount_path(&spec.target, &self.project_root);
-            check_credential_denylist(&source)?;
+            // NB: identity_context is the sanctioned escape hatch for a specific
+            // curated file INSIDE an otherwise-denylisted dir (e.g. ~/.claude/CLAUDE.md),
+            // so we do NOT apply the blanket credential-DIR denylist here — that would
+            // defeat the documented use. We keep the M8 control-plane/socket floor and
+            // rely on `check_identity_context_mount` to reject credential FILES, dirs,
+            // and writable mounts.
+            check_control_plane_denylist(&source)?;
             check_identity_context_mount(&source, spec.writable)?;
             if !seen_targets.insert(target.clone()) {
                 continue;
@@ -1321,7 +1327,11 @@ impl SandboxSession for MicrosandboxSession {
             })?;
             let source = expand_mount_path(&ispec.source, &self.project_root);
             let target = expand_mount_path(&ispec.target, &self.project_root);
-            check_credential_denylist(&source)?;
+            // identity_context is the sanctioned curated-file escape hatch inside an
+            // otherwise-denylisted dir: keep the M8 control-plane/socket floor but not
+            // the blanket credential-DIR denylist; `check_identity_context_mount`
+            // rejects credential FILES, dirs, and writable mounts.
+            check_control_plane_denylist(&source)?;
             check_identity_context_mount(&source, ispec.writable)?;
             if !seen_targets.insert(target.clone()) {
                 continue;
@@ -2043,6 +2053,43 @@ mod tests {
             "a credential file must never mount as curated identity"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P3 regression: a curated file INSIDE a denylisted dir (e.g. `~/.claude/CLAUDE.md`)
+    /// is the sanctioned `identity_context` hatch. The blanket credential-DIR denylist
+    /// (used for normal mounts) rejects it, but the identity_context path uses the M8
+    /// control-plane floor + file validation, which ALLOW the curated file while still
+    /// refusing the credential file and `~/.varda`.
+    #[test]
+    fn identity_context_allows_curated_file_inside_denylisted_dir() {
+        let Some(home) = home_dir() else {
+            return; // No HOME in this env; nothing to assert.
+        };
+        let curated = home.join(".claude/CLAUDE.md");
+        // Normal mounts: the blanket denylist rejects ANYTHING under ~/.claude...
+        assert!(
+            check_credential_denylist(&curated).is_err(),
+            "the blanket credential denylist should reject a ~/.claude path for normal mounts"
+        );
+        // ...but the identity_context path allows a curated file inside it.
+        assert!(
+            check_control_plane_denylist(&curated).is_ok(),
+            "control-plane floor must not reject a curated identity file under ~/.claude"
+        );
+        assert!(
+            check_identity_context_mount(&curated, false).is_ok(),
+            "a curated read-only file inside ~/.claude must be allowed as identity_context"
+        );
+        // The credential file itself is still refused by identity validation.
+        assert!(
+            check_identity_context_mount(&home.join(".claude/.credentials.json"), false).is_err(),
+            "the credential file must never mount, even via identity_context"
+        );
+        // And ~/.varda (control plane) is refused even on the identity path.
+        assert!(
+            check_control_plane_denylist(&home.join(".varda/config.toml")).is_err(),
+            "the control plane must never mount, even via identity_context"
+        );
     }
 
     /// M2 egress: no allow-list ⇒ fully offline (`--network none`, no DNS/host
