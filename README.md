@@ -727,7 +727,7 @@ Inline `mounts` join the docker/microsandbox mount merge as a **third origin** (
 - **Env key floor.** A `.varda` env map cannot set reserved process/control keys (`PATH`, `HOME`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_*`, `VARDA_*`, `SSH_AUTH_SOCK`) and cannot override trusted agent/route env or a credential injection target.
 - On any violation Varda **refuses to run** with an error naming the offending `.varda` and key.
 
-**Credential-directory denylist (ALL origins, trusted config included).** Any mount whose SOURCE resolves (symlinks followed) into a known secret/identity store is refused regardless of origin: `~/.claude`, `~/.codex`, `~/.copilot`, `~/.aws`, `~/.ssh`, `~/.config/gcloud`, `~/.config/fnox`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.git-credentials`. These carry live LLM tokens **and** cross-project history; mounting one defeats the sandbox and leaks other clients' data.
+**Credential-directory denylist (ALL origins, trusted config included).** Any mount whose SOURCE resolves (symlinks followed) into a known secret/identity store is refused regardless of origin: `~/.claude`, `~/.codex`, `~/.copilot`, `~/.aws`, `~/.azure`, `~/.terraform.d`, `~/.ssh`, `~/.config/gcloud`, `~/.config/fnox`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.git-credentials`. These carry live LLM tokens **and** cross-project history; mounting one defeats the sandbox and leaks other clients' data.
 
 #### Passing identity & auth into the box (three channels)
 
@@ -754,7 +754,7 @@ At `prepare`, Varda reads `$CLAUDE_SANDBOX_TOKEN` on the host and re-exports its
 | | `from_secret = "name"` | a named secret from the host store (`fnox get name`) |
 | | `command = "…"` | run on the HOST at `prepare`; stdout (newline-trimmed) is the value — for host-minted, least-privilege, short-lived tokens |
 | **target** (one) | `env = "IN_BOX_VAR"` | scoped `-e IN_BOX_VAR=…` (default) |
-| | `file = "/guest/abs/path"` | staged as a **read-only file** in the guest (via `stage_file`, cleaned on teardown) |
+| | `file = "/guest/abs/path"` | the minimal value is staged as a **read-only** (`0o400`) file in the guest — in **both** batch and interactive runs (docker `cp` / msb `--copy-file`), and both the host temp and the guest copy are removed on teardown |
 
 A `from_env`/`from_secret` source that is unset is skipped (the box still boots unauthenticated); a `command` that errors or prints nothing **fails the run loudly** — a broken mint must never silently degrade to an unauthenticated session. `refresh_seconds` is accepted for forward-compat but the value is currently minted **once** at `prepare` (periodic re-mint is a follow-up). Sources belong in the **trusted central `config.toml`** only; a `.varda` may reference a secret *name* (`from_secret`) but never a raw value or a `command`.
 

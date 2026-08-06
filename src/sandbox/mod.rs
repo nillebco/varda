@@ -65,6 +65,8 @@ pub const CREDENTIAL_DENYLIST: &[&str] = &[
     ".codex",
     ".copilot",
     ".aws",
+    ".azure",
+    ".terraform.d",
     ".ssh",
     ".config/gcloud",
     ".config/fnox",
@@ -577,19 +579,39 @@ pub trait SandboxSession: Send + Sync {
     /// temp whose path is already guest-visible. The default implements the local
     /// behavior.
     fn stage_file(&self, content: &str, _guest_path: &str) -> Result<String> {
-        let name = format!("varda-stage-{}", staged_temp_suffix(content));
-        let tmp = std::env::temp_dir().join(name);
-        std::fs::write(&tmp, content)
-            .with_context(|| format!("failed to stage file {}", tmp.display()))?;
-        Ok(tmp.display().to_string())
+        Ok(write_stage_temp(content, false)?.display().to_string())
+    }
+    /// Stage a scoped credential VALUE as a READ-ONLY file inside the guest
+    /// (M11-ext file target). Same guest-delivery machinery as
+    /// [`stage_file`](Self::stage_file), but the host temp is written `0o400` so
+    /// the value is never left mutable and — because `docker cp` / `msb
+    /// --copy-file` preserve the source mode — lands read-only in-guest. Unlike
+    /// the prompt, this must reach the guest in BOTH launch modes, so
+    /// boundary-crossing providers deliver it in batch too (docker via
+    /// [`begin_batch`](Self::begin_batch), msb via a pre-boot `--copy-file`).
+    fn stage_credential_file(&self, content: &str, _guest_path: &str) -> Result<String> {
+        Ok(write_stage_temp(content, true)?.display().to_string())
     }
     /// Scoped credential values (`guest_abs_path → value`) that must be staged as
     /// read-only files INSIDE the guest before the process starts (M11-ext file
-    /// targets). The caller stages each via [`stage_file`](Self::stage_file) between
-    /// `prepare` and `wrap`. The default is empty (`local` crosses no boundary);
+    /// targets). The caller stages each via
+    /// [`stage_credential_file`](Self::stage_credential_file) between `prepare`
+    /// and `wrap`. The default is empty (`local` crosses no boundary);
     /// boundary-crossing providers return their identity's `auth_files`.
     fn identity_files(&self) -> BTreeMap<String, String> {
         BTreeMap::new()
+    }
+    /// Drive any provider-specific pre-start staging a BATCH launch needs and
+    /// return the FINAL command the caller spawns (stdin piped for the prompt,
+    /// stdout captured). Mirrors [`begin_interactive`](Self::begin_interactive)
+    /// for the non-TTY path. The default returns `wrapped` unchanged (local: no
+    /// boundary; msb: file targets are baked into `wrap` as pre-boot
+    /// `--copy-file`). Docker overrides it to `docker create` → `docker cp` the
+    /// staged credential files → `docker start -ai` so a batch `file`-target
+    /// credential actually reaches the guest (its `docker run` streaming form
+    /// cannot copy a file in before the agent starts).
+    async fn begin_batch(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
+        Ok(wrapped)
     }
     /// Drive a provider-specific interactive launch lifecycle and return the FINAL
     /// command the caller spawns with the user's TTY inherited (M13a §2). `wrapped`
@@ -1149,6 +1171,29 @@ fn staged_temp_suffix(content: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// Write `content` to a fresh host temp for staging into the guest. When
+/// `read_only` is set the temp is chmod-ed to `0o400` so a staged credential
+/// VALUE (M11-ext file target) is never left mutable on the host and — since
+/// `docker cp` / `msb --copy-file` preserve the source mode — lands read-only
+/// in the guest. The prompt uses the default (world-readable) perms so a
+/// non-root agent can still read it. Returns the host temp path.
+fn write_stage_temp(content: &str, read_only: bool) -> Result<PathBuf> {
+    let tmp = std::env::temp_dir().join(format!("varda-stage-{}", staged_temp_suffix(content)));
+    // The filename is content-addressed, so a prior run staging the SAME value may
+    // have left a read-only (0o400) temp here — which `std::fs::write` cannot
+    // truncate. Clear it first (best-effort) so re-staging identical content works.
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(&tmp, content)
+        .with_context(|| format!("failed to stage file {}", tmp.display()))?;
+    #[cfg(unix)]
+    if read_only {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o400))
+            .with_context(|| format!("failed to set read-only perms on {}", tmp.display()))?;
+    }
+    Ok(tmp)
+}
+
 /// Sanitize a session id into a docker-safe name/volume component.
 ///
 /// Docker names must match `[a-zA-Z0-9][a-zA-Z0-9_.-]*`; every other character
@@ -1214,6 +1259,68 @@ pub struct DockerSession {
     staged_files: std::sync::Mutex<Vec<(PathBuf, String)>>,
 }
 
+impl DockerSession {
+    /// Write `content` to a host temp (read-only when `read_only`) and record the
+    /// `(host_temp, guest_path)` pair for a DEFERRED `docker cp`: the container
+    /// does not exist until the create → cp → start lifecycle runs. Returns the
+    /// guest path (used for `VARDA_PROMPT_FILE` / the credential guest path).
+    fn record_staged(&self, content: &str, guest_path: &str, read_only: bool) -> Result<String> {
+        let tmp = write_stage_temp(content, read_only)?;
+        self.staged_files
+            .lock()
+            .expect("staged_files mutex poisoned")
+            .push((tmp, guest_path.to_owned()));
+        Ok(guest_path.to_owned())
+    }
+
+    /// Shared create → cp → start lifecycle for both launch modes. `wrapped` is a
+    /// `docker create … (-it|-i) …`: run it to create (not start) the container,
+    /// `docker cp` every staged file in (removing each host temp after), then
+    /// return `docker start -ai <container>` for the caller to spawn. Interactive
+    /// attaches the user's TTY; batch pipes stdin (the prompt) / captures stdout.
+    /// Teardown/extract reuse the same container/volume.
+    async fn create_cp_start(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
+        let output = tokio::process::Command::new(&wrapped.program)
+            .args(&wrapped.args)
+            .output()
+            .await
+            .with_context(|| format!("failed to run `docker create` for '{}'", self.container))?;
+        if !output.status.success() {
+            bail!(
+                "`docker create` for '{}' failed with status {}; stderr: {}",
+                self.container,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let staged =
+            std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"));
+        for (host_temp, guest_path) in staged {
+            let src = host_temp.display().to_string();
+            let dst = format!("{}:{guest_path}", self.container);
+            let output = tokio::process::Command::new("docker")
+                .args(["cp", &src, &dst])
+                .output()
+                .await
+                .with_context(|| format!("failed to `docker cp {src} {dst}`"))?;
+            if !output.status.success() {
+                bail!(
+                    "`docker cp {src} {dst}` failed with status {}; stderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let _ = std::fs::remove_file(&host_temp);
+        }
+        Ok(CommandSpec {
+            program: "docker".to_owned(),
+            args: vec!["start".to_owned(), "-ai".to_owned(), self.container.clone()],
+            env: BTreeMap::new(),
+            cwd: None,
+        })
+    }
+}
+
 #[async_trait]
 impl SandboxSession for DockerSession {
     fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec> {
@@ -1233,7 +1340,17 @@ impl SandboxSession for DockerSession {
         // `run`): the container is created, the prompt is `docker cp`-ed in, and
         // `begin_interactive` attaches the user's TTY via `docker start -ai`.
         // Batch keeps the streaming `docker run -i` form unchanged.
+        // Batch normally streams via `docker run -i`. But a `file`-target
+        // credential must be `docker cp`-ed into the container BEFORE the agent
+        // starts, which `run` cannot do — so when files are staged, batch also
+        // takes the `create` → cp → `start -ai` lifecycle (still `-i`, no TTY).
+        let has_staged = !self
+            .staged_files
+            .lock()
+            .expect("staged_files mutex poisoned")
+            .is_empty();
         let (verb, tty_flag) = match mode {
+            LaunchMode::Batch if has_staged => ("create", "-i"),
             LaunchMode::Batch => ("run", "-i"),
             LaunchMode::Interactive => ("create", "-it"),
         };
@@ -1370,18 +1487,14 @@ impl SandboxSession for DockerSession {
     }
 
     fn stage_file(&self, content: &str, guest_path: &str) -> Result<String> {
-        // Write the content to a host temp now, but DEFER the copy: the container
-        // does not exist until `begin_interactive` runs `docker create`. Record
-        // the (host_temp, guest_path) pair so `begin_interactive` can `docker cp`
-        // it between `create` and `start`. Return the guest path for VARDA_PROMPT_FILE.
-        let tmp = std::env::temp_dir().join(format!("varda-stage-{}", staged_temp_suffix(content)));
-        std::fs::write(&tmp, content)
-            .with_context(|| format!("failed to stage file {}", tmp.display()))?;
-        self.staged_files
-            .lock()
-            .expect("staged_files mutex poisoned")
-            .push((tmp, guest_path.to_owned()));
-        Ok(guest_path.to_owned())
+        self.record_staged(content, guest_path, false)
+    }
+
+    fn stage_credential_file(&self, content: &str, guest_path: &str) -> Result<String> {
+        // File-target credential: same deferred-copy machinery as the prompt, but
+        // the host temp is written read-only (0o400) so the value is not left
+        // mutable and lands read-only in-guest after `docker cp`.
+        self.record_staged(content, guest_path, true)
     }
 
     fn identity_files(&self) -> BTreeMap<String, String> {
@@ -1389,47 +1502,25 @@ impl SandboxSession for DockerSession {
     }
 
     async fn begin_interactive(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
-        // `wrapped` is `docker create … -it …`. Run it to create (but not start)
-        // the container, then `docker cp` every staged file into it, then return
-        // the `docker start -ai <container>` command whose TTY the caller attaches
-        // to the user's terminal. Teardown/extract reuse the batch container/volume.
-        let output = tokio::process::Command::new(&wrapped.program)
-            .args(&wrapped.args)
-            .output()
-            .await
-            .with_context(|| format!("failed to run `docker create` for '{}'", self.container))?;
-        if !output.status.success() {
-            bail!(
-                "`docker create` for '{}' failed with status {}; stderr: {}",
-                self.container,
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        // `wrapped` is `docker create … -it …`. Create, cp the staged files, and
+        // return `docker start -ai` whose TTY the caller attaches to the user.
+        self.create_cp_start(wrapped).await
+    }
+
+    async fn begin_batch(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
+        // No staged files ⇒ `wrapped` is a plain `docker run -i …`; spawn it as-is.
+        // Otherwise `wrap` produced `docker create -i …` so a file-target
+        // credential can be `docker cp`-ed in BEFORE the agent starts; run the same
+        // create → cp → `start -ai` lifecycle as interactive (no TTY, stdin piped).
+        if self
+            .staged_files
+            .lock()
+            .expect("staged_files mutex poisoned")
+            .is_empty()
+        {
+            return Ok(wrapped);
         }
-        let staged = std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"));
-        for (host_temp, guest_path) in staged {
-            let src = host_temp.display().to_string();
-            let dst = format!("{}:{guest_path}", self.container);
-            let output = tokio::process::Command::new("docker")
-                .args(["cp", &src, &dst])
-                .output()
-                .await
-                .with_context(|| format!("failed to `docker cp {src} {dst}`"))?;
-            if !output.status.success() {
-                bail!(
-                    "`docker cp {src} {dst}` failed with status {}; stderr: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-            let _ = std::fs::remove_file(&host_temp);
-        }
-        Ok(CommandSpec {
-            program: "docker".to_owned(),
-            args: vec!["start".to_owned(), "-ai".to_owned(), self.container.clone()],
-            env: BTreeMap::new(),
-            cwd: None,
-        })
+        self.create_cp_start(wrapped).await
     }
 
     fn session_store_root(&self) -> Option<PathBuf> {
@@ -1510,6 +1601,13 @@ impl SandboxSession for DockerSession {
     }
 
     async fn teardown(self: Box<Self>) -> Result<()> {
+        // Remove any host temps still staged (e.g. a cancel before create/cp
+        // consumed them) so no credential value is left behind on the host.
+        for (host_temp, _) in
+            std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"))
+        {
+            let _ = std::fs::remove_file(&host_temp);
+        }
         // Without `--rm` the container and its per-session volume persist; remove
         // both here. Best-effort: a cleanup failure must not fail the run.
         let _ = tokio::process::Command::new("docker")
@@ -1663,6 +1761,20 @@ pub struct MicrosandboxSession {
     staged_files: std::sync::Mutex<Vec<(PathBuf, String)>>,
 }
 
+impl MicrosandboxSession {
+    /// Write `content` to a host temp (read-only when `read_only`) and record it so
+    /// [`wrap`](Self::wrap) can emit a pre-boot `--copy-file host:guest` flag (msb
+    /// copies it in before the guest boots). Returns the guest path.
+    fn record_staged(&self, content: &str, guest_path: &str, read_only: bool) -> Result<String> {
+        let tmp = write_stage_temp(content, read_only)?;
+        self.staged_files
+            .lock()
+            .expect("staged_files mutex poisoned")
+            .push((tmp, guest_path.to_owned()));
+        Ok(guest_path.to_owned())
+    }
+}
+
 #[async_trait]
 impl SandboxSession for MicrosandboxSession {
     fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec> {
@@ -1689,6 +1801,13 @@ impl SandboxSession for MicrosandboxSession {
         ];
         if matches!(mode, LaunchMode::Interactive) {
             args.push("-t".to_owned());
+        }
+        // Pre-boot copy every staged file (`msb` copies it in before the guest
+        // boots). The prompt is only staged in Interactive, but a `file`-target
+        // credential is staged in EITHER mode — so emitting `--copy-file` here for
+        // both modes is what makes a BATCH file-target credential reach the guest
+        // (M11-ext), while a batch run with nothing staged still emits none.
+        {
             let staged = self.staged_files.lock().expect("staged_files mutex poisoned");
             for (host_temp, guest_path) in staged.iter() {
                 args.push("--copy-file".to_owned());
@@ -1801,17 +1920,14 @@ impl SandboxSession for MicrosandboxSession {
     }
 
     fn stage_file(&self, content: &str, guest_path: &str) -> Result<String> {
-        // Write the content to a host temp and record it so `wrap(.., Interactive)`
-        // can emit a pre-boot `--copy-file host:guest` flag (msb copies it in
-        // before the guest boots). Return the guest path for VARDA_PROMPT_FILE.
-        let tmp = std::env::temp_dir().join(format!("varda-stage-{}", staged_temp_suffix(content)));
-        std::fs::write(&tmp, content)
-            .with_context(|| format!("failed to stage file {}", tmp.display()))?;
-        self.staged_files
-            .lock()
-            .expect("staged_files mutex poisoned")
-            .push((tmp, guest_path.to_owned()));
-        Ok(guest_path.to_owned())
+        self.record_staged(content, guest_path, false)
+    }
+
+    fn stage_credential_file(&self, content: &str, guest_path: &str) -> Result<String> {
+        // File-target credential: same pre-boot `--copy-file` machinery as the
+        // prompt, but the host temp is written read-only (0o400) so the value is
+        // not left mutable and lands read-only in-guest after the copy.
+        self.record_staged(content, guest_path, true)
     }
 
     fn identity_files(&self) -> BTreeMap<String, String> {
@@ -1897,6 +2013,14 @@ impl SandboxSession for MicrosandboxSession {
     }
 
     async fn teardown(self: Box<Self>) -> Result<()> {
+        // Remove the host temps staged for `--copy-file` (msb copies them into the
+        // guest but leaves the host originals) so no credential value is left
+        // behind; the guest copies vanish with the sandbox `rm` below.
+        for (host_temp, _) in
+            std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"))
+        {
+            let _ = std::fs::remove_file(&host_temp);
+        }
         // Best-effort: stop then remove the per-session sandbox; a cleanup
         // failure must not fail the run.
         let _ = tokio::process::Command::new("msb")
@@ -2468,6 +2592,172 @@ mod tests {
             .stage_file("scoped-file-token", "/home/agent/.config/gcloud-token")
             .unwrap();
         assert_eq!(guest, "/home/agent/.config/gcloud-token");
+        // stage_file leaks nothing under test: drop the host temp it wrote.
+        for (host_temp, _) in session.staged_files.lock().unwrap().drain(..) {
+            let _ = std::fs::remove_file(&host_temp);
+        }
+    }
+
+    /// M11-ext Finding 1: a CONFIGURED mount (any origin) of `~/.azure` or
+    /// `~/.terraform.d` — both in our documented cloud recipes — is REFUSED. Proven
+    /// two ways: the denylist predicate rejects the resolved source, AND a docker
+    /// `wrap()` carrying such a mount fails (the real rejection path a launch takes).
+    #[test]
+    fn m11ext_credential_denylist_rejects_azure_and_terraform() {
+        let home = std::env::var("HOME").expect("HOME set in tests");
+        for entry in ["/.azure", "/.terraform.d", "/.azure/accessTokens.json"] {
+            let src = PathBuf::from(format!("{home}{entry}"));
+            assert!(
+                check_credential_denylist(&src).is_err(),
+                "expected {entry} to be denied by the credential denylist"
+            );
+        }
+        // Exercise the actual launch-time rejection path: a route/central-config
+        // mount of either dir must make docker `wrap` bail, not silently mount it.
+        for raw in ["~/.azure:/creds", "~/.terraform.d:/tf"] {
+            let session = DockerSession::for_test(
+                "img",
+                "/srv/app",
+                vec![(MountOrigin::Route, raw.to_owned())],
+                vec![],
+                "/var/varda/sessions/s1",
+            );
+            let err = session
+                .wrap(
+                    CommandSpec {
+                        program: "claude".to_owned(),
+                        args: vec![],
+                        env: BTreeMap::new(),
+                        cwd: None,
+                    },
+                    LaunchMode::Batch,
+                )
+                .expect_err("a configured mount of a credential store must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("credential/identity store"),
+                "rejection must cite the credential denylist, got: {msg}"
+            );
+        }
+    }
+
+    /// M11-ext Finding 2 (docker): a BATCH run with a `file`-target credential
+    /// actually delivers the value into the guest. Staging writes a READ-ONLY host
+    /// temp and, because a copy must precede the agent, batch `wrap` switches to the
+    /// `docker create` (not `run`) lifecycle so `begin_batch` can `docker cp` it in.
+    /// Teardown removes the host temp — no credential value is left behind.
+    #[tokio::test]
+    async fn m11ext_batch_file_target_delivered_and_cleaned_docker() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut auth_files = BTreeMap::new();
+        auth_files.insert("/home/agent/.azure-token".to_owned(), "scoped-value-docker".to_owned());
+        let id = SandboxIdentity {
+            auth_files,
+            ..Default::default()
+        };
+        let session = Box::new(DockerSession::for_test_with_identity(
+            "img",
+            "/srv/app",
+            "/var/varda/sessions/s1",
+            id,
+        ));
+        // Stage exactly as `stage_identity_files` does for a batch launch.
+        for (guest_path, value) in session.identity_files() {
+            let advertised = session.stage_credential_file(&value, &guest_path).unwrap();
+            assert_eq!(advertised, guest_path);
+        }
+        // The host temp holds the value and is read-only (0o400) — not left mutable.
+        let host_temp = {
+            let staged = session.staged_files.lock().unwrap();
+            assert_eq!(staged.len(), 1, "one file-target credential staged");
+            assert_eq!(staged[0].1, "/home/agent/.azure-token");
+            let path = staged[0].0.clone();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "scoped-value-docker");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o400, "staged credential must be read-only, got {mode:o}");
+            path
+        };
+        // Batch with a staged file takes the `create` → cp → `start -ai` lifecycle
+        // (so the credential can be copied in BEFORE the agent runs), NOT `docker run`.
+        let wrapped = session
+            .wrap(
+                CommandSpec {
+                    program: "claude".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+        assert_eq!(wrapped.args.first().map(String::as_str), Some("create"));
+        assert!(wrapped.args.iter().any(|a| a == "-i"), "batch keeps stdin open");
+        assert!(!wrapped.args.iter().any(|a| a == "-t"), "batch must not allocate a TTY");
+        // The credential is delivered by copy, never as a host bind mount.
+        for v in docker_v_flags(&wrapped.args) {
+            assert!(!v.contains(".azure-token"), "credential must not be bind-mounted: {v}");
+        }
+        // Teardown removes the staged host temp (best-effort docker rm needs no daemon).
+        assert!(host_temp.exists());
+        session.teardown().await.unwrap();
+        assert!(!host_temp.exists(), "teardown must remove the staged credential host temp");
+    }
+
+    /// M11-ext Finding 2 (msb): a BATCH run with a `file`-target credential reaches
+    /// the guest via a pre-boot `--copy-file` (emitted in EITHER mode now), the host
+    /// temp is read-only, and teardown removes it.
+    #[tokio::test]
+    async fn m11ext_batch_file_target_delivered_and_cleaned_msb() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut auth_files = BTreeMap::new();
+        auth_files.insert("/home/agent/.tf-token".to_owned(), "scoped-value-msb".to_owned());
+        let session = Box::new(MicrosandboxSession {
+            image: "busybox".to_owned(),
+            project_root: PathBuf::from("/proj"),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-abc".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity {
+                auth_files,
+                ..Default::default()
+            },
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        });
+        for (guest_path, value) in session.identity_files() {
+            session.stage_credential_file(&value, &guest_path).unwrap();
+        }
+        let host_temp = session.staged_files.lock().unwrap()[0].0.clone();
+        let mode = std::fs::metadata(&host_temp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400, "staged credential must be read-only, got {mode:o}");
+        // BATCH wrap emits a `--copy-file host:guest` for the staged credential and
+        // still no TTY — the fix over the old "interactive-only copy" behavior.
+        let wrapped = session
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+        assert!(!wrapped.args.iter().any(|a| a == "-t"), "batch must not allocate a TTY");
+        let copy_idx = wrapped
+            .args
+            .iter()
+            .position(|a| a == "--copy-file")
+            .expect("batch msb must deliver the file-target credential via --copy-file");
+        assert!(
+            wrapped.args[copy_idx + 1].ends_with(":/home/agent/.tf-token"),
+            "copy-file target must be the guest credential path, got {}",
+            wrapped.args[copy_idx + 1]
+        );
+        assert!(host_temp.exists());
+        session.teardown().await.unwrap();
+        assert!(!host_temp.exists(), "teardown must remove the staged credential host temp");
     }
 
     /// M11 channel 2 (git identity): SSH_AUTH_SOCK is forwarded as a bind + env, and

@@ -29,14 +29,15 @@ use crate::sandbox::{
 const GUEST_PROMPT_FILE: &str = "/home/agent/.varda-prompt.txt";
 
 /// M11-ext — stage every file-target credential the identity resolved
-/// ([`SandboxSession::identity_files`]) into the guest via `stage_file`, so the
-/// value lands as a read-only file inside the box (cleaned on teardown). Env-target
-/// credentials fold in via the provider's `guest_env()` at wrap and need no staging.
-/// Must run after `prepare` and before `wrap` (providers bake staging into the argv).
+/// ([`SandboxSession::identity_files`]) into the guest via `stage_credential_file`,
+/// so the value lands as a READ-ONLY file inside the box in BOTH launch modes
+/// (docker cp / msb `--copy-file`; cleaned on teardown). Env-target credentials
+/// fold in via the provider's `guest_env()` at wrap and need no staging. Must run
+/// after `prepare` and before `wrap` (providers bake staging into the argv).
 fn stage_identity_files(session: &dyn SandboxSession, sandbox_name: &str) -> Result<()> {
     for (guest_path, value) in session.identity_files() {
         session
-            .stage_file(&value, &guest_path)
+            .stage_credential_file(&value, &guest_path)
             .with_context(|| {
                 format!("failed to stage credential file '{guest_path}' into '{sandbox_name}' sandbox")
             })?;
@@ -303,6 +304,16 @@ impl AcpSubprocessClient {
         let spec = session.wrap(spec, LaunchMode::Batch).with_context(|| {
             format!(
                 "failed to wrap command for '{}' sandbox",
+                self.sandbox.name()
+            )
+        })?;
+        // Provider-specific batch pre-start staging: docker `create` → `docker cp`
+        // any file-target credentials → `start -ai` so they actually reach the
+        // guest (its `docker run` streaming form cannot copy a file in first).
+        // local/msb return the wrapped command unchanged.
+        let spec = session.begin_batch(spec).await.with_context(|| {
+            format!(
+                "failed to begin batch session for '{}' sandbox",
                 self.sandbox.name()
             )
         })?;
