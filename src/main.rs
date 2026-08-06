@@ -1307,8 +1307,8 @@ impl orchestration::SubtaskResults for VardaSubtaskResults {
     }
 }
 
-struct OrchestratedAgentClient {
-    inner: acp::AcpSubprocessClient,
+struct OrchestratedAgentClient<C: AgentClient = acp::AcpSubprocessClient> {
+    inner: C,
     config: config::Config,
     policy: orchestration::OrchestrationPolicy,
     project_path: PathBuf,
@@ -1324,9 +1324,13 @@ struct SpawnLineage {
 }
 
 #[async_trait]
-impl AgentClient for OrchestratedAgentClient {
+impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
     async fn run_task(&self, mut request: agent::AgentRunRequest) -> Result<agent::AgentRunResult> {
-        if !self.policy.enabled || request.interactive || request.interpret {
+        // An interactive orchestrated run (the long-lived resident) DOES get a broker:
+        // the socket is served for the whole session and torn down root-only after
+        // outstanding children join (see the teardown below). Only `interpret` (a
+        // read-only recap pass) and a policy-disabled run short-circuit with no broker.
+        if !self.policy.enabled || request.interpret {
             return self.inner.run_task(request).await;
         }
 
@@ -2895,6 +2899,33 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
     )?;
+    // Wire the nested-orchestration broker onto the interactive resident: when
+    // orchestration is enabled for this project, wrap the session in
+    // `OrchestratedAgentClient` so it serves the MCP socket and exports
+    // `VARDA_MCP_SOCKET`, exactly as the batch path does. A non-orchestrated run
+    // stays a plain client (no broker, no overhead). The socket lives for the whole
+    // interactive session and is torn down root-only after children join (461b).
+    let policy = task_document
+        .frontmatter
+        .project
+        .as_deref()
+        .map(Path::new)
+        .map(|path| config.resolve_orchestration_for(path))
+        .unwrap_or_else(|| config.orchestration.clone());
+    let orchestrated_client = task_document
+        .frontmatter
+        .project
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|_| policy.enabled)
+        .map(|project_path| OrchestratedAgentClient {
+            inner: client.clone(),
+            config: config.clone(),
+            policy,
+            project_path,
+            fallback_agent: route.agent.clone(),
+            lineage: None,
+        });
     if config.git.auto_commit {
         git::commit_task_file(
             &task_path,
@@ -2908,7 +2939,9 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         &display_name,
         route.role_instructions.as_deref(),
         &task_path,
-        &client,
+        orchestrated_client
+            .as_ref()
+            .map_or(&client as &dyn AgentClient, |c| c as &dyn AgentClient),
         interactive,
         stream,
     )
@@ -3681,6 +3714,250 @@ planner_agent: codex
         .await
         .expect("root cleanup should join the completed child");
         assert_eq!(state.handle_count(), 0);
+    }
+
+    /// Test double for `OrchestratedAgentClient`'s inner agent: it never spawns a
+    /// real subprocess. It records what the broker wiring handed it (the injected
+    /// `orchestration_socket_path`, whether the request was interactive) and probes
+    /// the served Unix socket so a test can assert the broker was live for the whole
+    /// inner run — at entry and, after a brief hold, at exit.
+    #[derive(Clone)]
+    struct RecordingInnerClient {
+        interactive_during_run: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        observed_socket: std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>,
+        socket_live_at_start: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        socket_live_at_end: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RecordingInnerClient {
+        fn new() -> Self {
+            Self {
+                interactive_during_run: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
+                observed_socket: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                socket_live_at_start: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                socket_live_at_end: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+
+        fn observed_socket(&self) -> Option<String> {
+            self.observed_socket
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("inner run should have executed")
+        }
+    }
+
+    #[async_trait]
+    impl AgentClient for RecordingInnerClient {
+        async fn run_task(
+            &self,
+            request: agent::AgentRunRequest,
+        ) -> Result<agent::AgentRunResult> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.interactive_during_run
+                .store(request.interactive, SeqCst);
+            *self.observed_socket.lock().unwrap() = Some(request.orchestration_socket_path.clone());
+            if let Some(path) = request.orchestration_socket_path.as_deref() {
+                // serve_unix_socket binds asynchronously; poll briefly for it to appear.
+                for _ in 0..100 {
+                    if Path::new(path).exists() {
+                        self.socket_live_at_start.store(true, SeqCst);
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                // Hold the session open, then confirm the broker is STILL served — the
+                // socket must span the whole session, not be torn down per-child.
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                self.socket_live_at_end
+                    .store(Path::new(path).exists(), SeqCst);
+            }
+            Ok(agent::AgentRunResult {
+                recap: "recap".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            })
+        }
+    }
+
+    fn broker_test_config() -> config::Config {
+        config::Config {
+            defaults: config::Defaults::default(),
+            routes: Vec::new(),
+            agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
+            git: config::GitConfig { auto_commit: false },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: orchestration::OrchestrationPolicy::default(),
+        }
+    }
+
+    /// Short `/tmp`-rooted project dir so the derived Unix socket path stays under
+    /// the ~104-char `sockaddr_un` limit on macOS.
+    fn broker_test_project(tag: &str) -> PathBuf {
+        let path = PathBuf::from("/tmp").join(format!(
+            "v461d-{tag}-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn interactive_broker_request(session_id: &str) -> agent::AgentRunRequest {
+        let doc = test_task_document();
+        // Mirrors runner::run_task's interactive build: socket path starts unset and is
+        // threaded in by OrchestratedAgentClient when orchestration is enabled.
+        agent::AgentRunRequest {
+            agent_name: "codex".to_owned(),
+            role_instructions: None,
+            task_path: "task.md".to_owned(),
+            frontmatter: doc.frontmatter,
+            body: doc.body,
+            timeout: std::time::Duration::from_secs(600),
+            session_id: session_id.to_owned(),
+            session_log_path: None,
+            interactive: true,
+            interpret: false,
+            stream: false,
+            resume_command: None,
+            orchestration_socket_path: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_orchestrated_run_serves_broker_socket() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let project = broker_test_project("int");
+        let inner = RecordingInnerClient::new();
+        let client = OrchestratedAgentClient {
+            inner: inner.clone(),
+            config: broker_test_config(),
+            policy: orchestration::OrchestrationPolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            project_path: project.clone(),
+            fallback_agent: "codex".to_owned(),
+            lineage: None,
+        };
+
+        let session_id = "root";
+        let result = client
+            .run_task(interactive_broker_request(session_id))
+            .await
+            .unwrap();
+        assert_eq!(result.recap, "recap");
+
+        // Interactive flowed THROUGH the broker instead of short-circuiting.
+        assert!(inner.interactive_during_run.load(SeqCst));
+        // The per-session socket path was threaded into the request (so env_for_request
+        // will export VARDA_MCP_SOCKET) and the broker served it live during the run.
+        let expected = project
+            .join(".varda-mcp")
+            .join(format!("{session_id}.sock"));
+        assert_eq!(
+            inner.observed_socket(),
+            Some(expected.display().to_string())
+        );
+        assert!(
+            inner.socket_live_at_start.load(SeqCst),
+            "broker socket must be served during the interactive session"
+        );
+        // Root-only teardown removes the socket and its dir after the session ends.
+        assert!(!expected.exists(), "socket must be torn down after the session");
+        assert!(!project.join(".varda-mcp").exists());
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_orchestrated_interactive_run_gets_no_broker() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let project = broker_test_project("plain");
+        let inner = RecordingInnerClient::new();
+        let client = OrchestratedAgentClient {
+            inner: inner.clone(),
+            config: broker_test_config(),
+            // Orchestration disabled ⇒ the interactive path must stay exactly as today.
+            policy: orchestration::OrchestrationPolicy::default(),
+            project_path: project.clone(),
+            fallback_agent: "codex".to_owned(),
+            lineage: None,
+        };
+
+        client
+            .run_task(interactive_broker_request("interactive-plain"))
+            .await
+            .unwrap();
+
+        assert!(inner.interactive_during_run.load(SeqCst));
+        // No socket threaded in ⇒ env_for_request exports no VARDA_MCP_SOCKET.
+        assert_eq!(inner.observed_socket(), None);
+        assert!(!inner.socket_live_at_start.load(SeqCst));
+        // And no broker directory was ever created under the project.
+        assert!(!project.join(".varda-mcp").exists());
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_broker_socket_spans_whole_session_then_tears_down() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // Lifetime guarantee: the interactive resident is the root run (lineage None),
+        // so teardown is root-only — finish_spawned_subtasks joins any detached children
+        // BEFORE the server is aborted and the socket removed (461b ordering, exercised
+        // by join_spawned_subtasks_drains_* and nested_orchestrated_child_* above). Here
+        // we assert the complementary half: the socket is served for the ENTIRE inner
+        // session (start AND end), never torn down mid-session, and only removed after.
+        let project = broker_test_project("life");
+        let inner = RecordingInnerClient::new();
+        let client = OrchestratedAgentClient {
+            inner: inner.clone(),
+            config: broker_test_config(),
+            policy: orchestration::OrchestrationPolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            project_path: project.clone(),
+            fallback_agent: "codex".to_owned(),
+            lineage: None,
+        };
+
+        let expected = project.join(".varda-mcp").join("resident.sock");
+        client
+            .run_task(interactive_broker_request("resident"))
+            .await
+            .unwrap();
+
+        assert!(inner.socket_live_at_start.load(SeqCst), "live at session start");
+        assert!(
+            inner.socket_live_at_end.load(SeqCst),
+            "broker must still be served at the end of the session (not per-child teardown)"
+        );
+        assert!(!expected.exists(), "socket removed only after the session ends");
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn broker_socket_dir_is_gitignored() {
+        // The broker socket dir lives under the resident's repo (the varda mother),
+        // so an orchestrate session must not dirty the worktree it is about to merge.
+        // Bind the ignore entry to the exact dir name the run path creates.
+        let gitignore =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|line| line.trim() == ".varda-mcp/"),
+            "'.varda-mcp/' must be gitignored so the broker socket dir stays untracked"
+        );
     }
 
     #[test]
