@@ -669,7 +669,7 @@ These are the main config knobs that shape execution. The shipped default config
 
 | Knob | One-line example |
 |---|---|
-| Interactive interpreter agent | `interpreter_agent = "codex"` on `[agents.shell]` makes Codex produce the post-interactive Varda recap. |
+| Interactive interpreter agent | `interpreter_agent = "codex"` on `[agents.claude]` makes Codex produce the post-interactive Varda recap. |
 | Agent output streaming | `streams_output = true` is set for Codex; leave it unset or `false` for buffered print-mode agents. |
 | Agent static env | `[agents.claude.env] STATIC_TOOL_VALUE = "enabled"` injects a non-secret agent-specific value. |
 | Per-route env | `env = { GCLOUD_PROJECT = "example-project" }` on `[[routes]]` injects trusted project constants. |
