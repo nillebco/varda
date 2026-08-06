@@ -41,6 +41,23 @@ agents = ["codex"]
 # max_fanout = 1
 # global_child_budget = 2
 
+# Resident route example for a trusted, un-sandboxed orchestrator:
+# match your varda repo, leave sandbox unset (or set "local"), and run an agent
+# that can safely touch host git. Spawned workers must request docker/microsandbox
+# sandboxes and are re-validated by the host before launch.
+#
+# [[routes]]
+# glob = "/path/to/varda/**"
+# agents = ["trusted-resident"]
+# sandbox = "local"
+#
+# [routes.orchestration]
+# enabled = true
+# max_depth = 1                 # resident depth0 -> workers depth1; worker spawns hit DepthExceeded
+# max_fanout = 16               # one resident can launch a full worker/reviewer/resolver wave
+# global_child_budget = 64      # multi-wave interactive sessions keep headroom
+# deny_sandboxes = ["local"]    # spawned children must never land un-sandboxed
+
 [agents.codex]
 kind = "acp"
 command = "codex"
