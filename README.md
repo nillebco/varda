@@ -626,6 +626,7 @@ agents = ["codex"]
 kind = "acp"
 command = "codex"
 args = ["exec", "--cd", ".", "--add-dir", "{varda_project}", "--add-dir", "{varda_home}", "--sandbox", "workspace-write", "-"]
+streams_output = true
 interactive_command = "sh"
 interactive_args = ["-c", "codex \"$(cat $VARDA_PROMPT_FILE)\" -C {project} --add-dir {varda_project} --add-dir {varda_home} -s workspace-write"]
 resume_command_template = "codex resume -C {project} --add-dir {varda_project} --add-dir {varda_home} -s workspace-write {external_session_id}"
@@ -661,6 +662,33 @@ Run `varda config edit` to open the global config in `$EDITOR`. If `EDITOR` is n
 For now, `kind = "acp"` means Varda uses its ACP-facing agent abstraction. The concrete POC adapter drives the local Codex CLI with `codex exec` through stdin/stdout because this machine's Codex CLI does not expose a direct `--acp` flag.
 
 When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder. Varda also expands `{varda_project}` to the Varda source project directory and `{varda_home}` to the Varda control-plane directory, then passes both as additional writable directories to the default Codex, Claude, and Copilot launch commands, so interpreter and resume sessions can create follow-up Varda tasks after the current task finishes.
+
+### Configuration reference
+
+These are the main config knobs that shape execution. The shipped default config keeps optional examples commented so copy-pasting a stanza is explicit and does not change behavior during `varda init`.
+
+| Knob | One-line example |
+|---|---|
+| Interactive interpreter agent | `interpreter_agent = "codex"` on `[agents.shell]` makes Codex produce the post-interactive Varda recap. |
+| Agent output streaming | `streams_output = true` is set for Codex; leave it unset or `false` for buffered print-mode agents. |
+| Agent static env | `[agents.claude.env] STATIC_TOOL_VALUE = "enabled"` injects a non-secret agent-specific value. |
+| Per-route env | `env = { GCLOUD_PROJECT = "example-project" }` on `[[routes]]` injects trusted project constants. |
+| Sandbox env | `[sandboxes.dev.env] TOOLCHAIN_HOME = "/opt/toolchain"` injects image-intrinsic, non-secret constants. |
+| Devcontainer image source | `image_from = "devcontainer"` on `[sandboxes.dev]` uses only the project's `.devcontainer` image/build definition. |
+| Dockerfile build image | `build = "./Dockerfile.varda"` on `[sandboxes.custom]` builds the sandbox image at prepare time. |
+| Credential from env | `[[agents.claude.credentials]] from_env = "CLAUDE_SANDBOX_TOKEN"; env = "ANTHROPIC_API_KEY"` copies a host env value into a scoped in-box env var. |
+| Credential from secret | `from_secret = "tfc-token"; env = "TF_TOKEN_app_terraform_io"` resolves a named host secret; the config stores the name only. |
+| Credential from command | `command = "az account get-access-token --query accessToken -o tsv"; env = "AZURE_TOKEN"` mints a short-lived value on the host. |
+| Credential file target | `from_secret = "gcp-service-account-json"; file = "/home/agent/.config/gcloud/application_default_credentials.json"` stages one read-only file. |
+| GCP deploy recipe | `command = "gcloud auth print-access-token --impersonate-service-account=deployer@example-project.iam.gserviceaccount.com"; env = "CLOUDSDK_AUTH_ACCESS_TOKEN"` lets the box run `gcloud run deploy SERVICE --source . --project "$GCLOUD_PROJECT"` without mounting `~/.config/gcloud`. |
+| Terraform Cloud recipe | `from_secret = "tfc-token"; env = "TF_TOKEN_app_terraform_io"` exposes only the Terraform Cloud token value. |
+| Azure DevOps recipe | `from_secret = "azdo-pat"; env = "AZURE_DEVOPS_EXT_PAT"` exposes only the PAT value. |
+| Azure CLI recipe | `from_secret = "azure-client-id"; env = "AZURE_CLIENT_ID"` plus client secret and tenant secret env entries supports service-principal auth without `~/.azure`. |
+| Orchestration defaults | `[orchestration] enabled = true; max_depth = 2; max_fanout = 4; global_child_budget = 16; deny_sandboxes = ["local"]` gates sandboxed subtask spawning. |
+| Route orchestration override | `[routes.orchestration] enabled = false` disables spawning for that matched route. |
+| Repo-local tasks and config | `.varda/tasks/<id>-<slug>.md` stores committed task definitions; `.varda/config.toml` can carry repo workflow rules while runtime state remains in `$VARDA_HOME`. |
+
+Credential entries must name exactly one source (`from_env`, `from_secret`, or `command`) and one target (`env` or `file`). Store secret names, not resolved secret values, in config.
 
 ### Sandbox providers
 
