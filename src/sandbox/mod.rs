@@ -1306,6 +1306,24 @@ impl DockerSession {
     /// attaches the user's TTY; batch pipes stdin (the prompt) / captures stdout.
     /// Teardown/extract reuse the same container/volume.
     async fn create_cp_start(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
+        // Drain `staged_files` and arm the cleanup guard BEFORE `docker create`
+        // runs. Once drained, teardown can no longer see these host temps, so the
+        // guard alone must guarantee no credential VALUE survives ANY exit from
+        // this function. Arming it here (not after create) means the guard's `Drop`
+        // also covers a `docker create` failure / early `?` — not just `docker cp`.
+        // Every not-yet-consumed temp is removed on drop: the happy path, a
+        // `docker create` failure, an errored/`?`-ed `docker cp`, all trigger it.
+        let staged =
+            std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"));
+        struct StagedTempGuard(Vec<PathBuf>);
+        impl Drop for StagedTempGuard {
+            fn drop(&mut self) {
+                for host_temp in &self.0 {
+                    let _ = std::fs::remove_file(host_temp);
+                }
+            }
+        }
+        let mut guard = StagedTempGuard(staged.iter().map(|(t, _)| t.clone()).collect());
         let output = tokio::process::Command::new(&wrapped.program)
             .args(&wrapped.args)
             .output()
@@ -1319,22 +1337,6 @@ impl DockerSession {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let staged =
-            std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"));
-        // Draining `staged_files` above means teardown can no longer see these host
-        // temps, so cleanup must live HERE and survive ANY early return: a failed
-        // `docker cp` below must NOT leave a credential VALUE on the host. This
-        // scope guard removes every not-yet-consumed temp on drop — the happy path,
-        // an errored `cp`, or the `?` on `docker cp` itself all trigger it.
-        struct StagedTempGuard(Vec<PathBuf>);
-        impl Drop for StagedTempGuard {
-            fn drop(&mut self) {
-                for host_temp in &self.0 {
-                    let _ = std::fs::remove_file(host_temp);
-                }
-            }
-        }
-        let mut guard = StagedTempGuard(staged.iter().map(|(t, _)| t.clone()).collect());
         for (host_temp, guest_path) in &staged {
             let src = host_temp.display().to_string();
             let dst = format!("{}:{guest_path}", self.container);
@@ -3256,6 +3258,39 @@ mod tests {
         assert!(
             !host_temp.exists(),
             "credential host temp must be removed even when `docker cp` fails"
+        );
+    }
+
+    /// M11-ext fix3: the cleanup guard is armed BEFORE `docker create`, so a
+    /// `docker create` FAILURE (before any `docker cp`) must ALSO remove the staged
+    /// credential host temp — without relying on a separate teardown pass. We stand
+    /// in `false` for `docker create` so it exits non-zero; the guard's `Drop` on
+    /// the early `bail!` is the sole thing that clears the credential VALUE.
+    #[tokio::test]
+    async fn m11ext_docker_create_failure_removes_staged_temp() {
+        let session = DockerSession::for_test(
+            "img",
+            "/proj",
+            vec![],
+            vec![],
+            "/var/varda/sessions/createfail",
+        );
+        session
+            .stage_credential_file("create-fail-secret", "/home/agent/.tok")
+            .unwrap();
+        let host_temp = session.staged_files.lock().unwrap()[0].0.clone();
+        assert!(host_temp.exists());
+        let wrapped = CommandSpec {
+            program: "false".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let result = session.create_cp_start(wrapped).await;
+        assert!(result.is_err(), "a failing `docker create` must surface an error");
+        assert!(
+            !host_temp.exists(),
+            "credential host temp must be removed even when `docker create` fails"
         );
     }
 
