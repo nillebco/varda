@@ -1221,6 +1221,41 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
     }
 }
 
+/// Host-side collect channel: resolves a spawned subtask id to its STATE
+/// (status + recap text) from the `~/.varda` home store. Injected into the
+/// [`orchestration::SpawnBroker`] so a sandboxed master's `await_subtask*` /
+/// `subtask_result` calls can harvest a child's result without any host
+/// capability crossing the boundary. The resident (un-sandboxed) host reuses
+/// this SAME impl directly, so it is public and holds only the config it needs.
+#[derive(Clone)]
+pub struct VardaSubtaskResults {
+    config: config::Config,
+}
+
+impl VardaSubtaskResults {
+    pub fn new(config: config::Config) -> Self {
+        Self { config }
+    }
+
+    /// Shared id→STATE resolution: a subtask id is the numeric task id the
+    /// launcher assigned. A non-numeric id (fallback path form) never matches.
+    fn state(&self, id: &str) -> Option<(task::TaskStatus, Option<String>)> {
+        let num = id.parse::<u64>().ok()?;
+        task::lookup_task_state(&self.config, num).ok().flatten()
+    }
+}
+
+impl orchestration::SubtaskResults for VardaSubtaskResults {
+    fn status(&self, id: &str) -> Option<task::TaskStatus> {
+        self.state(id).map(|(status, _)| status)
+    }
+
+    fn recap(&self, id: &str) -> Option<String> {
+        let (_, recap_path) = self.state(id)?;
+        std::fs::read_to_string(recap_path?).ok()
+    }
+}
+
 struct OrchestratedAgentClient {
     inner: acp::AcpSubprocessClient,
     config: config::Config,
@@ -1267,13 +1302,16 @@ impl AgentClient for OrchestratedAgentClient {
             fallback_agent: self.fallback_agent.clone(),
             spawn_state: spawn_state.clone(),
         };
-        let broker = std::sync::Arc::new(orchestration::SpawnBroker::with_shared_state(
-            self.policy.clone(),
-            root_id.clone(),
-            root_depth,
-            spawn_state,
-            launcher,
-        ));
+        let broker = std::sync::Arc::new(
+            orchestration::SpawnBroker::with_shared_state(
+                self.policy.clone(),
+                root_id.clone(),
+                root_depth,
+                spawn_state,
+                launcher,
+            )
+            .with_results(VardaSubtaskResults::new(self.config.clone())),
+        );
         let server_path = socket_path.clone();
         let server = tokio::spawn(async move {
             if let Err(error) =

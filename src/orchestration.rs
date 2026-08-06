@@ -37,10 +37,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use globset::Glob;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use crate::agent::{parse_blocked_commands, parse_files_touched};
+use crate::task::TaskStatus;
 
 /// Identifier of a task in the spawn tree. The root master task has some id; each
 /// accepted subtask gets its own. Used to attribute fan-out and depth.
@@ -411,10 +415,83 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 
 /// Name of the single spawn tool exposed into the sandbox. Nothing else crosses.
 pub const SPAWN_SUBTASK_TOOL: &str = "spawn_subtask";
-/// Optional read-back tools (result plumbing). Present in the manifest so a master
-/// can discover them; the live wiring for results flows through varda memory.
+/// Collect-side read-back tools (result plumbing). A master spawns with
+/// [`SPAWN_SUBTASK_TOOL`], then blocks on one of these to harvest the child's
+/// terminal status and recap once the host STATE store records them.
 pub const AWAIT_SUBTASK_TOOL: &str = "await_subtask";
 pub const SUBTASK_RESULT_TOOL: &str = "subtask_result";
+/// Wave primitive: block until EVERY listed subtask reaches a terminal status.
+pub const AWAIT_SUBTASKS_TOOL: &str = "await_subtasks";
+
+/// Tool error returned by `await_subtask*`/`subtask_result` when no collect
+/// channel is wired ([`NoSubtaskResults`]): the pre-collect stub semantics,
+/// short-circuited so an unwired broker reports at once rather than polling to
+/// the [`SpawnBroker::max_wait`] ceiling.
+const RESULTS_UNAVAILABLE: &str =
+    "not available on this channel: sub-task results flow back through varda memory";
+
+/// Default poll cadence for `await_subtask*`: how often the broker re-reads a
+/// child's status while blocking. Task-spec range is 1–2s; 1s keeps a wave
+/// responsive without hammering the STATE store.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Absolute ceiling on a single `await_subtask*` call. A wedged child that never
+/// reaches a terminal status must not hang the master forever, so the collect
+/// channel gives up after this and returns a timeout error (never a silent
+/// success). 30 minutes comfortably outlasts a normal headless subtask run.
+const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// A terminal status is one a subtask run has actually settled on: the runner
+/// writes exactly `Done`/`Failed`/`NeedsUser`/`Pending` when a headless run ends
+/// (`runner::run_task`). `Ready`/`Running`/`Backlog` mean "still in flight", so
+/// the collect channel keeps polling.
+fn is_terminal(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::NeedsUser | TaskStatus::Pending
+    )
+}
+
+/// The host-side seam the collect channel reads through: resolve a subtask id to
+/// its current terminal status and (once finished) its recap TEXT. The broker is
+/// pure and has no handle to the `~/.varda` STATE store, so the run path injects a
+/// concrete implementation (see `main::VardaSubtaskResults`) that resolves ids via
+/// the `task::` helpers. Kept read-only and object-safe so one impl can serve both
+/// the sandboxed broker and the resident host.
+pub trait SubtaskResults: Send + Sync {
+    /// Current status of `id`, or `None` if no task carries that id.
+    fn status(&self, id: &str) -> Option<TaskStatus>;
+    /// Most recent recap TEXT for `id`, or `None` if the task is unknown or has
+    /// not yet produced a recap.
+    fn recap(&self, id: &str) -> Option<String>;
+    /// Whether a real collect channel is wired. A wired provider leaves the
+    /// default `true`; the no-op [`NoSubtaskResults`] overrides to `false` so
+    /// `await_subtask*`/`subtask_result` short-circuit INSTANTLY with the "not
+    /// available on this channel" error instead of polling every id to the
+    /// [`SpawnBroker::max_wait`] ceiling (30 min) before timing out. This
+    /// preserves the pre-collect stub semantics for an unwired broker.
+    fn is_available(&self) -> bool {
+        true
+    }
+}
+
+/// Default results seam: no collect channel wired. `status`/`recap` always return
+/// `None` and `is_available` is `false`, so `await_subtask*`/`subtask_result`
+/// short-circuit INSTANTLY with the "not available on this channel" error instead
+/// of polling to the ceiling — preserving the pre-collect behaviour until the run
+/// path injects a real [`SubtaskResults`] via [`SpawnBroker::with_results`].
+struct NoSubtaskResults;
+
+impl SubtaskResults for NoSubtaskResults {
+    fn status(&self, _id: &str) -> Option<TaskStatus> {
+        None
+    }
+    fn recap(&self, _id: &str) -> Option<String> {
+        None
+    }
+    fn is_available(&self) -> bool {
+        false
+    }
+}
 
 /// The host-side seam that actually launches an AUTHORIZED subtask in its own
 /// sibling sandbox. The broker calls this ONLY after
@@ -486,6 +563,13 @@ pub struct SpawnBroker<L: SubtaskLauncher> {
     policy: OrchestrationPolicy,
     state: SharedSpawnState,
     launcher: Mutex<L>,
+    /// Collect-side seam (id → status/recap). Defaults to [`NoSubtaskResults`];
+    /// the run path swaps in a real impl via [`SpawnBroker::with_results`].
+    results: Box<dyn SubtaskResults>,
+    /// How often `await_subtask*` re-reads a child's status while blocking.
+    poll_interval: Duration,
+    /// Absolute ceiling on one `await_subtask*` call before it times out.
+    max_wait: Duration,
 }
 
 impl<L: SubtaskLauncher> SpawnBroker<L> {
@@ -514,7 +598,30 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
             policy,
             state,
             launcher: Mutex::new(launcher),
+            results: Box::new(NoSubtaskResults),
+            poll_interval: DEFAULT_POLL_INTERVAL,
+            max_wait: DEFAULT_MAX_WAIT,
         }
+    }
+
+    /// Inject the collect-side [`SubtaskResults`] seam. Consumes and returns the
+    /// broker (builder style) so wiring reads
+    /// `SpawnBroker::with_shared_state(..).with_results(host_impl)`. Until this is
+    /// called the broker uses [`NoSubtaskResults`] and the read-back tools report
+    /// "not available on this channel".
+    pub fn with_results(mut self, results: impl SubtaskResults + 'static) -> Self {
+        self.results = Box::new(results);
+        self
+    }
+
+    /// Override the blocking poll cadence and absolute timeout for
+    /// `await_subtask*`. Builder style; used by tests to keep the never-terminal
+    /// bound check fast, and available to the run path to cap by a caller's
+    /// `max_seconds` when desired.
+    pub fn with_poll_timing(mut self, poll_interval: Duration, max_wait: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self.max_wait = max_wait;
+        self
     }
 
     /// Total subtasks spawned so far this run (for observability/tests).
@@ -596,8 +703,81 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
         }
     }
 
+    /// Block until `id` reaches a terminal status, polling the injected
+    /// [`SubtaskResults`] every [`Self::poll_interval`]. Returns the terminal
+    /// status, or `None` if the [`Self::max_wait`] ceiling elapses first (a wedged
+    /// child) or no collect channel is wired. Never blocks past the cap. An
+    /// unwired provider short-circuits at once (no polling) — callers translate
+    /// that `None` into the [`RESULTS_UNAVAILABLE`] error via `is_available`.
+    fn await_subtask(&self, id: &str) -> Option<TaskStatus> {
+        if !self.results.is_available() {
+            return None;
+        }
+        let start = Instant::now();
+        loop {
+            if let Some(status) = self.results.status(id)
+                && is_terminal(status)
+            {
+                return Some(status);
+            }
+            if start.elapsed() >= self.max_wait {
+                return None;
+            }
+            std::thread::sleep(self.poll_interval);
+        }
+    }
+
+    /// Block until EVERY id reaches a terminal status; return `(id, status)` for
+    /// each once all are settled. `None` if the ceiling elapses before every id is
+    /// terminal, or no collect channel is wired. This is the wave primitive.
+    fn await_subtasks(&self, ids: &[String]) -> Option<Vec<(String, TaskStatus)>> {
+        if !self.results.is_available() {
+            return None;
+        }
+        let start = Instant::now();
+        loop {
+            let settled: Vec<(String, TaskStatus)> = ids
+                .iter()
+                .filter_map(|id| {
+                    self.results
+                        .status(id)
+                        .filter(|s| is_terminal(*s))
+                        .map(|s| (id.clone(), s))
+                })
+                .collect();
+            if settled.len() == ids.len() {
+                return Some(settled);
+            }
+            if start.elapsed() >= self.max_wait {
+                return None;
+            }
+            std::thread::sleep(self.poll_interval);
+        }
+    }
+
+    /// Harvest a finished subtask's result: its status plus the files-touched /
+    /// blocked-commands parsed from its recap (mirroring `runner::run_task`) and
+    /// the raw recap text. `None` if the child is unknown or has produced no recap
+    /// yet. This never blocks — the master is expected to `await_subtask` first.
+    fn subtask_result(&self, id: &str) -> Option<Value> {
+        let recap = self.results.recap(id)?;
+        let files_touched: Vec<String> = parse_files_touched(&recap)
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let blocked_commands = parse_blocked_commands(&recap);
+        let status = self.results.status(id).map(TaskStatus::as_str);
+        Some(json!({
+            "subtask_id": id,
+            "status": status,
+            "files_touched": files_touched,
+            "blocked_commands": blocked_commands,
+            "recap": recap,
+        }))
+    }
+
     /// The MCP `tools/list` manifest: exactly the narrow spawn tool plus the
-    /// optional read-backs. Nothing else is advertised across the boundary.
+    /// collect-side read-backs. Nothing else is advertised across the boundary.
     pub fn tool_manifest() -> Value {
         json!({
             "tools": [
@@ -615,8 +795,9 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                         }
                     }
                 },
-                {"name": AWAIT_SUBTASK_TOOL, "description": "Block until a spawned sub-task finishes (result flows via varda memory).", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
-                {"name": SUBTASK_RESULT_TOOL, "description": "Fetch the recap/result of a finished sub-task.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}}
+                {"name": AWAIT_SUBTASK_TOOL, "description": "Block until a spawned sub-task reaches a terminal status; returns {subtask_id, status}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
+                {"name": AWAIT_SUBTASKS_TOOL, "description": "Block until ALL listed sub-tasks reach a terminal status; returns [{subtask_id, status}]. The wave primitive.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}},
+                {"name": SUBTASK_RESULT_TOOL, "description": "Fetch a finished sub-task's result: {status, files_touched, blocked_commands, recap}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}}
             ]
         })
     }
@@ -670,13 +851,94 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                     Err(e) => rpc_result(id, tool_text(&e.to_string(), true)),
                 }
             }
-            AWAIT_SUBTASK_TOOL | SUBTASK_RESULT_TOOL => rpc_result(
-                id,
-                tool_text(
-                    "not available on this channel: sub-task results flow back through varda memory",
-                    true,
-                ),
-            ),
+            AWAIT_SUBTASK_TOOL => {
+                let Some(sid) = args.get("subtask_id").and_then(Value::as_str) else {
+                    return rpc_error(id, -32602, "await_subtask requires a `subtask_id`");
+                };
+                if !self.results.is_available() {
+                    return rpc_result(id, tool_text(RESULTS_UNAVAILABLE, true));
+                }
+                match self.await_subtask(sid) {
+                    Some(status) => rpc_result(
+                        id,
+                        tool_text(
+                            &json!({"subtask_id": sid, "status": status.as_str()}).to_string(),
+                            false,
+                        ),
+                    ),
+                    None => rpc_result(
+                        id,
+                        tool_text(
+                            &format!(
+                                "await_subtask timed out after {}s waiting for subtask '{sid}' to finish",
+                                self.max_wait.as_secs()
+                            ),
+                            true,
+                        ),
+                    ),
+                }
+            }
+            AWAIT_SUBTASKS_TOOL => {
+                let ids: Vec<String> = args
+                    .get("subtask_ids")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if ids.is_empty() {
+                    return rpc_error(
+                        id,
+                        -32602,
+                        "await_subtasks requires a non-empty `subtask_ids` array",
+                    );
+                }
+                if !self.results.is_available() {
+                    return rpc_result(id, tool_text(RESULTS_UNAVAILABLE, true));
+                }
+                match self.await_subtasks(&ids) {
+                    Some(settled) => {
+                        let payload: Vec<Value> = settled
+                            .into_iter()
+                            .map(|(sid, status)| json!({"subtask_id": sid, "status": status.as_str()}))
+                            .collect();
+                        rpc_result(id, tool_text(&json!(payload).to_string(), false))
+                    }
+                    None => rpc_result(
+                        id,
+                        tool_text(
+                            &format!(
+                                "await_subtasks timed out after {}s; not all subtasks reached a terminal status",
+                                self.max_wait.as_secs()
+                            ),
+                            true,
+                        ),
+                    ),
+                }
+            }
+            SUBTASK_RESULT_TOOL => {
+                let Some(sid) = args.get("subtask_id").and_then(Value::as_str) else {
+                    return rpc_error(id, -32602, "subtask_result requires a `subtask_id`");
+                };
+                if !self.results.is_available() {
+                    return rpc_result(id, tool_text(RESULTS_UNAVAILABLE, true));
+                }
+                match self.subtask_result(sid) {
+                    Some(result) => rpc_result(id, tool_text(&result.to_string(), false)),
+                    None => rpc_result(
+                        id,
+                        tool_text(
+                            &format!(
+                                "no result available for subtask '{sid}': unknown id or no recap yet"
+                            ),
+                            true,
+                        ),
+                    ),
+                }
+            }
             other => rpc_error(id, -32601, &format!("unknown tool: {other}")),
         }
     }
@@ -1256,7 +1518,12 @@ deny_sandboxes = ["local"]
             .collect();
         assert_eq!(
             names,
-            vec![SPAWN_SUBTASK_TOOL, AWAIT_SUBTASK_TOOL, SUBTASK_RESULT_TOOL]
+            vec![
+                SPAWN_SUBTASK_TOOL,
+                AWAIT_SUBTASK_TOOL,
+                AWAIT_SUBTASKS_TOOL,
+                SUBTASK_RESULT_TOOL
+            ]
         );
     }
 
@@ -1314,5 +1581,227 @@ deny_sandboxes = ["local"]
             text.contains("must run in an isolating sibling box"),
             "got {text}"
         );
+    }
+
+    // --- Collect channel (461a) --------------------------------------------
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::task::TaskStatus;
+
+    /// A `(id, nth-call) -> status` rule the [`MockResults`] mock consults.
+    type StatusFn = Box<dyn Fn(&str, u32) -> Option<TaskStatus> + Send + Sync>;
+
+    /// Controllable [`SubtaskResults`] mock: `status_fn` receives (id, nth-call)
+    /// so a test can flip a child to terminal after N polls; recaps are canned.
+    struct MockResults {
+        counts: Mutex<BTreeMap<String, u32>>,
+        status_fn: StatusFn,
+        recaps: BTreeMap<String, String>,
+    }
+
+    impl MockResults {
+        fn new(status_fn: impl Fn(&str, u32) -> Option<TaskStatus> + Send + Sync + 'static) -> Self {
+            Self {
+                counts: Mutex::new(BTreeMap::new()),
+                status_fn: Box::new(status_fn),
+                recaps: BTreeMap::new(),
+            }
+        }
+        fn with_recap(mut self, id: &str, recap: &str) -> Self {
+            self.recaps.insert(id.to_owned(), recap.to_owned());
+            self
+        }
+    }
+
+    impl SubtaskResults for MockResults {
+        fn status(&self, id: &str) -> Option<TaskStatus> {
+            let n = {
+                let mut c = self.counts.lock().unwrap();
+                let e = c.entry(id.to_owned()).or_insert(0);
+                *e += 1;
+                *e
+            };
+            (self.status_fn)(id, n)
+        }
+        fn recap(&self, id: &str) -> Option<String> {
+            self.recaps.get(id).cloned()
+        }
+    }
+
+    fn fast_timing<L: SubtaskLauncher>(broker: SpawnBroker<L>) -> SpawnBroker<L> {
+        broker.with_poll_timing(Duration::from_millis(1), Duration::from_secs(5))
+    }
+
+    #[test]
+    fn await_subtask_blocks_until_terminal_not_before() {
+        // Child reports Running for its first two polls, then Done on the third.
+        let polls = Arc::new(AtomicU32::new(0));
+        let p = polls.clone();
+        let results = MockResults::new(move |_, _| {
+            let n = p.fetch_add(1, Ordering::SeqCst) + 1;
+            Some(if n >= 3 {
+                TaskStatus::Done
+            } else {
+                TaskStatus::Running
+            })
+        });
+        let broker = fast_timing(
+            SpawnBroker::new(base_policy(), "root", MockLauncher::new()).with_results(results),
+        );
+        assert_eq!(broker.await_subtask("child"), Some(TaskStatus::Done));
+        // It could only return on a terminal poll, so it must have polled ≥ 3×.
+        assert!(
+            polls.load(Ordering::SeqCst) >= 3,
+            "await returned before the child was terminal"
+        );
+    }
+
+    #[test]
+    fn await_subtask_times_out_on_wedged_child() {
+        // Never terminal ⇒ the bound must fire and return a timeout (not hang).
+        let results = MockResults::new(|_, _| Some(TaskStatus::Running));
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new())
+            .with_results(results)
+            .with_poll_timing(Duration::from_millis(1), Duration::from_millis(30));
+        assert_eq!(broker.await_subtask("child"), None);
+    }
+
+    #[test]
+    fn rpc_await_subtask_timeout_is_a_tool_error() {
+        let results = MockResults::new(|_, _| Some(TaskStatus::Running));
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new())
+            .with_results(results)
+            .with_poll_timing(Duration::from_millis(1), Duration::from_millis(20));
+        let resp = broker.handle_rpc(
+            "root",
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": AWAIT_SUBTASK_TOOL, "arguments": {"subtask_id": "child"}}}),
+        );
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("timed out"), "got {text}");
+    }
+
+    #[test]
+    fn rpc_await_subtask_returns_status_when_terminal() {
+        let results = MockResults::new(|_, _| Some(TaskStatus::Done));
+        let broker = fast_timing(
+            SpawnBroker::new(base_policy(), "root", MockLauncher::new()).with_results(results),
+        );
+        let resp = broker.handle_rpc(
+            "root",
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": AWAIT_SUBTASK_TOOL, "arguments": {"subtask_id": "child"}}}),
+        );
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed, json!({"subtask_id": "child", "status": "done"}));
+    }
+
+    #[test]
+    fn subtask_result_returns_recap_and_parsed_sections() {
+        let recap = "# Done\n\n## Files touched\n/abs/a.rs\n/abs/b.rs\n\n## Blocked commands\nmsb\ndocker build\n\nrequires_user: false\n";
+        let results =
+            MockResults::new(|_, _| Some(TaskStatus::Done)).with_recap("child", recap);
+        let broker =
+            SpawnBroker::new(base_policy(), "root", MockLauncher::new()).with_results(results);
+        let result = broker.subtask_result("child").expect("result present");
+        assert_eq!(result["status"], json!("done"));
+        assert_eq!(result["files_touched"], json!(["/abs/a.rs", "/abs/b.rs"]));
+        assert_eq!(result["blocked_commands"], json!(["msb", "docker build"]));
+        assert_eq!(result["recap"], json!(recap));
+        // Unknown / no-recap child ⇒ no result.
+        assert!(broker.subtask_result("ghost").is_none());
+    }
+
+    #[test]
+    fn await_subtasks_returns_only_once_all_terminal() {
+        // `a` is terminal immediately; `b` only on its 4th poll. The call must not
+        // return until BOTH are settled.
+        let bpolls = Arc::new(AtomicU32::new(0));
+        let bc = bpolls.clone();
+        let results = MockResults::new(move |id, _| match id {
+            "a" => Some(TaskStatus::Done),
+            "b" => {
+                let n = bc.fetch_add(1, Ordering::SeqCst) + 1;
+                Some(if n >= 4 {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Running
+                })
+            }
+            _ => None,
+        });
+        let broker = fast_timing(
+            SpawnBroker::new(base_policy(), "root", MockLauncher::new()).with_results(results),
+        );
+        let settled = broker
+            .await_subtasks(&["a".to_owned(), "b".to_owned()])
+            .expect("both settle before the cap");
+        assert!(
+            bpolls.load(Ordering::SeqCst) >= 4,
+            "await_subtasks returned before `b` was terminal"
+        );
+        let map: BTreeMap<_, _> = settled.into_iter().collect();
+        assert_eq!(map["a"], TaskStatus::Done);
+        assert_eq!(map["b"], TaskStatus::Failed);
+    }
+
+    #[test]
+    fn unwired_broker_await_short_circuits_instantly() {
+        // Default results seam (NoSubtaskResults): no collect channel wired.
+        // A generous max_wait would hang 30 min IF the loop polled to the ceiling;
+        // the short-circuit must return at once instead. Cap set to 1h so any
+        // polling would blow the timing assertion by orders of magnitude.
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new())
+            .with_poll_timing(Duration::from_secs(1), Duration::from_secs(3600));
+
+        let t = Instant::now();
+        assert_eq!(broker.await_subtask("child"), None);
+        assert_eq!(
+            broker.await_subtasks(&["a".to_owned(), "b".to_owned()]),
+            None
+        );
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "unwired await polled instead of short-circuiting ({:?})",
+            t.elapsed()
+        );
+
+        // Over the RPC surface it is the "not available on this channel" tool
+        // error (the old stub semantics), NOT a "timed out" error.
+        for args in [
+            json!({"name": AWAIT_SUBTASK_TOOL, "arguments": {"subtask_id": "child"}}),
+            json!({"name": AWAIT_SUBTASKS_TOOL, "arguments": {"subtask_ids": ["child"]}}),
+            json!({"name": SUBTASK_RESULT_TOOL, "arguments": {"subtask_id": "child"}}),
+        ] {
+            let resp = broker.handle_rpc(
+                "root",
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": args}),
+            );
+            assert_eq!(resp["result"]["isError"], json!(true));
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("not available on this channel"),
+                "expected not-available error, got {text}"
+            );
+            assert!(!text.contains("timed out"), "unwired hit the poll ceiling: {text}");
+        }
+    }
+
+    #[test]
+    fn manifest_advertises_the_collect_tools() {
+        let manifest = SpawnBroker::<MockLauncher>::tool_manifest();
+        let names: Vec<&str> = manifest["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&AWAIT_SUBTASK_TOOL));
+        assert!(names.contains(&AWAIT_SUBTASKS_TOOL));
+        assert!(names.contains(&SUBTASK_RESULT_TOOL));
     }
 }

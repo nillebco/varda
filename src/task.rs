@@ -502,6 +502,25 @@ fn materialize_from_repo_definition(
     Ok(Some(state_path))
 }
 
+/// Resolve a numeric task id to its current STATE: the terminal-or-in-flight
+/// `TaskStatus` and the path of its most recent recap (if any). Reads the home
+/// STATE store — the runtime authority for status/recaps — via
+/// [`find_task_by_id`]. Returns `None` when no task carries `id`. The collect
+/// channel ([`crate::orchestration::SubtaskResults`]) polls this to know when a
+/// spawned subtask has finished and where to read its recap. Kept here so recap
+/// path resolution is not duplicated across call sites.
+pub fn lookup_task_state(
+    config: &Config,
+    id: u64,
+) -> Result<Option<(TaskStatus, Option<String>)>> {
+    let Some(path) = find_task_by_id(config, id)? else {
+        return Ok(None);
+    };
+    let doc = load_task(&path)?;
+    let recap_path = doc.frontmatter.recaps.last().cloned();
+    Ok(Some((doc.frontmatter.status, recap_path)))
+}
+
 fn find_task_by_id(config: &Config, id: u64) -> Result<Option<PathBuf>> {
     let task_dir = Path::new(&config.defaults.operations_dir).join("tasks");
     if !task_dir.exists() {
