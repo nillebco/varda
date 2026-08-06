@@ -2006,6 +2006,103 @@ mod tests {
         assert!(result.recap.contains("GCLOUD_PROJECT=healthy-silo-31898"));
     }
 
+    /// Build a client whose interactive launch runs a REAL coding agent inside the
+    /// sandbox, reading the task from the staged `VARDA_PROMPT_FILE` — exactly the
+    /// M13b default-config shape (`sh -c '<agent> "$(cat $VARDA_PROMPT_FILE)" …'`).
+    /// `command` stays the bare agent name so external-session capture (M13a) keys
+    /// off the right transcript store. Caller supplies an image that has the agent
+    /// installed + authenticated via injected identity.
+    #[cfg(test)]
+    fn interactive_agent_client(
+        command: &str,
+        interactive_shell: &str,
+        image: &str,
+    ) -> AcpSubprocessClient {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: command.to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: Some("sh".to_owned()),
+            interactive_args: Some(vec!["-c".to_owned(), interactive_shell.to_owned()]),
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+        };
+        let sandbox_config = crate::config::SandboxConfig {
+            image: Some(image.to_owned()),
+            ..Default::default()
+        };
+        let merged = crate::sandbox::merge_mount_origins(&sandbox_config.mounts, &[], &[]);
+        let provider = std::sync::Arc::new(
+            crate::sandbox::DockerProvider::from_config("docker", &sandbox_config, merged)
+                .expect("docker provider"),
+        );
+        AcpSubprocessClient::with_sandbox(command, &config, provider)
+    }
+
+    /// M13b live smoke — a REAL interactive agent session inside docker. These are
+    /// `#[ignore]`d because they need (1) a real TTY on stdin — `cargo test`
+    /// provides none, so run them from a terminal: `cargo test -- --ignored
+    /// --nocapture`; (2) a running docker daemon; and (3) an image with the agent
+    /// installed and authenticated via the injected identity (scoped token env /
+    /// staged file), NOT a creds-dir mount. Each drives the sandboxed interactive
+    /// launch through `run_task(interactive=true)`, attaches the user's TTY, and
+    /// asserts the session completes and teardown leaves no `varda-sbx-*` container.
+    async fn interactive_agent_smoke(command: &str, interactive_shell: &str, session: &str) {
+        use std::io::IsTerminal as _;
+        if !std::io::stdin().is_terminal() {
+            eprintln!("skipping {command} interactive smoke: no TTY on stdin (run from a terminal)");
+            return;
+        }
+        let client = interactive_agent_client(command, interactive_shell, "varda-agent:latest");
+        let mut request = docker_request(".", session);
+        request.interactive = true;
+        let result = client
+            .run_task(request)
+            .await
+            .unwrap_or_else(|e| panic!("{command} interactive session should complete: {e:#}"));
+        assert!(!result.requires_user);
+    }
+
+    #[tokio::test]
+    #[ignore = "live: real claude interactive under docker; needs a TTY + auth image"]
+    async fn claude_interactive_under_sandbox_smoke() {
+        interactive_agent_smoke(
+            "claude",
+            "claude \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --permission-mode acceptEdits",
+            "m13b-claude-smoke",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live: real codex interactive under docker; needs a TTY + auth image"]
+    async fn codex_interactive_under_sandbox_smoke() {
+        interactive_agent_smoke(
+            "codex",
+            "codex \"$(cat $VARDA_PROMPT_FILE)\" -C {project} -s workspace-write",
+            "m13b-codex-smoke",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live: real copilot interactive under docker; needs a TTY + auth image"]
+    async fn copilot_interactive_under_sandbox_smoke() {
+        interactive_agent_smoke(
+            "copilot",
+            "copilot \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {project}",
+            "m13b-copilot-smoke",
+        )
+        .await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn interpreter_subprocess_uses_separate_process_group() {

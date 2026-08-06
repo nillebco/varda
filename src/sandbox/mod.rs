@@ -3376,6 +3376,116 @@ mod tests {
         assert_eq!(interactive, spec);
     }
 
+    /// M13b: a REAL coding agent (not a bare `sh`) launched interactively under
+    /// docker must (a) take the create/cp/start `-it` lifecycle, (b) carry the
+    /// staged prompt path as `-e VARDA_PROMPT_FILE=<guest path>` so the wrapped
+    /// `sh -c 'claude "$(cat $VARDA_PROMPT_FILE)" …'` reads the task in-guest, and
+    /// (c) keep the agent argv intact after the image name. The prompt is staged
+    /// via the same deferred `docker cp` the shell path uses.
+    #[test]
+    fn m13b_docker_interactive_real_agent_reads_prompt_file() {
+        let session =
+            DockerSession::for_test("img", "/proj", vec![], vec![], "/var/varda/sessions/s1");
+        // Stage the prompt exactly as `execute_interactive_sandboxed` does.
+        let guest_prompt = session
+            .stage_file("do the task", "/home/agent/.varda-prompt.txt")
+            .unwrap();
+        let mut env = BTreeMap::new();
+        env.insert("VARDA_PROMPT_FILE".to_owned(), guest_prompt.clone());
+        // The config expands `interactive_command`/`interactive_args` into this spec.
+        let spec = CommandSpec {
+            program: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "claude \"$(cat $VARDA_PROMPT_FILE)\" --add-dir /proj --permission-mode acceptEdits"
+                    .to_owned(),
+            ],
+            env,
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Interactive).unwrap();
+        assert_eq!(wrapped.args[0], "create", "real-agent interactive must create, not run");
+        assert!(wrapped.args.iter().any(|a| a == "-it"), "must allocate a TTY");
+        assert!(
+            docker_env_flags(&wrapped.args)
+                .iter()
+                .any(|e| **e == format!("VARDA_PROMPT_FILE={guest_prompt}")),
+            "the staged guest prompt path must be advertised as VARDA_PROMPT_FILE: {:?}",
+            wrapped.args
+        );
+        // The agent argv survives verbatim after the image, so `sh -c 'claude …'` runs.
+        let img_idx = wrapped.args.iter().position(|a| a == "img").unwrap();
+        assert_eq!(wrapped.args[img_idx + 1], "sh");
+        assert_eq!(wrapped.args[img_idx + 2], "-c");
+        assert!(
+            wrapped.args[img_idx + 3].contains("claude \"$(cat $VARDA_PROMPT_FILE)\""),
+            "the wrapped shell must invoke the real agent reading the prompt file: {}",
+            wrapped.args[img_idx + 3]
+        );
+        // The prompt is queued for a deferred `docker cp` (create/cp/start), not lost.
+        let staged = session.staged_files.lock().unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].1, "/home/agent/.varda-prompt.txt");
+        let _ = std::fs::remove_file(&staged[0].0);
+    }
+
+    /// M13b exit criterion: an interactive agent launch injects the FULL identity
+    /// bundle (scoped auth token env, forwarded SSH-agent socket + in-guest
+    /// `SSH_AUTH_SOCK`, read-only git identity) exactly as the batch path does —
+    /// identity is mode-agnostic — while NEVER mounting `~/.aws`/`~/.ssh`/a
+    /// credential dir. This is what authenticates the agent inside the box without
+    /// a creds-dir mount, and what lets `git push` work via the forwarded agent.
+    #[test]
+    fn m13b_docker_interactive_injects_identity_no_creds_mount() {
+        let mut auth_env = BTreeMap::new();
+        auth_env.insert("ANTHROPIC_API_KEY".to_owned(), "sk-scoped-sandbox".to_owned());
+        let id = SandboxIdentity {
+            auth_env,
+            ssh_auth_sock: Some("/tmp/host-agent.sock".to_owned()),
+            git_name: Some("Varda Bot".to_owned()),
+            git_email: Some("bot@varda.dev".to_owned()),
+            ..Default::default()
+        };
+        let session =
+            DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
+        let mut env = BTreeMap::new();
+        env.insert("VARDA_PROMPT_FILE".to_owned(), "/home/agent/.varda-prompt.txt".to_owned());
+        let spec = CommandSpec {
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "claude \"$(cat $VARDA_PROMPT_FILE)\"".to_owned()],
+            env,
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Interactive).unwrap();
+        let envs = docker_env_flags(&wrapped.args);
+        assert!(
+            envs.iter().any(|e| *e == "ANTHROPIC_API_KEY=sk-scoped-sandbox"),
+            "scoped auth token must be injected on the interactive path: {envs:?}"
+        );
+        assert!(
+            envs.iter().any(|e| **e == format!("SSH_AUTH_SOCK={SSH_AGENT_GUEST_SOCK}")),
+            "in-guest SSH_AUTH_SOCK must point at the forwarded socket: {envs:?}"
+        );
+        assert!(envs.iter().any(|e| *e == "GIT_AUTHOR_NAME=Varda Bot"));
+        assert!(envs.iter().any(|e| *e == "GIT_COMMITTER_EMAIL=bot@varda.dev"));
+        let vs = docker_v_flags(&wrapped.args);
+        assert!(
+            vs.iter().any(|v| **v == format!("/tmp/host-agent.sock:{SSH_AGENT_GUEST_SOCK}")),
+            "the host SSH-agent socket must be forwarded as a bind for git push: {vs:?}"
+        );
+        // Exit criterion: no credential dir is EVER visible in-guest.
+        for v in &vs {
+            assert!(
+                !v.contains("/.aws")
+                    && !v.contains("/.ssh")
+                    && !v.contains("/.claude")
+                    && !v.contains("/.codex")
+                    && !v.contains("/.copilot"),
+                "no credential dir may be mounted on the interactive path: {v}"
+            );
+        }
+    }
+
     /// M4 live exit criteria — verified against a real `msb` microVM: a
     /// read-only mount blocks writes, host `~/.aws` is NOT visible (own-kernel
     /// isolation), and the session store round-trips guest→host via `msb cp`.
