@@ -1172,25 +1172,51 @@ fn staged_temp_suffix(content: &str) -> String {
 }
 
 /// Write `content` to a fresh host temp for staging into the guest. When
-/// `read_only` is set the temp is chmod-ed to `0o400` so a staged credential
-/// VALUE (M11-ext file target) is never left mutable on the host and — since
-/// `docker cp` / `msb --copy-file` preserve the source mode — lands read-only
-/// in the guest. The prompt uses the default (world-readable) perms so a
-/// non-root agent can still read it. Returns the host temp path.
+/// `read_only` is set the temp is created `0o400` FROM CREATION TIME (not
+/// write-then-chmod, which would briefly expose a world-readable credential
+/// under a normal umask) so a staged credential VALUE (M11-ext file target) is
+/// never left mutable OR world-readable on the host and — since `docker cp` /
+/// `msb --copy-file` preserve the source mode — lands read-only in the guest.
+/// The prompt uses the default (world-readable) perms so a non-root agent can
+/// still read it. Returns the host temp path.
 fn write_stage_temp(content: &str, read_only: bool) -> Result<PathBuf> {
     let tmp = std::env::temp_dir().join(format!("varda-stage-{}", staged_temp_suffix(content)));
     // The filename is content-addressed, so a prior run staging the SAME value may
-    // have left a read-only (0o400) temp here — which `std::fs::write` cannot
-    // truncate. Clear it first (best-effort) so re-staging identical content works.
+    // have left a temp here (a read-only `0o400` credential temp `std::fs::write`
+    // cannot truncate, or an attacker-planted file). Clear it first (best-effort)
+    // so the credential create below owns a FRESH inode.
     let _ = std::fs::remove_file(&tmp);
-    std::fs::write(&tmp, content)
-        .with_context(|| format!("failed to stage file {}", tmp.display()))?;
     #[cfg(unix)]
     if read_only {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Credential VALUE: create the file `0o400` FROM CREATION TIME. Writing
+        // with `std::fs::write` then chmod-ing `0o400` afterward leaves a brief
+        // window where the file exists world-readable (`0o644` under a normal
+        // umask) on the host — a credential must never be exposed that way.
+        // `create_new` additionally refuses a pre-existing file, so we never write
+        // the credential into an attacker-planted inode (belt to the remove above).
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(&tmp)
+            .with_context(|| format!("failed to stage file {}", tmp.display()))?;
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("failed to write staged file {}", tmp.display()))?;
+        // `create_new`'s mode is masked by the umask; force exactly `0o400` so the
+        // owner can still read the credential regardless of the process umask. This
+        // only ever tightens/keeps perms private — never opens a world-readable
+        // window, since the file was already created private.
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o400))
             .with_context(|| format!("failed to set read-only perms on {}", tmp.display()))?;
+        return Ok(tmp);
     }
+    // Prompt / non-credential: default (umask) perms so a non-root guest agent can
+    // still read the file after `docker cp`/`--copy-file` preserves the source mode.
+    std::fs::write(&tmp, content)
+        .with_context(|| format!("failed to stage file {}", tmp.display()))?;
     Ok(tmp)
 }
 
@@ -1295,7 +1321,21 @@ impl DockerSession {
         }
         let staged =
             std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"));
-        for (host_temp, guest_path) in staged {
+        // Draining `staged_files` above means teardown can no longer see these host
+        // temps, so cleanup must live HERE and survive ANY early return: a failed
+        // `docker cp` below must NOT leave a credential VALUE on the host. This
+        // scope guard removes every not-yet-consumed temp on drop — the happy path,
+        // an errored `cp`, or the `?` on `docker cp` itself all trigger it.
+        struct StagedTempGuard(Vec<PathBuf>);
+        impl Drop for StagedTempGuard {
+            fn drop(&mut self) {
+                for host_temp in &self.0 {
+                    let _ = std::fs::remove_file(host_temp);
+                }
+            }
+        }
+        let mut guard = StagedTempGuard(staged.iter().map(|(t, _)| t.clone()).collect());
+        for (host_temp, guest_path) in &staged {
             let src = host_temp.display().to_string();
             let dst = format!("{}:{guest_path}", self.container);
             let output = tokio::process::Command::new("docker")
@@ -1310,8 +1350,12 @@ impl DockerSession {
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
             }
-            let _ = std::fs::remove_file(&host_temp);
+            // Consumed successfully: remove now and drop it from the guard so a
+            // later `cp` failure doesn't re-attempt (harmless) removal of it.
+            let _ = std::fs::remove_file(host_temp);
+            guard.0.retain(|p| p != host_temp);
         }
+        drop(guard);
         Ok(CommandSpec {
             program: "docker".to_owned(),
             args: vec!["start".to_owned(), "-ai".to_owned(), self.container.clone()],
@@ -3165,6 +3209,54 @@ mod tests {
         // The host temp actually holds the content, ready for `docker cp`.
         assert_eq!(std::fs::read_to_string(&staged[0].0).unwrap(), "hello prompt");
         let _ = std::fs::remove_file(&staged[0].0);
+    }
+
+    /// M11-ext fix2 Finding 1 (docker): a staged credential host temp is `0o400`
+    /// and NEVER group/world-accessible — asserted immediately after
+    /// `stage_credential_file` returns, so there is no create-time window where a
+    /// normal umask would leave the value world-readable (`0o644`) on the host.
+    #[test]
+    fn m11ext_docker_staged_credential_private_at_creation() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let session =
+            DockerSession::for_test("img", "/proj", vec![], vec![], "/var/varda/sessions/priv");
+        session
+            .stage_credential_file("top-secret-value", "/home/agent/.tok")
+            .unwrap();
+        let host_temp = session.staged_files.lock().unwrap()[0].0.clone();
+        let mode = std::fs::metadata(&host_temp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400, "credential temp must be exactly 0o400, got {mode:o}");
+        assert_eq!(mode & 0o077, 0, "credential temp must never be group/world-accessible");
+        let _ = std::fs::remove_file(&host_temp);
+    }
+
+    /// M11-ext fix2 Finding 2 (docker): if `docker cp` fails (or errors) AFTER the
+    /// staged list is drained, the credential host temp must STILL be removed —
+    /// teardown can no longer see it, so `create_cp_start` cleans it up on the
+    /// error path. We stand in `true` for `docker create` so it succeeds and the
+    /// list is drained, then the real `docker cp` fails (nonexistent container /
+    /// no daemon), exercising the drained-then-error cleanup.
+    #[tokio::test]
+    async fn m11ext_docker_cp_failure_removes_staged_temp() {
+        let session =
+            DockerSession::for_test("img", "/proj", vec![], vec![], "/var/varda/sessions/cpfail");
+        session
+            .stage_credential_file("scoped-secret", "/home/agent/.tok")
+            .unwrap();
+        let host_temp = session.staged_files.lock().unwrap()[0].0.clone();
+        assert!(host_temp.exists());
+        let wrapped = CommandSpec {
+            program: "true".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let result = session.create_cp_start(wrapped).await;
+        assert!(result.is_err(), "`docker cp` against a nonexistent container must fail");
+        assert!(
+            !host_temp.exists(),
+            "credential host temp must be removed even when `docker cp` fails"
+        );
     }
 
     /// M13a §2/§3: msb Interactive adds `-t` and a pre-boot `--copy-file` per
