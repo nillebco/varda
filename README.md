@@ -642,6 +642,8 @@ resume_command_template = "claude --resume {external_session_id} --add-dir {proj
 kind = "acp"
 command = "sh"
 args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} -s"]
+interactive_command = "sh"
+interactive_args = ["-c", "copilot \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home}"]
 resume_command_template = "copilot --resume={external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --allow-all-tools"
 
 [roles.tester]
@@ -712,12 +714,13 @@ Two knobs are deliberately separate. **`image`/`build`** decides *what tools are
 
 **`microsandbox`** shells to the `msb` CLI (install with the microsandbox project; expects `msb` on `PATH`) and runs the agent inside an **own-kernel microVM** — a stronger inward boundary than docker's shared kernel, plus Windows coverage. It mirrors the docker provider: the same `image`/`build` inputs (a `build` Dockerfile is built via docker into a tag `msb` runs), the same project-only + opt-in merged mounts (`msb --mount HOST:GUEST`, read-only by default), the same resume-capture model (the guest `HOME` lives in VM storage and is `msb cp`-ed out to `~/.varda/sessions/{session_id}` after the run, so the host `$HOME`/credentials are never exposed), and default-deny egress (fully offline with no `egress`; `egress` hosts become per-host `msb` net allow-rules — enforced in-guest, so hostnames/CIDRs are passed directly rather than pre-resolved to IPs as docker requires). The keys never enter the VM, and an OCI image can bake in the agent CLI (e.g. the copilot CLI for the Windows path). *The `msb` argv spellings are centralized in `MicrosandboxSession::wrap`/`extract_session_store`; confirm them against your installed `msb --help` — see the M4 task notes on live verification.*
 
-#### Interactive sandbox (shell): TTY, prompt staging, and the docker lifecycle
+#### Interactive sandbox (real agents): TTY, prompt staging, injected auth, and the docker lifecycle
 
-`--interactive` runs now work under `docker` and `microsandbox`, not just `local`. When an agent's `interactive_command` (e.g. `sh`) is set and the resolved sandbox is not `local`, Varda attaches **your terminal** to a shell *inside the box* — the project is mounted, but `~/.aws`/`~/.claude`/etc. stay invisible (the same isolation as a batch run), and teardown removes the container/microVM and its volume on every exit path.
+`--interactive` runs now put the **real coding agents** (`claude`, `codex`, `copilot`) — not just a bare shell — inside `docker` and `microsandbox`, not just `local`. Each default agent ships an `interactive_command`/`interactive_args` that launches the agent through a login shell reading the staged prompt (`sh -c '<agent> "$(cat $VARDA_PROMPT_FILE)" …'`); when the resolved sandbox is not `local`, Varda attaches **your terminal** to that agent *inside the box*. The project is mounted, but `~/.aws`/`~/.ssh`/`~/.claude`/etc. stay invisible (the same isolation as a batch run), and teardown removes the container/microVM and its volume on every exit path.
 
+- **The agent authenticates via injected identity, not a creds-dir mount.** The interactive path reuses the same `SandboxIdentity` channels as a batch run (M11/M11-ext): a scoped, host-minted token injected as an in-box env var (or staged as a read-only `0o400` file), the read-only git identity (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`), and — when `forward_ssh_agent` is set and a live `$SSH_AUTH_SOCK` exists — the host **SSH agent socket forwarded** as a bind (`… :/ssh-agent`) with the in-guest `SSH_AUTH_SOCK` pointing at it, so `git push` signs on the host and **no private key ever enters the box**. `~/.aws`/`~/.ssh` and every credential dir remain unmounted; identity injection is mode-agnostic (the batch and interactive argv carry the exact same channels).
 - **A real terminal is required.** A sandboxed interactive launch needs a TTY on stdin (`docker -it` / `msb -t` fail without one). Varda checks `stdin` up front and fails clearly if you pipe input or run headless — use a batch run (no `--interactive`) or `sandbox = "local"` in that case.
-- **The prompt is staged *into* the guest.** The task prompt is copied to `/home/agent/.varda-prompt.txt` inside the box and exposed as `$VARDA_PROMPT_FILE`, so the in-guest shell can read the task even though the host temp file is not visible in the guest. (Under `local`, `$VARDA_PROMPT_FILE` points at a host temp, exactly as before.)
+- **The prompt is staged *into* the guest.** The task prompt is copied to `/home/agent/.varda-prompt.txt` inside the box and exposed as `$VARDA_PROMPT_FILE`, so the in-guest agent can read the task even though the host temp file is not visible in the guest. (Under `local`, `$VARDA_PROMPT_FILE` points at a host temp, exactly as before.)
 - **Docker interactive is a different lifecycle, not just `-it`.** Because the container `HOME` is a per-session named volume and a host bind of `~/.varda` hits the VM-visibility trap, Varda cannot `docker run` an interactive session directly. Instead it:
   1. `docker create … -it …` — create the container (do **not** run it),
   2. `docker cp` the staged prompt into it,
@@ -727,7 +730,7 @@ Two knobs are deliberately separate. **`image`/`build`** decides *what tools are
 
   `microsandbox` needs no such dance: it stages the prompt with a native pre-boot `--copy-file` and runs `msb run -t`. Session capture and the `resume_command` are produced exactly like a batch run.
 - **Ctrl-C** under `-it` propagates to the guest process; the `SessionTeardownGuard` still fires on the way out, so no `varda-sbx-*` container or volume leaks.
-- **The interpretation pass stays local.** After the interactive session ends, Varda's post-session interpretation pass only reads the host session log to produce the recap (no untrusted exec), so it runs **un-sandboxed**. An optional `interpreter_agent` on the agent config selects which agent runs that pass; when unset it defaults to the same agent that drove the session (a bare `sh` shell can't emit a Varda recap on its own).
+- **The interpretation pass stays local.** After the interactive session ends, Varda's post-session interpretation pass only reads the host session log to produce the recap and the captured `resume_command` (no untrusted exec), so it runs **un-sandboxed** on the host. An optional `interpreter_agent` on the agent config selects which agent runs that pass; when unset it defaults to the same agent that drove the session (a real agent re-reads its own transcript; a bare `sh` shell that can't emit a Varda recap should point `interpreter_agent` at a real agent).
 
 > Resuming an interactive session under a sandbox is not yet supported (the fresh-shell launch is); resume runs remain `local`-only.
 
@@ -867,7 +870,7 @@ These rules are what make the sandbox meaningful; they also gate the future nest
 
 Current limitations:
 
-- **Non-interactive runs only.** Starting an interactive or resume session under a non-`local` sandbox returns a clear error (interactive-under-sandbox is a later milestone).
+- **Resume is `local`-only.** Fresh interactive sessions run under `docker`/`microsandbox` (the real `claude`/`codex`/`copilot` agents attach to your TTY inside the box — see [Interactive sandbox](#interactive-sandbox-real-agents-tty-prompt-staging-injected-auth-and-the-docker-lifecycle)). **Resuming** an interactive session under a non-`local` sandbox still returns a clear error and remains `local`-only.
 ### Per-folder `.varda` overrides
 
 A project subtree can pin its own sandbox by placing a `.varda` file in (or above) the task's project directory. At launch Varda walks up from the project path to the git root and uses the **nearest** `.varda`, with precedence:

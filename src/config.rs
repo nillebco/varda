@@ -54,6 +54,8 @@ resume_command_template = "claude --resume {external_session_id} --add-dir {proj
 kind = "acp"
 command = "sh"
 args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} -s"]
+interactive_command = "sh"
+interactive_args = ["-c", "copilot \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home}"]
 resume_command_template = "copilot --resume={external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --allow-all-tools"
 
 [roles.tester]
@@ -1063,7 +1065,9 @@ fn add_varda_project_dir_to_default_agents(config: &mut Config) {
                 .interactive_args
                 .as_deref()
                 .and_then(|args| args.get(1))
-                .is_some_and(|arg| arg.contains("codex ") || arg.contains("claude "));
+                .is_some_and(|arg| {
+                    arg.contains("codex ") || arg.contains("claude ") || arg.contains("copilot ")
+                });
             if is_wrapped_agent && let Some(args) = agent.interactive_args.as_mut() {
                 add_varda_dirs_to_shell_arg(args);
             }
@@ -1381,6 +1385,25 @@ operations_dir = "operations"
                 "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} -s"
             ]
         );
+        // M13b: copilot runs interactively under the sandbox too, seeded from the
+        // staged prompt file — mirroring claude/codex.
+        assert_eq!(
+            config.agents["copilot"].interactive_command.as_deref(),
+            Some("sh")
+        );
+        let copilot_interactive = config.agents["copilot"]
+            .interactive_args
+            .as_ref()
+            .expect("copilot must have interactive_args wired for the sandbox interactive path");
+        assert_eq!(copilot_interactive[0], "-c");
+        assert!(
+            copilot_interactive[1].contains("copilot \"$(cat $VARDA_PROMPT_FILE)\""),
+            "copilot interactive must read the prompt from the staged VARDA_PROMPT_FILE, got: {}",
+            copilot_interactive[1]
+        );
+        // Normalization must fold the varda dirs into the copilot interactive arg.
+        assert!(copilot_interactive[1].contains("--add-dir {varda_project}"));
+        assert!(copilot_interactive[1].contains("--add-dir {varda_home}"));
         assert_eq!(config.agents["codex"].max_prompt_tokens, None);
         assert!(
             !config.agents["codex"]
