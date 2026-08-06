@@ -423,6 +423,13 @@ pub const SUBTASK_RESULT_TOOL: &str = "subtask_result";
 /// Wave primitive: block until EVERY listed subtask reaches a terminal status.
 pub const AWAIT_SUBTASKS_TOOL: &str = "await_subtasks";
 
+/// Tool error returned by `await_subtask*`/`subtask_result` when no collect
+/// channel is wired ([`NoSubtaskResults`]): the pre-collect stub semantics,
+/// short-circuited so an unwired broker reports at once rather than polling to
+/// the [`SpawnBroker::max_wait`] ceiling.
+const RESULTS_UNAVAILABLE: &str =
+    "not available on this channel: sub-task results flow back through varda memory";
+
 /// Default poll cadence for `await_subtask*`: how often the broker re-reads a
 /// child's status while blocking. Task-spec range is 1–2s; 1s keeps a wave
 /// responsive without hammering the STATE store.
@@ -456,12 +463,22 @@ pub trait SubtaskResults: Send + Sync {
     /// Most recent recap TEXT for `id`, or `None` if the task is unknown or has
     /// not yet produced a recap.
     fn recap(&self, id: &str) -> Option<String>;
+    /// Whether a real collect channel is wired. A wired provider leaves the
+    /// default `true`; the no-op [`NoSubtaskResults`] overrides to `false` so
+    /// `await_subtask*`/`subtask_result` short-circuit INSTANTLY with the "not
+    /// available on this channel" error instead of polling every id to the
+    /// [`SpawnBroker::max_wait`] ceiling (30 min) before timing out. This
+    /// preserves the pre-collect stub semantics for an unwired broker.
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 /// Default results seam: no collect channel wired. `status`/`recap` always return
-/// `None`, so `await_subtask*`/`subtask_result` report "not available on this
-/// channel" — preserving the pre-collect behaviour until the run path injects a
-/// real [`SubtaskResults`] via [`SpawnBroker::with_results`].
+/// `None` and `is_available` is `false`, so `await_subtask*`/`subtask_result`
+/// short-circuit INSTANTLY with the "not available on this channel" error instead
+/// of polling to the ceiling — preserving the pre-collect behaviour until the run
+/// path injects a real [`SubtaskResults`] via [`SpawnBroker::with_results`].
 struct NoSubtaskResults;
 
 impl SubtaskResults for NoSubtaskResults {
@@ -470,6 +487,9 @@ impl SubtaskResults for NoSubtaskResults {
     }
     fn recap(&self, _id: &str) -> Option<String> {
         None
+    }
+    fn is_available(&self) -> bool {
+        false
     }
 }
 
@@ -686,8 +706,13 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
     /// Block until `id` reaches a terminal status, polling the injected
     /// [`SubtaskResults`] every [`Self::poll_interval`]. Returns the terminal
     /// status, or `None` if the [`Self::max_wait`] ceiling elapses first (a wedged
-    /// child) or no collect channel is wired. Never blocks past the cap.
+    /// child) or no collect channel is wired. Never blocks past the cap. An
+    /// unwired provider short-circuits at once (no polling) — callers translate
+    /// that `None` into the [`RESULTS_UNAVAILABLE`] error via `is_available`.
     fn await_subtask(&self, id: &str) -> Option<TaskStatus> {
+        if !self.results.is_available() {
+            return None;
+        }
         let start = Instant::now();
         loop {
             if let Some(status) = self.results.status(id)
@@ -706,6 +731,9 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
     /// each once all are settled. `None` if the ceiling elapses before every id is
     /// terminal, or no collect channel is wired. This is the wave primitive.
     fn await_subtasks(&self, ids: &[String]) -> Option<Vec<(String, TaskStatus)>> {
+        if !self.results.is_available() {
+            return None;
+        }
         let start = Instant::now();
         loop {
             let settled: Vec<(String, TaskStatus)> = ids
@@ -827,6 +855,9 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                 let Some(sid) = args.get("subtask_id").and_then(Value::as_str) else {
                     return rpc_error(id, -32602, "await_subtask requires a `subtask_id`");
                 };
+                if !self.results.is_available() {
+                    return rpc_result(id, tool_text(RESULTS_UNAVAILABLE, true));
+                }
                 match self.await_subtask(sid) {
                     Some(status) => rpc_result(
                         id,
@@ -865,6 +896,9 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                         "await_subtasks requires a non-empty `subtask_ids` array",
                     );
                 }
+                if !self.results.is_available() {
+                    return rpc_result(id, tool_text(RESULTS_UNAVAILABLE, true));
+                }
                 match self.await_subtasks(&ids) {
                     Some(settled) => {
                         let payload: Vec<Value> = settled
@@ -889,6 +923,9 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                 let Some(sid) = args.get("subtask_id").and_then(Value::as_str) else {
                     return rpc_error(id, -32602, "subtask_result requires a `subtask_id`");
                 };
+                if !self.results.is_available() {
+                    return rpc_result(id, tool_text(RESULTS_UNAVAILABLE, true));
+                }
                 match self.subtask_result(sid) {
                     Some(result) => rpc_result(id, tool_text(&result.to_string(), false)),
                     None => rpc_result(
@@ -1575,6 +1612,48 @@ mod tests {
         let map: BTreeMap<_, _> = settled.into_iter().collect();
         assert_eq!(map["a"], TaskStatus::Done);
         assert_eq!(map["b"], TaskStatus::Failed);
+    }
+
+    #[test]
+    fn unwired_broker_await_short_circuits_instantly() {
+        // Default results seam (NoSubtaskResults): no collect channel wired.
+        // A generous max_wait would hang 30 min IF the loop polled to the ceiling;
+        // the short-circuit must return at once instead. Cap set to 1h so any
+        // polling would blow the timing assertion by orders of magnitude.
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new())
+            .with_poll_timing(Duration::from_secs(1), Duration::from_secs(3600));
+
+        let t = Instant::now();
+        assert_eq!(broker.await_subtask("child"), None);
+        assert_eq!(
+            broker.await_subtasks(&["a".to_owned(), "b".to_owned()]),
+            None
+        );
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "unwired await polled instead of short-circuiting ({:?})",
+            t.elapsed()
+        );
+
+        // Over the RPC surface it is the "not available on this channel" tool
+        // error (the old stub semantics), NOT a "timed out" error.
+        for args in [
+            json!({"name": AWAIT_SUBTASK_TOOL, "arguments": {"subtask_id": "child"}}),
+            json!({"name": AWAIT_SUBTASKS_TOOL, "arguments": {"subtask_ids": ["child"]}}),
+            json!({"name": SUBTASK_RESULT_TOOL, "arguments": {"subtask_id": "child"}}),
+        ] {
+            let resp = broker.handle_rpc(
+                "root",
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": args}),
+            );
+            assert_eq!(resp["result"]["isError"], json!(true));
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("not available on this channel"),
+                "expected not-available error, got {text}"
+            );
+            assert!(!text.contains("timed out"), "unwired hit the poll ceiling: {text}");
+        }
     }
 
     #[test]
