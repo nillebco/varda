@@ -2940,12 +2940,21 @@ fn resolve_resident_launch(
     let credentials = agent_config.effective_credentials();
     let orchestration = config.resolve_orchestration_for(workspace);
 
+    // The resident's EFFECTIVE env, merged with the same precedence as the real
+    // launch (`build_client` → `env_for_request`): agent env is the base, the
+    // resolved sandbox+route+`.varda` static env overrides on collision. Presence of
+    // a push-enabling key — from ANY origin — is what `enforce_resident_launch`
+    // rejects, so this union is the full env-channel surface to scan.
+    let mut effective_env = agent_config.env.clone();
+    effective_env.extend(resolved.env.clone());
+
     config::enforce_resident_launch(
         &resolved.name,
         &resolved.config,
         &mounts,
         workspace,
         &credentials,
+        &effective_env,
         config.defaults.forward_ssh_agent,
         &orchestration,
     )?;
