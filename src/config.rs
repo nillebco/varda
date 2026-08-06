@@ -41,22 +41,35 @@ agents = ["codex"]
 # max_fanout = 1
 # global_child_budget = 2
 
-# Resident route example for a trusted, un-sandboxed orchestrator:
-# match your varda repo, leave sandbox unset (or set "local"), and run an agent
-# that can safely touch host git. Spawned workers must request docker/microsandbox
-# sandboxes and are re-validated by the host before launch.
+# Sandboxed resident route (self-hosting orchestrator — `varda orchestrate`).
+# The resident runs INSIDE an isolating sandbox with a DEDICATED workspace mounted
+# rw; it drives workers and merges their branches IN-BOX against that mount. Blast
+# radius = the local, un-pushed workspace + the capped worker budget. This supersedes
+# the old un-sandboxed `local` resident example — the four load-bearing gates are
+# asserted in code before launch and a violation FAILS LOUDLY:
+#   G1  dedicated rw workspace mount (never $HOME / a home-ancestor / ~/dev)
+#   G2  isolating sandbox (never `local`), net-denied (`egress = []`), and NO push
+#       credential (nothing that lets the box authenticate `git push` to a remote)
+#   G7  broker caps bound the worker fan-out (see [routes.orchestration] below)
+# Pushing back out is a separate, human-gated step performed on the HOST.
+#
+# [sandboxes.orchestration]
+# image = "your-dev-image:latest"
+# primitive = "docker"          # isolating — NEVER "local"
+# egress = []                   # net-deny: the box runs with `--network none`
 #
 # [[routes]]
-# glob = "/path/to/varda/**"
-# agents = ["trusted-resident"]
-# sandbox = "local"
+# glob = "/path/to/orchestration/workspace/**"
+# agents = ["claude"]           # resident identity carries NO git push credential
+# sandbox = "orchestration"
+# mounts = ["/path/to/orchestration/workspace:/workspace:rw"]  # dedicated rw workspace
 #
 # [routes.orchestration]
 # enabled = true
 # max_depth = 1                 # resident depth0 -> workers depth1; worker spawns hit DepthExceeded
 # max_fanout = 16               # one resident can launch a full worker/reviewer/resolver wave
 # global_child_budget = 64      # multi-wave interactive sessions keep headroom
-# deny_sandboxes = ["local"]    # spawned children must never land un-sandboxed
+# deny_sandboxes = ["local"]    # spawned workers must never land un-sandboxed
 
 [agents.codex]
 kind = "acp"
@@ -954,6 +967,364 @@ impl Config {
             .or(self.defaults.sandbox.as_deref())
             .unwrap_or(DEFAULT_SANDBOX_PROVIDER)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sandboxed-resident route enforcement (#461 capstone — `varda orchestrate`).
+//
+// The self-hosting orchestrator (the RESIDENT) runs inside a sandbox with a
+// dedicated workspace mounted rw. These functions assert, IN CODE (not just
+// docs), the load-bearing security gates before the resident is allowed to
+// launch. A violation is a loud, refused launch — never a silent downgrade.
+// ---------------------------------------------------------------------------
+
+/// In-box env var NAMES that would hand the sandbox a `git push` credential — OR a
+/// channel through which one can be injected (an askpass helper, an `SSH_AUTH_SOCK`
+/// forward, a `GIT_CONFIG_*` override that installs a credential helper). A resident
+/// receiving any of these — via a credential target OR via a plain `[…].env` map —
+/// could authenticate a push to a remote, which the sandboxed-resident model forbids
+/// (pushing is a separate, human-gated HOST step). Matched case-insensitively.
+///
+/// `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` are matched by prefix in
+/// [`env_key_enables_push`], not listed here, because their suffix is unbounded.
+pub const PUSH_CREDENTIAL_ENV_TARGETS: &[&str] = &[
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "GIT_TOKEN",
+    "GIT_PASSWORD",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "SSH_AUTH_SOCK",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_TERMINAL_PROMPT",
+];
+
+/// Substrings of a staged-file TARGET path that would hand the sandbox a git push
+/// credential: an SSH private key, a `*credential*` store file (`.git-credentials`,
+/// `~/.config/git/credentials`, any `credential.helper = store --file <path>`
+/// target), the gh CLI token store (`~/.config/gh/hosts.yml`), an askpass/credential
+/// helper SCRIPT, or a netrc. Broad on purpose — a resident that stages ANY of these
+/// as a file is carrying a push credential regardless of the exact filename.
+pub const PUSH_CREDENTIAL_FILE_MARKERS: &[&str] = &[
+    "credential", // .git-credentials, .config/git/credentials, *-credential-store, helper stores
+    ".netrc",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "/.ssh/",
+    ".config/gh", // gh CLI hosts.yml token store (any file under .config/gh)
+    "askpass",    // askpass / credential-helper scripts
+];
+
+/// True when an in-box env var NAMED `key` would hand the sandbox a push credential
+/// or a channel to inject one. Covers the fixed [`PUSH_CREDENTIAL_ENV_TARGETS`] list
+/// plus the unbounded `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` family (which can set
+/// `credential.helper` from the environment). Case-insensitive.
+pub fn env_key_enables_push(key: &str) -> bool {
+    if PUSH_CREDENTIAL_ENV_TARGETS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(key))
+    {
+        return true;
+    }
+    let upper = key.to_ascii_uppercase();
+    upper.starts_with("GIT_CONFIG_KEY_") || upper.starts_with("GIT_CONFIG_VALUE_")
+}
+
+/// The first push-enabling key present in `env`, if any. `env` is the resident's
+/// EFFECTIVE env (agent + sandbox + route + `.varda`, merged with the same
+/// precedence as the real launch) — presence of the key is what matters, not its
+/// origin or value, so a push-enabling var slipped in through ANY `[…].env` map is
+/// caught here even though it is not a `[[credentials]]` entry.
+pub fn env_enables_push(env: &BTreeMap<String, String>) -> Option<String> {
+    env.keys().find(|key| env_key_enables_push(key)).cloned()
+}
+
+/// True when injecting `cred` into the box would give it a credential capable of
+/// authenticating `git push` to a remote. Conservative: an unresolvable/ambiguous
+/// target is treated as NOT a push cred here (the `target()` validation runs
+/// elsewhere) so this never masks a config error — it only classifies valid ones.
+pub fn credential_enables_push(cred: &CredentialConfig) -> bool {
+    match cred.target() {
+        Ok(CredentialTarget::Env(name)) => env_key_enables_push(name),
+        Ok(CredentialTarget::File(path)) => {
+            let lower = path.to_ascii_lowercase();
+            PUSH_CREDENTIAL_FILE_MARKERS
+                .iter()
+                .any(|marker| lower.contains(marker))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Inspect a workspace's `.git/config` (and any submodule configs under
+/// `.git/modules`) for a pre-seeded push credential: a remote URL with an EMBEDDED
+/// credential (`https://x-access-token:TOKEN@…`, `https://user:pass@…`) or a
+/// configured `credential.helper`. A resident that *merges* worker branches is fine;
+/// a workspace whose `.git/config` already carries a token-bearing remote or a
+/// credential helper hands the box a push credential and is REFUSED.
+///
+/// Absent/unreadable configs are treated as clean (a bare workspace has no `.git`);
+/// this only classifies configs it can read.
+pub fn enforce_workspace_git_config(workspace: &Path) -> Result<()> {
+    let git_dir = workspace.join(".git");
+    inspect_git_config_file(&git_dir.join("config"), workspace)?;
+    let modules = git_dir.join("modules");
+    if modules.is_dir() {
+        inspect_git_config_tree(&modules, workspace, 0)?;
+    }
+    Ok(())
+}
+
+/// Bounded recursive walk of a `.git/modules` tree, inspecting every `config` file.
+fn inspect_git_config_tree(dir: &Path, workspace: &Path, depth: usize) -> Result<()> {
+    if depth > 12 {
+        return Ok(());
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            inspect_git_config_tree(&path, workspace, depth + 1)?;
+        } else if path.file_name().and_then(|n| n.to_str()) == Some("config") {
+            inspect_git_config_file(&path, workspace)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read one git config file and reject an embedded-credential remote or a configured
+/// credential helper. Missing/unreadable file ⇒ clean.
+fn inspect_git_config_file(path: &Path, workspace: &Path) -> Result<()> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    if let Some(reason) = git_config_text_has_push_credential(&text) {
+        bail!(
+            "orchestration workspace {} has a pre-seeded push credential in its git config ({reason}); \
+             the sandboxed resident MUST NOT carry a credential that can push to a remote. Remove the \
+             embedded-credential remote / credential helper — pushing is a separate, human-gated host step.",
+            workspace.display()
+        );
+    }
+    Ok(())
+}
+
+/// Classify git-config TEXT (INI-like) for a push credential. Returns a redacted
+/// reason (never the secret itself) when the config embeds a credential in a remote
+/// URL or configures a `credential.helper`.
+fn git_config_text_has_push_credential(text: &str) -> Option<String> {
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            section = line
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim()
+                .to_ascii_lowercase();
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k.trim().to_ascii_lowercase(), v.trim()),
+            None => (line.to_ascii_lowercase(), ""),
+        };
+        // `[credential]` / `[credential "https://…"]` with a non-empty helper.
+        if section.starts_with("credential") && key == "helper" && !value.is_empty() {
+            return Some("credential.helper is configured".to_owned());
+        }
+        // A remote (or any) URL that embeds userinfo (`user[:pass]@host`).
+        if key == "url" && url_embeds_credential(value) {
+            return Some("remote url embeds an inline credential".to_owned());
+        }
+    }
+    None
+}
+
+/// True when `url` carries a non-empty userinfo component (`scheme://userinfo@host…`)
+/// — e.g. `https://x-access-token:TOKEN@github.com/…` or `https://user:pass@…`. The
+/// userinfo value itself is never returned, so callers cannot leak the secret.
+fn url_embeds_credential(url: &str) -> bool {
+    let Some((_, after_scheme)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    match authority.split_once('@') {
+        Some((userinfo, _host)) => !userinfo.is_empty(),
+        None => false,
+    }
+}
+
+/// Refuse a workspace mount of `$HOME` itself or any ancestor of `$HOME` (e.g.
+/// `/`, `/Users`, `/home`). The orchestration workspace must be a DEDICATED
+/// directory so the blast radius stays bounded to un-pushed work — mounting a
+/// home-ancestor rw would expose credential stores and the whole dev tree.
+pub fn enforce_dedicated_workspace(workspace: &Path) -> Result<()> {
+    if !workspace.is_absolute() {
+        bail!(
+            "orchestration workspace {} must be an absolute path",
+            workspace.display()
+        );
+    }
+    let ws = canonical_or_self(workspace);
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let home = canonical_or_self(&home);
+        if ws == home {
+            bail!(
+                "orchestration workspace {} is $HOME; use a dedicated directory (never your home or dev tree)",
+                workspace.display()
+            );
+        }
+        if home.starts_with(&ws) {
+            bail!(
+                "orchestration workspace {} is an ancestor of $HOME ({}); use a dedicated directory",
+                workspace.display(),
+                home.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort canonicalization for prefix comparison; falls back to the path as
+/// written when it does not yet exist on the host.
+fn canonical_or_self(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// True when `mounts` (merged `source[:target][:mode]` strings) mount `workspace`
+/// as a READ-WRITE bind — the resident must be able to write its merged result to
+/// the host-visible mount.
+pub fn workspace_mounted_rw(mounts: &[String], workspace: &Path) -> bool {
+    let ws = canonical_or_self(workspace);
+    mounts.iter().any(|raw| {
+        let Ok(spec) = crate::sandbox::parse_mount(raw) else {
+            return false;
+        };
+        spec.writable && canonical_or_self(&spec.source) == ws
+    })
+}
+
+/// Assert every load-bearing gate of the sandboxed-resident model before launch.
+///
+/// - **G1** — `workspace` is a dedicated dir (not `$HOME`/home-ancestor) and is
+///   mounted **rw** in `mounts`.
+/// - **G2** — the sandbox is **isolating** (`primitive != "local"`, name != `local`),
+///   **net-denied** (`egress` empty ⇒ `--network none`), and the resident identity
+///   carries **no push credential**. "No push credential" spans every channel a
+///   credential can reach the box through: a forwarded SSH agent, a push-capable
+///   `credentials` target, a push-enabling key in the resident's EFFECTIVE `env`
+///   (agent + sandbox + route + `.varda`, per `effective_env`), or a pre-seeded
+///   push credential in the workspace's `.git/config`.
+/// - **G7** — orchestration is enabled (so the broker is wired) and `local` is in
+///   `deny_sandboxes` (spawned workers can never land un-sandboxed).
+///
+/// Any violation is a hard, refused launch. Net-deny already contains an actual push
+/// today; this CLAIMED gate is defense-in-depth — if net-deny is ever misconfigured,
+/// the resident must still hold no push credential.
+#[allow(clippy::too_many_arguments)]
+pub fn enforce_resident_launch(
+    sandbox_name: &str,
+    sandbox: &SandboxConfig,
+    mounts: &[String],
+    workspace: &Path,
+    credentials: &[CredentialConfig],
+    effective_env: &BTreeMap<String, String>,
+    forward_ssh_agent: bool,
+    orchestration: &crate::orchestration::OrchestrationPolicy,
+) -> Result<()> {
+    // G2 — isolating sandbox. A resident about to launch un-sandboxed is refused.
+    if sandbox_name == DEFAULT_SANDBOX_PROVIDER || sandbox.primitive == "local" {
+        bail!(
+            "resident route resolved to an un-sandboxed provider (name='{sandbox_name}', primitive='{}'); \
+             the orchestrator MUST run in an isolating sandbox (docker/microsandbox). Set an isolating \
+             `sandbox` on the workspace route.",
+            sandbox.primitive
+        );
+    }
+
+    // G2 — net-deny. A non-empty egress list would let the box reach a remote.
+    if !sandbox.egress.is_empty() {
+        bail!(
+            "resident sandbox '{sandbox_name}' allows egress ({:?}); the orchestrator MUST be network-denied \
+             (`egress = []` ⇒ `--network none`). Remove the egress allow-list.",
+            sandbox.egress
+        );
+    }
+
+    // G2 — no push credential. The resident's identity must not reach a remote.
+    if forward_ssh_agent {
+        bail!(
+            "resident identity forwards the SSH agent (`forward_ssh_agent = true`), which enables `git push`; \
+             the sandboxed resident MUST NOT carry a push credential. Pushing is a separate, human-gated host step."
+        );
+    }
+    for cred in credentials {
+        if credential_enables_push(cred) {
+            let target = match cred.target() {
+                Ok(CredentialTarget::Env(name)) => format!("env `{name}`"),
+                Ok(CredentialTarget::File(path)) => format!("file `{path}`"),
+                Err(_) => "unknown target".to_owned(),
+            };
+            bail!(
+                "resident identity injects a git push credential ({target}); the sandboxed resident MUST NOT \
+                 carry a credential that can push to a remote. Remove it — pushing is a separate, human-gated host step."
+            );
+        }
+    }
+    // G2 — no push-enabling env. A push credential (or a channel to inject one) can
+    // reach the box through ANY `[agents.X].env` / `[sandboxes.X].env` / `[[routes]].env`
+    // map, not only via `[[credentials]]`. Scan the merged effective env.
+    if let Some(key) = env_enables_push(effective_env) {
+        bail!(
+            "resident environment sets `{key}`, which hands the box a git push credential (or a channel to \
+             inject one); the sandboxed resident MUST NOT carry a push credential. Remove it from the \
+             agent/sandbox/route env — pushing is a separate, human-gated host step."
+        );
+    }
+
+    // G1 — dedicated, rw workspace.
+    enforce_dedicated_workspace(workspace)?;
+    if !workspace_mounted_rw(mounts, workspace) {
+        bail!(
+            "orchestration workspace {} is not mounted read-write in the resident sandbox; add a \
+             `{}:/workspace:rw` mount so the resident can merge worker branches against the host-visible dir.",
+            workspace.display(),
+            workspace.display()
+        );
+    }
+    // G2 (defense-in-depth) — a workspace whose `.git/config` already carries a
+    // token-bearing remote or a credential helper is a pre-seeded push credential.
+    enforce_workspace_git_config(workspace)?;
+
+    // G7 — broker wired + workers isolated.
+    if !orchestration.enabled {
+        bail!(
+            "orchestration is disabled for the resident route; enable `[routes.orchestration] enabled = true` \
+             so the spawn broker is wired and the resident can launch capped workers."
+        );
+    }
+    if !orchestration.deny_sandboxes.iter().any(|s| s == "local") {
+        bail!(
+            "resident orchestration policy does not deny the `local` sandbox; add `local` to `deny_sandboxes` \
+             so spawned workers can never land un-sandboxed."
+        );
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2243,5 +2614,477 @@ agents = ["claude"]
         // A path without an override inherits the top-level defaults.
         let other = c.resolve_orchestration_for(Path::new("/work/other/proj"));
         assert_eq!(other, permissive);
+    }
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+    use crate::orchestration::OrchestrationPolicy;
+
+    fn tmp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("varda-resident-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// An isolating, net-denied sandbox — the required resident placement.
+    fn isolating_sandbox() -> SandboxConfig {
+        SandboxConfig {
+            image: Some("dev:latest".to_owned()),
+            primitive: "docker".to_owned(),
+            egress: vec![],
+            ..SandboxConfig::default()
+        }
+    }
+
+    /// A broker-enabled policy that denies `local` — the required resident policy.
+    fn resident_policy() -> OrchestrationPolicy {
+        OrchestrationPolicy {
+            enabled: true,
+            deny_sandboxes: vec!["local".to_owned()],
+            ..OrchestrationPolicy::default()
+        }
+    }
+
+    fn env_cred(target: &str) -> CredentialConfig {
+        CredentialConfig {
+            from_env: Some("HOST".to_owned()),
+            env: Some(target.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// An empty effective env — the default for gates that don't exercise the env
+    /// scan.
+    fn no_env() -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
+
+    /// A single-entry effective env, for the push-via-env adversarial cases.
+    fn env_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// Initialize `<workspace>/.git/config` with the given contents, returning the
+    /// workspace so callers can chain it into `enforce_resident_launch`.
+    fn seed_git_config(workspace: &Path, contents: &str) {
+        let git_dir = workspace.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("config"), contents).unwrap();
+    }
+
+    #[test]
+    fn credential_enables_push_flags_push_channels_only() {
+        assert!(credential_enables_push(&env_cred("GITHUB_TOKEN")));
+        assert!(credential_enables_push(&env_cred("gh_token"))); // case-insensitive
+        assert!(credential_enables_push(&env_cred("SSH_AUTH_SOCK")));
+        assert!(credential_enables_push(&CredentialConfig {
+            from_secret: Some("k".to_owned()),
+            file: Some("/home/agent/.ssh/id_ed25519".to_owned()),
+            ..Default::default()
+        }));
+        // A plain LLM API key is NOT a push credential.
+        assert!(!credential_enables_push(&env_cred("ANTHROPIC_API_KEY")));
+        assert!(!credential_enables_push(&CredentialConfig {
+            from_secret: Some("gcp".to_owned()),
+            file: Some("/home/agent/.config/gcloud/adc.json".to_owned()),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn dedicated_workspace_rejects_home_and_ancestors() {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        assert!(
+            enforce_dedicated_workspace(&home).is_err(),
+            "$HOME must be refused as a workspace"
+        );
+        if let Some(parent) = home.parent() {
+            assert!(
+                enforce_dedicated_workspace(parent).is_err(),
+                "an ancestor of $HOME must be refused"
+            );
+        }
+        assert!(
+            enforce_dedicated_workspace(Path::new("relative/dir")).is_err(),
+            "a relative workspace must be refused"
+        );
+        let dedicated = tmp("dedicated-ok");
+        enforce_dedicated_workspace(&dedicated).expect("a dedicated dir must be accepted");
+    }
+
+    #[test]
+    fn workspace_rw_mount_detection() {
+        let ws = tmp("rw-detect");
+        let rw = vec![format!("{}:/workspace:rw", ws.display())];
+        let ro = vec![format!("{}:/workspace:ro", ws.display())];
+        assert!(workspace_mounted_rw(&rw, &ws));
+        assert!(!workspace_mounted_rw(&ro, &ws), "ro mount is not writable");
+        assert!(!workspace_mounted_rw(&[], &ws), "no mount");
+    }
+
+    #[test]
+    fn happy_path_passes_every_gate() {
+        let ws = tmp("happy");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        enforce_resident_launch(
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[env_cred("ANTHROPIC_API_KEY")],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .expect("a well-formed sandboxed-resident route must pass");
+    }
+
+    #[test]
+    fn rejects_unsandboxed_resident() {
+        let ws = tmp("local");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        // name == "local"
+        let err = enforce_resident_launch(
+            "local",
+            &SandboxConfig {
+                primitive: "local".to_owned(),
+                ..SandboxConfig::default()
+            },
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("isolating sandbox"), "{err}");
+    }
+
+    #[test]
+    fn rejects_network_egress() {
+        let ws = tmp("net");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        let mut sandbox = isolating_sandbox();
+        sandbox.egress = vec!["api.example.com".to_owned()];
+        let err = enforce_resident_launch(
+            "orchestration",
+            &sandbox,
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("network-denied"), "{err}");
+    }
+
+    #[test]
+    fn rejects_forwarded_ssh_agent_and_push_cred() {
+        let ws = tmp("push");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        // Forwarded SSH agent = push channel.
+        let err = enforce_resident_launch(
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            true,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SSH agent"), "{err}");
+        // A push-token credential.
+        let err = enforce_resident_launch(
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[env_cred("GITHUB_TOKEN")],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("push credential"), "{err}");
+    }
+
+    #[test]
+    fn rejects_workspace_not_mounted_rw() {
+        let ws = tmp("nomount");
+        let err = enforce_resident_launch(
+            "orchestration",
+            &isolating_sandbox(),
+            &[format!("{}:/workspace:ro", ws.display())],
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("read-write"), "{err}");
+    }
+
+    #[test]
+    fn rejects_disabled_or_local_allowing_policy() {
+        let ws = tmp("policy");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        // Broker disabled.
+        let mut disabled = resident_policy();
+        disabled.enabled = false;
+        let err = enforce_resident_launch(
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &disabled,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("orchestration is disabled"), "{err}");
+        // Workers not pinned away from `local`.
+        let mut allows_local = resident_policy();
+        allows_local.deny_sandboxes = vec![];
+        let err = enforce_resident_launch(
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &allows_local,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("deny the `local` sandbox"), "{err}");
+    }
+
+    // ---- Finding 1 (BLOCKING) — push-enabling env via any `[…].env` map ----
+
+    #[test]
+    fn env_key_enables_push_classifies_channels() {
+        // Direct token channels.
+        assert!(env_key_enables_push("GITHUB_TOKEN"));
+        assert!(env_key_enables_push("gh_token")); // case-insensitive
+        assert!(env_key_enables_push("GITLAB_TOKEN"));
+        // Askpass / ssh channels.
+        assert!(env_key_enables_push("GIT_ASKPASS"));
+        assert!(env_key_enables_push("SSH_ASKPASS"));
+        assert!(env_key_enables_push("GIT_SSH_COMMAND"));
+        assert!(env_key_enables_push("GIT_SSH"));
+        assert!(env_key_enables_push("SSH_AUTH_SOCK"));
+        // GIT_CONFIG_* credential-helper injection.
+        assert!(env_key_enables_push("GIT_CONFIG_COUNT"));
+        assert!(env_key_enables_push("GIT_CONFIG_KEY_0"));
+        assert!(env_key_enables_push("GIT_CONFIG_VALUE_0"));
+        assert!(env_key_enables_push("GIT_CONFIG_GLOBAL"));
+        assert!(env_key_enables_push("GIT_CONFIG_SYSTEM"));
+        assert!(env_key_enables_push("GIT_TERMINAL_PROMPT"));
+        // Plain, non-push env is fine.
+        assert!(!env_key_enables_push("ANTHROPIC_API_KEY"));
+        assert!(!env_key_enables_push("PATH"));
+        assert!(!env_key_enables_push("RUST_LOG"));
+    }
+
+    #[test]
+    fn rejects_push_enabling_env_map() {
+        let ws = tmp("env-push");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        // A resident whose merged env carries GITHUB_TOKEN is refused — even though
+        // it arrives via a plain `[…].env` map, not a `[[credentials]]` entry.
+        for pairs in [
+            &[("GITHUB_TOKEN", "ghp_x")][..],
+            &[("GIT_ASKPASS", "/tmp/ask.sh")][..],
+            &[("GIT_CONFIG_KEY_0", "credential.helper")][..],
+            &[("GIT_CONFIG_COUNT", "1")][..],
+            &[("SSH_AUTH_SOCK", "/tmp/agent.sock")][..],
+        ] {
+            let err = enforce_resident_launch(
+                "orchestration",
+                &isolating_sandbox(),
+                &mounts,
+                &ws,
+                &[],
+                &env_map(pairs),
+                false,
+                &resident_policy(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("push credential"),
+                "env {pairs:?} must be refused: {err}"
+            );
+        }
+        // A benign env map still passes.
+        enforce_resident_launch(
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[],
+            &env_map(&[("ANTHROPIC_API_KEY", "sk"), ("RUST_LOG", "info")]),
+            false,
+            &resident_policy(),
+        )
+        .expect("a benign env map must pass");
+    }
+
+    // ---- Finding 2 (BLOCKING) — file-target credential shapes ----
+
+    #[test]
+    fn credential_enables_push_flags_git_credential_file_shapes() {
+        let file_cred = |path: &str| CredentialConfig {
+            from_secret: Some("k".to_owned()),
+            file: Some(path.to_owned()),
+            ..Default::default()
+        };
+        // gh CLI token store.
+        assert!(credential_enables_push(&file_cred(
+            "/home/agent/.config/gh/hosts.yml"
+        )));
+        // git credential store files, any name/location.
+        assert!(credential_enables_push(&file_cred(
+            "/home/agent/.git-credentials"
+        )));
+        assert!(credential_enables_push(&file_cred(
+            "/home/agent/.config/git/credentials"
+        )));
+        assert!(credential_enables_push(&file_cred(
+            "/opt/creds/my-credential-store"
+        )));
+        // askpass / credential-helper scripts.
+        assert!(credential_enables_push(&file_cred(
+            "/home/agent/bin/git-askpass.sh"
+        )));
+        // Still NOT flagged: an LLM/cloud key file.
+        assert!(!credential_enables_push(&file_cred(
+            "/home/agent/.config/gcloud/adc.json"
+        )));
+    }
+
+    #[test]
+    fn rejects_file_target_push_credential() {
+        let ws = tmp("file-push");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        let file_cred = |path: &str| CredentialConfig {
+            from_secret: Some("k".to_owned()),
+            file: Some(path.to_owned()),
+            ..Default::default()
+        };
+        for path in [
+            "/home/agent/.config/gh/hosts.yml",
+            "/home/agent/.config/git/credentials",
+        ] {
+            let err = enforce_resident_launch(
+                "orchestration",
+                &isolating_sandbox(),
+                &mounts,
+                &ws,
+                &[file_cred(path)],
+                &no_env(),
+                false,
+                &resident_policy(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("push credential"),
+                "file {path} must be refused: {err}"
+            );
+        }
+    }
+
+    // ---- Finding 3 (BLOCKING) — pre-seeded workspace `.git/config` ----
+
+    #[test]
+    fn url_embeds_credential_classifies_remotes() {
+        assert!(url_embeds_credential(
+            "https://x-access-token:ghp_secret@github.com/foo/bar.git"
+        ));
+        assert!(url_embeds_credential("https://user:pass@example.com/repo"));
+        assert!(url_embeds_credential("https://token@github.com/foo/bar"));
+        // Clean remotes — no embedded userinfo.
+        assert!(!url_embeds_credential("https://github.com/foo/bar.git"));
+        assert!(!url_embeds_credential("git@github.com:foo/bar.git")); // ssh, no scheme://
+        assert!(!url_embeds_credential("../relative/path"));
+    }
+
+    #[test]
+    fn rejects_workspace_git_config_with_embedded_token() {
+        let ws = tmp("git-token");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        seed_git_config(
+            &ws,
+            "[remote \"origin\"]\n\turl = https://x-access-token:ghp_secret@github.com/foo/bar.git\n",
+        );
+        let err = enforce_resident_launch(
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pre-seeded push credential"), "{err}");
+        // The secret itself is never echoed in the refusal.
+        assert!(!err.to_string().contains("ghp_secret"), "must not leak token: {err}");
+    }
+
+    #[test]
+    fn rejects_workspace_git_config_with_credential_helper() {
+        let ws = tmp("git-helper");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        seed_git_config(
+            &ws,
+            "[remote \"origin\"]\n\turl = https://github.com/foo/bar.git\n[credential]\n\thelper = store\n",
+        );
+        let err = enforce_resident_launch(
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pre-seeded push credential"), "{err}");
+    }
+
+    #[test]
+    fn accepts_workspace_git_config_with_clean_remote() {
+        let ws = tmp("git-clean");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        seed_git_config(
+            &ws,
+            "[remote \"origin\"]\n\turl = https://github.com/foo/bar.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n",
+        );
+        enforce_resident_launch(
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[env_cred("ANTHROPIC_API_KEY")],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .expect("a workspace with a clean, credential-free remote must pass");
     }
 }

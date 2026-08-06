@@ -986,6 +986,59 @@ Invariants 1 and 2 are enforced at the mount layer (folded into `check_credentia
 
 > **Status:** the policy engine, live broker, Unix-socket MCP transport, concrete sibling-task launcher, collect channel (`await_subtask`/`await_subtasks`/`subtask_result` + the host `SubtaskResults` seam), and `[orchestration]` config surface are implemented and covered by unit tests. **Remaining:** the launcher is still synchronous/blocking (a non-blocking launcher so a master can spawn a wave then `await_subtasks` is a follow-up), and a docker-backed negative-isolation integration test (`--ignored`) that exercises a real sandboxed master end-to-end and asserts no docker socket / no `~/.varda` in the guest.
 
+### Self-hosting orchestrator (`varda orchestrate`)
+
+`varda orchestrate` launches the **RESIDENT** — a long-lived orchestrator agent that drives Varda's own dev loop by spawning capped workers through the broker above. Unlike the earlier un-sandboxed resident sketch, the resident now runs **inside an isolating sandbox** with a dedicated workspace mounted read-write; it merges worker branches **in-box** against that mount. The blast radius is therefore bounded to *local, un-pushed work in the workspace* plus the *capped worker budget* — nothing reaches a remote from inside the box.
+
+```bash
+# Headless: run the resident autonomously until it terminates or signals needs_user.
+varda orchestrate
+
+# Interactive: attach your terminal (M13b), operator in the conversation, broker available.
+varda orchestrate --interactive
+
+# Point it at a specific dedicated workspace (default: <varda_home>/orchestrate/workspace).
+varda orchestrate --workspace /path/to/orchestration/workspace
+```
+
+The command resolves (or scaffolds) a `resident-orchestrator` task under the workspace whose body points at the workspace's **`.varda/WORKFLOW.md`** — that file holds the loop *intelligence* (a separate concern); `orchestrate` only handles the command, routing, and enforcement. It then delegates to the standard run path, which for an orchestration-enabled route wraps the session in the interactive spawn broker so `spawn_subtask` is served for the whole session.
+
+**Load-bearing gates — asserted in code before launch (`config::enforce_resident_launch`), a violation FAILS LOUDLY:**
+
+| Gate | Requirement | Rejected when… |
+|---|---|---|
+| **G1** workspace | a **dedicated** directory mounted **rw** | the workspace is `$HOME` or a home-ancestor, or it is not mounted read-write |
+| **G2** isolation | an **isolating** sandbox (`primitive != "local"`) | the route resolves to `local`/un-sandboxed |
+| **G2** network | **net-deny** (`egress = []` ⇒ `--network none`) | the sandbox declares any egress allow-list |
+| **G2** no push cred | the resident identity carries **no `git push` credential**, across *every* channel one can reach the box through | `forward_ssh_agent = true`; a credential targets a push channel (env `GITHUB_TOKEN`/`SSH_AUTH_SOCK`/… or a file `.ssh/` key, `*credential*` store, `.config/gh/hosts.yml`, `.netrc`, askpass script); a push-enabling key in the resident's **effective env** (agent + sandbox + route `env` maps — `GITHUB_TOKEN`, `GIT_ASKPASS`, `SSH_AUTH_SOCK`, `GIT_SSH_COMMAND`, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`, `GIT_CONFIG_GLOBAL`/`SYSTEM`, `GIT_TERMINAL_PROMPT`, …); or the workspace's `.git/config` (incl. submodules) carries a token-embedded remote URL or a `credential.helper` |
+| **G7** broker caps | orchestration **enabled** and `local` in `deny_sandboxes` | spawning is disabled, or workers could land un-sandboxed |
+
+**Human-gated push.** Because the resident is network-denied and holds no push credential, it *cannot* push its merged result to a remote. Pushing back out is a deliberate, separate step performed **on the host by a human** after reviewing the workspace — the sandbox produces local commits/branches, never a remote mutation. This is the same clawk-style split the interactive sandbox uses for identity, taken to its strict end: the box has *no* path to a remote at all.
+
+Configure the sandboxed resident route in `config.toml` (see the commented `[sandboxes.orchestration]` / `[[routes]]` / `[routes.orchestration]` example the default config ships):
+
+```toml
+[sandboxes.orchestration]
+image = "your-dev-image:latest"
+primitive = "docker"          # isolating — NEVER "local"
+egress = []                   # net-deny: the box runs with --network none
+
+[[routes]]
+glob = "/path/to/orchestration/workspace/**"
+agents = ["claude"]           # resident identity carries NO git push credential
+sandbox = "orchestration"
+mounts = ["/path/to/orchestration/workspace:/workspace:rw"]  # dedicated rw workspace
+
+[routes.orchestration]
+enabled = true
+max_depth = 1                 # resident depth0 -> workers depth1
+max_fanout = 16               # a full worker/reviewer/resolver wave
+global_child_budget = 64
+deny_sandboxes = ["local"]    # spawned workers must never land un-sandboxed
+```
+
+> A docker-backed live end-to-end test (`#[ignore = "requires docker"]` — `orchestrate_live_resident`) captures the full scenario: a resident in a box spawns one worker that edits a file on a branch, merges it in-box, the change is visible on the host through the mount, and `~/.aws`/host `$HOME` were never visible and no push occurred.
+
 ### Per-task capability allowlist (headless permission grants)
 
 A headless Varda run has **no interactive approver**. The agent backend's own permission layer therefore denies any command it was not pre-authorized to execute — in Claude Code `-p`/print mode there is no human to answer the "allow this command?" prompt, so the command simply fails and the agent (correctly) degrades to `needs_user`. This is the friction that blocked the sandbox-self-test agent, which needed host `msb`/`docker` to live-verify.
