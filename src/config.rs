@@ -32,12 +32,20 @@ max_tool_calls = 0          # reserved; non-zero warns but is not enforced yet
 [[routes]]
 glob = "**"
 agents = ["codex"]
+# sandbox = "devcontainer"
+# env = { GCLOUD_PROJECT = "example-project" }  # trusted, non-secret per-route env
+
+# [routes.orchestration]  # optional per-route override; replaces [orchestration]
+# enabled = false
+# max_depth = 1
+# max_fanout = 1
+# global_child_budget = 2
 
 [agents.codex]
 kind = "acp"
 command = "codex"
 args = ["exec", "--cd", ".", "--add-dir", "{varda_project}", "--add-dir", "{varda_home}", "--sandbox", "workspace-write", "-"]
-streams_output = true
+streams_output = true  # Codex streams live output; leave false/unset for buffered agents.
 interactive_command = "sh"
 interactive_args = ["-c", "codex \"$(cat $VARDA_PROMPT_FILE)\" -C {project} --add-dir {varda_project} --add-dir {varda_home} -s workspace-write"]
 resume_command_template = "codex resume -C {project} --add-dir {varda_project} --add-dir {varda_home} -s workspace-write {external_session_id}"
@@ -49,6 +57,7 @@ args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}", "--a
 interactive_command = "sh"
 interactive_args = ["-c", "claude \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --permission-mode acceptEdits"]
 resume_command_template = "claude --resume {external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --permission-mode acceptEdits"
+# interpreter_agent = "codex"  # optional: agent for post-interactive recap interpretation
 
 [agents.copilot]
 kind = "acp"
@@ -57,6 +66,59 @@ args = ["-c", "copilot -p \"$(cat)\" --allow-all-tools --add-dir {project} --add
 interactive_command = "sh"
 interactive_args = ["-c", "copilot \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home}"]
 resume_command_template = "copilot --resume={external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --allow-all-tools"
+
+# Scoped credential examples: sources are host env vars, named secrets, or
+# host-minted command output; targets are in-box env vars or read-only files.
+# Secret NAMES only here — never paste a resolved secret value into config.toml.
+#
+# Static env source -> in-box env target.
+# [[agents.claude.credentials]]
+# from_env = "CLAUDE_SANDBOX_TOKEN"
+# env = "ANTHROPIC_API_KEY"
+#
+# Secret-store source -> read-only file target.
+# [[agents.claude.credentials]]
+# from_secret = "gcp-service-account-json"
+# file = "/home/agent/.config/gcloud/application_default_credentials.json"
+#
+# GCP deploy with an impersonated, host-minted token; run
+# `gcloud run deploy SERVICE --source . --project "$GCLOUD_PROJECT"` in the box.
+# [[agents.claude.credentials]]
+# command = "gcloud auth print-access-token --impersonate-service-account=deployer@example-project.iam.gserviceaccount.com"
+# env = "CLOUDSDK_AUTH_ACCESS_TOKEN"
+# [[agents.claude.credentials]]
+# command = "gcloud auth print-access-token --impersonate-service-account=deployer@example-project.iam.gserviceaccount.com"
+# env = "GOOGLE_OAUTH_ACCESS_TOKEN"
+#
+# Terraform Cloud API token from the host secret store.
+# [[agents.claude.credentials]]
+# from_secret = "tfc-token"
+# env = "TF_TOKEN_app_terraform_io"
+#
+# Azure DevOps PAT from the host secret store.
+# [[agents.claude.credentials]]
+# from_secret = "azdo-pat"
+# env = "AZURE_DEVOPS_EXT_PAT"
+#
+# Azure CLI service principal via env, or a host-minted access token.
+# [[agents.claude.credentials]]
+# from_secret = "azure-client-id"
+# env = "AZURE_CLIENT_ID"
+# [[agents.claude.credentials]]
+# from_secret = "azure-client-secret"
+# env = "AZURE_CLIENT_SECRET"
+# [[agents.claude.credentials]]
+# from_secret = "azure-tenant-id"
+# env = "AZURE_TENANT_ID"
+# [[agents.claude.credentials]]
+# command = "az account get-access-token --query accessToken -o tsv"
+# env = "AZURE_TOKEN"
+#
+# Command-minted credential with refresh hint.
+# [[agents.claude.credentials]]
+# command = "security find-generic-password -w -s varda-sandbox-token"
+# env = "CUSTOM_SANDBOX_TOKEN"
+# refresh_seconds = 1800
 
 [roles.tester]
 backend = "codex"
@@ -74,6 +136,25 @@ Tester workflow:
 
 [git]
 auto_commit = true
+
+# [sandboxes.devcontainer]
+# image_from = "devcontainer"          # use .devcontainer image/build only
+# primitive = "docker"
+# env = { GCLOUD_PROJECT = "example-project" }
+#
+# [sandboxes.custom]
+# build = "./Dockerfile.varda"         # build at prepare time and run that image
+# primitive = "docker"
+#
+# [orchestration]                      # safe defaults when omitted: disabled
+# enabled = true                       # allow sandboxed masters to request subtasks
+# max_depth = 2
+# max_fanout = 4                       # sibling cap per parent
+# global_child_budget = 16
+# deny_sandboxes = ["local"]           # spawned children must remain isolated
+#
+# Repo-local task definitions live under `.varda/tasks/`; repo workflow rules can
+# live in `.varda/config.toml`. Runtime state stays in the central Varda home.
 "#;
 
 const OPERATIONS_README_CONTENT: &str = r#"# Varda Operations
@@ -1497,6 +1578,158 @@ operations_dir = "operations"
             "no sandbox config keys should be emitted when none are set: {serialized}"
         );
 
+        let reparsed: Config = toml::from_str(&serialized).expect("serialized config should parse");
+        assert_eq!(config, reparsed);
+    }
+
+    #[test]
+    fn documented_config_knobs_parse_and_round_trip() {
+        let documented = format!(
+            r#"{DEFAULT_CONFIG}
+
+[[routes]]
+glob = "/work/gcp/**"
+agents = ["claude"]
+sandbox = "devcontainer"
+env = {{ GCLOUD_PROJECT = "example-project" }}
+
+[routes.orchestration]
+enabled = false
+max_depth = 1
+max_fanout = 1
+global_child_budget = 2
+
+[[agents.claude.credentials]]
+from_env = "CLAUDE_SANDBOX_TOKEN"
+env = "ANTHROPIC_API_KEY"
+
+[[agents.claude.credentials]]
+from_secret = "gcp-service-account-json"
+file = "/home/agent/.config/gcloud/application_default_credentials.json"
+
+[[agents.claude.credentials]]
+command = "gcloud auth print-access-token --impersonate-service-account=deployer@example-project.iam.gserviceaccount.com"
+env = "CLOUDSDK_AUTH_ACCESS_TOKEN"
+
+[[agents.claude.credentials]]
+command = "gcloud auth print-access-token --impersonate-service-account=deployer@example-project.iam.gserviceaccount.com"
+env = "GOOGLE_OAUTH_ACCESS_TOKEN"
+
+[[agents.claude.credentials]]
+from_secret = "tfc-token"
+env = "TF_TOKEN_app_terraform_io"
+
+[[agents.claude.credentials]]
+from_secret = "azdo-pat"
+env = "AZURE_DEVOPS_EXT_PAT"
+
+[[agents.claude.credentials]]
+from_secret = "azure-client-id"
+env = "AZURE_CLIENT_ID"
+
+[[agents.claude.credentials]]
+from_secret = "azure-client-secret"
+env = "AZURE_CLIENT_SECRET"
+
+[[agents.claude.credentials]]
+from_secret = "azure-tenant-id"
+env = "AZURE_TENANT_ID"
+
+[[agents.claude.credentials]]
+command = "az account get-access-token --query accessToken -o tsv"
+env = "AZURE_TOKEN"
+
+[[agents.claude.credentials]]
+command = "security find-generic-password -w -s varda-sandbox-token"
+env = "CUSTOM_SANDBOX_TOKEN"
+refresh_seconds = 1800
+
+[agents.claude.env]
+STATIC_TOOL_VALUE = "enabled"
+
+[agents.local-shell]
+kind = "acp"
+command = "sh"
+args = ["-c", "cat"]
+interactive_command = "sh"
+interactive_args = ["-i"]
+interpreter_agent = "codex"
+
+[sandboxes.devcontainer]
+image_from = "devcontainer"
+primitive = "docker"
+env = {{ GCLOUD_PROJECT = "example-project" }}
+
+[sandboxes.custom]
+build = "./Dockerfile.varda"
+primitive = "docker"
+
+[orchestration]
+enabled = true
+max_depth = 2
+max_fanout = 4
+global_child_budget = 16
+deny_sandboxes = ["local"]
+"#
+        );
+        let config: Config =
+            toml::from_str(&documented).expect("documented config examples should parse");
+
+        assert_eq!(
+            config.agents["local-shell"].interpreter_agent.as_deref(),
+            Some("codex")
+        );
+        assert_eq!(config.agents["claude"].credentials.len(), 11);
+        assert!(
+            config.agents["claude"]
+                .credentials
+                .iter()
+                .any(|cred| cred.from_env.as_deref() == Some("CLAUDE_SANDBOX_TOKEN")
+                    && cred.env.as_deref() == Some("ANTHROPIC_API_KEY"))
+        );
+        assert!(
+            config.agents["claude"]
+                .credentials
+                .iter()
+                .any(|cred| cred.from_secret.as_deref() == Some("gcp-service-account-json")
+                    && cred.file.as_deref()
+                        == Some("/home/agent/.config/gcloud/application_default_credentials.json"))
+        );
+        assert!(
+            config.agents["claude"]
+                .credentials
+                .iter()
+                .any(|cred| cred.command.as_deref().is_some_and(|command| command
+                    .contains("gcloud auth print-access-token"))
+                    && cred.env.as_deref() == Some("CLOUDSDK_AUTH_ACCESS_TOKEN"))
+        );
+        assert_eq!(
+            config.routes[1].env.get("GCLOUD_PROJECT").map(String::as_str),
+            Some("example-project")
+        );
+        assert_eq!(
+            config.sandboxes["devcontainer"].env.get("GCLOUD_PROJECT").map(String::as_str),
+            Some("example-project")
+        );
+        assert_eq!(
+            config.sandboxes["devcontainer"].image_from.as_deref(),
+            Some("devcontainer")
+        );
+        assert_eq!(
+            config.sandboxes["custom"].build.as_deref(),
+            Some("./Dockerfile.varda")
+        );
+        assert!(config.orchestration.enabled);
+        assert_eq!(config.orchestration.max_fanout, 4);
+        assert!(
+            config.routes[1]
+                .orchestration
+                .as_ref()
+                .is_some_and(|policy| !policy.enabled && policy.max_depth == 1)
+        );
+        assert_eq!(config.agents["codex"].streams_output, Some(true));
+
+        let serialized = toml::to_string_pretty(&config).expect("config should serialize");
         let reparsed: Config = toml::from_str(&serialized).expect("serialized config should parse");
         assert_eq!(config, reparsed);
     }
