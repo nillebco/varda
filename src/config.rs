@@ -680,6 +680,15 @@ pub struct AgentConfig {
     /// name can be re-exported into the box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token_target: Option<String>,
+    /// M11-ext — a LIST of scoped credential injections (`[[agents.X.credentials]]`).
+    /// Each entry names exactly one SOURCE (host env var, host secret store, or a
+    /// host command whose stdout is a short-lived token) and exactly one TARGET
+    /// (a scoped in-box env var, or a read-only file staged in the guest). The
+    /// legacy `auth_token_env`/`auth_token_target` pair is one-entry sugar over
+    /// this list (see [`AgentConfig::effective_credentials`]). Sources live only in
+    /// the TRUSTED central config, never `.varda`; a credential DIR is never mounted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<CredentialConfig>,
     /// Command to use when running interactively (inherits terminal stdio).
     /// When set, the agent is spawned with all streams inherited from the terminal
     /// and $VARDA_PROMPT_FILE points to a file containing the task prompt.
@@ -706,6 +715,118 @@ pub struct AgentConfig {
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     Acp,
+}
+
+/// One scoped credential injection for a sandboxed agent (M11-ext).
+///
+/// Each entry names exactly one **source** — where the scoped value is minted on
+/// the HOST at `prepare` time — and exactly one **target** — how the (minimal,
+/// scoped) value is exposed INSIDE the box. A credential DIR is never mounted; only
+/// the resolved value crosses the boundary.
+///
+/// Sources belong in the TRUSTED central config only. `.varda` may reference secret
+/// NAMES (`from_secret`) but must never carry a raw value or a `command`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CredentialConfig {
+    /// SOURCE: read the value from this HOST env var at prepare time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_env: Option<String>,
+    /// SOURCE: read the value from this named secret in the host secret store
+    /// (`fnox` / Proton Pass), resolved by `fnox get <name>` at prepare time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_secret: Option<String>,
+    /// SOURCE: run this command on the HOST at prepare time and use its stdout
+    /// (trailing newline trimmed) — for host-minted, least-privilege short-lived
+    /// tokens. The minting identity stays on the host; the box only sees the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// TARGET (default): inject the value as this scoped in-box env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// TARGET: stage the value as a read-only file at this absolute GUEST path
+    /// (via the session's `stage_file`; cleaned on teardown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Re-mint (`command` sources) after this many seconds for long interactive
+    /// sessions. Parsed and preserved for forward-compat; periodic refresh is a
+    /// follow-up — today the value is minted ONCE at `prepare`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_seconds: Option<u64>,
+}
+
+/// The validated SOURCE of a [`CredentialConfig`] (exactly one is set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSource<'a> {
+    /// Host env var name.
+    Env(&'a str),
+    /// Host secret-store name (`fnox`).
+    Secret(&'a str),
+    /// Host command whose stdout is the value.
+    Command(&'a str),
+}
+
+/// The validated TARGET of a [`CredentialConfig`] (exactly one is set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialTarget<'a> {
+    /// Scoped in-box env var name.
+    Env(&'a str),
+    /// Absolute guest path for a staged read-only file.
+    File(&'a str),
+}
+
+impl CredentialConfig {
+    /// Validate and return the single source, erroring when none or more than one is set.
+    pub fn source(&self) -> Result<CredentialSource<'_>> {
+        let set = self.from_env.is_some() as u8
+            + self.from_secret.is_some() as u8
+            + self.command.is_some() as u8;
+        if set == 0 {
+            bail!("credential entry has no source: set exactly one of `from_env`, `from_secret`, or `command`");
+        }
+        if set > 1 {
+            bail!("credential entry sets multiple sources: use exactly one of `from_env`, `from_secret`, or `command`");
+        }
+        if let Some(name) = &self.from_env {
+            Ok(CredentialSource::Env(name))
+        } else if let Some(name) = &self.from_secret {
+            Ok(CredentialSource::Secret(name))
+        } else {
+            Ok(CredentialSource::Command(self.command.as_deref().expect("command set")))
+        }
+    }
+
+    /// Validate and return the single target, erroring when none or both are set.
+    pub fn target(&self) -> Result<CredentialTarget<'_>> {
+        match (self.env.as_deref(), self.file.as_deref()) {
+            (Some(_), Some(_)) => {
+                bail!("credential entry sets both `env` and `file`: choose exactly one target")
+            }
+            (Some(env), None) => Ok(CredentialTarget::Env(env)),
+            (None, Some(file)) => Ok(CredentialTarget::File(file)),
+            (None, None) => {
+                bail!("credential entry has no target: set exactly one of `env` or `file`")
+            }
+        }
+    }
+}
+
+impl AgentConfig {
+    /// Effective credential list: the explicit `[[agents.X.credentials]]` entries,
+    /// plus the legacy `auth_token_env`/`auth_token_target` single-token pair folded
+    /// in as one-entry sugar (`from_env` → `env`, defaulting the target name to the
+    /// source name). The legacy entry is appended last so explicit entries win on a
+    /// duplicate target during resolution.
+    pub fn effective_credentials(&self) -> Vec<CredentialConfig> {
+        let mut creds = self.credentials.clone();
+        if let Some(src) = &self.auth_token_env {
+            creds.push(CredentialConfig {
+                from_env: Some(src.clone()),
+                env: Some(self.auth_token_target.clone().unwrap_or_else(|| src.clone())),
+                ..Default::default()
+            });
+        }
+        creds
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1032,6 +1153,124 @@ fn default_auto_commit() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent_with_credentials(credentials: Vec<CredentialConfig>) -> AgentConfig {
+        AgentConfig {
+            kind: AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            streams_output: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials,
+            interactive_command: None,
+            interactive_args: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+        }
+    }
+
+    #[test]
+    fn credential_source_and_target_validation() {
+        // Exactly one source + one target resolves.
+        let ok = CredentialConfig {
+            from_env: Some("HOST_TOKEN".to_owned()),
+            env: Some("IN_BOX".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(ok.source().unwrap(), CredentialSource::Env("HOST_TOKEN"));
+        assert_eq!(ok.target().unwrap(), CredentialTarget::Env("IN_BOX"));
+
+        // No source / no target both error.
+        let bare = CredentialConfig::default();
+        assert!(bare.source().is_err(), "no source must error");
+        let no_target = CredentialConfig {
+            command: Some("mint".to_owned()),
+            ..Default::default()
+        };
+        assert!(no_target.target().is_err(), "no target must error");
+
+        // Multiple sources / both targets error.
+        let two_sources = CredentialConfig {
+            from_env: Some("A".to_owned()),
+            command: Some("mint".to_owned()),
+            env: Some("X".to_owned()),
+            ..Default::default()
+        };
+        assert!(two_sources.source().is_err(), "multiple sources must error");
+        let two_targets = CredentialConfig {
+            from_secret: Some("s".to_owned()),
+            env: Some("X".to_owned()),
+            file: Some("/etc/tok".to_owned()),
+            ..Default::default()
+        };
+        assert!(two_targets.target().is_err(), "both targets must error");
+    }
+
+    #[test]
+    fn effective_credentials_folds_legacy_auth_token_sugar() {
+        // Legacy single-token pair becomes a trailing `from_env` → `env` entry, with
+        // the target defaulting to the source name when `auth_token_target` is unset.
+        let mut agent = agent_with_credentials(vec![]);
+        agent.auth_token_env = Some("HOST_ANTHROPIC".to_owned());
+        let creds = agent.effective_credentials();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].source().unwrap(), CredentialSource::Env("HOST_ANTHROPIC"));
+        assert_eq!(creds[0].target().unwrap(), CredentialTarget::Env("HOST_ANTHROPIC"));
+
+        agent.auth_token_target = Some("ANTHROPIC_API_KEY".to_owned());
+        let creds = agent.effective_credentials();
+        assert_eq!(creds[0].target().unwrap(), CredentialTarget::Env("ANTHROPIC_API_KEY"));
+
+        // Explicit entries come first, legacy sugar appended last.
+        agent.credentials = vec![CredentialConfig {
+            command: Some("mint".to_owned()),
+            file: Some("/home/agent/.token".to_owned()),
+            ..Default::default()
+        }];
+        let creds = agent.effective_credentials();
+        assert_eq!(creds.len(), 2);
+        assert_eq!(creds[0].target().unwrap(), CredentialTarget::File("/home/agent/.token"));
+        assert_eq!(creds[1].source().unwrap(), CredentialSource::Env("HOST_ANTHROPIC"));
+    }
+
+    #[test]
+    fn credentials_list_parses_from_toml() {
+        let toml = r#"kind = "acp"
+command = "claude"
+
+[[credentials]]
+command = "gcloud auth print-access-token"
+env = "CLOUDSDK_AUTH_ACCESS_TOKEN"
+
+[[credentials]]
+from_secret = "tfc-token"
+env = "TF_TOKEN_app_terraform_io"
+
+[[credentials]]
+from_env = "HOST_TOKEN"
+file = "/home/agent/.config/token"
+refresh_seconds = 1800
+"#;
+        let agent: AgentConfig = toml::from_str(toml).unwrap();
+        assert_eq!(agent.credentials.len(), 3);
+        assert_eq!(
+            agent.credentials[0].source().unwrap(),
+            CredentialSource::Command("gcloud auth print-access-token")
+        );
+        assert_eq!(
+            agent.credentials[1].source().unwrap(),
+            CredentialSource::Secret("tfc-token")
+        );
+        assert_eq!(
+            agent.credentials[2].target().unwrap(),
+            CredentialTarget::File("/home/agent/.config/token")
+        );
+        assert_eq!(agent.credentials[2].refresh_seconds, Some(1800));
+    }
 
     #[test]
     fn legacy_config_without_m10_bounds_parses_with_defaults() {

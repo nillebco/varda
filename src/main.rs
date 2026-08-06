@@ -1315,7 +1315,7 @@ fn build_client(
     // M11 — resolve the three identity/auth channels (curated identity files,
     // SSH-agent + git identity, scoped auth token) once and inject them into
     // whichever provider is selected. `local` ignores them (no boundary to cross).
-    let identity = resolve_sandbox_identity(config, agent_config);
+    let identity = resolve_sandbox_identity(config, agent_config)?;
     let mut static_env = std::collections::BTreeMap::new();
     let provider = match project_path {
         Some(project_path) => {
@@ -1357,20 +1357,23 @@ fn enforce_varda_env_credential_floor(
     agent_config: &config::AgentConfig,
     resolved: &config::ResolvedSandbox,
 ) -> Result<()> {
-    if let Some(target) = agent_config
-        .auth_token_target
-        .as_ref()
-        .or(agent_config.auth_token_env.as_ref())
-        && resolved.varda_env_keys.iter().any(|key| key == target)
-    {
-        let origin = resolved
-            .varda_file
-            .as_deref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| ".varda".to_owned());
-        anyhow::bail!(
-            "`.varda` at {origin} declares env key '{target}', which would override credential injection"
-        );
+    // Every credential ENV target (the legacy pair folds into this list) is a
+    // credential-injection sink; a `.varda` may not shadow one. File targets are
+    // guest paths, not env keys, so they cannot collide with `varda_env_keys`.
+    for cred in agent_config.effective_credentials() {
+        let Ok(config::CredentialTarget::Env(target)) = cred.target() else {
+            continue;
+        };
+        if resolved.varda_env_keys.iter().any(|key| key == target) {
+            let origin = resolved
+                .varda_file
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| ".varda".to_owned());
+            anyhow::bail!(
+                "`.varda` at {origin} declares env key '{target}', which would override credential injection"
+            );
+        }
     }
     for key in &resolved.varda_env_keys {
         if agent_config.env.contains_key(key) {
@@ -1403,24 +1406,13 @@ fn enforce_varda_env_credential_floor(
 fn resolve_sandbox_identity(
     config: &config::Config,
     agent_config: &config::AgentConfig,
-) -> sandbox::SandboxIdentity {
+) -> Result<sandbox::SandboxIdentity> {
     let defaults = &config.defaults;
-    let mut auth_env = std::collections::BTreeMap::new();
-    if let Some(src) = &agent_config.auth_token_env {
-        match std::env::var(src) {
-            Ok(value) if !value.is_empty() => {
-                let target = agent_config
-                    .auth_token_target
-                    .clone()
-                    .unwrap_or_else(|| src.clone());
-                auth_env.insert(target, value);
-            }
-            _ => eprintln!(
-                "sandbox: auth_token_env '{src}' is unset/empty on the host; the sandboxed agent \
-                 will not be authenticated (set a dedicated, scoped sandbox token)"
-            ),
-        }
-    }
+    // M11-ext — resolve the effective credential list (explicit `credentials`
+    // entries plus the legacy `auth_token_env`/`auth_token_target` sugar) into the
+    // two injection channels: scoped in-box env vars and read-only staged files.
+    // Everything is minted HOST-side; only the scoped value crosses the boundary.
+    let (auth_env, auth_files) = resolve_agent_credentials(agent_config)?;
 
     // Forward the SSH agent socket only when forwarding is enabled AND a live
     // socket exists on the host; otherwise the mount source would be missing.
@@ -1445,17 +1437,107 @@ fn resolve_sandbox_identity(
         git_name: defaults.git_user_name.clone(),
         git_email: defaults.git_user_email.clone(),
         auth_env,
+        auth_files,
     };
     if !identity.is_empty() {
         eprintln!(
-            "sandbox: identity channels active — auth_token:{} ssh_agent:{} git_identity:{} identity_files:{}",
-            !identity.auth_env.is_empty(),
+            "sandbox: identity channels active — cred_env:{} cred_files:{} ssh_agent:{} git_identity:{} identity_files:{}",
+            identity.auth_env.len(),
+            identity.auth_files.len(),
             identity.ssh_auth_sock.is_some(),
             identity.git_name.is_some() || identity.git_email.is_some(),
             identity.identity_context.len(),
         );
     }
-    identity
+    Ok(identity)
+}
+
+/// M11-ext — resolve an agent's effective credential list into the two injection
+/// channels: `(auth_env, auth_files)` where `auth_env` maps in-box env var names to
+/// scoped values and `auth_files` maps absolute guest paths to scoped values. Each
+/// entry is validated (exactly one source, exactly one target) and minted HOST-side.
+fn resolve_agent_credentials(
+    agent_config: &config::AgentConfig,
+) -> Result<(
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+)> {
+    let mut auth_env = std::collections::BTreeMap::new();
+    let mut auth_files = std::collections::BTreeMap::new();
+    for cred in agent_config.effective_credentials() {
+        let source = cred.source()?;
+        let target = cred.target()?;
+        let Some(value) = resolve_credential_value(&source)? else {
+            continue;
+        };
+        match target {
+            config::CredentialTarget::Env(name) => {
+                auth_env.insert(name.to_owned(), value);
+            }
+            config::CredentialTarget::File(path) => {
+                auth_files.insert(path.to_owned(), value);
+            }
+        }
+    }
+    Ok((auth_env, auth_files))
+}
+
+/// Mint a single credential value on the HOST. Returns `Ok(None)` when a
+/// `from_env`/`from_secret` source is unset/empty (skip the injection so the box
+/// still boots, matching the legacy `auth_token_env` behavior). `command` and
+/// secret-store failures fail loudly — the minting identity never reaches the box,
+/// so a broken mint must not silently degrade to an unauthenticated run.
+fn resolve_credential_value(source: &config::CredentialSource<'_>) -> Result<Option<String>> {
+    match source {
+        config::CredentialSource::Env(name) => match std::env::var(name) {
+            Ok(value) if !value.is_empty() => Ok(Some(value)),
+            _ => {
+                eprintln!(
+                    "sandbox: credential source env '{name}' is unset/empty on the host; skipping \
+                     this injection (set a dedicated, scoped sandbox token)"
+                );
+                Ok(None)
+            }
+        },
+        config::CredentialSource::Secret(name) => {
+            let value = run_host_credential_command("fnox", &["get", name]).with_context(|| {
+                format!("failed to resolve secret '{name}' from the host secret store (`fnox get {name}`)")
+            })?;
+            if value.is_empty() {
+                anyhow::bail!("secret '{name}' resolved to an empty value on the host");
+            }
+            Ok(Some(value))
+        }
+        config::CredentialSource::Command(cmd) => {
+            let value = run_host_credential_command("sh", &["-c", cmd])
+                .with_context(|| format!("credential command failed on the host: {cmd}"))?;
+            if value.is_empty() {
+                anyhow::bail!("credential command produced empty output on the host: {cmd}");
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
+/// Run a host-side credential minting command and return its stdout with the
+/// trailing newline trimmed. Never logs stdout (it is a secret); errors surface
+/// only the command and its stderr.
+fn run_host_credential_command(program: &str, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to spawn host credential command `{program}`"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`{program} {}` exited with {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(['\n', '\r'])
+        .to_owned())
 }
 
 /// Bound for the upward `.varda` walk: the git repository root of `project_path`,
@@ -3502,6 +3584,7 @@ planner_agent: codex
             env: std::collections::BTreeMap::from([("TRUSTED_AGENT".to_owned(), "x".to_owned())]),
             auth_token_env: Some("HOST_TOKEN".to_owned()),
             auth_token_target: Some("SANDBOX_TOKEN".to_owned()),
+            credentials: Vec::new(),
             interactive_command: None,
             interactive_args: None,
             streams_output: None,
@@ -3525,6 +3608,116 @@ planner_agent: codex
         resolved.varda_env_keys = vec!["SANDBOX_TOKEN".to_owned()];
         let err = enforce_varda_env_credential_floor(&agent, &resolved).unwrap_err();
         assert!(err.to_string().contains("SANDBOX_TOKEN"), "{err}");
+    }
+
+    fn agent_for_credentials(credentials: Vec<config::CredentialConfig>) -> config::AgentConfig {
+        config::AgentConfig {
+            kind: config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: Vec::new(),
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: std::collections::BTreeMap::new(),
+            streams_output: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials,
+            interactive_command: None,
+            interactive_args: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+        }
+    }
+
+    /// Exit criterion: several credentials inject per run — multiple env targets and
+    /// ≥1 file target, minted at prepare from a `command` source (the FAKE mint) plus
+    /// a `from_env` source. The scoped values reach BOTH channels.
+    #[test]
+    fn resolve_agent_credentials_mints_env_and_file_targets() {
+        // SAFETY: a uniquely-named var this test owns; set and removed within it.
+        unsafe { std::env::set_var("VARDA_TEST_CRED_HOST", "sk-host-token") };
+        let agent = agent_for_credentials(vec![
+            // command source → env target (host-minted short-lived token).
+            config::CredentialConfig {
+                command: Some("printf scoped-access-token".to_owned()),
+                env: Some("CLOUDSDK_AUTH_ACCESS_TOKEN".to_owned()),
+                ..Default::default()
+            },
+            // from_env source → env target.
+            config::CredentialConfig {
+                from_env: Some("VARDA_TEST_CRED_HOST".to_owned()),
+                env: Some("ANTHROPIC_API_KEY".to_owned()),
+                ..Default::default()
+            },
+            // command source → file target (staged read-only in the guest).
+            config::CredentialConfig {
+                command: Some("printf scoped-file-token".to_owned()),
+                file: Some("/home/agent/.config/gcloud-token".to_owned()),
+                ..Default::default()
+            },
+        ]);
+
+        let (auth_env, auth_files) = resolve_agent_credentials(&agent).unwrap();
+        unsafe { std::env::remove_var("VARDA_TEST_CRED_HOST") };
+
+        assert_eq!(
+            auth_env.get("CLOUDSDK_AUTH_ACCESS_TOKEN").map(String::as_str),
+            Some("scoped-access-token")
+        );
+        assert_eq!(
+            auth_env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-host-token")
+        );
+        assert_eq!(
+            auth_files.get("/home/agent/.config/gcloud-token").map(String::as_str),
+            Some("scoped-file-token")
+        );
+    }
+
+    /// Back-compat: the legacy `auth_token_env`/`auth_token_target` pair still injects
+    /// as a single env-target credential (one-entry sugar over the list).
+    #[test]
+    fn resolve_agent_credentials_back_compat_single_token() {
+        unsafe { std::env::set_var("VARDA_TEST_LEGACY_TOKEN", "sk-legacy") };
+        let mut agent = agent_for_credentials(vec![]);
+        agent.auth_token_env = Some("VARDA_TEST_LEGACY_TOKEN".to_owned());
+        agent.auth_token_target = Some("ANTHROPIC_API_KEY".to_owned());
+
+        let (auth_env, auth_files) = resolve_agent_credentials(&agent).unwrap();
+        unsafe { std::env::remove_var("VARDA_TEST_LEGACY_TOKEN") };
+
+        assert_eq!(auth_env.get("ANTHROPIC_API_KEY").map(String::as_str), Some("sk-legacy"));
+        assert!(auth_files.is_empty());
+    }
+
+    /// A missing `from_env` source is skipped (box still boots unauthenticated); a
+    /// failing or empty `command` source fails loudly (a broken mint must not silently
+    /// degrade to an unauthenticated run).
+    #[test]
+    fn resolve_agent_credentials_missing_env_skips_but_bad_command_fails() {
+        let agent = agent_for_credentials(vec![config::CredentialConfig {
+            from_env: Some("VARDA_TEST_UNSET_CRED_9x".to_owned()),
+            env: Some("SHOULD_NOT_APPEAR".to_owned()),
+            ..Default::default()
+        }]);
+        let (auth_env, _) = resolve_agent_credentials(&agent).unwrap();
+        assert!(auth_env.is_empty(), "missing env source must be skipped: {auth_env:?}");
+
+        // Empty output fails loudly.
+        let empty = agent_for_credentials(vec![config::CredentialConfig {
+            command: Some("true".to_owned()),
+            env: Some("X".to_owned()),
+            ..Default::default()
+        }]);
+        assert!(resolve_agent_credentials(&empty).is_err(), "empty command output must fail");
+
+        // Non-zero exit fails loudly.
+        let failing = agent_for_credentials(vec![config::CredentialConfig {
+            command: Some("exit 3".to_owned()),
+            env: Some("X".to_owned()),
+            ..Default::default()
+        }]);
+        assert!(resolve_agent_credentials(&failing).is_err(), "failed command must fail");
     }
 
     fn test_task_document() -> task::TaskDocument {

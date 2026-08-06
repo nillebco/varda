@@ -28,6 +28,23 @@ use crate::sandbox::{
 /// via `VARDA_PROMPT_FILE` (M13a §5).
 const GUEST_PROMPT_FILE: &str = "/home/agent/.varda-prompt.txt";
 
+/// M11-ext — stage every file-target credential the identity resolved
+/// ([`SandboxSession::identity_files`]) into the guest via `stage_credential_file`,
+/// so the value lands as a READ-ONLY file inside the box in BOTH launch modes
+/// (docker cp / msb `--copy-file`; cleaned on teardown). Env-target credentials
+/// fold in via the provider's `guest_env()` at wrap and need no staging. Must run
+/// after `prepare` and before `wrap` (providers bake staging into the argv).
+fn stage_identity_files(session: &dyn SandboxSession, sandbox_name: &str) -> Result<()> {
+    for (guest_path, value) in session.identity_files() {
+        session
+            .stage_credential_file(&value, &guest_path)
+            .with_context(|| {
+                format!("failed to stage credential file '{guest_path}' into '{sandbox_name}' sandbox")
+            })?;
+    }
+    Ok(())
+}
+
 /// Owns the prepared sandbox [`SandboxSession`] and guarantees `teardown()` runs
 /// on EVERY exit path — including a cancel, where the M10 idle/budget watchdog
 /// drops the in-flight `run_task` future before it reaches the inline teardown.
@@ -277,12 +294,26 @@ impl AcpSubprocessClient {
         session
             .validate_mounts()
             .with_context(|| format!("unusable mount for '{}' sandbox", self.sandbox.name()))?;
+        // M11-ext — stage any file-target credentials as read-only guest files
+        // before wrap bakes the argv. env-target credentials fold in via the
+        // provider's `guest_env()` at wrap; file targets need the live session.
+        stage_identity_files(session, self.sandbox.name())?;
         // Live stores (local) are polled while the agent runs; extracted stores
         // (docker volume + `docker cp`) are only discovered post-exit.
         let store_is_live = session.store_is_live();
         let spec = session.wrap(spec, LaunchMode::Batch).with_context(|| {
             format!(
                 "failed to wrap command for '{}' sandbox",
+                self.sandbox.name()
+            )
+        })?;
+        // Provider-specific batch pre-start staging: docker `create` → `docker cp`
+        // any file-target credentials → `start -ai` so they actually reach the
+        // guest (its `docker run` streaming form cannot copy a file in first).
+        // local/msb return the wrapped command unchanged.
+        let spec = session.begin_batch(spec).await.with_context(|| {
+            format!(
+                "failed to begin batch session for '{}' sandbox",
                 self.sandbox.name()
             )
         })?;
@@ -754,6 +785,8 @@ impl AcpSubprocessClient {
             .stage_file(prompt, GUEST_PROMPT_FILE)
             .context("failed to stage the task prompt into the sandbox")?;
         env.insert("VARDA_PROMPT_FILE".to_owned(), guest_prompt.clone());
+        // M11-ext — stage file-target credentials (env targets fold in via env above).
+        stage_identity_files(session, self.sandbox.name())?;
         let spec = CommandSpec {
             env: env.clone(),
             ..spec
@@ -1626,6 +1659,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            credentials: Vec::new(),
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
@@ -1727,6 +1761,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            credentials: Vec::new(),
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
@@ -1790,6 +1825,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            credentials: Vec::new(),
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
@@ -1944,6 +1980,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            credentials: Vec::new(),
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
@@ -1986,6 +2023,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            credentials: Vec::new(),
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
@@ -2058,6 +2096,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            credentials: Vec::new(),
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
@@ -2125,6 +2164,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            credentials: Vec::new(),
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
@@ -2336,6 +2376,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            credentials: Vec::new(),
             streams_output: None,
             resume_command_template: Some(
                 "claude --resume {external_session_id} --add-dir {project}".to_owned(),
@@ -2367,6 +2408,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            credentials: Vec::new(),
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
@@ -2525,6 +2567,7 @@ mod tests {
             interactive_args: None,
             auth_token_env: None,
             auth_token_target: None,
+            credentials: Vec::new(),
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
