@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 use globset::Glob;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::task::JoinHandle;
 
 use crate::agent::{parse_blocked_commands, parse_files_touched};
 use crate::task::TaskStatus;
@@ -542,6 +543,10 @@ struct SpawnTreeState {
     /// at its inherited depth for a spawned subtask run); each accepted child is
     /// registered at its granted depth so future brokers resolve depth correctly.
     depths: BTreeMap<SubtaskId, u32>,
+    /// Detached child runs still owned by this root orchestration run. The run
+    /// path drains these on normal completion before tearing down the broker
+    /// socket, or aborts them when the parent run itself errors/cancels.
+    handles: BTreeMap<SubtaskId, JoinHandle<()>>,
 }
 
 /// Shared spawn tree state for one root orchestration run. Clone and pass this
@@ -553,6 +558,29 @@ pub struct SharedSpawnState(Arc<Mutex<SpawnTreeState>>);
 impl SharedSpawnState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn insert_handle(&self, id: SubtaskId, handle: JoinHandle<()>) {
+        self.0
+            .lock()
+            .expect("spawn state mutex poisoned")
+            .handles
+            .insert(id, handle);
+    }
+
+    pub fn drain_handles(&self) -> Vec<(SubtaskId, JoinHandle<()>)> {
+        std::mem::take(&mut self.0.lock().expect("spawn state mutex poisoned").handles)
+            .into_iter()
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn handle_count(&self) -> usize {
+        self.0
+            .lock()
+            .expect("spawn state mutex poisoned")
+            .handles
+            .len()
     }
 }
 
@@ -1501,6 +1529,24 @@ deny_sandboxes = ["local"]
         // A failed launch must not consume budget/fan-out.
         assert_eq!(broker.global_spawned(), 0);
         assert_eq!(broker.depth_of("sub-1"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_state_tracks_and_drains_detached_handles() {
+        let state = SharedSpawnState::new();
+        state.insert_handle(
+            "child".to_owned(),
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+            }),
+        );
+
+        assert_eq!(state.handle_count(), 1);
+        let handles = state.drain_handles();
+        assert_eq!(state.handle_count(), 0);
+        assert_eq!(handles.len(), 1);
+
+        handles.into_iter().next().unwrap().1.await.unwrap();
     }
 
     #[test]
