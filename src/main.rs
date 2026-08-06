@@ -1256,6 +1256,22 @@ async fn abort_spawned_subtasks(spawn_state: &orchestration::SharedSpawnState) {
     }
 }
 
+async fn finish_spawned_subtasks(
+    spawn_state: &orchestration::SharedSpawnState,
+    is_root_run: bool,
+    run_succeeded: bool,
+) {
+    if !is_root_run {
+        return;
+    }
+
+    if run_succeeded {
+        join_spawned_subtasks(spawn_state).await;
+    } else {
+        abort_spawned_subtasks(spawn_state).await;
+    }
+}
+
 /// Host-side collect channel: resolves a spawned subtask id to its STATE
 /// (status + recap text) from the `~/.varda` home store. Injected into the
 /// [`orchestration::SpawnBroker`] so a sandboxed master's `await_subtask*` /
@@ -1357,12 +1373,9 @@ impl AgentClient for OrchestratedAgentClient {
         });
 
         request.orchestration_socket_path = Some(socket_path.display().to_string());
+        let is_root_run = self.lineage.is_none();
         let result = self.inner.run_task(request).await;
-        if result.is_ok() {
-            join_spawned_subtasks(&spawn_state).await;
-        } else {
-            abort_spawned_subtasks(&spawn_state).await;
-        }
+        finish_spawned_subtasks(&spawn_state, is_root_run, result.is_ok()).await;
         server.abort();
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir(&socket_dir);
@@ -3630,6 +3643,43 @@ planner_agent: codex
         join_spawned_subtasks(&state).await;
 
         assert_eq!(completed.load(Ordering::SeqCst), 2);
+        assert_eq!(state.handle_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_orchestrated_child_returns_without_self_joining_shared_state() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let state = orchestration::SharedSpawnState::new();
+        let child_state = state.clone();
+        let terminal_written = Arc::new(AtomicBool::new(false));
+        let child_terminal_written = terminal_written.clone();
+
+        let child_handle = tokio::spawn(async move {
+            finish_spawned_subtasks(&child_state, false, true).await;
+            child_terminal_written.store(true, Ordering::SeqCst);
+        });
+        state.insert_handle("child".to_owned(), child_handle);
+
+        timeout(Duration::from_millis(100), async {
+            while !terminal_written.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("child run should not self-join");
+
+        timeout(
+            Duration::from_millis(100),
+            finish_spawned_subtasks(&state, true, true),
+        )
+        .await
+        .expect("root cleanup should join the completed child");
         assert_eq!(state.handle_count(), 0);
     }
 
