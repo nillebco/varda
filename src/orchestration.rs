@@ -705,6 +705,17 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 mod tests {
     use super::*;
 
+    fn resident_policy() -> OrchestrationPolicy {
+        OrchestrationPolicy {
+            enabled: true,
+            max_depth: 1,
+            max_fanout: 16,
+            global_child_budget: 64,
+            deny_sandboxes: vec!["local".to_owned()],
+            ..Default::default()
+        }
+    }
+
     fn base_policy() -> OrchestrationPolicy {
         OrchestrationPolicy {
             enabled: true,
@@ -922,6 +933,130 @@ mod tests {
         assert!(ledger.authorize(&policy, &deny_ctx, &req()).is_err());
         assert_eq!(ledger.global_spawned(), 0);
         assert_eq!(ledger.children_of("deep"), 0);
+    }
+
+    #[test]
+    fn resident_policy_stops_workers_from_spawning_with_max_depth_one() {
+        let policy = resident_policy();
+        let ledger = SpawnLedger::new();
+
+        assert!(ledger.authorize(&policy, &ctx("resident", 0), &req()).is_ok());
+        assert_eq!(
+            ledger.authorize(&policy, &ctx("worker", 1), &req()),
+            Err(SpawnDenied::DepthExceeded {
+                attempted: 2,
+                max: 1
+            })
+        );
+    }
+
+    #[test]
+    fn resident_policy_denies_spawned_children_from_landing_local() {
+        let policy = resident_policy();
+        let ledger = SpawnLedger::new();
+        let mut local = req();
+        local.sandbox = Some("local".to_owned());
+
+        assert_eq!(
+            ledger.authorize(&policy, &ctx("resident", 0), &local),
+            Err(SpawnDenied::SandboxNotAllowed {
+                sandbox: "local".to_owned()
+            })
+        );
+
+        let mut isolated = req();
+        isolated.sandbox = Some("docker".to_owned());
+        assert!(
+            ledger
+                .authorize(&policy, &ctx("resident", 0), &isolated)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn resident_max_fanout_sixteen_fits_full_wave_then_denies_seventeenth() {
+        let policy = resident_policy();
+        let mut ledger = SpawnLedger::new();
+
+        for _ in 0..12 {
+            ledger
+                .authorize_and_record(&policy, &ctx("resident", 0), &req())
+                .unwrap();
+        }
+        assert_eq!(ledger.children_of("resident"), 12);
+
+        for _ in 0..4 {
+            ledger
+                .authorize_and_record(&policy, &ctx("resident", 0), &req())
+                .unwrap();
+        }
+        assert_eq!(ledger.children_of("resident"), 16);
+        assert_eq!(
+            ledger.authorize(&policy, &ctx("resident", 0), &req()),
+            Err(SpawnDenied::FanoutExceeded {
+                parent: "resident".to_owned(),
+                max: 16
+            })
+        );
+    }
+
+    #[test]
+    fn resident_global_child_budget_is_enforced_across_parents() {
+        let mut policy = resident_policy();
+        policy.max_fanout = 64;
+        policy.global_child_budget = 3;
+        let mut ledger = SpawnLedger::new();
+
+        ledger
+            .authorize_and_record(&policy, &ctx("resident-a", 0), &req())
+            .unwrap();
+        ledger
+            .authorize_and_record(&policy, &ctx("resident-b", 0), &req())
+            .unwrap();
+        ledger
+            .authorize_and_record(&policy, &ctx("resident-c", 0), &req())
+            .unwrap();
+
+        assert_eq!(
+            ledger.authorize(&policy, &ctx("resident-d", 0), &req()),
+            Err(SpawnDenied::BudgetExceeded {
+                spent: 3,
+                budget: 3
+            })
+        );
+    }
+
+    #[test]
+    fn documented_resident_route_orchestration_override_round_trips() {
+        let toml_src = r#"
+[defaults]
+timeout_seconds = 600
+operations_dir = "operations"
+
+[[routes]]
+glob = "/Users/nilleb/dev/nillebco/varda/**"
+agents = ["trusted-resident"]
+sandbox = "local"
+
+[routes.orchestration]
+enabled = true
+max_depth = 1
+max_fanout = 16
+global_child_budget = 64
+deny_sandboxes = ["local"]
+"#;
+        let config: crate::config::Config = toml::from_str(toml_src).unwrap();
+        let route_policy = config.routes[0].orchestration.as_ref().unwrap();
+
+        assert!(route_policy.enabled);
+        assert_eq!(route_policy.max_depth, 1);
+        assert_eq!(route_policy.max_fanout, 16);
+        assert_eq!(route_policy.global_child_budget, 64);
+        assert_eq!(route_policy.deny_sandboxes, vec!["local".to_owned()]);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: crate::config::Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.routes[0].orchestration.as_ref(), Some(route_policy));
     }
 
     // --- Live broker -------------------------------------------------------
