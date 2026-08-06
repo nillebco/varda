@@ -1806,6 +1806,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn env_for_request_exports_socket_for_interactive_and_omits_it_without_socket() {
+        // 461d: the interactive resident is env-wired exactly like a batch orchestrated
+        // run — an `orchestration_socket_path` (regardless of `interactive`) exports
+        // `VARDA_MCP_SOCKET`; a request without one carries no such key (non-regression).
+        let mut interactive = docker_request("/srv/app", "interactive-broker");
+        interactive.interactive = true;
+        interactive.orchestration_socket_path = Some("/srv/app/.varda-mcp/root.sock".to_owned());
+        let with_socket = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &interactive);
+        assert_eq!(with_socket["VARDA_MCP_SOCKET"], "/srv/app/.varda-mcp/root.sock");
+
+        let mut plain = docker_request("/srv/app", "no-broker");
+        plain.interactive = true;
+        assert_eq!(plain.orchestration_socket_path, None);
+        let without_socket = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &plain);
+        assert!(!without_socket.contains_key("VARDA_MCP_SOCKET"));
+    }
+
     /// M5: build a sandbox image from `testdata/Dockerfile.rust` (a trivial
     /// `FROM busybox` — installs nothing heavy) and run a shell agent under it,
     /// asserting the recap is parsed. Proves the `build` knob is honoured end to
