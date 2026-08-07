@@ -2949,6 +2949,7 @@ fn resolve_resident_launch(
     effective_env.extend(resolved.env.clone());
 
     config::enforce_resident_launch(
+        &route.agent,
         &resolved.name,
         &resolved.config,
         &mounts,

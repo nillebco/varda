@@ -20,30 +20,33 @@ pub const OPERATIONS_README: &str = "README.md";
 #[allow(dead_code)]
 pub const DEFAULT_SANDBOX_PROVIDER: &str = "local";
 
-/// The ONLY hosts a net-restricted sandboxed resident may reach.
+/// The ONLY hosts a Claude net-restricted sandboxed resident may reach.
 ///
-/// The resident is a CLOUD LLM agent (claude/codex) that cannot function without
-/// reaching its provider API, so a fully net-denied box would be inert. Rather than
-/// open the network, `enforce_resident_launch` permits egress ONLY to this fixed
-/// LLM-endpoint allowlist and denies everything else — crucially `github.com` and any
-/// other host — so there is still NO `git push` and NO arbitrary-host exfiltration.
+/// The resident is a CLOUD LLM agent that cannot function without reaching its
+/// provider API, so a fully net-denied box would be inert. Rather than open the
+/// network, `enforce_resident_launch` permits egress ONLY to the selected agent's
+/// fixed LLM-endpoint allowlist and denies everything else — crucially
+/// `github.com` and any other host — so there is still NO `git push` and NO
+/// arbitrary-host exfiltration.
 ///
 /// Matching is a case-insensitive EXACT host comparison (see `enforce_resident_launch`):
 /// no wildcard/suffix matching, so a look-alike like `api.openai.com.attacker.com`
 /// stays denied.
 ///
-/// Kept deliberately MINIMAL. It may need tuning to whatever the installed agents
-/// actually call:
-///   - `api.anthropic.com`  — Claude API (claude)
-///   - `api.openai.com`     — OpenAI API (codex)
-///   - `chatgpt.com`        — ChatGPT backend (codex/ChatGPT sign-in)
-///   - `auth.openai.com`    — OpenAI/ChatGPT auth flow (codex)
-pub const RESIDENT_EGRESS_ALLOWLIST: &[&str] = &[
-    "api.anthropic.com",
-    "api.openai.com",
-    "chatgpt.com",
-    "auth.openai.com",
-];
+pub const CLAUDE_RESIDENT_EGRESS_ALLOWLIST: &[&str] = &["api.anthropic.com"];
+
+/// The ONLY hosts a Codex/OpenAI net-restricted sandboxed resident may reach.
+pub const CODEX_RESIDENT_EGRESS_ALLOWLIST: &[&str] =
+    &["api.openai.com", "chatgpt.com", "auth.openai.com"];
+
+/// The known-safe Copilot resident endpoint set.
+///
+/// Intentionally empty today: Copilot needs endpoints that overlap GitHub, and a
+/// blanket `github.com` allow rule would create a resident push/exfiltration route.
+/// Until exact non-push Copilot auth/API hosts are proven, Copilot resident mode
+/// fails closed. Ordinary worker sandboxes can still opt into broader egress via
+/// route/user policy; this resident inventory is deliberately stricter.
+pub const COPILOT_RESIDENT_EGRESS_ALLOWLIST: &[&str] = &[];
 
 const DEFAULT_CONFIG: &str = r#"[defaults]
 timeout_seconds = 600
@@ -73,8 +76,9 @@ agents = ["codex"]
 # the old un-sandboxed `local` resident example — the four load-bearing gates are
 # asserted in code before launch and a violation FAILS LOUDLY:
 #   G1  dedicated rw workspace mount (never $HOME / a home-ancestor / ~/dev)
-#   G2  isolating sandbox (never `local`), net-restricted to the LLM-endpoint allowlist
-#       ONLY (github.com etc. stay denied — no push, no exfil), and NO push credential
+#   G2  isolating sandbox (never `local`), net-restricted to the selected resident
+#       agent's exact LLM-endpoint allowlist ONLY (github.com etc. stay denied — no
+#       push, no exfil), and NO push credential
 #       (nothing that lets the box authenticate `git push` to a remote)
 #   G7  broker caps bound the worker fan-out (see [routes.orchestration] below)
 # Pushing back out is a separate, human-gated step performed on the HOST.
@@ -82,11 +86,12 @@ agents = ["codex"]
 # [sandboxes.orchestration]
 # image = "your-dev-image:latest"
 # primitive = "docker"          # isolating — NEVER "local"
-# egress = ["api.anthropic.com", "api.openai.com"]  # LLM endpoints ONLY — github.com etc. stay denied (no push, no exfil)
+# egress = ["api.anthropic.com"]  # resident agent's exact LLM endpoints ONLY — no wildcard/github.com
 #
 # [[routes]]
 # glob = "/path/to/orchestration/workspace/**"
-# agents = ["claude"]           # resident identity carries NO git push credential
+# agents = ["claude"]           # Claude resident; Codex uses api.openai.com/chatgpt.com/auth.openai.com.
+#                               # Copilot resident is unsupported until exact non-push endpoints are known.
 # sandbox = "orchestration"
 # mounts = ["/path/to/orchestration/workspace:/workspace:rw"]  # dedicated rw workspace
 #
@@ -1088,6 +1093,30 @@ pub fn credential_enables_push(cred: &CredentialConfig) -> bool {
     }
 }
 
+/// Return the resident egress allowlist for one backend agent.
+///
+/// This is intentionally NOT a worker sandbox policy. Workers may use whatever
+/// egress their trusted route/user configuration permits. The long-lived resident
+/// is stricter because allowing broad GitHub domains there can create a push or
+/// exfiltration path from the orchestrator workspace.
+pub fn resident_egress_allowlist_for_agent(agent: &str) -> Result<&'static [&'static str]> {
+    match agent.to_ascii_lowercase().as_str() {
+        "claude" => Ok(CLAUDE_RESIDENT_EGRESS_ALLOWLIST),
+        "codex" | "openai" => Ok(CODEX_RESIDENT_EGRESS_ALLOWLIST),
+        "copilot" if !COPILOT_RESIDENT_EGRESS_ALLOWLIST.is_empty() => {
+            Ok(COPILOT_RESIDENT_EGRESS_ALLOWLIST)
+        }
+        "copilot" => bail!(
+            "Copilot resident sandbox egress is unsupported until exact non-push Copilot auth/API endpoints are known; \
+             do not add blanket `github.com` to resident egress. Use Claude/Codex for `varda orchestrate`, or run \
+             Copilot only as an ordinary worker sandbox with explicit route/user-approved egress."
+        ),
+        other => bail!(
+            "resident endpoint policy for agent '{other}' is not configured; add exact LLM endpoints before using it as a sandboxed resident"
+        ),
+    }
+}
+
 /// Inspect a workspace's `.git/config` (and any submodule configs under
 /// `.git/modules`) for a pre-seeded push credential: a remote URL with an EMBEDDED
 /// credential (`https://x-access-token:TOKEN@…`, `https://user:pass@…`) or a
@@ -1249,14 +1278,15 @@ pub fn workspace_mounted_rw(mounts: &[String], workspace: &Path) -> bool {
 /// - **G1** — `workspace` is a dedicated dir (not `$HOME`/home-ancestor) and is
 ///   mounted **rw** in `mounts`.
 /// - **G2** — the sandbox is **isolating** (`primitive != "local"`, name != `local`),
-///   **net-restricted** (every `egress` host must be in `RESIDENT_EGRESS_ALLOWLIST` — an
-///   LLM-only allowlist; `github.com`/general hosts stay denied so there is no push or
-///   exfiltration; an empty `egress` ⇒ `--network none` still passes), and the resident
-///   identity carries **no push credential**. "No push credential" spans every channel a
-///   credential can reach the box through: a forwarded SSH agent, a push-capable
-///   `credentials` target, a push-enabling key in the resident's EFFECTIVE `env`
-///   (agent + sandbox + route + `.varda`, per `effective_env`), or a pre-seeded
-///   push credential in the workspace's `.git/config`.
+///   **net-restricted** (every `egress` host must be in the selected agent's exact
+///   LLM endpoint allowlist; `github.com`/general hosts stay denied so there is no
+///   push or exfiltration; an empty `egress` ⇒ `--network none` still passes), and
+///   the resident identity carries **no push credential**. "No push credential"
+///   spans every channel a credential can reach the box through: a forwarded SSH
+///   agent, a push-capable `credentials` target, a push-enabling key in the
+///   resident's EFFECTIVE `env` (agent + sandbox + route + `.varda`, per
+///   `effective_env`), or a pre-seeded push credential in the workspace's
+///   `.git/config`.
 /// - **G7** — orchestration is enabled (so the broker is wired) and `local` is in
 ///   `deny_sandboxes` (spawned workers can never land un-sandboxed).
 ///
@@ -1265,6 +1295,7 @@ pub fn workspace_mounted_rw(mounts: &[String], workspace: &Path) -> bool {
 /// the resident must still hold no push credential.
 #[allow(clippy::too_many_arguments)]
 pub fn enforce_resident_launch(
+    resident_agent: &str,
     sandbox_name: &str,
     sandbox: &SandboxConfig,
     mounts: &[String],
@@ -1285,21 +1316,23 @@ pub fn enforce_resident_launch(
     }
 
     // G2 — LLM-only egress. The resident is a cloud LLM agent that MUST reach its
-    // provider API, so a fully net-denied box would be inert. Permit egress ONLY to the
-    // fixed LLM-endpoint allowlist and deny everything else — crucially `github.com` and
-    // any other host — so there is still NO push and NO arbitrary-host exfiltration. An
-    // EMPTY egress still passes (fully offline is allowed). Matching is a case-insensitive
-    // EXACT host comparison: no wildcard/suffix, so `api.openai.com.attacker.com` is denied.
+    // provider API, so a fully net-denied box would be inert. Permit egress ONLY to
+    // that agent's fixed LLM-endpoint allowlist and deny everything else — crucially
+    // `github.com` and any other host — so there is still NO push and NO arbitrary-host
+    // exfiltration. An EMPTY egress still passes (fully offline is allowed). Matching
+    // is a case-insensitive EXACT host comparison: no wildcard/suffix, so
+    // `api.openai.com.attacker.com` is denied.
+    let resident_allowlist = resident_egress_allowlist_for_agent(resident_agent)?;
     for host in &sandbox.egress {
-        let allowed = RESIDENT_EGRESS_ALLOWLIST
+        let allowed = resident_allowlist
             .iter()
             .any(|a| a.eq_ignore_ascii_case(host));
         if !allowed {
             bail!(
-                "resident sandbox '{sandbox_name}' allows egress to '{host}', which is not an LLM endpoint; \
-                 a net-restricted resident may reach ONLY the LLM API allowlist ({:?}) so there is no push \
-                 and no exfiltration. Remove '{host}' from `egress` (github.com and general hosts stay denied).",
-                RESIDENT_EGRESS_ALLOWLIST
+                "resident agent '{resident_agent}' sandbox '{sandbox_name}' allows egress to '{host}', which is not an approved endpoint for that agent; \
+                 a net-restricted resident may reach ONLY its exact LLM API allowlist ({:?}) so there is no push \
+                 and no exfiltration. Remove '{host}' from resident `egress` (github.com and general hosts stay denied).",
+                resident_allowlist
             );
         }
     }
@@ -2772,6 +2805,7 @@ mod resident_tests {
         let ws = tmp("happy");
         let mounts = vec![format!("{}:/workspace:rw", ws.display())];
         enforce_resident_launch(
+            "claude",
             "orchestration",
             &isolating_sandbox(),
             &mounts,
@@ -2790,6 +2824,7 @@ mod resident_tests {
         let mounts = vec![format!("{}:/workspace:rw", ws.display())];
         // name == "local"
         let err = enforce_resident_launch(
+            "claude",
             "local",
             &SandboxConfig {
                 primitive: "local".to_owned(),
@@ -2807,13 +2842,14 @@ mod resident_tests {
     }
 
     /// Run `enforce_resident_launch` for a resident whose ONLY departure from the happy
-    /// path is the given egress list. Returns Ok(()) / the refusal error.
-    fn resident_with_egress(tag: &str, egress: &[&str]) -> Result<()> {
+    /// path is the given agent/egress list. Returns Ok(()) / the refusal error.
+    fn resident_agent_with_egress(agent: &str, tag: &str, egress: &[&str]) -> Result<()> {
         let ws = tmp(tag);
         let mounts = vec![format!("{}:/workspace:rw", ws.display())];
         let mut sandbox = isolating_sandbox();
         sandbox.egress = egress.iter().map(|h| (*h).to_owned()).collect();
         enforce_resident_launch(
+            agent,
             "orchestration",
             &sandbox,
             &mounts,
@@ -2825,17 +2861,76 @@ mod resident_tests {
         )
     }
 
+    fn resident_with_egress(tag: &str, egress: &[&str]) -> Result<()> {
+        resident_agent_with_egress("claude", tag, egress)
+    }
+
     #[test]
-    fn allows_llm_endpoint_egress() {
-        // The full allowlist passes — the resident may reach its LLM provider APIs.
-        resident_with_egress("llm-full", RESIDENT_EGRESS_ALLOWLIST)
-            .expect("egress limited to the LLM allowlist must pass");
-        // A single LLM host also passes.
-        resident_with_egress("llm-one", &["api.anthropic.com"])
-            .expect("a single LLM endpoint must pass");
+    fn resident_endpoint_inventory_is_agent_specific() {
+        assert_eq!(
+            resident_egress_allowlist_for_agent("claude").unwrap(),
+            CLAUDE_RESIDENT_EGRESS_ALLOWLIST
+        );
+        assert_eq!(
+            resident_egress_allowlist_for_agent("codex").unwrap(),
+            CODEX_RESIDENT_EGRESS_ALLOWLIST
+        );
+        assert_eq!(
+            resident_egress_allowlist_for_agent("openai").unwrap(),
+            CODEX_RESIDENT_EGRESS_ALLOWLIST
+        );
+        assert!(
+            resident_egress_allowlist_for_agent("copilot")
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported"),
+            "Copilot must fail closed until exact non-push endpoints are known"
+        );
+    }
+
+    #[test]
+    fn allows_claude_resident_endpoint_egress() {
+        resident_with_egress("claude-llm", CLAUDE_RESIDENT_EGRESS_ALLOWLIST)
+            .expect("Claude egress limited to the Claude LLM allowlist must pass");
         // Matching is case-insensitive on the host.
-        resident_with_egress("llm-case", &["API.Anthropic.Com"])
+        resident_with_egress("claude-case", &["API.Anthropic.Com"])
             .expect("host match must be case-insensitive");
+    }
+
+    #[test]
+    fn allows_codex_resident_endpoint_egress() {
+        resident_agent_with_egress("codex", "codex-llm", CODEX_RESIDENT_EGRESS_ALLOWLIST)
+            .expect("Codex egress limited to the OpenAI allowlist must pass");
+        resident_agent_with_egress("codex", "codex-one", &["api.openai.com"])
+            .expect("a single Codex endpoint must pass");
+    }
+
+    #[test]
+    fn rejects_cross_agent_resident_endpoint_egress() {
+        let err = resident_agent_with_egress("claude", "claude-openai", &["api.openai.com"])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("api.openai.com"),
+            "Claude resident must not inherit Codex endpoints: {err}"
+        );
+
+        let err =
+            resident_agent_with_egress("codex", "codex-claude", &["api.anthropic.com"])
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("api.anthropic.com"),
+            "Codex resident must not inherit Claude endpoints: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_copilot_resident_until_exact_non_push_endpoints_are_known() {
+        for egress in [&[][..], &["github.com"][..]] {
+            let err = resident_agent_with_egress("copilot", "copilot", egress).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("Copilot resident sandbox egress is unsupported"), "{msg}");
+            assert!(msg.contains("github.com"), "{msg}");
+        }
     }
 
     #[test]
@@ -2887,6 +2982,7 @@ mod resident_tests {
         let mounts = vec![format!("{}:/workspace:rw", ws.display())];
         // Forwarded SSH agent = push channel.
         let err = enforce_resident_launch(
+            "claude",
             "orchestration",
             &isolating_sandbox(),
             &mounts,
@@ -2900,6 +2996,7 @@ mod resident_tests {
         assert!(err.to_string().contains("SSH agent"), "{err}");
         // A push-token credential.
         let err = enforce_resident_launch(
+            "claude",
             "orchestration",
             &isolating_sandbox(),
             &mounts,
@@ -2917,6 +3014,7 @@ mod resident_tests {
     fn rejects_workspace_not_mounted_rw() {
         let ws = tmp("nomount");
         let err = enforce_resident_launch(
+            "claude",
             "orchestration",
             &isolating_sandbox(),
             &[format!("{}:/workspace:ro", ws.display())],
@@ -2938,6 +3036,7 @@ mod resident_tests {
         let mut disabled = resident_policy();
         disabled.enabled = false;
         let err = enforce_resident_launch(
+            "claude",
             "orchestration",
             &isolating_sandbox(),
             &mounts,
@@ -2953,6 +3052,7 @@ mod resident_tests {
         let mut allows_local = resident_policy();
         allows_local.deny_sandboxes = vec![];
         let err = enforce_resident_launch(
+            "claude",
             "orchestration",
             &isolating_sandbox(),
             &mounts,
@@ -3007,6 +3107,7 @@ mod resident_tests {
             &[("SSH_AUTH_SOCK", "/tmp/agent.sock")][..],
         ] {
             let err = enforce_resident_launch(
+                "claude",
                 "orchestration",
                 &isolating_sandbox(),
                 &mounts,
@@ -3024,6 +3125,7 @@ mod resident_tests {
         }
         // A benign env map still passes.
         enforce_resident_launch(
+            "claude",
             "orchestration",
             &isolating_sandbox(),
             &mounts,
@@ -3083,6 +3185,7 @@ mod resident_tests {
             "/home/agent/.config/git/credentials",
         ] {
             let err = enforce_resident_launch(
+                "claude",
                 "orchestration",
                 &isolating_sandbox(),
                 &mounts,
@@ -3124,6 +3227,7 @@ mod resident_tests {
             "[remote \"origin\"]\n\turl = https://x-access-token:ghp_secret@github.com/foo/bar.git\n",
         );
         let err = enforce_resident_launch(
+            "claude",
             "orchestration",
             &isolating_sandbox(),
             &mounts,
@@ -3148,6 +3252,7 @@ mod resident_tests {
             "[remote \"origin\"]\n\turl = https://github.com/foo/bar.git\n[credential]\n\thelper = store\n",
         );
         let err = enforce_resident_launch(
+            "claude",
             "orchestration",
             &isolating_sandbox(),
             &mounts,
@@ -3170,6 +3275,7 @@ mod resident_tests {
             "[remote \"origin\"]\n\turl = https://github.com/foo/bar.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n",
         );
         enforce_resident_launch(
+            "claude",
             "orchestration",
             &isolating_sandbox(),
             &mounts,
