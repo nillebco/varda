@@ -2946,6 +2946,7 @@ fn resolve_resident_launch(config: &config::Config, workspace: &Path) -> Result<
     effective_env.extend(resolved.env.clone());
 
     config::enforce_resident_launch(
+        &route.agent,
         &resolved.name,
         &resolved.config,
         &mounts,
