@@ -95,8 +95,8 @@ pub const CREDENTIAL_FILENAMES: &[&str] = &[
 /// System / OS directories a mount TARGET may never be (nor sit under). Shadowing
 /// these inside the container is a sandbox-integrity break.
 pub const SYSTEM_TARGET_DIRS: &[&str] = &[
-    "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev",
-    "/proc", "/sys", "/var", "/root",
+    "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys",
+    "/var", "/root",
 ];
 
 fn home_dir() -> Option<PathBuf> {
@@ -1068,26 +1068,91 @@ fn strip_jsonc(text: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
 }
 
-/// Placeholder provider for isolation primitives whose runtime is not yet
-/// wired up (microsandbox, clawk). Config parses and routing resolves, but
-/// `prepare()` fails with a clear "runtime not installed" error so the missing
-/// capability surfaces at launch rather than being silently ignored.
-pub struct StubProvider {
+fn command_on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
+}
+
+/// Provider backed by the `clawk` CLI. Unlike the old stub, this constructs a
+/// real clawk launch when the binary is available, while failing before session
+/// construction with the contractually clear error when it is not.
+pub struct ClawkProvider {
     name: String,
-    primitive: String,
+    image: Option<String>,
+    build: Option<String>,
+    mounts: Vec<(MountOrigin, String)>,
+    egress: Vec<String>,
+    identity: SandboxIdentity,
+    command_exists: fn(&str) -> bool,
+}
+
+impl ClawkProvider {
+    pub fn with_identity(mut self, identity: SandboxIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    pub fn from_config(
+        name: &str,
+        config: &SandboxConfig,
+        mounts: Vec<(MountOrigin, String)>,
+    ) -> Result<Self> {
+        Ok(Self {
+            name: name.to_owned(),
+            image: config.image.clone().filter(|image| !image.is_empty()),
+            build: config.build.clone().filter(|build| !build.is_empty()),
+            mounts,
+            egress: config.egress.clone(),
+            identity: SandboxIdentity::default(),
+            command_exists: command_on_path,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_command_exists(mut self, command_exists: fn(&str) -> bool) -> Self {
+        self.command_exists = command_exists;
+        self
+    }
+
+    async fn resolve_image(&self) -> Result<Option<String>> {
+        if let Some(build) = &self.build {
+            return Ok(Some(build_image(&self.name, build).await?));
+        }
+        Ok(self.image.clone())
+    }
 }
 
 #[async_trait]
-impl SandboxProvider for StubProvider {
+impl SandboxProvider for ClawkProvider {
     fn name(&self) -> &str {
         &self.name
     }
 
-    async fn prepare(&self, _ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
-        bail!(
-            "sandbox primitive '{}' not yet available: runtime not installed",
-            self.primitive
-        )
+    async fn prepare(&self, ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
+        if !(self.command_exists)("clawk") {
+            bail!("sandbox primitive 'clawk' requires the clawk CLI on PATH");
+        }
+        let session_store = varda_sessions_root().join(ctx.session_id);
+        std::fs::create_dir_all(&session_store).with_context(|| {
+            format!(
+                "failed to create sandbox session store {}",
+                session_store.display()
+            )
+        })?;
+        let handle = sanitize_docker_name(ctx.session_id);
+        Ok(Box::new(ClawkSession {
+            image: self.resolve_image().await?,
+            project_root: ctx.project_root.to_path_buf(),
+            mounts: self.mounts.clone(),
+            egress: self.egress.clone(),
+            session_store,
+            sandbox: format!("varda-sbx-{handle}"),
+            home: "/home/agent".to_owned(),
+            identity: self.identity.clone(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        }))
     }
 }
 
@@ -1313,8 +1378,12 @@ impl DockerSession {
         // also covers a `docker create` failure / early `?` — not just `docker cp`.
         // Every not-yet-consumed temp is removed on drop: the happy path, a
         // `docker create` failure, an errored/`?`-ed `docker cp`, all trigger it.
-        let staged =
-            std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"));
+        let staged = std::mem::take(
+            &mut *self
+                .staged_files
+                .lock()
+                .expect("staged_files mutex poisoned"),
+        );
         struct StagedTempGuard(Vec<PathBuf>);
         impl Drop for StagedTempGuard {
             fn drop(&mut self) {
@@ -1476,7 +1545,10 @@ impl SandboxSession for DockerSession {
         // the mounts above (first declaration wins).
         for raw in &self.identity.identity_context {
             let spec = parse_mount(raw).with_context(|| {
-                format!("invalid identity_context mount '{raw}' for sandbox '{}'", self.image)
+                format!(
+                    "invalid identity_context mount '{raw}' for sandbox '{}'",
+                    self.image
+                )
             })?;
             let source = expand_mount_path(&spec.source, &self.project_root);
             let target = expand_mount_path(&spec.target, &self.project_root);
@@ -1611,7 +1683,10 @@ impl SandboxSession for DockerSession {
         }
         for raw in &self.identity.identity_context {
             let spec = parse_mount(raw).with_context(|| {
-                format!("invalid identity_context mount '{raw}' for sandbox '{}'", self.image)
+                format!(
+                    "invalid identity_context mount '{raw}' for sandbox '{}'",
+                    self.image
+                )
             })?;
             let source = expand_mount_path(&spec.source, &self.project_root);
             check_control_plane_denylist(&source)?;
@@ -1649,9 +1724,12 @@ impl SandboxSession for DockerSession {
     async fn teardown(self: Box<Self>) -> Result<()> {
         // Remove any host temps still staged (e.g. a cancel before create/cp
         // consumed them) so no credential value is left behind on the host.
-        for (host_temp, _) in
-            std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"))
-        {
+        for (host_temp, _) in std::mem::take(
+            &mut *self
+                .staged_files
+                .lock()
+                .expect("staged_files mutex poisoned"),
+        ) {
             let _ = std::fs::remove_file(&host_temp);
         }
         // Without `--rm` the container and its per-session volume persist; remove
@@ -1840,11 +1918,7 @@ impl SandboxSession for MicrosandboxSession {
         // TTY) and pre-boot `--copy-file` flags for any staged prompt/identity
         // files (M13a §2/§3) — msb has a native pre-boot copy, so unlike docker no
         // create/cp/start dance is needed.
-        let mut args = vec![
-            "run".to_owned(),
-            "--name".to_owned(),
-            self.sandbox.clone(),
-        ];
+        let mut args = vec!["run".to_owned(), "--name".to_owned(), self.sandbox.clone()];
         if matches!(mode, LaunchMode::Interactive) {
             args.push("-t".to_owned());
         }
@@ -1854,7 +1928,10 @@ impl SandboxSession for MicrosandboxSession {
         // both modes is what makes a BATCH file-target credential reach the guest
         // (M11-ext), while a batch run with nothing staged still emits none.
         {
-            let staged = self.staged_files.lock().expect("staged_files mutex poisoned");
+            let staged = self
+                .staged_files
+                .lock()
+                .expect("staged_files mutex poisoned");
             for (host_temp, guest_path) in staged.iter() {
                 args.push("--copy-file".to_owned());
                 args.push(format!("{}:{guest_path}", host_temp.display()));
@@ -1910,7 +1987,10 @@ impl SandboxSession for MicrosandboxSession {
         // whole dotdir / credential file, so we never widen the exposure.
         for raw in &self.identity.identity_context {
             let ispec = parse_mount(raw).with_context(|| {
-                format!("invalid identity_context mount '{raw}' for sandbox '{}'", self.image)
+                format!(
+                    "invalid identity_context mount '{raw}' for sandbox '{}'",
+                    self.image
+                )
             })?;
             let source = expand_mount_path(&ispec.source, &self.project_root);
             let target = expand_mount_path(&ispec.target, &self.project_root);
@@ -2024,7 +2104,10 @@ impl SandboxSession for MicrosandboxSession {
         }
         for raw in &self.identity.identity_context {
             let ispec = parse_mount(raw).with_context(|| {
-                format!("invalid identity_context mount '{raw}' for sandbox '{}'", self.image)
+                format!(
+                    "invalid identity_context mount '{raw}' for sandbox '{}'",
+                    self.image
+                )
             })?;
             let source = expand_mount_path(&ispec.source, &self.project_root);
             check_control_plane_denylist(&source)?;
@@ -2045,9 +2128,7 @@ impl SandboxSession for MicrosandboxSession {
             .args(["cp", &src, &dst])
             .output()
             .await
-            .with_context(|| {
-                format!("failed to spawn `msb cp` from sandbox '{}'", self.sandbox)
-            })?;
+            .with_context(|| format!("failed to spawn `msb cp` from sandbox '{}'", self.sandbox))?;
         if !output.status.success() {
             bail!(
                 "`msb cp {src} {dst}` failed with status {}; stderr: {}",
@@ -2062,9 +2143,12 @@ impl SandboxSession for MicrosandboxSession {
         // Remove the host temps staged for `--copy-file` (msb copies them into the
         // guest but leaves the host originals) so no credential value is left
         // behind; the guest copies vanish with the sandbox `rm` below.
-        for (host_temp, _) in
-            std::mem::take(&mut *self.staged_files.lock().expect("staged_files mutex poisoned"))
-        {
+        for (host_temp, _) in std::mem::take(
+            &mut *self
+                .staged_files
+                .lock()
+                .expect("staged_files mutex poisoned"),
+        ) {
             let _ = std::fs::remove_file(&host_temp);
         }
         // Best-effort: stop then remove the per-session sandbox; a cleanup
@@ -2085,6 +2169,285 @@ impl SandboxSession for MicrosandboxSession {
     }
 }
 
+pub struct ClawkSession {
+    image: Option<String>,
+    project_root: PathBuf,
+    mounts: Vec<(MountOrigin, String)>,
+    /// Egress allow-list applied before launch through `clawk network allow`.
+    egress: Vec<String>,
+    /// Host dir the guest HOME is copied into after the run. clawk's session
+    /// store is not assumed live on the host, so resume discovery runs post-exit.
+    session_store: PathBuf,
+    sandbox: String,
+    home: String,
+    identity: SandboxIdentity,
+    staged_files: std::sync::Mutex<Vec<(PathBuf, String)>>,
+}
+
+impl ClawkSession {
+    fn record_staged(&self, content: &str, guest_path: &str, read_only: bool) -> Result<String> {
+        let tmp = write_stage_temp(content, read_only)?;
+        self.staged_files
+            .lock()
+            .expect("staged_files mutex poisoned")
+            .push((tmp, guest_path.to_owned()));
+        Ok(guest_path.to_owned())
+    }
+
+    async fn apply_network_allowlist(&self) -> Result<()> {
+        for host in &self.egress {
+            let output = tokio::process::Command::new("clawk")
+                .args(["network", "allow", &self.sandbox, host])
+                .output()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to spawn `clawk network allow {}` for sandbox '{}'",
+                        host, self.sandbox
+                    )
+                })?;
+            if !output.status.success() {
+                bail!(
+                    "`clawk network allow {} {host}` failed with status {}; stderr: {}",
+                    self.sandbox,
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SandboxSession for ClawkSession {
+    fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec> {
+        let proj = self.project_root.display().to_string();
+        let cwd = spec
+            .cwd
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| proj.clone());
+
+        // Centralized clawk CLI shape. Normal tests assert this construction; live
+        // tests are ignored because this repository must not require clawk locally.
+        let mut args = vec![
+            "run".to_owned(),
+            "--name".to_owned(),
+            self.sandbox.clone(),
+            "--project".to_owned(),
+            proj.clone(),
+            "--home".to_owned(),
+            self.home.clone(),
+        ];
+        if matches!(mode, LaunchMode::Interactive) {
+            args.push("--tty".to_owned());
+        }
+        if let Some(image) = &self.image {
+            args.push("--image".to_owned());
+            args.push(image.clone());
+        }
+        if self.egress.is_empty() {
+            args.push("--network".to_owned());
+            args.push("none".to_owned());
+        } else {
+            args.push("--network".to_owned());
+            args.push("default-deny".to_owned());
+        }
+
+        args.push("--mount".to_owned());
+        args.push(format!("{proj}:{proj}:rw"));
+        let mut seen_targets: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for (_origin, raw) in &self.mounts {
+            let cspec = parse_mount(raw).with_context(|| {
+                format!("invalid mount '{raw}' for clawk sandbox '{}'", self.sandbox)
+            })?;
+            let source = expand_mount_path(&cspec.source, &self.project_root);
+            let target = expand_mount_path(&cspec.target, &self.project_root);
+            check_credential_denylist(&source)?;
+            if source.is_file() {
+                bail!(
+                    "clawk sandbox '{}' does not support file bind mount '{}'; mount a directory or stage a file credential instead",
+                    self.sandbox,
+                    source.display()
+                );
+            }
+            if !seen_targets.insert(target.clone()) {
+                continue;
+            }
+            args.push("--mount".to_owned());
+            args.push(format!(
+                "{}:{}:{}",
+                source.display(),
+                target.display(),
+                if cspec.writable { "rw" } else { "ro" }
+            ));
+        }
+
+        for raw in &self.identity.identity_context {
+            let ispec = parse_mount(raw).with_context(|| {
+                format!(
+                    "invalid identity_context mount '{raw}' for clawk sandbox '{}'",
+                    self.sandbox
+                )
+            })?;
+            let source = expand_mount_path(&ispec.source, &self.project_root);
+            let target = expand_mount_path(&ispec.target, &self.project_root);
+            check_control_plane_denylist(&source)?;
+            check_identity_context_mount(&source, ispec.writable)?;
+            if !seen_targets.insert(target.clone()) {
+                continue;
+            }
+            args.push("--mount-file".to_owned());
+            args.push(format!("{}:{}:ro", source.display(), target.display()));
+        }
+
+        if let Some(sock) = &self.identity.ssh_auth_sock {
+            args.push("--mount-file".to_owned());
+            args.push(format!("{sock}:{SSH_AGENT_GUEST_SOCK}:ro"));
+        }
+        {
+            let staged = self
+                .staged_files
+                .lock()
+                .expect("staged_files mutex poisoned");
+            for (host_temp, guest_path) in staged.iter() {
+                args.push("--copy-file".to_owned());
+                args.push(format!("{}:{guest_path}", host_temp.display()));
+            }
+        }
+        args.push("--workdir".to_owned());
+        args.push(cwd);
+
+        let mut env = spec.env;
+        env.extend(self.identity.guest_env());
+        env.insert("HOME".to_owned(), self.home.clone());
+        for (key, value) in &env {
+            args.push("--env".to_owned());
+            args.push(format!("{key}={value}"));
+        }
+        args.push("--".to_owned());
+        args.push(spec.program);
+        args.extend(spec.args);
+
+        Ok(CommandSpec {
+            program: "clawk".to_owned(),
+            args,
+            env: BTreeMap::new(),
+            cwd: None,
+        })
+    }
+
+    fn stage_file(&self, content: &str, guest_path: &str) -> Result<String> {
+        self.record_staged(content, guest_path, false)
+    }
+
+    fn stage_credential_file(&self, content: &str, guest_path: &str) -> Result<String> {
+        self.record_staged(content, guest_path, true)
+    }
+
+    fn identity_files(&self) -> BTreeMap<String, String> {
+        self.identity.auth_files.clone()
+    }
+
+    async fn begin_batch(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
+        self.apply_network_allowlist().await?;
+        Ok(wrapped)
+    }
+
+    async fn begin_interactive(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
+        self.apply_network_allowlist().await?;
+        Ok(wrapped)
+    }
+
+    fn session_store_root(&self) -> Option<PathBuf> {
+        Some(self.session_store.clone())
+    }
+
+    fn store_is_live(&self) -> bool {
+        false
+    }
+
+    fn validate_mounts(&self) -> Result<()> {
+        if !self.project_root.exists() {
+            bail!(
+                "sandbox project mount source '{}' does not exist on the host (check the path / VM share)",
+                self.project_root.display()
+            );
+        }
+        for (origin, raw) in &self.mounts {
+            let cspec = parse_mount(raw).with_context(|| {
+                format!("invalid mount '{raw}' for clawk sandbox '{}'", self.sandbox)
+            })?;
+            let source = expand_mount_path(&cspec.source, &self.project_root);
+            check_credential_denylist(&source)?;
+            if !source.exists() {
+                bail!(
+                    "sandbox {origin:?} mount source '{}' does not exist on the host (check the path / VM share)",
+                    source.display()
+                );
+            }
+            if source.is_file() {
+                bail!(
+                    "clawk sandbox '{}' does not support file bind mount '{}'; mount a directory or stage a file credential instead",
+                    self.sandbox,
+                    source.display()
+                );
+            }
+        }
+        for raw in &self.identity.identity_context {
+            let ispec = parse_mount(raw).with_context(|| {
+                format!(
+                    "invalid identity_context mount '{raw}' for clawk sandbox '{}'",
+                    self.sandbox
+                )
+            })?;
+            let source = expand_mount_path(&ispec.source, &self.project_root);
+            check_control_plane_denylist(&source)?;
+            check_identity_context_mount(&source, ispec.writable)?;
+        }
+        Ok(())
+    }
+
+    async fn extract_session_store(&self) -> Result<()> {
+        let src = format!("{}:{}", self.sandbox, self.home);
+        let dst = self.session_store.display().to_string();
+        let output = tokio::process::Command::new("clawk")
+            .args(["cp", &src, &dst])
+            .output()
+            .await
+            .with_context(|| {
+                format!("failed to spawn `clawk cp` from sandbox '{}'", self.sandbox)
+            })?;
+        if !output.status.success() {
+            bail!(
+                "`clawk cp {src} {dst}` failed with status {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    async fn teardown(self: Box<Self>) -> Result<()> {
+        for (host_temp, _) in std::mem::take(
+            &mut *self
+                .staged_files
+                .lock()
+                .expect("staged_files mutex poisoned"),
+        ) {
+            let _ = std::fs::remove_file(&host_temp);
+        }
+        let _ = tokio::process::Command::new("clawk")
+            .args(["destroy", &self.sandbox])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        Ok(())
+    }
+}
+
 /// Resolve the effective provider for a sandbox name against the config.
 ///
 /// Dispatch is driven by the resolved [`SandboxConfig::primitive`] (the "what
@@ -2093,8 +2456,7 @@ impl SandboxSession for MicrosandboxSession {
 /// - `"local"` → [`LocalProvider`] (no isolation)
 /// - `"docker"` → [`DockerProvider`] (shared-kernel container)
 /// - `"microsandbox"` → [`MicrosandboxProvider`] (own-kernel microVM via `msb`)
-/// - `"clawk"` → [`StubProvider`] (own-kernel microVM; `prepare()` errors until
-///   the runtime is wired up in a later milestone)
+/// - `"clawk"` → [`ClawkProvider`] (own-kernel microVM via `clawk`)
 ///
 /// The bare name `"local"` with no `[sandboxes.local]` entry stays a shortcut
 /// for the identity provider; any other name must have a `[sandboxes.<name>]`
@@ -2140,10 +2502,9 @@ pub fn provider_from_config(
             MicrosandboxProvider::from_config(name, config, mounts)?
                 .with_identity(identity.clone()),
         )),
-        "clawk" => Ok(std::sync::Arc::new(StubProvider {
-            name: name.to_owned(),
-            primitive: config.primitive.clone(),
-        })),
+        "clawk" => Ok(std::sync::Arc::new(
+            ClawkProvider::from_config(name, config, mounts)?.with_identity(identity.clone()),
+        )),
         other => bail!(
             "sandbox '{name}' has unknown primitive '{other}' (expected local, docker, microsandbox, or clawk)"
         ),
@@ -2427,12 +2788,15 @@ mod tests {
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         let mounts: Vec<&String> = wrapped
             .args
@@ -2444,10 +2808,7 @@ mod tests {
         // Project root plus the per-session HOME mount; nothing else.
         assert_eq!(
             mounts,
-            vec![
-                "/srv/app:/srv/app",
-                "varda-sbx-s1:/home/agent"
-            ]
+            vec!["/srv/app:/srv/app", "varda-sbx-s1:/home/agent"]
         );
     }
 
@@ -2467,12 +2828,15 @@ mod tests {
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         let mounts: Vec<&String> = wrapped
             .args
@@ -2521,12 +2885,15 @@ mod tests {
         let session =
             DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         assert_eq!(
             docker_v_flags(&wrapped.args),
@@ -2540,7 +2907,10 @@ mod tests {
     #[test]
     fn m11_auth_token_injected_as_scoped_env_no_creds_mount() {
         let mut auth_env = BTreeMap::new();
-        auth_env.insert("ANTHROPIC_API_KEY".to_owned(), "sk-scoped-sandbox".to_owned());
+        auth_env.insert(
+            "ANTHROPIC_API_KEY".to_owned(),
+            "sk-scoped-sandbox".to_owned(),
+        );
         let id = SandboxIdentity {
             auth_env,
             ..Default::default()
@@ -2548,12 +2918,15 @@ mod tests {
         let session =
             DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "claude".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "claude".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         assert!(
             docker_env_flags(&wrapped.args)
@@ -2597,7 +2970,10 @@ mod tests {
             auth_files,
             ..Default::default()
         };
-        assert!(!id.is_empty(), "a file-only credential still activates identity wiring");
+        assert!(
+            !id.is_empty(),
+            "a file-only credential still activates identity wiring"
+        );
         let session =
             DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
         let wrapped = session
@@ -2614,7 +2990,8 @@ mod tests {
         // Env target injects as a scoped -e; the file target is NOT an env var.
         let env = docker_env_flags(&wrapped.args);
         assert!(
-            env.iter().any(|e| *e == "CLOUDSDK_AUTH_ACCESS_TOKEN=scoped-access-token"),
+            env.iter()
+                .any(|e| *e == "CLOUDSDK_AUTH_ACCESS_TOKEN=scoped-access-token"),
             "env-target credential must be a scoped -e: {env:?}"
         );
         // No credential dir/file is ever a bind-mount SOURCE — not even the file target.
@@ -2631,7 +3008,9 @@ mod tests {
         // The file target is exposed as a staged read-only guest file, not a mount.
         let files = session.identity_files();
         assert_eq!(
-            files.get("/home/agent/.config/gcloud-token").map(String::as_str),
+            files
+                .get("/home/agent/.config/gcloud-token")
+                .map(String::as_str),
             Some("scoped-file-token")
         );
         let guest = session
@@ -2696,7 +3075,10 @@ mod tests {
     async fn m11ext_batch_file_target_delivered_and_cleaned_docker() {
         use std::os::unix::fs::PermissionsExt as _;
         let mut auth_files = BTreeMap::new();
-        auth_files.insert("/home/agent/.azure-token".to_owned(), "scoped-value-docker".to_owned());
+        auth_files.insert(
+            "/home/agent/.azure-token".to_owned(),
+            "scoped-value-docker".to_owned(),
+        );
         let id = SandboxIdentity {
             auth_files,
             ..Default::default()
@@ -2718,9 +3100,15 @@ mod tests {
             assert_eq!(staged.len(), 1, "one file-target credential staged");
             assert_eq!(staged[0].1, "/home/agent/.azure-token");
             let path = staged[0].0.clone();
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "scoped-value-docker");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "scoped-value-docker"
+            );
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o400, "staged credential must be read-only, got {mode:o}");
+            assert_eq!(
+                mode, 0o400,
+                "staged credential must be read-only, got {mode:o}"
+            );
             path
         };
         // Batch with a staged file takes the `create` → cp → `start -ai` lifecycle
@@ -2737,16 +3125,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(wrapped.args.first().map(String::as_str), Some("create"));
-        assert!(wrapped.args.iter().any(|a| a == "-i"), "batch keeps stdin open");
-        assert!(!wrapped.args.iter().any(|a| a == "-t"), "batch must not allocate a TTY");
+        assert!(
+            wrapped.args.iter().any(|a| a == "-i"),
+            "batch keeps stdin open"
+        );
+        assert!(
+            !wrapped.args.iter().any(|a| a == "-t"),
+            "batch must not allocate a TTY"
+        );
         // The credential is delivered by copy, never as a host bind mount.
         for v in docker_v_flags(&wrapped.args) {
-            assert!(!v.contains(".azure-token"), "credential must not be bind-mounted: {v}");
+            assert!(
+                !v.contains(".azure-token"),
+                "credential must not be bind-mounted: {v}"
+            );
         }
         // Teardown removes the staged host temp (best-effort docker rm needs no daemon).
         assert!(host_temp.exists());
         session.teardown().await.unwrap();
-        assert!(!host_temp.exists(), "teardown must remove the staged credential host temp");
+        assert!(
+            !host_temp.exists(),
+            "teardown must remove the staged credential host temp"
+        );
     }
 
     /// M11-ext Finding 2 (msb): a BATCH run with a `file`-target credential reaches
@@ -2756,7 +3156,10 @@ mod tests {
     async fn m11ext_batch_file_target_delivered_and_cleaned_msb() {
         use std::os::unix::fs::PermissionsExt as _;
         let mut auth_files = BTreeMap::new();
-        auth_files.insert("/home/agent/.tf-token".to_owned(), "scoped-value-msb".to_owned());
+        auth_files.insert(
+            "/home/agent/.tf-token".to_owned(),
+            "scoped-value-msb".to_owned(),
+        );
         let session = Box::new(MicrosandboxSession {
             image: "busybox".to_owned(),
             project_root: PathBuf::from("/proj"),
@@ -2776,7 +3179,10 @@ mod tests {
         }
         let host_temp = session.staged_files.lock().unwrap()[0].0.clone();
         let mode = std::fs::metadata(&host_temp).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o400, "staged credential must be read-only, got {mode:o}");
+        assert_eq!(
+            mode, 0o400,
+            "staged credential must be read-only, got {mode:o}"
+        );
         // BATCH wrap emits a `--copy-file host:guest` for the staged credential and
         // still no TTY — the fix over the old "interactive-only copy" behavior.
         let wrapped = session
@@ -2790,7 +3196,10 @@ mod tests {
                 LaunchMode::Batch,
             )
             .unwrap();
-        assert!(!wrapped.args.iter().any(|a| a == "-t"), "batch must not allocate a TTY");
+        assert!(
+            !wrapped.args.iter().any(|a| a == "-t"),
+            "batch must not allocate a TTY"
+        );
         let copy_idx = wrapped
             .args
             .iter()
@@ -2803,7 +3212,10 @@ mod tests {
         );
         assert!(host_temp.exists());
         session.teardown().await.unwrap();
-        assert!(!host_temp.exists(), "teardown must remove the staged credential host temp");
+        assert!(
+            !host_temp.exists(),
+            "teardown must remove the staged credential host temp"
+        );
     }
 
     /// M11 channel 2 (git identity): SSH_AUTH_SOCK is forwarded as a bind + env, and
@@ -2820,12 +3232,15 @@ mod tests {
         let session =
             DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         // Socket forwarded as a bind mount to the fixed in-guest path.
         assert!(
@@ -2850,7 +3265,10 @@ mod tests {
         }
         // No private key material is ever a mount source.
         for v in docker_v_flags(&wrapped.args) {
-            assert!(!v.contains("id_rsa") && !v.contains("/.ssh"), "no key mount: {v}");
+            assert!(
+                !v.contains("id_rsa") && !v.contains("/.ssh"),
+                "no key mount: {v}"
+            );
         }
     }
 
@@ -2870,12 +3288,15 @@ mod tests {
         let session =
             DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         assert!(
             docker_v_flags(&wrapped.args)
@@ -2896,12 +3317,15 @@ mod tests {
             DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", bad);
         assert!(
             bad_session
-                .wrap(CommandSpec {
-                    program: "sh".to_owned(),
-                    args: vec![],
-                    env: BTreeMap::new(),
-                    cwd: None,
-}, LaunchMode::Batch)
+                .wrap(
+                    CommandSpec {
+                        program: "sh".to_owned(),
+                        args: vec![],
+                        env: BTreeMap::new(),
+                        cwd: None,
+                    },
+                    LaunchMode::Batch
+                )
                 .is_err(),
             "a credential file must never mount as curated identity"
         );
@@ -2972,12 +3396,15 @@ mod tests {
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         let n = wrapped.args.iter().position(|a| a == "--network").unwrap();
         assert_eq!(wrapped.args[n + 1], "none");
@@ -3005,12 +3432,15 @@ mod tests {
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         let n = wrapped.args.iter().position(|a| a == "--network").unwrap();
         assert_eq!(wrapped.args[n + 1], "bridge");
@@ -3025,14 +3455,22 @@ mod tests {
             .collect();
         assert_eq!(
             add_hosts,
-            vec!["api.example.com:93.184.216.34", "cdn.example.com:203.0.113.7"]
+            vec![
+                "api.example.com:93.184.216.34",
+                "cdn.example.com:203.0.113.7"
+            ]
         );
     }
 
     #[test]
     fn provider_for_local_and_docker() {
         let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
-        assert_eq!(provider_for("local", &sandboxes, &[], &SandboxIdentity::default()).unwrap().name(), "local");
+        assert_eq!(
+            provider_for("local", &sandboxes, &[], &SandboxIdentity::default())
+                .unwrap()
+                .name(),
+            "local"
+        );
 
         // Unknown sandbox errors.
         assert!(provider_for("docker", &sandboxes, &[], &SandboxIdentity::default()).is_err());
@@ -3044,7 +3482,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(provider_for("docker", &sandboxes, &[], &SandboxIdentity::default()).unwrap().name(), "docker");
+        assert_eq!(
+            provider_for("docker", &sandboxes, &[], &SandboxIdentity::default())
+                .unwrap()
+                .name(),
+            "docker"
+        );
 
         // Missing image AND build errors under the docker primitive.
         sandboxes.insert(
@@ -3059,7 +3502,7 @@ mod tests {
 
     /// M5: `primitive` selects the boundary kind independently of the image.
     /// An explicit `primitive = "local"` yields the identity provider even with
-    /// an image set; microsandbox/clawk yield the stub.
+    /// an image set; microsandbox/clawk yield real providers.
     #[test]
     fn provider_for_dispatches_on_primitive() {
         let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
@@ -3072,7 +3515,9 @@ mod tests {
             },
         );
         assert_eq!(
-            provider_for("isolated", &sandboxes, &[], &SandboxIdentity::default()).unwrap().name(),
+            provider_for("isolated", &sandboxes, &[], &SandboxIdentity::default())
+                .unwrap()
+                .name(),
             "local"
         );
 
@@ -3085,8 +3530,8 @@ mod tests {
                     ..Default::default()
                 },
             );
-            // The stub resolves at provider_for time but errors at prepare().
-            let provider = provider_for("vm", &sandboxes, &[], &SandboxIdentity::default()).unwrap();
+            let provider =
+                provider_for("vm", &sandboxes, &[], &SandboxIdentity::default()).unwrap();
             assert_eq!(provider.name(), "vm");
         }
 
@@ -3173,8 +3618,14 @@ mod tests {
         };
         let wrapped = session.wrap(spec, LaunchMode::Interactive).unwrap();
         assert_eq!(wrapped.program, "docker");
-        assert_eq!(wrapped.args[0], "create", "interactive must create, not run");
-        assert!(wrapped.args.iter().any(|a| a == "-it"), "must allocate a TTY");
+        assert_eq!(
+            wrapped.args[0], "create",
+            "interactive must create, not run"
+        );
+        assert!(
+            wrapped.args.iter().any(|a| a == "-it"),
+            "must allocate a TTY"
+        );
         assert!(!wrapped.args.iter().any(|a| a == "-i" && a != "-it"));
     }
 
@@ -3209,7 +3660,10 @@ mod tests {
         assert_eq!(staged.len(), 1);
         assert_eq!(staged[0].1, "/home/agent/.varda-prompt.txt");
         // The host temp actually holds the content, ready for `docker cp`.
-        assert_eq!(std::fs::read_to_string(&staged[0].0).unwrap(), "hello prompt");
+        assert_eq!(
+            std::fs::read_to_string(&staged[0].0).unwrap(),
+            "hello prompt"
+        );
         let _ = std::fs::remove_file(&staged[0].0);
     }
 
@@ -3227,8 +3681,15 @@ mod tests {
             .unwrap();
         let host_temp = session.staged_files.lock().unwrap()[0].0.clone();
         let mode = std::fs::metadata(&host_temp).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o400, "credential temp must be exactly 0o400, got {mode:o}");
-        assert_eq!(mode & 0o077, 0, "credential temp must never be group/world-accessible");
+        assert_eq!(
+            mode, 0o400,
+            "credential temp must be exactly 0o400, got {mode:o}"
+        );
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "credential temp must never be group/world-accessible"
+        );
         let _ = std::fs::remove_file(&host_temp);
     }
 
@@ -3254,7 +3715,10 @@ mod tests {
             cwd: None,
         };
         let result = session.create_cp_start(wrapped).await;
-        assert!(result.is_err(), "`docker cp` against a nonexistent container must fail");
+        assert!(
+            result.is_err(),
+            "`docker cp` against a nonexistent container must fail"
+        );
         assert!(
             !host_temp.exists(),
             "credential host temp must be removed even when `docker cp` fails"
@@ -3287,7 +3751,10 @@ mod tests {
             cwd: None,
         };
         let result = session.create_cp_start(wrapped).await;
-        assert!(result.is_err(), "a failing `docker create` must surface an error");
+        assert!(
+            result.is_err(),
+            "a failing `docker create` must surface an error"
+        );
         assert!(
             !host_temp.exists(),
             "credential host temp must be removed even when `docker create` fails"
@@ -3320,7 +3787,10 @@ mod tests {
             cwd: None,
         };
         let wrapped = session.wrap(spec, LaunchMode::Interactive).unwrap();
-        assert!(wrapped.args.iter().any(|a| a == "-t"), "must allocate a TTY");
+        assert!(
+            wrapped.args.iter().any(|a| a == "-t"),
+            "must allocate a TTY"
+        );
         let copy_idx = wrapped
             .args
             .iter()
@@ -3371,7 +3841,9 @@ mod tests {
             cwd: Some(PathBuf::from("/work")),
         };
         let batch = LocalSession.wrap(spec.clone(), LaunchMode::Batch).unwrap();
-        let interactive = LocalSession.wrap(spec.clone(), LaunchMode::Interactive).unwrap();
+        let interactive = LocalSession
+            .wrap(spec.clone(), LaunchMode::Interactive)
+            .unwrap();
         assert_eq!(batch, spec);
         assert_eq!(interactive, spec);
     }
@@ -3404,8 +3876,14 @@ mod tests {
             cwd: None,
         };
         let wrapped = session.wrap(spec, LaunchMode::Interactive).unwrap();
-        assert_eq!(wrapped.args[0], "create", "real-agent interactive must create, not run");
-        assert!(wrapped.args.iter().any(|a| a == "-it"), "must allocate a TTY");
+        assert_eq!(
+            wrapped.args[0], "create",
+            "real-agent interactive must create, not run"
+        );
+        assert!(
+            wrapped.args.iter().any(|a| a == "-it"),
+            "must allocate a TTY"
+        );
         assert!(
             docker_env_flags(&wrapped.args)
                 .iter()
@@ -3438,7 +3916,10 @@ mod tests {
     #[test]
     fn m13b_docker_interactive_injects_identity_no_creds_mount() {
         let mut auth_env = BTreeMap::new();
-        auth_env.insert("ANTHROPIC_API_KEY".to_owned(), "sk-scoped-sandbox".to_owned());
+        auth_env.insert(
+            "ANTHROPIC_API_KEY".to_owned(),
+            "sk-scoped-sandbox".to_owned(),
+        );
         let id = SandboxIdentity {
             auth_env,
             ssh_auth_sock: Some("/tmp/host-agent.sock".to_owned()),
@@ -3449,28 +3930,40 @@ mod tests {
         let session =
             DockerSession::for_test_with_identity("img", "/srv/app", "/var/varda/sessions/s1", id);
         let mut env = BTreeMap::new();
-        env.insert("VARDA_PROMPT_FILE".to_owned(), "/home/agent/.varda-prompt.txt".to_owned());
+        env.insert(
+            "VARDA_PROMPT_FILE".to_owned(),
+            "/home/agent/.varda-prompt.txt".to_owned(),
+        );
         let spec = CommandSpec {
             program: "sh".to_owned(),
-            args: vec!["-c".to_owned(), "claude \"$(cat $VARDA_PROMPT_FILE)\"".to_owned()],
+            args: vec![
+                "-c".to_owned(),
+                "claude \"$(cat $VARDA_PROMPT_FILE)\"".to_owned(),
+            ],
             env,
             cwd: None,
         };
         let wrapped = session.wrap(spec, LaunchMode::Interactive).unwrap();
         let envs = docker_env_flags(&wrapped.args);
         assert!(
-            envs.iter().any(|e| *e == "ANTHROPIC_API_KEY=sk-scoped-sandbox"),
+            envs.iter()
+                .any(|e| *e == "ANTHROPIC_API_KEY=sk-scoped-sandbox"),
             "scoped auth token must be injected on the interactive path: {envs:?}"
         );
         assert!(
-            envs.iter().any(|e| **e == format!("SSH_AUTH_SOCK={SSH_AGENT_GUEST_SOCK}")),
+            envs.iter()
+                .any(|e| **e == format!("SSH_AUTH_SOCK={SSH_AGENT_GUEST_SOCK}")),
             "in-guest SSH_AUTH_SOCK must point at the forwarded socket: {envs:?}"
         );
         assert!(envs.iter().any(|e| *e == "GIT_AUTHOR_NAME=Varda Bot"));
-        assert!(envs.iter().any(|e| *e == "GIT_COMMITTER_EMAIL=bot@varda.dev"));
+        assert!(
+            envs.iter()
+                .any(|e| *e == "GIT_COMMITTER_EMAIL=bot@varda.dev")
+        );
         let vs = docker_v_flags(&wrapped.args);
         assert!(
-            vs.iter().any(|v| **v == format!("/tmp/host-agent.sock:{SSH_AGENT_GUEST_SOCK}")),
+            vs.iter()
+                .any(|v| **v == format!("/tmp/host-agent.sock:{SSH_AGENT_GUEST_SOCK}")),
             "the host SSH-agent socket must be forwarded as a bind for git push: {vs:?}"
         );
         // Exit criterion: no credential dir is EVER visible in-guest.
@@ -3517,17 +4010,20 @@ mod tests {
 
         // The agent writes a session-store file under HOME and probes host creds.
         let spec = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![
                     "-c".to_owned(),
                     "mkdir -p \"$HOME/.claude\" && echo hi > \"$HOME/.claude/transcript.jsonl\"; \
                      ls /Users/nilleb/.aws >/dev/null 2>&1 && echo AWS_VISIBLE || echo AWS_HIDDEN"
                         .to_owned(),
                 ],
-                env: BTreeMap::new(),
-                cwd: Some(root.clone()),
-}, LaunchMode::Batch)
+                    env: BTreeMap::new(),
+                    cwd: Some(root.clone()),
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         let out = TokioCommand::new(&spec.program)
             .args(&spec.args)
@@ -3557,24 +4053,220 @@ mod tests {
         );
     }
 
-    /// M5: the clawk stub parses and resolves, but `prepare()` fails with a
-    /// clear "runtime not installed" message (microsandbox is now a real
-    /// provider; clawk stays stubbed).
+    /// clawk parses and resolves, but `prepare()` fails with the contractually
+    /// clear missing-runtime message when the CLI is not on PATH. The command
+    /// lookup is a fake seam so this test never depends on the developer machine.
     #[tokio::test]
-    async fn stub_provider_prepare_errors_clearly() {
-        let provider = StubProvider {
-            name: "vm".to_owned(),
-            primitive: "clawk".to_owned(),
-        };
+    async fn clawk_provider_prepare_errors_clearly_when_runtime_missing() {
+        fn missing(_: &str) -> bool {
+            false
+        }
+        let provider = ClawkProvider::from_config(
+            "vm",
+            &SandboxConfig {
+                primitive: "clawk".to_owned(),
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .unwrap()
+        .with_command_exists(missing);
         let root = Path::new("/proj");
         let err = match provider.prepare(&ctx(root)).await {
-            Ok(_) => panic!("stub prepare should not succeed"),
+            Ok(_) => panic!("prepare should not succeed without clawk"),
             Err(err) => err.to_string(),
         };
-        assert!(
-            err.contains("not yet available") && err.contains("clawk"),
-            "unexpected stub error: {err}"
+        assert_eq!(
+            err,
+            "sandbox primitive 'clawk' requires the clawk CLI on PATH"
         );
+    }
+
+    /// clawk argv shape: project rw mount, extra mounts with Varda's ro/rw
+    /// grammar, default-deny network when egress is present, env/identity folded
+    /// into guest flags, command after `--`. Pure unit test; needs no clawk.
+    #[test]
+    fn clawk_wrap_produces_expected_argv() {
+        let mut auth_env = BTreeMap::new();
+        auth_env.insert("ANTHROPIC_API_KEY".to_owned(), "scoped".to_owned());
+        let session = ClawkSession {
+            image: Some("varda:latest".to_owned()),
+            project_root: PathBuf::from("/proj"),
+            mounts: vec![
+                (MountOrigin::Sandbox, "/cache:/cache:ro".to_owned()),
+                (MountOrigin::Route, "/shared:/shared:rw".to_owned()),
+            ],
+            egress: vec!["api.openai.com".to_owned()],
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-abc".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity {
+                auth_env,
+                git_name: Some("Varda Bot".to_owned()),
+                git_email: Some("bot@example.com".to_owned()),
+                ..Default::default()
+            },
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut env = BTreeMap::new();
+        env.insert("FOO".to_owned(), "bar".to_owned());
+        let wrapped = session
+            .wrap(
+                CommandSpec {
+                    program: "codex".to_owned(),
+                    args: vec!["--print".to_owned(), "-".to_owned()],
+                    env,
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+        assert_eq!(wrapped.program, "clawk");
+        assert_eq!(
+            wrapped.args,
+            vec![
+                "run",
+                "--name",
+                "varda-sbx-abc",
+                "--project",
+                "/proj",
+                "--home",
+                "/home/agent",
+                "--image",
+                "varda:latest",
+                "--network",
+                "default-deny",
+                "--mount",
+                "/proj:/proj:rw",
+                "--mount",
+                "/cache:/cache:ro",
+                "--mount",
+                "/shared:/shared:rw",
+                "--workdir",
+                "/proj",
+                "--env",
+                "ANTHROPIC_API_KEY=scoped",
+                "--env",
+                "FOO=bar",
+                "--env",
+                "GIT_AUTHOR_EMAIL=bot@example.com",
+                "--env",
+                "GIT_AUTHOR_NAME=Varda Bot",
+                "--env",
+                "GIT_COMMITTER_EMAIL=bot@example.com",
+                "--env",
+                "GIT_COMMITTER_NAME=Varda Bot",
+                "--env",
+                "HOME=/home/agent",
+                "--",
+                "codex",
+                "--print",
+                "-",
+            ]
+        );
+        assert!(wrapped.env.is_empty());
+        assert!(wrapped.cwd.is_none());
+        assert!(!session.store_is_live());
+        assert_eq!(
+            session.session_store_root(),
+            Some(PathBuf::from("/host/store"))
+        );
+    }
+
+    #[test]
+    fn clawk_rejects_unsupported_file_mounts_loudly() {
+        let dir = std::env::temp_dir().join(format!("varda-clawk-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.txt");
+        std::fs::write(&file, "data").unwrap();
+        let session = ClawkSession {
+            image: None,
+            project_root: dir.clone(),
+            mounts: vec![(MountOrigin::Route, format!("{}:/data:ro", file.display()))],
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-file".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let err = session
+            .validate_mounts()
+            .expect_err("file-level clawk mount must be rejected");
+        assert!(
+            err.to_string().contains("does not support file bind mount"),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn clawk_staged_credential_is_private_and_cleaned() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let session = Box::new(ClawkSession {
+            image: None,
+            project_root: PathBuf::from("/proj"),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-clean".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        });
+        session
+            .stage_credential_file("scoped-secret", "/home/agent/.token")
+            .unwrap();
+        let host_temp = session.staged_files.lock().unwrap()[0].0.clone();
+        let mode = std::fs::metadata(&host_temp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400);
+        session.teardown().await.unwrap();
+        assert!(!host_temp.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the clawk runtime"]
+    async fn clawk_live_smoke_requires_installed_runtime() {
+        if !command_on_path("clawk") {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("clawk-it-proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let provider = ClawkProvider::from_config(
+            "clawk",
+            &SandboxConfig {
+                primitive: "clawk".to_owned(),
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let session = provider
+            .prepare(&ctx_with_id(&root, "clawk-it-1"))
+            .await
+            .unwrap();
+        let spec = session
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec!["-c".to_owned(), "printf clawk-ok".to_owned()],
+                    env: BTreeMap::new(),
+                    cwd: Some(root),
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+        let final_spec = session.begin_batch(spec).await.unwrap();
+        let out = tokio::process::Command::new(&final_spec.program)
+            .args(&final_spec.args)
+            .output()
+            .await
+            .expect("failed to run clawk");
+        session.teardown().await.ok();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "clawk-ok");
     }
 
     /// M5: a `build` sandbox defers image resolution to `prepare()`; a missing
@@ -3715,7 +4407,10 @@ mod tests {
             },
             Vec::new(),
         );
-        assert!(provider.is_ok(), "image_from should satisfy the source requirement");
+        assert!(
+            provider.is_ok(),
+            "image_from should satisfy the source requirement"
+        );
     }
 
     /// M7: a missing devcontainer.json surfaces a clear error naming the project.
@@ -3743,7 +4438,10 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        let err = provider.resolve_image(Path::new("/proj")).await.unwrap_err();
+        let err = provider
+            .resolve_image(Path::new("/proj"))
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("unknown `image_from"),
             "unexpected error: {err}"
@@ -3783,8 +4481,7 @@ mod tests {
             image_from: Some("devcontainer".to_owned()),
             ..Default::default()
         };
-        let provider =
-            DockerProvider::from_config("dc", &resolved, Vec::new()).unwrap();
+        let provider = DockerProvider::from_config("dc", &resolved, Vec::new()).unwrap();
         docker_cleanup("devc-home-1").await;
         let session = provider
             .prepare(&ctx_with_id(&root, "devc-home-1"))
@@ -3816,7 +4513,10 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         session.teardown().await.ok();
 
-        assert!(out.status.success(), "container run should succeed: {stdout}");
+        assert!(
+            out.status.success(),
+            "container run should succeed: {stdout}"
+        );
         assert!(
             stdout.contains("AWS_HIDDEN"),
             "devcontainer `mounts` must be ignored — host ~/.aws must NOT be visible; got: {stdout}"
@@ -3937,12 +4637,15 @@ mod tests {
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         assert_eq!(
             mount_values(&wrapped),
@@ -3971,12 +4674,15 @@ mod tests {
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         assert!(
             mount_values(&wrapped).contains(&"/host/adb:/context/adb:ro".to_owned()),
@@ -4006,12 +4712,15 @@ mod tests {
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         let values = mount_values(&wrapped);
         assert!(values.contains(&"/srv/app/vendor:/vendor:ro".to_owned()));
@@ -4052,12 +4761,15 @@ mod tests {
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         let values = mount_values(&wrapped);
         // Same target `/context` de-duped to the sandbox origin's ro mount.
@@ -4109,12 +4821,15 @@ mod tests {
             "/var/varda/sessions/s1",
         );
         let wrapped = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         let values = mount_values(&wrapped);
         assert!(
@@ -4182,19 +4897,25 @@ mod tests {
             .join("m6a-proj");
         std::fs::create_dir_all(&root).unwrap();
         docker_cleanup("ro-mount-1").await;
-        let session = provider.prepare(&ctx_with_id(&root, "ro-mount-1")).await.unwrap();
+        let session = provider
+            .prepare(&ctx_with_id(&root, "ro-mount-1"))
+            .await
+            .unwrap();
 
         // Reading the mounted file succeeds; writing into it fails (ro).
         let spec = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![
-                    "-c".to_owned(),
-                    "cat /context/seed.txt && ! (echo x > /context/probe.txt)".to_owned(),
-                ],
-                env: BTreeMap::new(),
-                cwd: Some(root.clone()),
-}, LaunchMode::Batch)
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![
+                        "-c".to_owned(),
+                        "cat /context/seed.txt && ! (echo x > /context/probe.txt)".to_owned(),
+                    ],
+                    env: BTreeMap::new(),
+                    cwd: Some(root.clone()),
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         let status = TokioCommand::new(&spec.program)
             .args(&spec.args)
@@ -4244,16 +4965,19 @@ mod tests {
 
         // Simulate the agent writing a session-store file under HOME (the volume).
         let spec = session
-            .wrap(CommandSpec {
-                program: "sh".to_owned(),
-                args: vec![
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![
                     "-c".to_owned(),
                     "mkdir -p \"$HOME/.claude\" && echo hi > \"$HOME/.claude/transcript.jsonl\""
                         .to_owned(),
                 ],
-                env: BTreeMap::new(),
-                cwd: Some(root.clone()),
-}, LaunchMode::Batch)
+                    env: BTreeMap::new(),
+                    cwd: Some(root.clone()),
+                },
+                LaunchMode::Batch,
+            )
             .unwrap();
         let status = TokioCommand::new(&spec.program)
             .args(&spec.args)
