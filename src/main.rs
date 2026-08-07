@@ -112,6 +112,11 @@ enum TaskCommand {
         /// Agent to assign the task to. Skips the interactive assignee prompt.
         #[arg(long)]
         agent: Option<String>,
+        /// Pin this task to a named central sandbox (`[sandboxes.<NAME>]`),
+        /// overriding route/`.varda`/defaults resolution at run time. Use `local`
+        /// for the identity provider. Composes with `--exec --interactive`.
+        #[arg(long, value_name = "NAME")]
+        sandbox: Option<String>,
         /// Treat the task name as a complete one-line task and run it immediately.
         #[arg(long)]
         exec: bool,
@@ -313,6 +318,7 @@ async fn main() -> Result<()> {
                 file,
                 project,
                 agent,
+                sandbox,
                 exec,
                 edit,
                 background,
@@ -361,6 +367,18 @@ async fn main() -> Result<()> {
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
+                // Validate the pinned sandbox up front so `--sandbox typo` fails at
+                // creation time rather than only at run time. `local` is always valid.
+                if let Some(name) = sandbox.as_deref() {
+                    let known = name == config::DEFAULT_SANDBOX_PROVIDER
+                        || config.sandboxes.contains_key(name);
+                    if !known {
+                        anyhow::bail!(
+                            "sandbox '{name}' is not configured; \
+                             add a `[sandboxes.{name}]` entry or use `local`"
+                        );
+                    }
+                }
                 let assignee = if let Some(ref agent_name) = agent {
                     routing::match_route(&config, &project_path, Some(agent_name))?;
                     Some(agent_name.clone())
@@ -379,6 +397,7 @@ async fn main() -> Result<()> {
                     &project_path,
                     assignee.as_deref(),
                     description.as_deref(),
+                    sandbox.as_deref(),
                 )?;
                 let mut task_doc = task::load_task(&task_path)?;
                 if ready || exec {
@@ -968,6 +987,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         &[],
         &std::collections::BTreeMap::new(),
         None,
+        None,
     )?;
     let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
     let request = agent::AgentRunRequest {
@@ -977,6 +997,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         frontmatter: task::TaskFrontmatter {
             bounds: crate::task::TaskBounds::default(),
             id: None,
+            sandbox: None,
             status: task::TaskStatus::Ready,
             project: None,
             assignee: Some(planner_agent),
@@ -1214,6 +1235,7 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
             &project,
             Some(assignee),
             Some(&req.brief),
+            None,
         )
         .context("failed to create spawned subtask")?;
         let mut task_doc = task::load_task(&task_path)?;
@@ -1420,6 +1442,7 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
 /// is `None` (no project context, e.g. plan transformation) the trusted-only
 /// by-name path is used with `sandbox_name`/`route_mounts`. `local` yields the
 /// identity provider; any other name must have a matching `[sandboxes.<name>]`.
+#[allow(clippy::too_many_arguments)]
 fn build_client(
     config: &config::Config,
     display_name: &str,
@@ -1428,6 +1451,7 @@ fn build_client(
     route_mounts: &[String],
     route_env: &std::collections::BTreeMap<String, String>,
     project_path: Option<&Path>,
+    pinned_sandbox: Option<&str>,
 ) -> Result<acp::AcpSubprocessClient> {
     // M11 — resolve the three identity/auth channels (curated identity files,
     // SSH-agent + git identity, scoped auth token) once and inject them into
@@ -1437,7 +1461,8 @@ fn build_client(
     let provider = match project_path {
         Some(project_path) => {
             let routing_root = routing_root_for(project_path);
-            let resolved = config.resolve_sandbox_for(project_path, &routing_root)?;
+            let resolved =
+                config.resolve_sandbox_for(project_path, &routing_root, pinned_sandbox)?;
             enforce_varda_env_credential_floor(agent_config, &resolved)?;
             if let Some(varda_file) = &resolved.varda_file {
                 eprintln!(
@@ -1695,6 +1720,7 @@ async fn run_task_path_for_parallel(
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document.frontmatter.sandbox.as_deref(),
     )?;
     let policy = task_document
         .frontmatter
@@ -2925,7 +2951,10 @@ fn resolve_resident_launch(config: &config::Config, workspace: &Path) -> Result<
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let routing_root = routing_root_for(workspace);
-    let resolved = config.resolve_sandbox_for(workspace, &routing_root)?;
+    // Orchestrate/resident launch has no task frontmatter → no task-pinned
+    // override. Route/`.varda`/defaults precedence is unchanged, keeping
+    // `enforce_resident_launch` intact.
+    let resolved = config.resolve_sandbox_for(workspace, &routing_root, None)?;
     let mounts: Vec<String> = sandbox::merge_mount_origins(
         &resolved.config.mounts,
         &resolved.route_mounts,
@@ -3009,6 +3038,7 @@ fn resolve_or_scaffold_resident_task(
         workspace,
         Some(agent),
         Some(RESIDENT_TASK_BODY),
+        None,
     )?;
     let mut task_doc = task::load_task(&task_path)?;
     task_doc.set_status(task::TaskStatus::Ready);
@@ -3105,6 +3135,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document.frontmatter.sandbox.as_deref(),
     )?;
     // Wire the nested-orchestration broker onto the interactive resident: when
     // orchestration is enabled for this project, wrap the session in
@@ -3250,6 +3281,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document.frontmatter.sandbox.as_deref(),
     )?;
     let outcome = runner::plan_task(
         &config,
@@ -3342,6 +3374,7 @@ async fn run_captured_resume_command(
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document.frontmatter.sandbox.as_deref(),
     )?;
     if config.git.auto_commit {
         git::commit_task_file(
@@ -4553,6 +4586,7 @@ deny_sandboxes = ["local"]
                 status: task::TaskStatus::Ready,
                 project: None,
                 assignee: None,
+                sandbox: None,
                 recap: None,
                 recaps: vec![],
                 plan: None,

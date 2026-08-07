@@ -39,6 +39,13 @@ pub struct TaskFrontmatter {
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// Task-pinned sandbox override. When set (via `varda task add --sandbox
+    /// <NAME>`), the run path resolves the sandbox to the central
+    /// `[sandboxes.<NAME>]` with HIGHEST precedence — above the nearest `.varda`,
+    /// the matched route, and `defaults.sandbox`. `"local"` selects the identity
+    /// provider. See `config::Config::resolve_sandbox_for`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     // Legacy single-recap field; kept for backward-compat deserialization only.
     // Migrated to `recaps` on load. Not serialized.
     #[serde(default, skip_serializing)]
@@ -277,6 +284,7 @@ pub fn create_task(
     project_path: &Path,
     assignee: Option<&str>,
     description: Option<&str>,
+    sandbox: Option<&str>,
 ) -> Result<PathBuf> {
     let task_root = Path::new(&config.defaults.operations_dir).join("tasks");
     let task_dir = task_root.join(project_task_folder(project_path)?);
@@ -308,6 +316,7 @@ pub fn create_task(
             status: TaskStatus::Backlog,
             project: Some(project_path.display().to_string()),
             assignee: assignee.map(str::to_owned),
+            sandbox: sandbox.map(str::to_owned),
             recap: None,
             recaps: vec![],
             plan: None,
@@ -911,6 +920,7 @@ Verify the sandbox.
                 status: TaskStatus::Running,
                 project: None,
                 assignee: Some("codex".to_owned()),
+                sandbox: None,
                 recap: None,
                 recaps: vec![],
                 plan: None,
@@ -956,6 +966,7 @@ Verify the sandbox.
                 status: TaskStatus::Pending,
                 project: None,
                 assignee: Some("codex".to_owned()),
+                sandbox: None,
                 recap: None,
                 recaps: vec![".varda/operations/recaps/run.md".to_owned()],
                 plan: None,
@@ -1012,6 +1023,7 @@ Verify the sandbox.
             project_path,
             Some("codex"),
             None,
+            None,
         )
         .expect("task should be created");
         let content = fs::read_to_string(&path).expect("task should be readable");
@@ -1061,7 +1073,7 @@ requires_user: false
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
-        let path = create_task(&config, "Next Task", Path::new("/work/project"), None, None)
+        let path = create_task(&config, "Next Task", Path::new("/work/project"), None, None, None)
             .expect("task should be created");
         let content = fs::read_to_string(&path).expect("task should be readable");
 
@@ -1096,9 +1108,9 @@ requires_user: false
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
-        let first = create_task(&config, "Project Task", &first_project, None, None)
+        let first = create_task(&config, "Project Task", &first_project, None, None, None)
             .expect("first task should be created");
-        let second = create_task(&config, "Project Task", &second_project, None, None)
+        let second = create_task(&config, "Project Task", &second_project, None, None, None)
             .expect("second task should be created");
 
         assert_ne!(first.parent(), second.parent());
@@ -1159,7 +1171,7 @@ requires_user: false
         fs::create_dir_all(project.join(".varda")).expect("repo .varda should be created");
         let config = test_config(&operations_dir);
 
-        let state_path = create_task(&config, "Repo Local Task", &project, Some("claude"), None)
+        let state_path = create_task(&config, "Repo Local Task", &project, Some("claude"), None, None)
             .expect("task should be created");
 
         // The returned path is the HOME state file (run-time authority), which

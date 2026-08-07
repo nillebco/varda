@@ -464,6 +464,7 @@ mod tests {
                     status: TaskStatus::Ready,
                     project: Some("/work/project".to_owned()),
                     assignee: Some("codex".to_owned()),
+                    sandbox: None,
                     recap: None,
                     recaps: vec![],
                     plan: None,

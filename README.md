@@ -220,6 +220,27 @@ varda task add --agent claude --exec --interactive "Task name" "Optional task de
 
 Use them when you want to start an interactive session with a specific agent without typing the full flag list.
 
+#### Pinning a sandbox (`--sandbox`)
+
+By default the sandbox for a task is resolved from the nearest `.varda`, the
+matched route, and `defaults.sandbox` (see [Sandbox providers](#sandbox-providers)).
+`varda task add --sandbox <NAME>` pins the task to a named central
+`[sandboxes.<NAME>]` instead, overriding that resolution with the **highest**
+precedence (task-pin → `.varda` → route → `defaults.sandbox` → `local`). Use it
+to force a specific sandbox for a one-off task from any directory, regardless of
+route — e.g. an interactive microsandbox shell over the current directory:
+
+```sh
+varda task add --sandbox msbshell --exec --interactive "shell"
+```
+
+The name is validated at creation time and again at run time: it must match a
+configured `[sandboxes.<NAME>]` (or be the literal `local`, the identity
+provider), otherwise the command errors. The pin is persisted as a `sandbox:`
+field in the task frontmatter. It composes with `--exec`, `--interactive`, and
+`--agent`. It does **not** relax the resident/orchestrate launch checks
+(`enforce_resident_launch` runs for `varda orchestrate`, not plain `task add`).
+
 `taskname` and `description` are two separate positional arguments, so quote any multi-word values:
 
 ```sh
@@ -770,8 +791,12 @@ Two knobs are deliberately separate. **`image`/`build`** decides *what tools are
 A folder can commit its own sandbox choice in a **`.varda`** file. When resolving the sandbox for a task, Varda walks **up** from the task's project/target path to the routing root and uses the **nearest `.varda`**. Precedence:
 
 ```
-nearest .varda  →  central route (glob)  →  defaults.sandbox  →  "local"
+task-pin (task add --sandbox)  →  nearest .varda  →  central route (glob)  →  defaults.sandbox  →  "local"
 ```
+
+A task-pinned sandbox (`varda task add --sandbox <NAME>`, persisted as the
+`sandbox:` task-frontmatter field) is a trusted operator origin, so it wins over
+even the nearest `.varda` and is not subject to the `.varda` hardening floor.
 
 `.varda` is TOML in one of two forms:
 
@@ -907,7 +932,7 @@ Current limitations:
 A project subtree can pin its own sandbox by placing a `.varda` file in (or above) the task's project directory. At launch Varda walks up from the project path to the git root and uses the **nearest** `.varda`, with precedence:
 
 ```
-nearest .varda  →  central route sandbox  →  defaults.sandbox  →  "local"
+task-pin (task add --sandbox)  →  nearest .varda  →  central route sandbox  →  defaults.sandbox  →  "local"
 ```
 
 A `.varda` is TOML in one of two forms:

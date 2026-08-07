@@ -1999,6 +1999,7 @@ Help interactively.
             status: TaskStatus::Ready,
             project: None,
             assignee: None,
+            sandbox: None,
             recap: None,
             recaps: vec![],
             plan: None,

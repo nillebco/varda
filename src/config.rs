@@ -588,13 +588,21 @@ pub fn find_nearest_varda(start: &Path, routing_root: &Path) -> Option<PathBuf> 
 
 impl Config {
     /// Resolve the effective sandbox for a task at `project_path`, honoring the
-    /// precedence `nearest .varda → central route (glob) → defaults.sandbox →
-    /// "local"` and clamping the untrusted `.varda` origin with the M6b hardening
-    /// floor. `routing_root` bounds the upward `.varda` walk.
+    /// precedence `task-pinned → nearest .varda → central route (glob) →
+    /// defaults.sandbox → "local"` and clamping the untrusted `.varda` origin with
+    /// the M6b hardening floor. `routing_root` bounds the upward `.varda` walk.
+    ///
+    /// `pinned` carries the task-frontmatter `sandbox` override (`varda task add
+    /// --sandbox <NAME>`). When set it wins over EVERY other origin: the named
+    /// central `[sandboxes.<NAME>]` (or `"local"`) is used directly, the `.varda`
+    /// walk is skipped, and the route's project-context mounts/env are still
+    /// applied. The name must resolve to a configured sandbox (or `"local"`),
+    /// otherwise a clear error is returned.
     pub fn resolve_sandbox_for(
         &self,
         project_path: &Path,
         routing_root: &Path,
+        pinned: Option<&str>,
     ) -> Result<ResolvedSandbox> {
         // Trusted baseline from the central route: its glob-selected sandbox name
         // and project-context mounts. Used directly when no `.varda` applies.
@@ -605,6 +613,29 @@ impl Config {
             .and_then(|r| r.sandbox.clone())
             .or_else(|| self.defaults.sandbox.clone())
             .unwrap_or_else(|| DEFAULT_SANDBOX_PROVIDER.to_owned());
+
+        // Task-pinned sandbox wins over `.varda`, route, and defaults. It is a
+        // TRUSTED origin (set by the operator via `--sandbox`), so no `.varda`
+        // hardening floor applies — but the name must exist in config.
+        if let Some(name) = pinned {
+            if name != DEFAULT_SANDBOX_PROVIDER && !self.sandboxes.contains_key(name) {
+                bail!(
+                    "task-pinned sandbox '{name}' is not configured; \
+                     add a `[sandboxes.{name}]` entry or use `local`"
+                );
+            }
+            let config = self.sandbox_config_by_name(name);
+            let env = merge_static_env(&config.env, &route_env, &BTreeMap::new());
+            return Ok(ResolvedSandbox {
+                name: name.to_owned(),
+                config,
+                route_mounts,
+                varda_mounts: Vec::new(),
+                env,
+                varda_env_keys: Vec::new(),
+                varda_file: None,
+            });
+        }
 
         let Some(varda_path) = find_nearest_varda(project_path, routing_root) else {
             let config = self.sandbox_config_by_name(&central_name);
@@ -2449,15 +2480,89 @@ mod m6b_tests {
         );
 
         // No `.varda` ⇒ central route/defaults ⇒ "local".
-        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        let r = config.resolve_sandbox_for(&proj, &root, None).unwrap();
         assert_eq!(r.name, "local");
         assert!(r.varda_file.is_none());
 
         // Reference `.varda` selects the central sandbox by name.
         fs::write(proj.join(VARDA_FILE), "sandbox = \"rust\"\n").unwrap();
-        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        let r = config.resolve_sandbox_for(&proj, &root, None).unwrap();
         assert_eq!(r.name, "rust");
         assert_eq!(r.config.image.as_deref(), Some("rust:latest"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn task_pinned_sandbox_wins_over_route_and_varda() {
+        let root = tmp("pinned");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let mut config = base_config();
+        config.sandboxes.insert(
+            "msbshell".to_owned(),
+            SandboxConfig {
+                image: Some("msb:latest".to_owned()),
+                ..SandboxConfig::default()
+            },
+        );
+
+        // Route/defaults would resolve "local"; the task-pin forces "msbshell".
+        let r = config
+            .resolve_sandbox_for(&proj, &root, Some("msbshell"))
+            .unwrap();
+        assert_eq!(r.name, "msbshell");
+        assert_eq!(r.config.image.as_deref(), Some("msb:latest"));
+        assert!(r.varda_file.is_none());
+
+        // Even a `.varda` reference is overridden by the task-pin (highest precedence).
+        fs::write(proj.join(VARDA_FILE), "sandbox = \"rust\"\n").unwrap();
+        let r = config
+            .resolve_sandbox_for(&proj, &root, Some("msbshell"))
+            .unwrap();
+        assert_eq!(r.name, "msbshell");
+        assert!(r.varda_file.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn task_pinned_unknown_sandbox_errors() {
+        let root = tmp("pinned-unknown");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let config = base_config();
+
+        let err = config
+            .resolve_sandbox_for(&proj, &root, Some("nope"))
+            .unwrap_err();
+        assert!(err.to_string().contains("nope"));
+        assert!(err.to_string().contains("not configured"));
+
+        // "local" is always a valid pin (identity provider), never an error.
+        let r = config
+            .resolve_sandbox_for(&proj, &root, Some("local"))
+            .unwrap();
+        assert_eq!(r.name, "local");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_pin_leaves_route_based_resolution_unchanged() {
+        let root = tmp("nopin");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let mut config = base_config();
+        config.sandboxes.insert(
+            "rust".to_owned(),
+            SandboxConfig {
+                image: Some("rust:latest".to_owned()),
+                ..SandboxConfig::default()
+            },
+        );
+        // A `.varda` reference still governs when no task-pin is supplied.
+        fs::write(proj.join(VARDA_FILE), "sandbox = \"rust\"\n").unwrap();
+        let r = config.resolve_sandbox_for(&proj, &root, None).unwrap();
+        assert_eq!(r.name, "rust");
+        assert!(r.varda_file.is_some());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2473,7 +2578,7 @@ mod m6b_tests {
         )
         .unwrap();
 
-        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        let r = config.resolve_sandbox_for(&proj, &root, None).unwrap();
         assert_eq!(r.name, "inline");
         assert_eq!(r.varda_mounts.len(), 1);
         // Forced :ro (writable not allowed by default) and source made absolute.
@@ -2506,7 +2611,7 @@ mod m6b_tests {
             },
         );
 
-        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        let r = config.resolve_sandbox_for(&proj, &root, None).unwrap();
         assert_eq!(r.env["FROM_SANDBOX"], "sandbox");
         assert_eq!(r.env["FROM_ROUTE"], "route");
         assert_eq!(r.env["SHARED"], "route");
@@ -2517,7 +2622,7 @@ mod m6b_tests {
             "[sandbox]\nimage = \"x:1\"\nenv = { FROM_VARDA = \"varda\", FROM_SANDBOX = \"varda\" }\n",
         )
         .unwrap();
-        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        let r = config.resolve_sandbox_for(&proj, &root, None).unwrap();
         assert_eq!(r.env["FROM_SANDBOX"], "varda");
         assert_eq!(r.env["FROM_ROUTE"], "route");
         assert_eq!(r.env["FROM_VARDA"], "varda");
@@ -2540,7 +2645,7 @@ mod m6b_tests {
             "[sandbox]\nimage = \"x:1\"\nenv = { PATH = \"/tmp\" }\n",
         )
         .unwrap();
-        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        let err = config.resolve_sandbox_for(&proj, &root, None).unwrap_err();
         assert!(err.to_string().contains("PATH"), "{err}");
 
         fs::write(
@@ -2548,7 +2653,7 @@ mod m6b_tests {
             "[sandbox]\nimage = \"x:1\"\nenv = { TRUSTED = \"override\" }\n",
         )
         .unwrap();
-        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        let err = config.resolve_sandbox_for(&proj, &root, None).unwrap_err();
         assert!(err.to_string().contains("TRUSTED"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
@@ -2564,7 +2669,7 @@ mod m6b_tests {
             "[sandbox]\nimage = \"x:1\"\nprimitive = \"local\"\n",
         )
         .unwrap();
-        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        let err = config.resolve_sandbox_for(&proj, &root, None).unwrap_err();
         assert!(err.to_string().contains("primitive"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
@@ -2580,7 +2685,7 @@ mod m6b_tests {
             "[sandbox]\nimage = \"x:1\"\nmounts = [\"/etc:/data\"]\n",
         )
         .unwrap();
-        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        let err = config.resolve_sandbox_for(&proj, &root, None).unwrap_err();
         assert!(
             err.to_string().contains("outside the project root"),
             "{err}"
@@ -2599,7 +2704,7 @@ mod m6b_tests {
             "[sandbox]\nimage = \"x:1\"\nmounts = [\"ctx:/etc\"]\n",
         )
         .unwrap();
-        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        let err = config.resolve_sandbox_for(&proj, &root, None).unwrap_err();
         assert!(err.to_string().contains("system dir"), "{err}");
 
         // Egress ceiling clamp.
@@ -2610,7 +2715,7 @@ mod m6b_tests {
             "[sandbox]\nimage = \"x:1\"\negress = [\"evil.example.com\"]\n",
         )
         .unwrap();
-        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        let err = config.resolve_sandbox_for(&proj, &root, None).unwrap_err();
         assert!(err.to_string().contains("egress_ceiling"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
@@ -2627,7 +2732,7 @@ mod m6b_tests {
             "[sandbox]\nimage = \"x:1\"\nmounts = [\"ctx:/ctx:rw\"]\n",
         )
         .unwrap();
-        let r = config.resolve_sandbox_for(&proj, &root).unwrap();
+        let r = config.resolve_sandbox_for(&proj, &root, None).unwrap();
         assert!(
             r.varda_mounts[0].ends_with(":/ctx:rw"),
             "{:?}",
@@ -2655,7 +2760,7 @@ mod m6b_tests {
         );
         fs::write(sub.join(VARDA_FILE), "sandbox = \"rust\"\n").unwrap();
 
-        let resolved = config.resolve_sandbox_for(&sub, &root).unwrap();
+        let resolved = config.resolve_sandbox_for(&sub, &root, None).unwrap();
         let mounts = crate::sandbox::merge_mount_origins(
             &resolved.config.mounts,
             &resolved.route_mounts,
@@ -2687,7 +2792,7 @@ mod m6b_tests {
         )
         .unwrap();
 
-        let resolved = config.resolve_sandbox_for(&proj, &root).unwrap();
+        let resolved = config.resolve_sandbox_for(&proj, &root, None).unwrap();
         let mounts = crate::sandbox::merge_mount_origins(
             &resolved.config.mounts,
             &resolved.route_mounts,
@@ -2729,7 +2834,7 @@ mod m6b_tests {
             "[sandbox]\nimage = \"x:1\"\nprimitive = \"local\"\n",
         )
         .unwrap();
-        let err = config.resolve_sandbox_for(&proj, &root).unwrap_err();
+        let err = config.resolve_sandbox_for(&proj, &root, None).unwrap_err();
         assert!(err.to_string().contains("primitive"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
