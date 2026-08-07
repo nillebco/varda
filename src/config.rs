@@ -3089,6 +3089,7 @@ mod resident_tests {
             ..SandboxConfig::default()
         };
         let err = enforce_resident_launch(
+            "claude-resident",
             "orchestration",
             &sandbox,
             &mounts,
@@ -3117,6 +3118,7 @@ mod resident_tests {
             ..SandboxConfig::default()
         };
         let err = enforce_resident_launch(
+            "claude-resident",
             "orchestration",
             &sandbox,
             &mounts,
