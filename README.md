@@ -1040,7 +1040,9 @@ global_child_budget = 64
 deny_sandboxes = ["local"]    # spawned workers must never land un-sandboxed
 ```
 
-> A docker-backed live end-to-end test (`#[ignore = "requires docker"]` — `orchestrate_live_resident`) captures the full scenario: a resident in a box spawns one worker that edits a file on a branch, merges it in-box, the change is visible on the host through the mount, and `~/.aws`/host `$HOME` were never visible and no push occurred.
+> **Project/workspace mount is auto-provided rw + host-visible.** Every sandbox mounts the project at its own absolute host path **once, read-write** (so a resident's in-box merges land on the host and are committable). For `orchestrate` the project *is* the workspace, so the G1 gate's explicit rw `mounts` entry can name the same host path as its guest target (`…/workspace:…/workspace:rw`) or a distinct one (`…/workspace:/workspace:rw`) — a mount that resolves to the **same guest path** as the auto project mount is de-duplicated rather than emitted twice (microsandbox/`msb` rejects two volumes on one guest path). NB: `msb run` 0.6.8 has **no** `--project` flag; the project is a plain `--mount-dir HOST:GUEST:rw` bind and the workdir is set via `--workdir`.
+
+> A docker-backed live end-to-end test (`#[ignore = "requires docker"]` — `orchestrate_live_resident`) captures the full scenario: a resident in a box spawns one worker that edits a file on a branch, merges it in-box, the change is visible on the host through the mount, and `~/.aws`/host `$HOME` were never visible and no push occurred. The microsandbox rw/host-visibility guarantee has its own `#[ignore = "requires the msb (microsandbox) runtime"]` check (`microsandbox_workspace_mount_is_rw_and_host_visible_live`).
 
 ### Per-task capability allowlist (headless permission grants)
 
