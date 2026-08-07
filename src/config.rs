@@ -20,6 +20,31 @@ pub const OPERATIONS_README: &str = "README.md";
 #[allow(dead_code)]
 pub const DEFAULT_SANDBOX_PROVIDER: &str = "local";
 
+/// The ONLY hosts a net-restricted sandboxed resident may reach.
+///
+/// The resident is a CLOUD LLM agent (claude/codex) that cannot function without
+/// reaching its provider API, so a fully net-denied box would be inert. Rather than
+/// open the network, `enforce_resident_launch` permits egress ONLY to this fixed
+/// LLM-endpoint allowlist and denies everything else — crucially `github.com` and any
+/// other host — so there is still NO `git push` and NO arbitrary-host exfiltration.
+///
+/// Matching is a case-insensitive EXACT host comparison (see `enforce_resident_launch`):
+/// no wildcard/suffix matching, so a look-alike like `api.openai.com.attacker.com`
+/// stays denied.
+///
+/// Kept deliberately MINIMAL. It may need tuning to whatever the installed agents
+/// actually call:
+///   - `api.anthropic.com`  — Claude API (claude)
+///   - `api.openai.com`     — OpenAI API (codex)
+///   - `chatgpt.com`        — ChatGPT backend (codex/ChatGPT sign-in)
+///   - `auth.openai.com`    — OpenAI/ChatGPT auth flow (codex)
+pub const RESIDENT_EGRESS_ALLOWLIST: &[&str] = &[
+    "api.anthropic.com",
+    "api.openai.com",
+    "chatgpt.com",
+    "auth.openai.com",
+];
+
 const DEFAULT_CONFIG: &str = r#"[defaults]
 timeout_seconds = 600
 operations_dir = "operations"
@@ -48,15 +73,16 @@ agents = ["codex"]
 # the old un-sandboxed `local` resident example — the four load-bearing gates are
 # asserted in code before launch and a violation FAILS LOUDLY:
 #   G1  dedicated rw workspace mount (never $HOME / a home-ancestor / ~/dev)
-#   G2  isolating sandbox (never `local`), net-denied (`egress = []`), and NO push
-#       credential (nothing that lets the box authenticate `git push` to a remote)
+#   G2  isolating sandbox (never `local`), net-restricted to the LLM-endpoint allowlist
+#       ONLY (github.com etc. stay denied — no push, no exfil), and NO push credential
+#       (nothing that lets the box authenticate `git push` to a remote)
 #   G7  broker caps bound the worker fan-out (see [routes.orchestration] below)
 # Pushing back out is a separate, human-gated step performed on the HOST.
 #
 # [sandboxes.orchestration]
 # image = "your-dev-image:latest"
 # primitive = "docker"          # isolating — NEVER "local"
-# egress = []                   # net-deny: the box runs with `--network none`
+# egress = ["api.anthropic.com", "api.openai.com"]  # LLM endpoints ONLY — github.com etc. stay denied (no push, no exfil)
 #
 # [[routes]]
 # glob = "/path/to/orchestration/workspace/**"
@@ -1223,8 +1249,10 @@ pub fn workspace_mounted_rw(mounts: &[String], workspace: &Path) -> bool {
 /// - **G1** — `workspace` is a dedicated dir (not `$HOME`/home-ancestor) and is
 ///   mounted **rw** in `mounts`.
 /// - **G2** — the sandbox is **isolating** (`primitive != "local"`, name != `local`),
-///   **net-denied** (`egress` empty ⇒ `--network none`), and the resident identity
-///   carries **no push credential**. "No push credential" spans every channel a
+///   **net-restricted** (every `egress` host must be in `RESIDENT_EGRESS_ALLOWLIST` — an
+///   LLM-only allowlist; `github.com`/general hosts stay denied so there is no push or
+///   exfiltration; an empty `egress` ⇒ `--network none` still passes), and the resident
+///   identity carries **no push credential**. "No push credential" spans every channel a
 ///   credential can reach the box through: a forwarded SSH agent, a push-capable
 ///   `credentials` target, a push-enabling key in the resident's EFFECTIVE `env`
 ///   (agent + sandbox + route + `.varda`, per `effective_env`), or a pre-seeded
@@ -1256,13 +1284,24 @@ pub fn enforce_resident_launch(
         );
     }
 
-    // G2 — net-deny. A non-empty egress list would let the box reach a remote.
-    if !sandbox.egress.is_empty() {
-        bail!(
-            "resident sandbox '{sandbox_name}' allows egress ({:?}); the orchestrator MUST be network-denied \
-             (`egress = []` ⇒ `--network none`). Remove the egress allow-list.",
-            sandbox.egress
-        );
+    // G2 — LLM-only egress. The resident is a cloud LLM agent that MUST reach its
+    // provider API, so a fully net-denied box would be inert. Permit egress ONLY to the
+    // fixed LLM-endpoint allowlist and deny everything else — crucially `github.com` and
+    // any other host — so there is still NO push and NO arbitrary-host exfiltration. An
+    // EMPTY egress still passes (fully offline is allowed). Matching is a case-insensitive
+    // EXACT host comparison: no wildcard/suffix, so `api.openai.com.attacker.com` is denied.
+    for host in &sandbox.egress {
+        let allowed = RESIDENT_EGRESS_ALLOWLIST
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(host));
+        if !allowed {
+            bail!(
+                "resident sandbox '{sandbox_name}' allows egress to '{host}', which is not an LLM endpoint; \
+                 a net-restricted resident may reach ONLY the LLM API allowlist ({:?}) so there is no push \
+                 and no exfiltration. Remove '{host}' from `egress` (github.com and general hosts stay denied).",
+                RESIDENT_EGRESS_ALLOWLIST
+            );
+        }
     }
 
     // G2 — no push credential. The resident's identity must not reach a remote.
@@ -2767,13 +2806,14 @@ mod resident_tests {
         assert!(err.to_string().contains("isolating sandbox"), "{err}");
     }
 
-    #[test]
-    fn rejects_network_egress() {
-        let ws = tmp("net");
+    /// Run `enforce_resident_launch` for a resident whose ONLY departure from the happy
+    /// path is the given egress list. Returns Ok(()) / the refusal error.
+    fn resident_with_egress(tag: &str, egress: &[&str]) -> Result<()> {
+        let ws = tmp(tag);
         let mounts = vec![format!("{}:/workspace:rw", ws.display())];
         let mut sandbox = isolating_sandbox();
-        sandbox.egress = vec!["api.example.com".to_owned()];
-        let err = enforce_resident_launch(
+        sandbox.egress = egress.iter().map(|h| (*h).to_owned()).collect();
+        enforce_resident_launch(
             "orchestration",
             &sandbox,
             &mounts,
@@ -2783,8 +2823,62 @@ mod resident_tests {
             false,
             &resident_policy(),
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("network-denied"), "{err}");
+    }
+
+    #[test]
+    fn allows_llm_endpoint_egress() {
+        // The full allowlist passes — the resident may reach its LLM provider APIs.
+        resident_with_egress("llm-full", RESIDENT_EGRESS_ALLOWLIST)
+            .expect("egress limited to the LLM allowlist must pass");
+        // A single LLM host also passes.
+        resident_with_egress("llm-one", &["api.anthropic.com"])
+            .expect("a single LLM endpoint must pass");
+        // Matching is case-insensitive on the host.
+        resident_with_egress("llm-case", &["API.Anthropic.Com"])
+            .expect("host match must be case-insensitive");
+    }
+
+    #[test]
+    fn empty_egress_still_passes() {
+        // Fully offline (`--network none`) remains allowed.
+        resident_with_egress("offline", &[]).expect("an empty egress (offline) must still pass");
+    }
+
+    #[test]
+    fn rejects_github_egress() {
+        // github.com is a push/exfil host — never an LLM endpoint.
+        let err = resident_with_egress("gh", &["github.com"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("github.com"), "error must name the host: {msg}");
+        assert!(msg.contains("LLM"), "error must state LLM-only policy: {msg}");
+    }
+
+    #[test]
+    fn one_bad_host_taints_the_whole_egress_list() {
+        // A single non-LLM host is refused even alongside a legitimate LLM endpoint.
+        let err =
+            resident_with_egress("mixed", &["api.anthropic.com", "github.com"]).unwrap_err();
+        assert!(
+            err.to_string().contains("github.com"),
+            "the offending host must be named: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_lookalike_hosts_no_suffix_bypass() {
+        // Exact match only — a suffix/subdomain of an allowlisted host is NOT admitted.
+        for host in [
+            "api.openai.com.evil.com",
+            "notapi.anthropic.com",
+            "api.anthropic.com.attacker.com",
+            "evil-api.anthropic.com",
+        ] {
+            let err = resident_with_egress("lookalike", &[host]).unwrap_err();
+            assert!(
+                err.to_string().contains(host),
+                "look-alike '{host}' must be refused by name: {err}"
+            );
+        }
     }
 
     #[test]

@@ -2973,13 +2973,15 @@ fn resolve_resident_launch(
 const RESIDENT_TASK_BODY: &str = "\
 # Resident orchestrator
 
-You are the Varda self-hosting RESIDENT. You run inside an isolating, network-denied \
-sandbox with this workspace mounted read-write. Your contract — the dev loop you \
-execute — is defined in `.varda/WORKFLOW.md` in this workspace. Read it and follow it.
+You are the Varda self-hosting RESIDENT. You run inside an isolating sandbox whose \
+egress is restricted to your LLM provider API ONLY (no `github.com`, no general hosts) \
+with this workspace mounted read-write. Your contract — the dev loop you execute — is \
+defined in `.varda/WORKFLOW.md` in this workspace. Read it and follow it.
 
 Spawn workers through the Varda spawn broker (`spawn_subtask`); merge their branches \
-in-box against the mounted workspace. You have NO network and NO push credential: \
-pushing back out to a remote is a separate, human-gated step performed on the host. \
+in-box against the mounted workspace. You can reach ONLY your LLM API and have NO push \
+credential and NO route to a remote: pushing back out is a separate, human-gated step \
+performed on the host. \
 Stop and signal `needs_user` when the workflow calls for a human decision.
 ";
 
@@ -3896,12 +3898,26 @@ deny_sandboxes = ["local"]
     }
 
     #[test]
-    fn resolve_resident_launch_rejects_networked_sandbox() {
+    fn resolve_resident_launch_rejects_non_llm_egress() {
+        // A non-LLM egress host (here `api.example.com`) is refused; only the fixed
+        // LLM-endpoint allowlist may be reached.
         let ws = resident_tmp("net");
         let config = resident_config(&ws, "docker", "\"api.example.com\"");
         let err = resolve_resident_launch(&config, &ws)
-            .expect_err("a networked resident sandbox must be rejected");
-        assert!(err.to_string().contains("network-denied"), "{err}");
+            .expect_err("a non-LLM-endpoint egress host must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("api.example.com"), "must name the host: {msg}");
+        assert!(msg.contains("LLM"), "must state the LLM-only policy: {msg}");
+    }
+
+    #[test]
+    fn resolve_resident_launch_allows_llm_egress() {
+        // The resident may reach its LLM provider API — an allowlisted egress passes.
+        let ws = resident_tmp("llm");
+        let config = resident_config(&ws, "docker", "\"api.anthropic.com\"");
+        let launch = resolve_resident_launch(&config, &ws)
+            .expect("egress limited to an LLM endpoint must resolve");
+        assert_eq!(launch.sandbox, "orchestration");
     }
 
     #[test]
