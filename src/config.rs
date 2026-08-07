@@ -1155,7 +1155,8 @@ pub fn credential_enables_push(cred: &CredentialConfig) -> bool {
 /// is stricter because allowing broad GitHub domains there can create a push or
 /// exfiltration path from the orchestrator workspace.
 pub fn resident_egress_allowlist_for_agent(agent: &str) -> Result<&'static [&'static str]> {
-    match agent.to_ascii_lowercase().as_str() {
+    let a = agent.to_ascii_lowercase();
+    match a.as_str() {
         "claude" => Ok(CLAUDE_RESIDENT_EGRESS_ALLOWLIST),
         "codex" | "openai" => Ok(CODEX_RESIDENT_EGRESS_ALLOWLIST),
         "copilot" if !COPILOT_RESIDENT_EGRESS_ALLOWLIST.is_empty() => {
@@ -1166,6 +1167,14 @@ pub fn resident_egress_allowlist_for_agent(agent: &str) -> Result<&'static [&'st
              do not add blanket `github.com` to resident egress. Use Claude/Codex for `varda orchestrate`, or run \
              Copilot only as an ordinary worker sandbox with explicit route/user-approved egress."
         ),
+        // Custom, operator-configured resident agents (trusted config) inherit the
+        // endpoint policy of the LLM family in their name, e.g. `claude-resident`.
+        // Copilot stays fail-closed. (Follow-up: a config-declared endpoint set.)
+        _ if a.contains("copilot") => bail!(
+            "Copilot resident sandbox egress is unsupported until exact non-push Copilot auth/API endpoints are known."
+        ),
+        _ if a.contains("claude") => Ok(CLAUDE_RESIDENT_EGRESS_ALLOWLIST),
+        _ if a.contains("codex") || a.contains("openai") => Ok(CODEX_RESIDENT_EGRESS_ALLOWLIST),
         other => bail!(
             "resident endpoint policy for agent '{other}' is not configured; add exact LLM endpoints before using it as a sandboxed resident"
         ),
