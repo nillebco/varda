@@ -509,10 +509,7 @@ fn materialize_from_repo_definition(
 /// channel ([`crate::orchestration::SubtaskResults`]) polls this to know when a
 /// spawned subtask has finished and where to read its recap. Kept here so recap
 /// path resolution is not duplicated across call sites.
-pub fn lookup_task_state(
-    config: &Config,
-    id: u64,
-) -> Result<Option<(TaskStatus, Option<String>)>> {
+pub fn lookup_task_state(config: &Config, id: u64) -> Result<Option<(TaskStatus, Option<String>)>> {
     let Some(path) = find_task_by_id(config, id)? else {
         return Ok(None);
     };
@@ -1233,8 +1230,7 @@ requires_user: false
         // the runner rejects anything that is not `Ready`. Materializing a fresh
         // repo definition must land it in a runnable state so its first `run`
         // (the advertised flow) is accepted rather than bailed out on.
-        let root =
-            std::env::temp_dir().join(format!("varda-repo-runnable-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("varda-repo-runnable-{}", std::process::id()));
         let operations_dir = root.join("operations");
         let project = root.join("clone");
         let store = project.join(".varda/tasks");
@@ -1245,8 +1241,7 @@ requires_user: false
         )
         .expect("definition should write");
         // A definition loads with the default status the runner would reject.
-        let definition =
-            load_task(&store.join("7-ship-it.md")).expect("definition should load");
+        let definition = load_task(&store.join("7-ship-it.md")).expect("definition should load");
         assert_eq!(definition.frontmatter.status, TaskStatus::Backlog);
 
         let config = test_config(&operations_dir);
@@ -1268,8 +1263,7 @@ requires_user: false
         // project path, which does not exist on this machine. Materialization must
         // bind the runtime project to the checkout we are running from so routing
         // and client-build target a real repo, not the committed stale path.
-        let root =
-            std::env::temp_dir().join(format!("varda-repo-rebind-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("varda-repo-rebind-{}", std::process::id()));
         let operations_dir = root.join("operations");
         let checkout = root.join("real-checkout");
         let store = checkout.join(".varda/tasks");
@@ -1313,8 +1307,7 @@ requires_user: false
         // Finding #3: a `run` issued from a SUBDIRECTORY of the repo must still
         // find `.varda/tasks` at the repo root. `find_repo_root` walks up to the
         // nearest ancestor that opts into the repo-local store.
-        let root =
-            std::env::temp_dir().join(format!("varda-repo-subdir-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("varda-repo-subdir-{}", std::process::id()));
         let operations_dir = root.join("operations");
         let repo = root.join("repo");
         let store = repo.join(".varda/tasks");

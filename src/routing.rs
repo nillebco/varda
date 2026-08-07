@@ -308,9 +308,10 @@ fn estimate_task_prompt_tokens(config: &Config, task: &TaskDocument, planning: b
 
     if !planning
         && let Some(assignee) = task.frontmatter.assignee.as_deref()
-            && let Some(role) = config.roles.get(assignee) {
-                characters += role.instructions.as_deref().map(str::len).unwrap_or(0);
-            }
+        && let Some(role) = config.roles.get(assignee)
+    {
+        characters += role.instructions.as_deref().map(str::len).unwrap_or(0);
+    }
 
     characters += task.path.display().to_string().len();
     characters += task.body.len();
@@ -321,12 +322,11 @@ fn estimate_task_prompt_tokens(config: &Config, task: &TaskDocument, planning: b
     if let Some(project) = task.frontmatter.project.as_deref() {
         characters += project_instructions_len(project);
     }
-    if !planning
-        && let Some(plan_path) = task.frontmatter.plan.as_deref() {
-            characters += fs::read_to_string(plan_path)
-                .map(|content| content.len())
-                .unwrap_or_default();
-        }
+    if !planning && let Some(plan_path) = task.frontmatter.plan.as_deref() {
+        characters += fs::read_to_string(plan_path)
+            .map(|content| content.len())
+            .unwrap_or_default();
+    }
 
     characters.div_ceil(4)
 }

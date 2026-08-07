@@ -2912,10 +2912,7 @@ struct ResidentLaunch {
 /// un-sandboxed, with network, with a push credential, or with an unsafe workspace
 /// mount. Pure over `config` + the host `$HOME`/filesystem, so it is exercised
 /// directly by the deterministic tests.
-fn resolve_resident_launch(
-    config: &config::Config,
-    workspace: &Path,
-) -> Result<ResidentLaunch> {
+fn resolve_resident_launch(config: &config::Config, workspace: &Path) -> Result<ResidentLaunch> {
     let route = routing::match_route(config, workspace, None).with_context(|| {
         format!(
             "no route matches the orchestration workspace {}; add a `[[routes]]` whose glob covers it \
@@ -3840,10 +3837,8 @@ planner_agent: codex
     }
 
     fn resident_tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "varda-orchestrate-{name}-{}",
-            std::process::id()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("varda-orchestrate-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -3902,7 +3897,7 @@ deny_sandboxes = ["local"]
         // A non-LLM egress host (here `api.example.com`) is refused; only the fixed
         // LLM-endpoint allowlist may be reached.
         let ws = resident_tmp("net");
-        let config = resident_config(&ws, "docker", "\"api.example.com\"");
+        let config = resident_config(&ws, "microsandbox", "\"api.example.com\"");
         let err = resolve_resident_launch(&config, &ws)
             .expect_err("a non-LLM-endpoint egress host must be rejected");
         let msg = err.to_string();
@@ -3912,12 +3907,24 @@ deny_sandboxes = ["local"]
 
     #[test]
     fn resolve_resident_launch_allows_llm_egress() {
-        // The resident may reach its LLM provider API — an allowlisted egress passes.
+        // The resident may reach its LLM provider API when the provider can enforce
+        // strict egress semantics.
         let ws = resident_tmp("llm");
-        let config = resident_config(&ws, "docker", "\"api.anthropic.com\"");
+        let config = resident_config(&ws, "microsandbox", "\"api.anthropic.com\"");
         let launch = resolve_resident_launch(&config, &ws)
             .expect("egress limited to an LLM endpoint must resolve");
         assert_eq!(launch.sandbox, "orchestration");
+    }
+
+    #[test]
+    fn resolve_resident_launch_rejects_docker_non_empty_egress() {
+        let ws = resident_tmp("docker-net");
+        let config = resident_config(&ws, "docker", "\"api.anthropic.com\"");
+        let err = resolve_resident_launch(&config, &ws)
+            .expect_err("docker resident egress must not silently downgrade to DNS pinning");
+        let msg = err.to_string();
+        assert!(msg.contains("direct-IP"), "{msg}");
+        assert!(msg.contains("refused rather than downgraded"), "{msg}");
     }
 
     #[test]
@@ -4088,11 +4095,13 @@ deny_sandboxes = ["local"]
     impl RecordingInnerClient {
         fn new() -> Self {
             Self {
-                interactive_during_run: std::sync::Arc::new(
-                    std::sync::atomic::AtomicBool::new(false),
-                ),
+                interactive_during_run: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
                 observed_socket: std::sync::Arc::new(std::sync::Mutex::new(None)),
-                socket_live_at_start: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                socket_live_at_start: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
                 socket_live_at_end: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
@@ -4108,10 +4117,7 @@ deny_sandboxes = ["local"]
 
     #[async_trait]
     impl AgentClient for RecordingInnerClient {
-        async fn run_task(
-            &self,
-            request: agent::AgentRunRequest,
-        ) -> Result<agent::AgentRunResult> {
+        async fn run_task(&self, request: agent::AgentRunRequest) -> Result<agent::AgentRunResult> {
             use std::sync::atomic::Ordering::SeqCst;
             self.interactive_during_run
                 .store(request.interactive, SeqCst);
@@ -4226,7 +4232,10 @@ deny_sandboxes = ["local"]
             "broker socket must be served during the interactive session"
         );
         // Root-only teardown removes the socket and its dir after the session ends.
-        assert!(!expected.exists(), "socket must be torn down after the session");
+        assert!(
+            !expected.exists(),
+            "socket must be torn down after the session"
+        );
         assert!(!project.join(".varda-mcp").exists());
 
         let _ = std::fs::remove_dir_all(&project);
@@ -4293,12 +4302,18 @@ deny_sandboxes = ["local"]
             .await
             .unwrap();
 
-        assert!(inner.socket_live_at_start.load(SeqCst), "live at session start");
+        assert!(
+            inner.socket_live_at_start.load(SeqCst),
+            "live at session start"
+        );
         assert!(
             inner.socket_live_at_end.load(SeqCst),
             "broker must still be served at the end of the session (not per-child teardown)"
         );
-        assert!(!expected.exists(), "socket removed only after the session ends");
+        assert!(
+            !expected.exists(),
+            "socket removed only after the session ends"
+        );
 
         let _ = std::fs::remove_dir_all(&project);
     }
@@ -4453,7 +4468,9 @@ deny_sandboxes = ["local"]
         unsafe { std::env::remove_var("VARDA_TEST_CRED_HOST") };
 
         assert_eq!(
-            auth_env.get("CLOUDSDK_AUTH_ACCESS_TOKEN").map(String::as_str),
+            auth_env
+                .get("CLOUDSDK_AUTH_ACCESS_TOKEN")
+                .map(String::as_str),
             Some("scoped-access-token")
         );
         assert_eq!(
@@ -4461,7 +4478,9 @@ deny_sandboxes = ["local"]
             Some("sk-host-token")
         );
         assert_eq!(
-            auth_files.get("/home/agent/.config/gcloud-token").map(String::as_str),
+            auth_files
+                .get("/home/agent/.config/gcloud-token")
+                .map(String::as_str),
             Some("scoped-file-token")
         );
     }
@@ -4478,7 +4497,10 @@ deny_sandboxes = ["local"]
         let (auth_env, auth_files) = resolve_agent_credentials(&agent).unwrap();
         unsafe { std::env::remove_var("VARDA_TEST_LEGACY_TOKEN") };
 
-        assert_eq!(auth_env.get("ANTHROPIC_API_KEY").map(String::as_str), Some("sk-legacy"));
+        assert_eq!(
+            auth_env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-legacy")
+        );
         assert!(auth_files.is_empty());
     }
 
@@ -4493,7 +4515,10 @@ deny_sandboxes = ["local"]
             ..Default::default()
         }]);
         let (auth_env, _) = resolve_agent_credentials(&agent).unwrap();
-        assert!(auth_env.is_empty(), "missing env source must be skipped: {auth_env:?}");
+        assert!(
+            auth_env.is_empty(),
+            "missing env source must be skipped: {auth_env:?}"
+        );
 
         // Empty output fails loudly.
         let empty = agent_for_credentials(vec![config::CredentialConfig {
@@ -4501,7 +4526,10 @@ deny_sandboxes = ["local"]
             env: Some("X".to_owned()),
             ..Default::default()
         }]);
-        assert!(resolve_agent_credentials(&empty).is_err(), "empty command output must fail");
+        assert!(
+            resolve_agent_credentials(&empty).is_err(),
+            "empty command output must fail"
+        );
 
         // Non-zero exit fails loudly.
         let failing = agent_for_credentials(vec![config::CredentialConfig {
@@ -4509,7 +4537,10 @@ deny_sandboxes = ["local"]
             env: Some("X".to_owned()),
             ..Default::default()
         }]);
-        assert!(resolve_agent_credentials(&failing).is_err(), "failed command must fail");
+        assert!(
+            resolve_agent_credentials(&failing).is_err(),
+            "failed command must fail"
+        );
     }
 
     fn test_task_document() -> task::TaskDocument {

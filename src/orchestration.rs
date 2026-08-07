@@ -1230,7 +1230,11 @@ mod tests {
         let policy = resident_policy();
         let ledger = SpawnLedger::new();
 
-        assert!(ledger.authorize(&policy, &ctx("resident", 0), &req()).is_ok());
+        assert!(
+            ledger
+                .authorize(&policy, &ctx("resident", 0), &req())
+                .is_ok()
+        );
         assert_eq!(
             ledger.authorize(&policy, &ctx("worker", 1), &req()),
             Err(SpawnDenied::DepthExceeded {
@@ -1346,7 +1350,10 @@ deny_sandboxes = ["local"]
 
         let serialized = toml::to_string(&config).unwrap();
         let reparsed: crate::config::Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.routes[0].orchestration.as_ref(), Some(route_policy));
+        assert_eq!(
+            reparsed.routes[0].orchestration.as_ref(),
+            Some(route_policy)
+        );
     }
 
     // --- Live broker -------------------------------------------------------
@@ -1404,8 +1411,7 @@ deny_sandboxes = ["local"]
     #[test]
     fn broker_denial_never_reaches_the_launcher() {
         // Disabled policy: the launcher must not be called at all.
-        let broker =
-            SpawnBroker::new(OrchestrationPolicy::default(), "root", MockLauncher::new());
+        let broker = SpawnBroker::new(OrchestrationPolicy::default(), "root", MockLauncher::new());
         match broker.spawn_subtask("root", req()) {
             Err(BrokerError::Denied(SpawnDenied::Disabled)) => {}
             other => panic!("expected Disabled denial, got {other:?}"),
@@ -1647,7 +1653,9 @@ deny_sandboxes = ["local"]
     }
 
     impl MockResults {
-        fn new(status_fn: impl Fn(&str, u32) -> Option<TaskStatus> + Send + Sync + 'static) -> Self {
+        fn new(
+            status_fn: impl Fn(&str, u32) -> Option<TaskStatus> + Send + Sync + 'static,
+        ) -> Self {
             Self {
                 counts: Mutex::new(BTreeMap::new()),
                 status_fn: Box::new(status_fn),
@@ -1749,8 +1757,7 @@ deny_sandboxes = ["local"]
     #[test]
     fn subtask_result_returns_recap_and_parsed_sections() {
         let recap = "# Done\n\n## Files touched\n/abs/a.rs\n/abs/b.rs\n\n## Blocked commands\nmsb\ndocker build\n\nrequires_user: false\n";
-        let results =
-            MockResults::new(|_, _| Some(TaskStatus::Done)).with_recap("child", recap);
+        let results = MockResults::new(|_, _| Some(TaskStatus::Done)).with_recap("child", recap);
         let broker =
             SpawnBroker::new(base_policy(), "root", MockLauncher::new()).with_results(results);
         let result = broker.subtask_result("child").expect("result present");
@@ -1833,7 +1840,10 @@ deny_sandboxes = ["local"]
                 text.contains("not available on this channel"),
                 "expected not-available error, got {text}"
             );
-            assert!(!text.contains("timed out"), "unwired hit the poll ceiling: {text}");
+            assert!(
+                !text.contains("timed out"),
+                "unwired hit the poll ceiling: {text}"
+            );
         }
     }
 

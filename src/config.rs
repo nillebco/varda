@@ -81,8 +81,8 @@ agents = ["codex"]
 #
 # [sandboxes.orchestration]
 # image = "your-dev-image:latest"
-# primitive = "docker"          # isolating — NEVER "local"
-# egress = ["api.anthropic.com", "api.openai.com"]  # LLM endpoints ONLY — github.com etc. stay denied (no push, no exfil)
+# primitive = "microsandbox"    # strict egress enforcement — NEVER "local"; docker may only be used with egress = []
+# egress = ["api.anthropic.com", "api.openai.com"]  # LLM endpoints ONLY, enforced by a real firewall; github.com etc. stay denied
 #
 # [[routes]]
 # glob = "/path/to/orchestration/workspace/**"
@@ -424,6 +424,44 @@ pub struct Route {
     pub orchestration: Option<crate::orchestration::OrchestrationPolicy>,
 }
 
+/// How a sandbox's `egress` allow-list is ENFORCED — an explicit, honest name for
+/// the difference between a name-resolution allow-list and a real network firewall.
+///
+/// The distinction matters because the two look identical in config (`egress =
+/// [...]`) but give VERY different guarantees. The docker provider's allow-list is
+/// DNS-only: it breaks ambient name resolution (`--dns 0.0.0.0`) and re-pins the
+/// allow-listed hostnames (`--add-host`), so a *hostname* not on the list cannot
+/// resolve — but an agent that already knows an IP can still open a raw connection
+/// to ANY address. That is NOT a firewall, and must never be claimed as
+/// clawk/microsandbox-equivalent.
+///
+/// `Strict` is the conservative DEFAULT: a non-empty allow-list is honored only when
+/// the provider can actually firewall egress at the IP level (microsandbox/clawk).
+/// The docker provider, which cannot enforce that portably, REFUSES a non-empty
+/// strict allow-list at build time rather than silently downgrading to DNS-pin.
+/// `DnsPin` is an explicit opt-in acknowledging the name-only, direct-IP-bypassable
+/// guarantee. An EMPTY `egress` is fully offline (`--network none`) and is strict in
+/// every mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum EgressMode {
+    /// Real IP-level egress firewalling, or a hard refusal before launch. Conservative
+    /// default: no silent downgrade to a weaker guarantee.
+    #[default]
+    Strict,
+    /// Name-resolution allow-list only (docker `--dns 0.0.0.0` + `--add-host`). Blocks
+    /// non-allow-listed HOSTNAMES but NOT direct-IP egress. Must be opted into explicitly.
+    DnsPin,
+}
+
+/// Whether a sandbox `primitive` can enforce a non-empty egress allow-list at the IP
+/// level (a real firewall), as opposed to only pinning hostnames. `microsandbox` and
+/// `clawk` firewall egress via their net-rule backends; `docker` cannot do so
+/// portably (its allow-list is DNS-pin only); `local` has no isolation at all.
+pub fn primitive_enforces_strict_egress(primitive: &str) -> bool {
+    matches!(primitive, "microsandbox" | "clawk")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,6 +495,12 @@ pub struct SandboxConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<String>,
+    /// How `egress` is ENFORCED. Defaults to [`EgressMode::Strict`] (fail-closed): a
+    /// non-empty allow-list under a provider that cannot IP-firewall (docker) is
+    /// refused at build time rather than silently treated as a DNS-only allow-list.
+    /// Set `egress_mode = "dns-pin"` to explicitly accept the name-only guarantee.
+    #[serde(default)]
+    pub egress_mode: EgressMode,
 }
 
 /// Default isolation primitive when a `[sandboxes.<name>]` entry omits one.
@@ -762,6 +806,7 @@ impl Default for SandboxConfig {
             mounts: Vec::new(),
             env: BTreeMap::new(),
             egress: Vec::new(),
+            egress_mode: EgressMode::Strict,
         }
     }
 }
@@ -920,17 +965,23 @@ impl CredentialConfig {
             + self.from_secret.is_some() as u8
             + self.command.is_some() as u8;
         if set == 0 {
-            bail!("credential entry has no source: set exactly one of `from_env`, `from_secret`, or `command`");
+            bail!(
+                "credential entry has no source: set exactly one of `from_env`, `from_secret`, or `command`"
+            );
         }
         if set > 1 {
-            bail!("credential entry sets multiple sources: use exactly one of `from_env`, `from_secret`, or `command`");
+            bail!(
+                "credential entry sets multiple sources: use exactly one of `from_env`, `from_secret`, or `command`"
+            );
         }
         if let Some(name) = &self.from_env {
             Ok(CredentialSource::Env(name))
         } else if let Some(name) = &self.from_secret {
             Ok(CredentialSource::Secret(name))
         } else {
-            Ok(CredentialSource::Command(self.command.as_deref().expect("command set")))
+            Ok(CredentialSource::Command(
+                self.command.as_deref().expect("command set"),
+            ))
         }
     }
 
@@ -960,7 +1011,11 @@ impl AgentConfig {
         if let Some(src) = &self.auth_token_env {
             creds.push(CredentialConfig {
                 from_env: Some(src.clone()),
-                env: Some(self.auth_token_target.clone().unwrap_or_else(|| src.clone())),
+                env: Some(
+                    self.auth_token_target
+                        .clone()
+                        .unwrap_or_else(|| src.clone()),
+                ),
                 ..Default::default()
             });
         }
@@ -1282,6 +1337,30 @@ pub fn enforce_resident_launch(
              `sandbox` on the workspace route.",
             sandbox.primitive
         );
+    }
+
+    // G2 — clawk-parity egress semantics. A non-empty resident allow-list is only
+    // acceptable when the provider can close the direct-IP bypass surface. Docker's
+    // compatibility mode is DNS-pin only (`--dns 0.0.0.0` + `--add-host`), so it
+    // blocks undeclared hostnames but still permits raw direct-IP egress on the
+    // bridge network. For residents, do not silently downgrade that guarantee.
+    if !sandbox.egress.is_empty() {
+        if sandbox.egress_mode != EgressMode::Strict {
+            bail!(
+                "resident sandbox '{sandbox_name}' declares non-empty egress with `egress_mode = \"dns-pin\"`; \
+                 residents require strict/clawk-parity egress semantics because DNS pinning still allows \
+                 direct-IP bypass. Use `microsandbox`/`clawk`, or set `egress = []` for fully offline."
+            );
+        }
+        if !primitive_enforces_strict_egress(&sandbox.primitive) {
+            bail!(
+                "resident sandbox '{sandbox_name}' uses primitive '{}' with non-empty egress in strict mode, \
+                 but this provider cannot enforce an IP-level firewall. Docker's DNS-pin allow-list can be \
+                 bypassed by direct-IP egress, so the resident launch is refused rather than downgraded. \
+                 Use `microsandbox`/`clawk`, or set `egress = []` for fully offline.",
+                sandbox.primitive
+            );
+        }
     }
 
     // G2 — LLM-only egress. The resident is a cloud LLM agent that MUST reach its
@@ -1730,12 +1809,21 @@ mod tests {
         agent.auth_token_env = Some("HOST_ANTHROPIC".to_owned());
         let creds = agent.effective_credentials();
         assert_eq!(creds.len(), 1);
-        assert_eq!(creds[0].source().unwrap(), CredentialSource::Env("HOST_ANTHROPIC"));
-        assert_eq!(creds[0].target().unwrap(), CredentialTarget::Env("HOST_ANTHROPIC"));
+        assert_eq!(
+            creds[0].source().unwrap(),
+            CredentialSource::Env("HOST_ANTHROPIC")
+        );
+        assert_eq!(
+            creds[0].target().unwrap(),
+            CredentialTarget::Env("HOST_ANTHROPIC")
+        );
 
         agent.auth_token_target = Some("ANTHROPIC_API_KEY".to_owned());
         let creds = agent.effective_credentials();
-        assert_eq!(creds[0].target().unwrap(), CredentialTarget::Env("ANTHROPIC_API_KEY"));
+        assert_eq!(
+            creds[0].target().unwrap(),
+            CredentialTarget::Env("ANTHROPIC_API_KEY")
+        );
 
         // Explicit entries come first, legacy sugar appended last.
         agent.credentials = vec![CredentialConfig {
@@ -1745,8 +1833,14 @@ mod tests {
         }];
         let creds = agent.effective_credentials();
         assert_eq!(creds.len(), 2);
-        assert_eq!(creds[0].target().unwrap(), CredentialTarget::File("/home/agent/.token"));
-        assert_eq!(creds[1].source().unwrap(), CredentialSource::Env("HOST_ANTHROPIC"));
+        assert_eq!(
+            creds[0].target().unwrap(),
+            CredentialTarget::File("/home/agent/.token")
+        );
+        assert_eq!(
+            creds[1].source().unwrap(),
+            CredentialSource::Env("HOST_ANTHROPIC")
+        );
     }
 
     #[test]
@@ -2111,31 +2205,41 @@ deny_sandboxes = ["local"]
             config.agents["claude"]
                 .credentials
                 .iter()
-                .any(|cred| cred.from_env.as_deref() == Some("CLAUDE_SANDBOX_TOKEN")
-                    && cred.env.as_deref() == Some("ANTHROPIC_API_KEY"))
+                .any(
+                    |cred| cred.from_env.as_deref() == Some("CLAUDE_SANDBOX_TOKEN")
+                        && cred.env.as_deref() == Some("ANTHROPIC_API_KEY")
+                )
         );
         assert!(
             config.agents["claude"]
                 .credentials
                 .iter()
-                .any(|cred| cred.from_secret.as_deref() == Some("gcp-service-account-json")
-                    && cred.file.as_deref()
-                        == Some("/home/agent/.config/gcloud/application_default_credentials.json"))
+                .any(
+                    |cred| cred.from_secret.as_deref() == Some("gcp-service-account-json")
+                        && cred.file.as_deref()
+                            == Some(
+                                "/home/agent/.config/gcloud/application_default_credentials.json"
+                            )
+                )
         );
-        assert!(
-            config.agents["claude"]
-                .credentials
-                .iter()
-                .any(|cred| cred.command.as_deref().is_some_and(|command| command
-                    .contains("gcloud auth print-access-token"))
-                    && cred.env.as_deref() == Some("CLOUDSDK_AUTH_ACCESS_TOKEN"))
-        );
+        assert!(config.agents["claude"].credentials.iter().any(|cred| {
+            cred.command
+                .as_deref()
+                .is_some_and(|command| command.contains("gcloud auth print-access-token"))
+                && cred.env.as_deref() == Some("CLOUDSDK_AUTH_ACCESS_TOKEN")
+        }));
         assert_eq!(
-            config.routes[1].env.get("GCLOUD_PROJECT").map(String::as_str),
+            config.routes[1]
+                .env
+                .get("GCLOUD_PROJECT")
+                .map(String::as_str),
             Some("example-project")
         );
         assert_eq!(
-            config.sandboxes["devcontainer"].env.get("GCLOUD_PROJECT").map(String::as_str),
+            config.sandboxes["devcontainer"]
+                .env
+                .get("GCLOUD_PROJECT")
+                .map(String::as_str),
             Some("example-project")
         );
         assert_eq!(
@@ -2194,9 +2298,19 @@ deny_sandboxes = ["local"]
         assert_eq!(docker.image.as_deref(), Some("varda:latest"));
         assert_eq!(docker.mounts, vec!["/tmp"]);
         assert_eq!(docker.egress, vec!["api.example.com"]);
+        assert_eq!(docker.egress_mode, EgressMode::Strict);
         // `primitive` defaults to "docker" when omitted, `build` to None.
         assert_eq!(docker.primitive, "docker");
         assert!(docker.build.is_none());
+    }
+
+    #[test]
+    fn parses_explicit_egress_mode() {
+        let toml = format!(
+            "{DEFAULT_CONFIG}\n[sandboxes.docker]\nimage = \"varda:latest\"\negress = [\"api.example.com\"]\negress_mode = \"dns-pin\"\n"
+        );
+        let config: Config = toml::from_str(&toml).expect("config with egress mode should parse");
+        assert_eq!(config.sandboxes["docker"].egress_mode, EgressMode::DnsPin);
     }
 
     #[test]
@@ -2672,7 +2786,7 @@ mod resident_tests {
     fn isolating_sandbox() -> SandboxConfig {
         SandboxConfig {
             image: Some("dev:latest".to_owned()),
-            primitive: "docker".to_owned(),
+            primitive: "microsandbox".to_owned(),
             egress: vec![],
             ..SandboxConfig::default()
         }
@@ -2849,19 +2963,79 @@ mod resident_tests {
         // github.com is a push/exfil host — never an LLM endpoint.
         let err = resident_with_egress("gh", &["github.com"]).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("github.com"), "error must name the host: {msg}");
-        assert!(msg.contains("LLM"), "error must state LLM-only policy: {msg}");
+        assert!(
+            msg.contains("github.com"),
+            "error must name the host: {msg}"
+        );
+        assert!(
+            msg.contains("LLM"),
+            "error must state LLM-only policy: {msg}"
+        );
     }
 
     #[test]
     fn one_bad_host_taints_the_whole_egress_list() {
         // A single non-LLM host is refused even alongside a legitimate LLM endpoint.
-        let err =
-            resident_with_egress("mixed", &["api.anthropic.com", "github.com"]).unwrap_err();
+        let err = resident_with_egress("mixed", &["api.anthropic.com", "github.com"]).unwrap_err();
         assert!(
             err.to_string().contains("github.com"),
             "the offending host must be named: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_docker_resident_non_empty_egress_in_strict_mode() {
+        let ws = tmp("docker-strict");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        let sandbox = SandboxConfig {
+            image: Some("dev:latest".to_owned()),
+            primitive: "docker".to_owned(),
+            egress: vec!["api.anthropic.com".to_owned()],
+            ..SandboxConfig::default()
+        };
+        let err = enforce_resident_launch(
+            "orchestration",
+            &sandbox,
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("direct-IP"), "{msg}");
+        assert!(msg.contains("refused rather than downgraded"), "{msg}");
+        assert!(msg.contains("microsandbox"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_dns_pin_resident_non_empty_egress() {
+        let ws = tmp("resident-dns-pin");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        let sandbox = SandboxConfig {
+            image: Some("dev:latest".to_owned()),
+            primitive: "docker".to_owned(),
+            egress: vec!["api.anthropic.com".to_owned()],
+            egress_mode: EgressMode::DnsPin,
+            ..SandboxConfig::default()
+        };
+        let err = enforce_resident_launch(
+            "orchestration",
+            &sandbox,
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("dns-pin"), "{msg}");
+        assert!(msg.contains("direct-IP bypass"), "{msg}");
+        assert!(msg.contains("residents require strict"), "{msg}");
     }
 
     #[test]
@@ -2948,7 +3122,10 @@ mod resident_tests {
             &disabled,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("orchestration is disabled"), "{err}");
+        assert!(
+            err.to_string().contains("orchestration is disabled"),
+            "{err}"
+        );
         // Workers not pinned away from `local`.
         let mut allows_local = resident_policy();
         allows_local.deny_sandboxes = vec![];
@@ -2963,7 +3140,10 @@ mod resident_tests {
             &allows_local,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("deny the `local` sandbox"), "{err}");
+        assert!(
+            err.to_string().contains("deny the `local` sandbox"),
+            "{err}"
+        );
     }
 
     // ---- Finding 1 (BLOCKING) — push-enabling env via any `[…].env` map ----
@@ -3134,9 +3314,15 @@ mod resident_tests {
             &resident_policy(),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("pre-seeded push credential"), "{err}");
+        assert!(
+            err.to_string().contains("pre-seeded push credential"),
+            "{err}"
+        );
         // The secret itself is never echoed in the refusal.
-        assert!(!err.to_string().contains("ghp_secret"), "must not leak token: {err}");
+        assert!(
+            !err.to_string().contains("ghp_secret"),
+            "must not leak token: {err}"
+        );
     }
 
     #[test]
@@ -3158,7 +3344,10 @@ mod resident_tests {
             &resident_policy(),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("pre-seeded push credential"), "{err}");
+        assert!(
+            err.to_string().contains("pre-seeded push credential"),
+            "{err}"
+        );
     }
 
     #[test]

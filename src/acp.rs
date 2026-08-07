@@ -39,7 +39,9 @@ fn stage_identity_files(session: &dyn SandboxSession, sandbox_name: &str) -> Res
         session
             .stage_credential_file(&value, &guest_path)
             .with_context(|| {
-                format!("failed to stage credential file '{guest_path}' into '{sandbox_name}' sandbox")
+                format!(
+                    "failed to stage credential file '{guest_path}' into '{sandbox_name}' sandbox"
+                )
             })?;
     }
     Ok(())
@@ -557,7 +559,13 @@ impl AcpSubprocessClient {
         if self.sandbox.name() != "local" {
             if let Some(interactive_cmd) = self.interactive_command.clone() {
                 return self
-                    .execute_interactive_sandboxed(request, &interactive_cmd, &prompt, working_dir, env)
+                    .execute_interactive_sandboxed(
+                        request,
+                        &interactive_cmd,
+                        &prompt,
+                        working_dir,
+                        env,
+                    )
                     .await;
             }
             bail!(
@@ -807,12 +815,14 @@ impl AcpSubprocessClient {
         let session_store_root = session.session_store_root();
         let store_is_live = session.store_is_live();
 
-        let wrapped = session.wrap(spec, LaunchMode::Interactive).with_context(|| {
-            format!(
-                "failed to wrap interactive command for '{}' sandbox",
-                self.sandbox.name()
-            )
-        })?;
+        let wrapped = session
+            .wrap(spec, LaunchMode::Interactive)
+            .with_context(|| {
+                format!(
+                    "failed to wrap interactive command for '{}' sandbox",
+                    self.sandbox.name()
+                )
+            })?;
         // Provider-specific interactive lifecycle: docker create → cp → start -ai;
         // msb/local return the wrapped command directly.
         let launch = session.begin_interactive(wrapped).await.with_context(|| {
@@ -825,9 +835,7 @@ impl AcpSubprocessClient {
         // Live stores (would be local; not this path) poll during the run; the
         // extracted docker/msb store is discovered post-exit.
         let mut record_handle = None;
-        if store_is_live
-            && let Some(session_root) = session_store_root.as_deref()
-        {
+        if store_is_live && let Some(session_root) = session_store_root.as_deref() {
             record_handle = self.record_external_session(request, started_at, session_root);
         }
 
@@ -1465,9 +1473,10 @@ fn expand_leading_tilde(value: &str) -> String {
         return std::env::var("HOME").unwrap_or_else(|_| value.to_owned());
     }
     if let Some(rest) = value.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
+    }
     value.to_owned()
 }
 
@@ -1815,7 +1824,10 @@ mod tests {
         interactive.interactive = true;
         interactive.orchestration_socket_path = Some("/srv/app/.varda-mcp/root.sock".to_owned());
         let with_socket = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &interactive);
-        assert_eq!(with_socket["VARDA_MCP_SOCKET"], "/srv/app/.varda-mcp/root.sock");
+        assert_eq!(
+            with_socket["VARDA_MCP_SOCKET"],
+            "/srv/app/.varda-mcp/root.sock"
+        );
 
         let mut plain = docker_request("/srv/app", "no-broker");
         plain.interactive = true;
@@ -2075,7 +2087,9 @@ mod tests {
     async fn interactive_agent_smoke(command: &str, interactive_shell: &str, session: &str) {
         use std::io::IsTerminal as _;
         if !std::io::stdin().is_terminal() {
-            eprintln!("skipping {command} interactive smoke: no TTY on stdin (run from a terminal)");
+            eprintln!(
+                "skipping {command} interactive smoke: no TTY on stdin (run from a terminal)"
+            );
             return;
         }
         let client = interactive_agent_client(command, interactive_shell, "varda-agent:latest");
@@ -2662,10 +2676,7 @@ mod tests {
         fn name(&self) -> &str {
             "docker"
         }
-        async fn prepare(
-            &self,
-            _ctx: &SandboxContext<'_>,
-        ) -> Result<Box<dyn SandboxSession>> {
+        async fn prepare(&self, _ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
             bail!("prepare should not be reached in the TTY-guard test")
         }
     }
