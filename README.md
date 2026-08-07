@@ -1009,11 +1009,11 @@ The command resolves (or scaffolds) a `resident-orchestrator` task under the wor
 |---|---|---|
 | **G1** workspace | a **dedicated** directory mounted **rw** | the workspace is `$HOME` or a home-ancestor, or it is not mounted read-write |
 | **G2** isolation | an **isolating** sandbox (`primitive != "local"`) | the route resolves to `local`/un-sandboxed |
-| **G2** network | **net-deny** (`egress = []` ⇒ `--network none`) | the sandbox declares any egress allow-list |
+| **G2** network | **net-restricted to LLM endpoints only** — every `egress` host must be in the fixed `RESIDENT_EGRESS_ALLOWLIST` (`api.anthropic.com`, `api.openai.com`, `chatgpt.com`, `auth.openai.com`; an empty `egress` ⇒ `--network none` also passes). The resident is a cloud LLM agent that must reach its provider API, but `github.com` and every other host stay denied — so still **no push, no exfiltration**. Match is case-insensitive EXACT host (no wildcard/suffix, so `api.openai.com.evil.com` is denied). | the sandbox declares any egress host outside the LLM allowlist |
 | **G2** no push cred | the resident identity carries **no `git push` credential**, across *every* channel one can reach the box through | `forward_ssh_agent = true`; a credential targets a push channel (env `GITHUB_TOKEN`/`SSH_AUTH_SOCK`/… or a file `.ssh/` key, `*credential*` store, `.config/gh/hosts.yml`, `.netrc`, askpass script); a push-enabling key in the resident's **effective env** (agent + sandbox + route `env` maps — `GITHUB_TOKEN`, `GIT_ASKPASS`, `SSH_AUTH_SOCK`, `GIT_SSH_COMMAND`, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`, `GIT_CONFIG_GLOBAL`/`SYSTEM`, `GIT_TERMINAL_PROMPT`, …); or the workspace's `.git/config` (incl. submodules) carries a token-embedded remote URL or a `credential.helper` |
 | **G7** broker caps | orchestration **enabled** and `local` in `deny_sandboxes` | spawning is disabled, or workers could land un-sandboxed |
 
-**Human-gated push.** Because the resident is network-denied and holds no push credential, it *cannot* push its merged result to a remote. Pushing back out is a deliberate, separate step performed **on the host by a human** after reviewing the workspace — the sandbox produces local commits/branches, never a remote mutation. This is the same clawk-style split the interactive sandbox uses for identity, taken to its strict end: the box has *no* path to a remote at all.
+**Human-gated push.** Because the resident's egress is restricted to LLM endpoints (no `github.com`, no general hosts) and it holds no push credential, it *cannot* push its merged result to a remote. Pushing back out is a deliberate, separate step performed **on the host by a human** after reviewing the workspace — the sandbox produces local commits/branches, never a remote mutation. This is the same clawk-style split the interactive sandbox uses for identity, taken to its strict end: the box has *no* path to a remote at all.
 
 Configure the sandboxed resident route in `config.toml` (see the commented `[sandboxes.orchestration]` / `[[routes]]` / `[routes.orchestration]` example the default config ships):
 
@@ -1021,7 +1021,7 @@ Configure the sandboxed resident route in `config.toml` (see the commented `[san
 [sandboxes.orchestration]
 image = "your-dev-image:latest"
 primitive = "docker"          # isolating — NEVER "local"
-egress = []                   # net-deny: the box runs with --network none
+egress = ["api.anthropic.com", "api.openai.com"]  # LLM endpoints ONLY — github.com etc. stay denied (no push, no exfil); egress = [] for fully offline
 
 [[routes]]
 glob = "/path/to/orchestration/workspace/**"
