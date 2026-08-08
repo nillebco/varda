@@ -16,6 +16,8 @@ install: release
 	install -m 0755 scripts/vclaude "$(BINDIR)/vclaude"
 	install -m 0755 scripts/vcodex "$(BINDIR)/vcodex"
 	install -m 0755 scripts/vcopilot "$(BINDIR)/vcopilot"
+	install -m 0755 scripts/vmsbsh "$(BINDIR)/vmsbsh"
+	install -m 0755 scripts/vdocksh "$(BINDIR)/vdocksh"
 
 test:
 	$(CARGO) test

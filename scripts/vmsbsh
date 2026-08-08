@@ -1,0 +1,4 @@
+#!/bin/sh
+# Interactive shell inside a microsandbox microVM over the current directory.
+# Forces the `msbshell` sandbox regardless of route, and the `shell` agent.
+exec varda task add "msb shell" --agent shell --sandbox msbshell --exec --interactive "$@"
