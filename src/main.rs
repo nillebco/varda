@@ -1025,6 +1025,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         stream: false,
         resume_command: None,
         orchestration_socket_path: None,
+        orchestration_addr: None,
     };
     let result = client.run_task(request).await?;
     let json = extract_json_object(&result.recap)?;
@@ -1358,6 +1359,40 @@ struct OrchestratedAgentClient<C: AgentClient = acp::AcpSubprocessClient> {
     project_path: PathBuf,
     fallback_agent: String,
     lineage: Option<SpawnLineage>,
+    /// Resolved sandbox primitive for this run (`local`/`docker`/`microsandbox`/
+    /// `clawk`). Selects the broker transport: own-kernel microVMs cannot reach a
+    /// bind-mounted Unix socket, so they get the TCP transport
+    /// ([`config::primitive_needs_tcp_broker`]); everything else keeps the socket.
+    sandbox_primitive: String,
+}
+
+/// Host IP the broker TCP listener binds to for a microVM guest. Loopback by
+/// default (host-only, never a public interface); override with
+/// `VARDA_BROKER_BIND_IP` to the per-sandbox gateway the guest actually reaches
+/// (e.g. an msb bridge gateway `172.16.0.x`). Kept as a host-only bind per the
+/// orchestration isolation invariants — the broker is capability-gated, so the
+/// port grants no capability, but it is still never exposed on `0.0.0.0`.
+fn broker_bind_ip() -> std::net::IpAddr {
+    std::env::var("VARDA_BROKER_BIND_IP")
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
+/// Resolve the effective sandbox primitive for the run at `project_path`, used to
+/// select the broker transport. Falls back to `local` (the Unix-socket transport)
+/// if resolution fails — a safe default that never mis-serves a microVM guest over
+/// an unreachable socket without at least the broker being harmless on loopback.
+fn resolve_sandbox_primitive(
+    config: &config::Config,
+    project_path: &Path,
+    pinned: Option<&str>,
+) -> String {
+    let routing_root = routing_root_for(project_path);
+    config
+        .resolve_sandbox_for(project_path, &routing_root, pinned)
+        .map(|resolved| resolved.config.primitive)
+        .unwrap_or_else(|_| "local".to_owned())
 }
 
 #[derive(Clone)]
@@ -1411,22 +1446,46 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
             )
             .with_results(VardaSubtaskResults::new(self.config.clone())),
         );
-        let server_path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            if let Err(error) =
-                mcp_transport::serve_unix_socket(&server_path, root_id, broker).await
-            {
-                eprintln!("warning: MCP broker transport exited: {error:#}");
-            }
-        });
+        // Transport selection by primitive. Own-kernel microVMs (microsandbox/clawk)
+        // share the project tree over virtio-fs, which exposes the socket FILE but
+        // not its AF_UNIX endpoint, so an in-guest connect() is refused; those guests
+        // reach the host over TCP instead. `local`/`docker` see the real socket
+        // through the bind mount and keep the Unix transport.
+        let use_tcp = config::primitive_needs_tcp_broker(&self.sandbox_primitive);
+        let server = if use_tcp {
+            let (addr, listener) = match mcp_transport::bind_tcp(broker_bind_ip()).await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    eprintln!("warning: MCP broker TCP bind failed: {error:#}");
+                    return self.inner.run_task(request).await;
+                }
+            };
+            request.orchestration_addr = Some(addr.to_string());
+            tokio::spawn(async move {
+                if let Err(error) = mcp_transport::serve_tcp(listener, root_id, broker).await {
+                    eprintln!("warning: MCP broker transport exited: {error:#}");
+                }
+            })
+        } else {
+            let server_path = socket_path.clone();
+            request.orchestration_socket_path = Some(socket_path.display().to_string());
+            tokio::spawn(async move {
+                if let Err(error) =
+                    mcp_transport::serve_unix_socket(&server_path, root_id, broker).await
+                {
+                    eprintln!("warning: MCP broker transport exited: {error:#}");
+                }
+            })
+        };
 
-        request.orchestration_socket_path = Some(socket_path.display().to_string());
         let is_root_run = self.lineage.is_none();
         let result = self.inner.run_task(request).await;
         finish_spawned_subtasks(&spawn_state, is_root_run, result.is_ok()).await;
         server.abort();
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir(&socket_dir);
+        if !use_tcp {
+            let _ = std::fs::remove_file(&socket_path);
+            let _ = std::fs::remove_dir(&socket_dir);
+        }
         result
     }
 }
@@ -1739,6 +1798,11 @@ async fn run_task_path_for_parallel(
             inner: client.clone(),
             config: config.clone(),
             policy,
+            sandbox_primitive: resolve_sandbox_primitive(
+                &config,
+                &project_path,
+                task_document.frontmatter.sandbox.as_deref(),
+            ),
             project_path,
             fallback_agent: route.agent.clone(),
             lineage,
@@ -3160,6 +3224,11 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
             inner: client.clone(),
             config: config.clone(),
             policy,
+            sandbox_primitive: resolve_sandbox_primitive(
+                &config,
+                &project_path,
+                task_document.frontmatter.sandbox.as_deref(),
+            ),
             project_path,
             fallback_agent: route.agent.clone(),
             lineage: None,
@@ -4122,6 +4191,8 @@ deny_sandboxes = ["local"]
     struct RecordingInnerClient {
         interactive_during_run: std::sync::Arc<std::sync::atomic::AtomicBool>,
         observed_socket: std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>,
+        observed_addr: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        tcp_live_at_start: std::sync::Arc<std::sync::atomic::AtomicBool>,
         socket_live_at_start: std::sync::Arc<std::sync::atomic::AtomicBool>,
         socket_live_at_end: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
@@ -4133,6 +4204,8 @@ deny_sandboxes = ["local"]
                     false,
                 )),
                 observed_socket: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                observed_addr: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                tcp_live_at_start: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 socket_live_at_start: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,
                 )),
@@ -4147,6 +4220,10 @@ deny_sandboxes = ["local"]
                 .clone()
                 .expect("inner run should have executed")
         }
+
+        fn observed_addr(&self) -> Option<String> {
+            self.observed_addr.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -4156,6 +4233,14 @@ deny_sandboxes = ["local"]
             self.interactive_during_run
                 .store(request.interactive, SeqCst);
             *self.observed_socket.lock().unwrap() = Some(request.orchestration_socket_path.clone());
+            *self.observed_addr.lock().unwrap() = request.orchestration_addr.clone();
+            if let Some(addr) = request.orchestration_addr.as_deref() {
+                // The TCP broker binds before the request is threaded in, so a connect
+                // must succeed immediately for the whole session.
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    self.tcp_live_at_start.store(true, SeqCst);
+                }
+            }
             if let Some(path) = request.orchestration_socket_path.as_deref() {
                 // serve_unix_socket binds asynchronously; poll briefly for it to appear.
                 for _ in 0..100 {
@@ -4222,6 +4307,7 @@ deny_sandboxes = ["local"]
             stream: false,
             resume_command: None,
             orchestration_socket_path: None,
+            orchestration_addr: None,
         }
     }
 
@@ -4234,6 +4320,7 @@ deny_sandboxes = ["local"]
         let client = OrchestratedAgentClient {
             inner: inner.clone(),
             config: broker_test_config(),
+            sandbox_primitive: "local".to_owned(),
             policy: orchestration::OrchestrationPolicy {
                 enabled: true,
                 ..Default::default()
@@ -4284,6 +4371,7 @@ deny_sandboxes = ["local"]
         let client = OrchestratedAgentClient {
             inner: inner.clone(),
             config: broker_test_config(),
+            sandbox_primitive: "local".to_owned(),
             // Orchestration disabled ⇒ the interactive path must stay exactly as today.
             policy: orchestration::OrchestrationPolicy::default(),
             project_path: project.clone(),
@@ -4321,6 +4409,7 @@ deny_sandboxes = ["local"]
         let client = OrchestratedAgentClient {
             inner: inner.clone(),
             config: broker_test_config(),
+            sandbox_primitive: "local".to_owned(),
             policy: orchestration::OrchestrationPolicy {
                 enabled: true,
                 ..Default::default()
@@ -4350,6 +4439,61 @@ deny_sandboxes = ["local"]
         );
 
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vm_backed_primitive_serves_broker_over_tcp_not_socket() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // An own-kernel microVM primitive cannot reach a bind-mounted Unix socket,
+        // so the broker is served over TCP and the guest env carries VARDA_MCP_ADDR
+        // (host:port) instead of a socket path — and no `.varda-mcp` socket dir is
+        // created under the project.
+        let project = broker_test_project("tcp");
+        let inner = RecordingInnerClient::new();
+        let client = OrchestratedAgentClient {
+            inner: inner.clone(),
+            config: broker_test_config(),
+            policy: orchestration::OrchestrationPolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            sandbox_primitive: "microsandbox".to_owned(),
+            project_path: project.clone(),
+            fallback_agent: "codex".to_owned(),
+            lineage: None,
+        };
+
+        client
+            .run_task(interactive_broker_request("root"))
+            .await
+            .unwrap();
+
+        // TCP addr threaded in (host:port on the loopback default bind), no socket path.
+        let addr = inner.observed_addr().expect("VARDA_MCP_ADDR must be set");
+        assert_eq!(inner.observed_socket(), None);
+        let socket_addr: std::net::SocketAddr =
+            addr.parse().expect("orchestration_addr must be host:port");
+        assert!(socket_addr.ip().is_loopback(), "host-only bind by default");
+        assert_ne!(socket_addr.port(), 0, "ephemeral port assigned");
+        // The listener was live and reachable for the whole session.
+        assert!(
+            inner.tcp_live_at_start.load(SeqCst),
+            "broker TCP listener must be reachable during the session"
+        );
+        // The TCP transport never creates the project socket dir.
+        assert!(!project.join(".varda-mcp").exists());
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn primitive_selects_tcp_only_for_microvm() {
+        // Transport predicate: own-kernel microVMs need TCP; shared-kernel / local do not.
+        assert!(config::primitive_needs_tcp_broker("microsandbox"));
+        assert!(config::primitive_needs_tcp_broker("clawk"));
+        assert!(!config::primitive_needs_tcp_broker("local"));
+        assert!(!config::primitive_needs_tcp_broker("docker"));
     }
 
     #[test]

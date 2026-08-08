@@ -31,8 +31,16 @@ pub struct AgentRunRequest {
     /// interactive execution resumes that session instead of delivering the task prompt.
     pub resume_command: Option<String>,
     /// Sandbox-visible Unix socket for the host-gated nested-orchestration MCP
-    /// broker. When present, Varda also exports it as `VARDA_MCP_SOCKET`.
+    /// broker. When present, Varda also exports it as `VARDA_MCP_SOCKET`. Used for
+    /// `local`/`docker` primitives whose guest sees the socket through the project
+    /// bind mount.
     pub orchestration_socket_path: Option<String>,
+    /// Host `host:port` for the nested-orchestration MCP broker served over TCP,
+    /// used for own-kernel microVM primitives (`microsandbox`/`clawk`) whose guest
+    /// cannot `connect()` the bind-mounted Unix socket but reaches the host over
+    /// TCP. When present, Varda exports it as `VARDA_MCP_ADDR` (and the port alone
+    /// as `VARDA_MCP_PORT`). Mutually exclusive with `orchestration_socket_path`.
+    pub orchestration_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,6 +493,7 @@ mod tests {
                 stream: false,
                 resume_command: None,
                 orchestration_socket_path: None,
+                orchestration_addr: None,
             })
             .await
             .expect("fake agent should return a result");

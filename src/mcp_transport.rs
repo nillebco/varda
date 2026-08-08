@@ -1,22 +1,79 @@
-//! Unix-socket MCP transport for the host-side spawn broker.
+//! MCP transports for the host-side spawn broker.
 //!
 //! The broker itself lives in [`crate::orchestration`]. This module is only the
 //! newline-delimited JSON-RPC transport: each line read from a sandbox-visible
-//! Unix socket is dispatched to `SpawnBroker::handle_rpc`, then answered with one
-//! JSON line. The socket path is created by the run path inside the mounted
-//! project tree, so a sandboxed master can reach it without receiving any host
-//! process capability.
+//! endpoint is dispatched to `SpawnBroker::handle_rpc`, then answered with one
+//! JSON line.
+//!
+//! Two transports exist, selected by the sandbox primitive (see
+//! `crate::config::primitive_needs_tcp_broker`):
+//!
+//! - **Unix socket** ([`serve_unix_socket`]) — for `local` (and shared-kernel
+//!   `docker`) launches the socket path is created inside the mounted project
+//!   tree, so a sandboxed master reaches it through the bind mount without
+//!   receiving any host process capability.
+//! - **TCP** ([`bind_tcp`] + [`serve_tcp`]) — for own-kernel microVM primitives
+//!   (`microsandbox`, `clawk`) the project bind mount shares the socket *file*
+//!   over virtio-fs but NOT the AF_UNIX endpoint, so an in-guest `connect()` is
+//!   refused. The guest instead reaches the host over TCP (its default gateway),
+//!   so the broker binds a host TCP listener on an ephemeral port and advertises
+//!   `host:port` to the guest. The listener is short-lived (torn down with the
+//!   session) and the broker is capability-gated regardless of reachability, so
+//!   a reachable port grants no capability the unix socket did not.
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, UnixListener};
 
 use crate::orchestration::{SpawnBroker, SubtaskLauncher};
 
 pub type SharedSpawnBroker<L> = Arc<SpawnBroker<L>>;
+
+/// Bind a host TCP listener for the broker on `bind_ip:0` (an ephemeral port).
+///
+/// Binding is eager and separate from serving so the caller can read the real
+/// port ([`TcpListener::local_addr`]) and advertise it to the guest as
+/// `VARDA_MCP_ADDR` BEFORE the agent starts, then hand the listener to
+/// [`serve_tcp`]. `bind_ip` is a host-only interface (loopback by default, or the
+/// per-sandbox gateway) — never a broad public exposure.
+pub async fn bind_tcp(bind_ip: IpAddr) -> Result<(SocketAddr, TcpListener)> {
+    let listener = TcpListener::bind((bind_ip, 0))
+        .await
+        .with_context(|| format!("failed to bind MCP TCP listener on {bind_ip}"))?;
+    let addr = listener
+        .local_addr()
+        .context("failed to read bound MCP TCP address")?;
+    Ok((addr, listener))
+}
+
+/// Serve the broker over a TCP listener obtained from [`bind_tcp`]. Each accepted
+/// connection is dispatched exactly like the unix-socket transport.
+pub async fn serve_tcp<L>(
+    listener: TcpListener,
+    parent_id: String,
+    broker: SharedSpawnBroker<L>,
+) -> Result<()>
+where
+    L: SubtaskLauncher + Send + 'static,
+{
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("failed to accept MCP TCP client")?;
+        let parent_id = parent_id.clone();
+        let broker = Arc::clone(&broker);
+        tokio::spawn(async move {
+            if let Err(error) = handle_stream(stream, parent_id, broker).await {
+                eprintln!("warning: MCP broker stream failed: {error:#}");
+            }
+        });
+    }
+}
 
 pub async fn serve_unix_socket<L>(
     socket_path: &Path,
@@ -57,15 +114,19 @@ where
     }
 }
 
-async fn handle_stream<L>(
-    stream: UnixStream,
+/// Dispatch newline-delimited JSON-RPC over any bidirectional stream (a
+/// [`tokio::net::UnixStream`] or [`tokio::net::TcpStream`]). The wire framing is
+/// identical for both transports; only the endpoint kind differs.
+async fn handle_stream<S, L>(
+    stream: S,
     parent_id: String,
     broker: SharedSpawnBroker<L>,
 ) -> Result<()>
 where
+    S: AsyncRead + AsyncWrite + Unpin,
     L: SubtaskLauncher + Send + 'static,
 {
-    let (read, mut write) = stream.into_split();
+    let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines
         .next_line()
@@ -163,6 +224,51 @@ mod tests {
         server.abort();
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir(&root);
+
+        assert_eq!(response["result"]["isError"], serde_json::json!(false));
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            serde_json::json!("subtask_id: child-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_round_trips_spawn_subtask_rpc() {
+        let policy = OrchestrationPolicy {
+            enabled: true,
+            ..Default::default()
+        };
+        let broker = Arc::new(crate::orchestration::SpawnBroker::new(
+            policy,
+            "root",
+            MockLauncher,
+        ));
+        // Loopback stands in for the per-sandbox gateway the msb guest reaches.
+        let (addr, listener) = bind_tcp(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .unwrap();
+        assert_ne!(addr.port(), 0, "an ephemeral port must be assigned");
+        let server = tokio::spawn(async move {
+            let _ = serve_tcp(listener, "root".to_owned(), broker).await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write
+            .write_all(
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{}\",\"arguments\":{{\"brief\":\"do it\"}}}}}}\n",
+                    SPAWN_SUBTASK_TOOL
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(read).read_line(&mut line).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        server.abort();
 
         assert_eq!(response["result"]["isError"], serde_json::json!(false));
         assert_eq!(
