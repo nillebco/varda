@@ -1963,21 +1963,41 @@ impl SandboxSession for MicrosandboxSession {
             }
         }
 
-        // Project root always mounted at its absolute path; nothing else unless
-        // explicitly allow-listed. `msb --mount-dir SOURCE:DEST[:ro|:rw]` binds a
-        // host directory into the guest (confirmed against msb 0.6.8).
+        // Project root always mounted ONCE at its absolute path, READ-WRITE and
+        // host-visible: the resident merges worker branches in-box, so its in-guest
+        // writes must land on the host to be committable. `msb --mount-dir
+        // SOURCE:DEST[:ro|:rw]` binds a host directory into the guest (confirmed
+        // against msb 0.6.8). NB: msb 0.6.8 has NO `--project` flag (the workdir is
+        // set via `--workdir` below), so the project is a plain rw bind — never a
+        // second `--project`-style mount of the same guest path.
+        let project_target = PathBuf::from(&proj);
         args.push("--mount-dir".to_owned());
-        args.push(format!("{proj}:{proj}"));
+        args.push(format!("{proj}:{proj}:rw"));
         // Effective extra mounts = union(sandbox, route), de-duplicated by the
-        // expanded absolute target; first declaration wins. Read-only unless the
-        // spec says otherwise (msb appends `:ro`/`:rw` like docker).
+        // expanded absolute target; first declaration wins. The project mount is
+        // PRE-REGISTERED so an explicit `mounts` / `--add-dir` entry resolving to
+        // the SAME guest path — e.g. the resident gate's `{workspace}:{workspace}:rw`,
+        // where project == workspace — collapses onto the single rw project bind
+        // rather than emitting a duplicate guest path (msb rejects "multiple volumes
+        // cannot mount the same guest path: <workspace>"). Read-only unless the spec
+        // says otherwise (msb appends `:ro`/`:rw` like docker).
         let mut seen_targets: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        seen_targets.insert(project_target.clone());
+        // msb (unlike docker) refuses to mount the SAME SOURCE at more than one
+        // guest path ("multiple volumes cannot mount the same guest path"). The
+        // project is already bound rw at its host path, so an explicit mount of the
+        // same source — e.g. the resident gate's required `{workspace}:/workspace:rw`
+        // where project == workspace — is REDUNDANT and must be skipped (dedup by
+        // source, in addition to target). The single rw project bind serves it.
+        let mut seen_sources: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        seen_sources.insert(project_target);
         for (_origin, raw) in &self.mounts {
             let mspec = parse_mount(raw)
                 .with_context(|| format!("invalid mount '{raw}' for sandbox '{}'", self.image))?;
             let source = expand_mount_path(&mspec.source, &self.project_root);
             let target = expand_mount_path(&mspec.target, &self.project_root);
-            if !seen_targets.insert(target.clone()) {
+            if !seen_targets.insert(target.clone()) || !seen_sources.insert(source.clone()) {
                 continue;
             }
             let source = source.display().to_string();
@@ -3670,7 +3690,7 @@ mod tests {
                 "--net-default",
                 "deny",
                 "--mount-dir",
-                "/proj:/proj",
+                "/proj:/proj:rw",
                 "--workdir",
                 "/proj",
                 "--env",
@@ -3688,6 +3708,173 @@ mod tests {
         assert_eq!(
             session.session_store_root(),
             Some(PathBuf::from("/host/store/agent"))
+        );
+    }
+
+    /// #535 regression: the sandboxed-resident/orchestrate shape — an explicit
+    /// `{workspace}:{workspace}:rw` mount (what `enforce_resident_launch`'s
+    /// `workspace_mounted_rw` gate requires) where the workspace IS the project.
+    /// The generated msb argv must (a) carry NO `--project` flag (msb 0.6.8 has
+    /// none), (b) mount the project exactly ONCE, rw, host-visibly — the explicit
+    /// duplicate collapses onto the auto-mount so msb never sees two volumes on the
+    /// same guest path — and (c) turn the egress allow-list into `--net-default-egress
+    /// deny` + one `--net-rule allow@<host>`.
+    #[test]
+    fn microsandbox_wrap_dedups_workspace_mount_and_maps_egress() {
+        let session = MicrosandboxSession {
+            image: "varda-agents:latest".to_owned(),
+            project_root: PathBuf::from("/ws"),
+            // The resident gate is satisfied by an explicit rw mount of the workspace
+            // (== project). A second, distinct mount stays as its own guest path.
+            mounts: vec![
+                (MountOrigin::Route, "/ws:/ws:rw".to_owned()),
+                (MountOrigin::Sandbox, "/data:/data:rw".to_owned()),
+            ],
+            egress: vec!["api.anthropic.com".to_owned()],
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-res".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec!["-p".to_owned(), "go".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+        assert_eq!(wrapped.program, "msb");
+
+        // (a) msb 0.6.8 has no `--project`; the drifted flag must be gone.
+        assert!(
+            !wrapped.args.iter().any(|a| a == "--project"),
+            "msb 0.6.8 has no --project flag; argv: {:?}",
+            wrapped.args
+        );
+
+        // (b) the project/workspace is mounted exactly once, rw, at its host path;
+        // the explicit `{ws}:{ws}:rw` collapses onto the auto-mount (no dup guest path).
+        let ws_mounts: Vec<&String> = wrapped
+            .args
+            .windows(2)
+            .filter(|w| w[0] == "--mount-dir" && parse_mount(&w[1]).unwrap().target == PathBuf::from("/ws"))
+            .map(|w| &w[1])
+            .collect();
+        assert_eq!(
+            ws_mounts,
+            vec![&"/ws:/ws:rw".to_owned()],
+            "workspace must be mounted once, rw, host-visibly; argv: {:?}",
+            wrapped.args
+        );
+        // No guest path appears twice across all --mount-dir specs.
+        let mut seen = std::collections::HashSet::new();
+        for w in wrapped.args.windows(2) {
+            if w[0] != "--mount-dir" {
+                continue;
+            }
+            let target = parse_mount(&w[1]).unwrap().target;
+            assert!(
+                seen.insert(target.clone()),
+                "duplicate guest mount path '{}'; argv: {:?}",
+                target.display(),
+                wrapped.args
+            );
+        }
+        // The distinct mount is still present as its own guest path.
+        assert!(
+            wrapped
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--mount-dir" && w[1] == "/data:/data:rw"),
+            "distinct extra mount must survive; argv: {:?}",
+            wrapped.args
+        );
+
+        // (c) egress → default-deny egress + one allow rule.
+        assert!(
+            wrapped
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--net-default-egress" && w[1] == "deny"),
+            "non-empty egress must default-deny egress; argv: {:?}",
+            wrapped.args
+        );
+        assert!(
+            wrapped
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--net-rule" && w[1] == "allow@api.anthropic.com"),
+            "egress host must become a net-rule allow; argv: {:?}",
+            wrapped.args
+        );
+    }
+
+    /// #535 iteration 2 regression: the live-captured failure was TWO `--mount-dir`
+    /// with the SAME SOURCE at DIFFERENT guest targets — `/ws:/ws:rw` (project
+    /// auto-mount) and `/ws:/workspace:rw` (the resident gate's explicit mount).
+    /// msb refuses the same source bound at more than one guest path (its error
+    /// reads "same guest path" but the true cause is the shared source), and a
+    /// target-only dedup does NOT catch this because the targets differ. The
+    /// `seen_sources` dedup must collapse the explicit same-source mount onto the
+    /// single rw project bind, while a genuinely distinct source survives.
+    #[test]
+    fn microsandbox_wrap_dedups_same_source_at_different_target() {
+        let session = MicrosandboxSession {
+            image: "varda-agents:latest".to_owned(),
+            project_root: PathBuf::from("/ws"),
+            // Same source as the project (/ws) but a DIFFERENT guest target — the
+            // exact shape the resident gate produced that broke msb.
+            mounts: vec![
+                (MountOrigin::Route, "/ws:/workspace:rw".to_owned()),
+                (MountOrigin::Sandbox, "/data:/data:rw".to_owned()),
+            ],
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-src".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec!["-p".to_owned(), "go".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+
+        // The source /ws is bound exactly ONCE — as the project bind /ws:/ws:rw —
+        // and the redundant /ws:/workspace:rw is dropped by the source dedup.
+        let ws_source_mounts: Vec<&String> = wrapped
+            .args
+            .windows(2)
+            .filter(|w| w[0] == "--mount-dir" && parse_mount(&w[1]).unwrap().source == PathBuf::from("/ws"))
+            .map(|w| &w[1])
+            .collect();
+        assert_eq!(
+            ws_source_mounts,
+            vec![&"/ws:/ws:rw".to_owned()],
+            "source /ws must be mounted exactly once (the project bind); argv: {:?}",
+            wrapped.args
+        );
+        // The redundant same-source mount at /workspace must NOT appear.
+        assert!(
+            !wrapped
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--mount-dir" && w[1] == "/ws:/workspace:rw"),
+            "same-source duplicate at a different target must be dropped; argv: {:?}",
+            wrapped.args
+        );
+        // A mount with a genuinely distinct source at a distinct target survives.
+        assert!(
+            wrapped
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--mount-dir" && w[1] == "/data:/data:rw"),
+            "distinct-source mount must survive; argv: {:?}",
+            wrapped.args
         );
     }
 
@@ -4141,6 +4328,90 @@ mod tests {
                 .trim(),
             "hi"
         );
+    }
+
+    /// #535 live exit criterion — the resident's rw project/workspace mount is
+    /// HOST-VISIBLE: a file the guest writes under the mounted project path appears
+    /// on the host DIRECTLY (no `msb cp`), which is what makes an in-box merge
+    /// committable. Also confirms an explicit `{proj}:{proj}:rw` mount (the resident
+    /// gate's shape) does NOT trip msb's "multiple volumes … same guest path".
+    #[tokio::test]
+    #[ignore = "requires the msb (microsandbox) runtime"]
+    async fn microsandbox_workspace_mount_is_rw_and_host_visible_live() {
+        use tokio::process::Command as TokioCommand;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("msb-it-ws");
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("guest-wrote.txt");
+        let _ = std::fs::remove_file(&marker);
+
+        // Mirror the orchestrate/resident shape: an EXPLICIT rw workspace mount of
+        // the project path, exactly what `workspace_mounted_rw` requires. The fix
+        // must dedup this against the auto project mount rather than double-mount it.
+        let provider = MicrosandboxProvider::from_config(
+            "microsandbox",
+            &SandboxConfig {
+                image: Some("busybox".to_owned()),
+                primitive: "microsandbox".to_owned(),
+                ..Default::default()
+            },
+            // The pre-merged, origin-tagged mount set: the explicit rw workspace
+            // mount the resident gate requires (== the project path).
+            vec![(MountOrigin::Route, format!("{0}:{0}:rw", root.display()))],
+        )
+        .unwrap();
+        let session = provider
+            .prepare(&ctx_with_id(&root, "msb-it-ws-1"))
+            .await
+            .unwrap();
+
+        let spec = session
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![
+                        "-c".to_owned(),
+                        format!("echo committed > {}", marker.display()),
+                    ],
+                    env: BTreeMap::new(),
+                    cwd: Some(root.clone()),
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+        // No duplicate guest path in the generated argv (the bug this fixes).
+        let mut seen = std::collections::HashSet::new();
+        for w in spec.args.windows(2) {
+            if w[0] == "--mount-dir" {
+                assert!(
+                    seen.insert(parse_mount(&w[1]).unwrap().target),
+                    "duplicate guest mount path in argv: {:?}",
+                    spec.args
+                );
+            }
+        }
+        let out = TokioCommand::new(&spec.program)
+            .args(&spec.args)
+            .output()
+            .await
+            .expect("failed to run msb");
+        let host_visible = std::fs::read_to_string(&marker);
+        session.teardown().await.ok();
+
+        assert!(
+            out.status.success(),
+            "msb run must succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            host_visible
+                .expect("guest write must be visible on the host via the rw bind")
+                .trim(),
+            "committed"
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 
     /// clawk parses and resolves, but `prepare()` fails with the contractually
