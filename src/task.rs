@@ -243,6 +243,10 @@ struct TaskDefinition<'a> {
     bounds: &'a TaskBounds,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     requires_user: bool,
+    // Operator sandbox pin (`--sandbox`) is part of the DEFINITION (not runtime
+    // state): a clone/worktree materializing this task must preserve the pin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox: Option<&'a str>,
 }
 
 /// Serialize a task's DEFINITION-only frontmatter + brief to
@@ -267,6 +271,7 @@ fn write_definition(store: &Path, slug: &str, task: &TaskDocument) -> Result<Pat
         allow_commands: &task.frontmatter.allow_commands,
         bounds: &task.frontmatter.bounds,
         requires_user: task.frontmatter.requires_user,
+        sandbox: task.frontmatter.sandbox.as_deref(),
     };
     let frontmatter =
         serde_yaml::to_string(&definition).context("failed to serialize task definition")?;
