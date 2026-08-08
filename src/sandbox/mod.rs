@@ -1982,13 +1982,22 @@ impl SandboxSession for MicrosandboxSession {
         // cannot mount the same guest path: <workspace>"). Read-only unless the spec
         // says otherwise (msb appends `:ro`/`:rw` like docker).
         let mut seen_targets: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        seen_targets.insert(project_target);
+        seen_targets.insert(project_target.clone());
+        // msb (unlike docker) refuses to mount the SAME SOURCE at more than one
+        // guest path ("multiple volumes cannot mount the same guest path"). The
+        // project is already bound rw at its host path, so an explicit mount of the
+        // same source — e.g. the resident gate's required `{workspace}:/workspace:rw`
+        // where project == workspace — is REDUNDANT and must be skipped (dedup by
+        // source, in addition to target). The single rw project bind serves it.
+        let mut seen_sources: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        seen_sources.insert(project_target);
         for (_origin, raw) in &self.mounts {
             let mspec = parse_mount(raw)
                 .with_context(|| format!("invalid mount '{raw}' for sandbox '{}'", self.image))?;
             let source = expand_mount_path(&mspec.source, &self.project_root);
             let target = expand_mount_path(&mspec.target, &self.project_root);
-            if !seen_targets.insert(target.clone()) {
+            if !seen_targets.insert(target.clone()) || !seen_sources.insert(source.clone()) {
                 continue;
             }
             let source = source.display().to_string();
@@ -3797,6 +3806,74 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0] == "--net-rule" && w[1] == "allow@api.anthropic.com"),
             "egress host must become a net-rule allow; argv: {:?}",
+            wrapped.args
+        );
+    }
+
+    /// #535 iteration 2 regression: the live-captured failure was TWO `--mount-dir`
+    /// with the SAME SOURCE at DIFFERENT guest targets — `/ws:/ws:rw` (project
+    /// auto-mount) and `/ws:/workspace:rw` (the resident gate's explicit mount).
+    /// msb refuses the same source bound at more than one guest path (its error
+    /// reads "same guest path" but the true cause is the shared source), and a
+    /// target-only dedup does NOT catch this because the targets differ. The
+    /// `seen_sources` dedup must collapse the explicit same-source mount onto the
+    /// single rw project bind, while a genuinely distinct source survives.
+    #[test]
+    fn microsandbox_wrap_dedups_same_source_at_different_target() {
+        let session = MicrosandboxSession {
+            image: "varda-agents:latest".to_owned(),
+            project_root: PathBuf::from("/ws"),
+            // Same source as the project (/ws) but a DIFFERENT guest target — the
+            // exact shape the resident gate produced that broke msb.
+            mounts: vec![
+                (MountOrigin::Route, "/ws:/workspace:rw".to_owned()),
+                (MountOrigin::Sandbox, "/data:/data:rw".to_owned()),
+            ],
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-src".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec!["-p".to_owned(), "go".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+
+        // The source /ws is bound exactly ONCE — as the project bind /ws:/ws:rw —
+        // and the redundant /ws:/workspace:rw is dropped by the source dedup.
+        let ws_source_mounts: Vec<&String> = wrapped
+            .args
+            .windows(2)
+            .filter(|w| w[0] == "--mount-dir" && parse_mount(&w[1]).unwrap().source == PathBuf::from("/ws"))
+            .map(|w| &w[1])
+            .collect();
+        assert_eq!(
+            ws_source_mounts,
+            vec![&"/ws:/ws:rw".to_owned()],
+            "source /ws must be mounted exactly once (the project bind); argv: {:?}",
+            wrapped.args
+        );
+        // The redundant same-source mount at /workspace must NOT appear.
+        assert!(
+            !wrapped
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--mount-dir" && w[1] == "/ws:/workspace:rw"),
+            "same-source duplicate at a different target must be dropped; argv: {:?}",
+            wrapped.args
+        );
+        // A mount with a genuinely distinct source at a distinct target survives.
+        assert!(
+            wrapped
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--mount-dir" && w[1] == "/data:/data:rw"),
+            "distinct-source mount must survive; argv: {:?}",
             wrapped.args
         );
     }
