@@ -90,6 +90,29 @@ pub struct TaskFrontmatter {
     pub requires_user: bool,
 }
 
+impl TaskFrontmatter {
+    /// A copy with varda's internal run-bookkeeping cleared, for injection into an
+    /// agent prompt. `recaps` / `agent_session_logs` are HOST filesystem paths
+    /// (under `<varda_home>/operations/…`) that do not exist inside a sandbox —
+    /// injecting them lures the agent into `ls`/`cat` of unreachable paths (and
+    /// grows the prompt unboundedly as a task accumulates runs). The agent gets the
+    /// task BODY and the fields that actually describe the work (id/status/project/
+    /// assignee/sandbox/plan/allow_commands/bounds); its own prior recaps are not
+    /// its concern. Applied uniformly (sandboxed or not) since these paths are
+    /// never useful handed to the agent.
+    pub fn sanitized_for_prompt(&self) -> Self {
+        let mut fm = self.clone();
+        fm.recap = None;
+        fm.recaps.clear();
+        fm.agent_session_id = None;
+        fm.agent_session_log = None;
+        fm.agent_session_ids.clear();
+        fm.agent_session_logs.clear();
+        fm.agent_resume_commands.clear();
+        fm
+    }
+}
+
 /// M10 per-task overrides for the cooperative-execution bounds. An unset field
 /// falls back to the matching `defaults.*` config value.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -913,6 +936,53 @@ Verify the sandbox.
         };
         let empty_yaml = serde_yaml::to_string(&empty).expect("frontmatter should serialize");
         assert!(!empty_yaml.contains("allow_commands"));
+    }
+
+    #[test]
+    fn sanitized_for_prompt_drops_host_bookkeeping_paths() {
+        let task = parse_task(
+            Path::new(".varda/operations/tasks/claude/resident.md"),
+            r#"---
+id: 523
+status: ready
+project: /Users/x/dev/ws
+assignee: claude-resident
+recaps:
+  - /Users/x/.varda/operations/recaps/aaa.md
+  - /Users/x/.varda/operations/recaps/bbb.md
+agent_session_ids:
+  - sess-1
+agent_session_logs:
+  - /Users/x/.varda/operations/runs/aaa.log
+agent_resume_commands:
+  - "claude --resume sess-1"
+allow_commands:
+  - msb
+---
+
+# Resident
+
+Body.
+"#,
+        )
+        .expect("task should parse");
+
+        let clean = task.frontmatter.sanitized_for_prompt();
+        // Host-path bookkeeping is gone…
+        assert!(clean.recaps.is_empty());
+        assert!(clean.agent_session_ids.is_empty());
+        assert!(clean.agent_session_logs.is_empty());
+        assert!(clean.agent_resume_commands.is_empty());
+        // …but the fields that describe the work survive.
+        assert_eq!(clean.id, Some(523));
+        assert_eq!(clean.assignee.as_deref(), Some("claude-resident"));
+        assert_eq!(clean.allow_commands, vec!["msb"]);
+
+        let yaml = serde_yaml::to_string(&clean).expect("serialize");
+        assert!(!yaml.contains("operations/recaps"), "yaml: {yaml}");
+        assert!(!yaml.contains("agent_session_logs"), "yaml: {yaml}");
+        // The original is untouched (we cloned).
+        assert_eq!(task.frontmatter.recaps.len(), 2);
     }
 
     #[test]

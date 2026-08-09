@@ -1324,7 +1324,7 @@ Task markdown:
         },
         agent = request.agent_name,
         task_path = request.task_path,
-        frontmatter = serde_yaml::to_string(&request.frontmatter)
+        frontmatter = serde_yaml::to_string(&request.frontmatter.sanitized_for_prompt())
             .unwrap_or_else(|_| "<frontmatter serialization failed>".to_owned()),
         body = request.body,
     )
@@ -1357,7 +1357,7 @@ Task markdown:
         instructions = build_planning_instructions(request.timeout),
         agent = request.agent_name,
         task_path = request.task_path,
-        frontmatter = serde_yaml::to_string(&request.frontmatter)
+        frontmatter = serde_yaml::to_string(&request.frontmatter.sanitized_for_prompt())
             .unwrap_or_else(|_| "<frontmatter serialization failed>".to_owned()),
         body = request.body,
     )
