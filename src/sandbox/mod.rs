@@ -1946,10 +1946,20 @@ impl SandboxSession for MicrosandboxSession {
             }
         }
 
-        // Egress: empty ⇒ fully offline; non-empty ⇒ default-deny plus an allow
-        // rule per host. `msb` enforces net policy in-guest (own-kernel), so
-        // unlike docker we hand it hostnames/CIDRs rather than pre-resolved IPs.
-        if self.egress.is_empty() {
+        // Broker reachability: when a host-gated MCP broker is wired for this run,
+        // the guest env carries `VARDA_MCP_HOST`/`VARDA_MCP_ADDR` (own-kernel
+        // microVM ⇒ TCP transport; see `acp::env_for_request`). The guest dials the
+        // host via `host.microsandbox.internal`, but msb DENIES host access by
+        // default, so the `host` net-rule group must be allowed — scoped strictly
+        // to broker-enabled runs, and never broadened past the local `host` group.
+        let broker_active =
+            spec.env.contains_key("VARDA_MCP_HOST") || spec.env.contains_key("VARDA_MCP_ADDR");
+
+        // Egress: empty (and no broker) ⇒ fully offline; otherwise default-deny
+        // egress plus an allow rule per host (and `allow@host` for the broker).
+        // `msb` enforces net policy in-guest (own-kernel), so unlike docker we hand
+        // it hostnames/CIDRs rather than pre-resolved IPs.
+        if self.egress.is_empty() && !broker_active {
             args.push("--net-default".to_owned());
             args.push("deny".to_owned());
         } else {
@@ -1960,6 +1970,12 @@ impl SandboxSession for MicrosandboxSession {
                 // msb net-rule token grammar: `<action>[:<direction>]@<target>`
                 // (confirmed against msb 0.6.8; e.g. `allow@example.com`).
                 args.push(format!("allow@{host}"));
+            }
+            if broker_active {
+                // `host` is msb's reserved group for the host machine (the local
+                // trusted orchestrator running the broker), NOT an exfil path.
+                args.push("--net-rule".to_owned());
+                args.push("allow@host".to_owned());
             }
         }
 
@@ -3810,6 +3826,89 @@ mod tests {
         );
     }
 
+    /// #546 last-mile: when a host-gated MCP broker is wired for the run (the guest
+    /// env carries `VARDA_MCP_HOST`/`VARDA_MCP_ADDR`, own-kernel microVM ⇒ TCP), the
+    /// msb argv must add `--net-rule allow@host` (msb denies host access by default,
+    /// so the guest cannot reach `host.microsandbox.internal` without it) ALONGSIDE
+    /// the per-egress-host allow rules — and only for broker-enabled runs.
+    #[test]
+    fn microsandbox_wrap_allows_host_group_when_broker_active() {
+        let session = MicrosandboxSession {
+            image: "varda-agents:latest".to_owned(),
+            project_root: PathBuf::from("/ws"),
+            mounts: Vec::new(),
+            egress: vec!["api.anthropic.com".to_owned()],
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-broker".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        // A broker-enabled run: the TCP transport exported VARDA_MCP_HOST/PORT.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "VARDA_MCP_HOST".to_owned(),
+            "host.microsandbox.internal".to_owned(),
+        );
+        env.insert("VARDA_MCP_PORT".to_owned(), "54321".to_owned());
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec!["-p".to_owned(), "go".to_owned()],
+            env,
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+        // The per-egress allow survives AND the host group is allowed for the broker.
+        assert!(
+            wrapped
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--net-rule" && w[1] == "allow@api.anthropic.com"),
+            "egress host must still become a net-rule allow; argv: {:?}",
+            wrapped.args
+        );
+        assert!(
+            wrapped
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--net-rule" && w[1] == "allow@host"),
+            "broker-enabled run must allow the msb `host` group; argv: {:?}",
+            wrapped.args
+        );
+    }
+
+    /// #546 last-mile (negative): a run with NO broker env must NOT allow the host
+    /// group — the `host` rule is scoped strictly to broker-enabled runs.
+    #[test]
+    fn microsandbox_wrap_no_host_group_without_broker() {
+        let session = MicrosandboxSession {
+            image: "varda-agents:latest".to_owned(),
+            project_root: PathBuf::from("/ws"),
+            mounts: Vec::new(),
+            egress: vec!["api.anthropic.com".to_owned()],
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-nobroker".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec!["-p".to_owned(), "go".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+        assert!(
+            !wrapped
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--net-rule" && w[1] == "allow@host"),
+            "non-broker run must NOT allow the host group; argv: {:?}",
+            wrapped.args
+        );
+    }
+
     /// #535 iteration 2 regression: the live-captured failure was TWO `--mount-dir`
     /// with the SAME SOURCE at DIFFERENT guest targets — `/ws:/ws:rw` (project
     /// auto-mount) and `/ws:/workspace:rw` (the resident gate's explicit mount).
@@ -4412,6 +4511,131 @@ mod tests {
             "committed"
         );
         let _ = std::fs::remove_file(&marker);
+    }
+
+    /// #546 last-mile LIVE exit criterion — the guest reaches the host-gated broker
+    /// through `host.microsandbox.internal`. A real `SpawnBroker` binds a TCP
+    /// listener on HOST loopback (`127.0.0.1`), and an msb guest — launched under
+    /// `--net-default-egress deny` with `--net-rule allow@host` (added by `wrap`
+    /// because the guest env carries `VARDA_MCP_HOST`/`VARDA_MCP_PORT`) — dials
+    /// `socat TCP:host.microsandbox.internal:$VARDA_MCP_PORT` and completes an MCP
+    /// `tools/list`, whose reply advertises `spawn_subtask`. Proves the guest's own
+    /// loopback is NOT the host, that `host.microsandbox.internal` bridges to the
+    /// host loopback service, and that the `host` net-rule is what unblocks it.
+    /// Needs the msb runtime AND a guest image with `socat` + `sh` (override via
+    /// `VARDA_MSB_SOCAT_IMAGE`).
+    #[tokio::test]
+    #[ignore = "requires the msb (microsandbox) runtime and a socat-capable guest image"]
+    async fn microsandbox_guest_reaches_broker_via_host_internal_live() {
+        use tokio::process::Command as TokioCommand;
+
+        // A live broker on HOST loopback, exactly as the run path binds it.
+        struct NoopLauncher;
+        impl crate::orchestration::SubtaskLauncher for NoopLauncher {
+            fn launch(
+                &mut self,
+                _req: &crate::orchestration::SpawnRequest,
+                _grant: &crate::orchestration::SpawnGrant,
+            ) -> anyhow::Result<crate::orchestration::SubtaskId> {
+                Ok("child-1".to_owned())
+            }
+        }
+        let policy = crate::orchestration::OrchestrationPolicy {
+            enabled: true,
+            ..Default::default()
+        };
+        let broker = std::sync::Arc::new(crate::orchestration::SpawnBroker::new(
+            policy,
+            "root",
+            NoopLauncher,
+        ));
+        let (addr, listener) =
+            crate::mcp_transport::bind_tcp(std::net::Ipv4Addr::LOCALHOST.into())
+                .await
+                .unwrap();
+        let server = tokio::spawn(async move {
+            let _ = crate::mcp_transport::serve_tcp(listener, "root".to_owned(), broker).await;
+        });
+        let port = addr.port().to_string();
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("msb-it-broker");
+        std::fs::create_dir_all(&root).unwrap();
+        let image =
+            std::env::var("VARDA_MSB_SOCAT_IMAGE").unwrap_or_else(|_| "alpine/socat".to_owned());
+        // Egress must permit the broker's `host` group; api.anthropic.com stands in
+        // for the agent's normal egress so we exercise `allow@host` ALONGSIDE it.
+        let provider = MicrosandboxProvider::from_config(
+            "microsandbox",
+            &SandboxConfig {
+                image: Some(image),
+                primitive: "microsandbox".to_owned(),
+                egress: vec!["api.anthropic.com".to_owned()],
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let session = provider
+            .prepare(&ctx_with_id(&root, "msb-it-broker-1"))
+            .await
+            .unwrap();
+
+        // The guest env carries what `env_for_request` exports for a VM broker, so
+        // `wrap` adds `--net-rule allow@host` and the guest dials the host name.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "VARDA_MCP_HOST".to_owned(),
+            "host.microsandbox.internal".to_owned(),
+        );
+        env.insert("VARDA_MCP_PORT".to_owned(), port);
+        let spec = session
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![
+                        "-c".to_owned(),
+                        // One-line MCP `tools/list`; the broker replies with a line
+                        // advertising the four tools including spawn_subtask.
+                        "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\\n' \
+                         | socat - TCP:${VARDA_MCP_HOST:-host.microsandbox.internal}:$VARDA_MCP_PORT"
+                            .to_owned(),
+                    ],
+                    env,
+                    cwd: Some(root.clone()),
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+        // The generated argv must carry the host allow-rule (real-code assertion).
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|w| w[0] == "--net-rule" && w[1] == "allow@host"),
+            "broker-enabled msb argv must allow the host group; argv: {:?}",
+            spec.args
+        );
+
+        let out = TokioCommand::new(&spec.program)
+            .args(&spec.args)
+            .output()
+            .await
+            .expect("failed to run msb");
+        server.abort();
+        session.teardown().await.ok();
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "msb run must succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("spawn_subtask"),
+            "guest must reach the host broker via host.microsandbox.internal and see \
+             tools/list; got: {stdout}"
+        );
     }
 
     /// clawk parses and resolves, but `prepare()` fails with the contractually
