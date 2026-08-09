@@ -1029,15 +1029,24 @@ Invariants 1 and 2 are enforced at the mount layer (folded into `check_credentia
 
 `varda orchestrate` launches the **RESIDENT** — a long-lived orchestrator agent that drives Varda's own dev loop by spawning capped workers through the broker above. Unlike the earlier un-sandboxed resident sketch, the resident now runs **inside an isolating sandbox** with a dedicated workspace mounted read-write; it merges worker branches **in-box** against that mount. The blast radius is therefore bounded to *local, un-pushed work in the workspace* plus the *capped worker budget* — nothing reaches a remote from inside the box.
 
+The resident authenticates with a long-lived Claude token via the `claude-resident` agent's
+`from_env = "CLAUDE_CODE_OAUTH_TOKEN"` credential. Rather than exporting the raw token, keep
+it as a reference in [fnox](https://fnox.jdx.dev) (a `fnox.toml` maps `CLAUDE_CODE_OAUTH_TOKEN`
+to a `pass://` Proton Pass reference) and launch through `fnox exec` — fnox resolves it on the
+host and varda copies it *scoped* into the box (fnox stays on the exterior; `~/.config/fnox`
+is never mounted). A ready `fnox.toml` ships in the orchestrate workspace.
+
 ```bash
 # Headless: run the resident autonomously until it terminates or signals needs_user.
-varda orchestrate
+# `fnox exec` injects CLAUDE_CODE_OAUTH_TOKEN from the pass:// reference; run from the
+# workspace so ./fnox.toml is discovered.
+cd /path/to/orchestration/workspace && fnox exec -- varda orchestrate
 
 # Interactive: attach your terminal (M13b), operator in the conversation, broker available.
-varda orchestrate --interactive
+fnox exec -- varda orchestrate --interactive
 
 # Point it at a specific dedicated workspace (default: <varda_home>/orchestrate/workspace).
-varda orchestrate --workspace /path/to/orchestration/workspace
+fnox exec -- varda orchestrate --workspace /path/to/orchestration/workspace
 ```
 
 The command resolves (or scaffolds) a `resident-orchestrator` task under the workspace whose body points at the workspace's **`.varda/WORKFLOW.md`** — that file holds the loop *intelligence* (a separate concern); `orchestrate` only handles the command, routing, and enforcement. It then delegates to the standard run path, which for an orchestration-enabled route wraps the session in the interactive spawn broker so `spawn_subtask` is served for the whole session.
