@@ -363,6 +363,7 @@ async fn run_auto_resume_loop(
                         stream,
                         resume_command: Some(resume),
                         orchestration_socket_path: None,
+                        orchestration_addr: None,
                     };
                     continue;
                 }
@@ -480,6 +481,7 @@ pub async fn run_task(
         stream,
         resume_command: None,
         orchestration_socket_path: None,
+        orchestration_addr: None,
     };
 
     // M10 cooperative model: an interactive run stays fully user-driven (no
@@ -673,6 +675,7 @@ pub async fn resume_interactive_task(
         stream: false,
         resume_command: Some(resume_command),
         orchestration_socket_path: None,
+        orchestration_addr: None,
     };
 
     let session_result = client.run_task(request).await.with_context(|| {
@@ -785,6 +788,7 @@ pub async fn plan_task(
         stream: false,
         resume_command: None,
         orchestration_socket_path: None,
+        orchestration_addr: None,
     };
 
     let result = match run_under_ceiling(
@@ -942,6 +946,7 @@ async fn interpret_interactive_session(
         stream: false,
         resume_command: None,
         orchestration_socket_path: None,
+        orchestration_addr: None,
     };
 
     eprintln!();

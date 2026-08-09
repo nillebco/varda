@@ -1456,9 +1456,20 @@ fn env_for_request(
             .iter()
             .map(|(key, value)| (key.clone(), expand_env_value(value, request))),
     );
-    // M8-transport: expose the per-session MCP broker socket to the sandboxed agent.
+    // M8-transport: expose the per-session MCP broker to the sandboxed agent. A
+    // `local`/`docker` guest reaches it through the bind-mounted Unix socket
+    // (`VARDA_MCP_SOCKET`); an own-kernel microVM guest (microsandbox/clawk) cannot
+    // `connect()` that socket and instead dials the host over TCP, so it gets
+    // `VARDA_MCP_ADDR` (host:port) plus `VARDA_MCP_PORT` (the port alone, for a
+    // guest bridge that pairs it with its own discovered default gateway).
     if let Some(socket) = request.orchestration_socket_path.as_deref() {
         out.insert("VARDA_MCP_SOCKET".to_owned(), socket.to_owned());
+    }
+    if let Some(addr) = request.orchestration_addr.as_deref() {
+        out.insert("VARDA_MCP_ADDR".to_owned(), addr.to_owned());
+        if let Some((_host, port)) = addr.rsplit_once(':') {
+            out.insert("VARDA_MCP_PORT".to_owned(), port.to_owned());
+        }
     }
     out
 }
@@ -1707,6 +1718,7 @@ mod tests {
                 stream: false,
                 resume_command: None,
                 orchestration_socket_path: None,
+                orchestration_addr: None,
             })
             .await
             .expect("subprocess should echo prompt");
@@ -1748,6 +1760,7 @@ mod tests {
             stream: false,
             resume_command: None,
             orchestration_socket_path: None,
+            orchestration_addr: None,
         }
     }
 
@@ -1836,6 +1849,20 @@ mod tests {
         assert_eq!(plain.orchestration_socket_path, None);
         let without_socket = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &plain);
         assert!(!without_socket.contains_key("VARDA_MCP_SOCKET"));
+    }
+
+    #[test]
+    fn env_for_request_exports_tcp_addr_for_vm_backed_broker() {
+        // #541: an own-kernel microVM guest gets the TCP broker address as
+        // `VARDA_MCP_ADDR` (host:port) plus `VARDA_MCP_PORT` (the port alone), and
+        // no `VARDA_MCP_SOCKET` (the two transports are mutually exclusive).
+        let mut vm = docker_request("/srv/app", "vm-broker");
+        vm.interactive = true;
+        vm.orchestration_addr = Some("172.16.0.177:54321".to_owned());
+        let env = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &vm);
+        assert_eq!(env["VARDA_MCP_ADDR"], "172.16.0.177:54321");
+        assert_eq!(env["VARDA_MCP_PORT"], "54321");
+        assert!(!env.contains_key("VARDA_MCP_SOCKET"));
     }
 
     /// M5: build a sandbox image from `testdata/Dockerfile.rust` (a trivial
@@ -2193,6 +2220,7 @@ mod tests {
                 stream: false,
                 resume_command: None,
                 orchestration_socket_path: None,
+                orchestration_addr: None,
             })
             .await
             .expect("interpreter subprocess should run");
@@ -2267,6 +2295,7 @@ mod tests {
                 stream: false,
                 resume_command: None,
                 orchestration_socket_path: None,
+                orchestration_addr: None,
             })
             .await
             .expect("subprocess should run");
@@ -2336,6 +2365,7 @@ mod tests {
                 stream: false,
                 resume_command: None,
                 orchestration_socket_path: None,
+                orchestration_addr: None,
             })
             .await
             .expect("subprocess should run");
@@ -2381,6 +2411,7 @@ mod tests {
             stream: false,
             resume_command: None,
             orchestration_socket_path: None,
+            orchestration_addr: None,
         };
 
         let args = args_for_request(
@@ -2441,6 +2472,7 @@ mod tests {
             stream: false,
             resume_command: None,
             orchestration_socket_path: None,
+            orchestration_addr: None,
         };
 
         let args = args_for_request(
@@ -2673,6 +2705,7 @@ mod tests {
             stream: false,
             resume_command: None,
             orchestration_socket_path: None,
+            orchestration_addr: None,
         }
     }
 

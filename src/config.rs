@@ -467,6 +467,23 @@ pub fn primitive_enforces_strict_egress(primitive: &str) -> bool {
     matches!(primitive, "microsandbox" | "clawk")
 }
 
+/// Whether the spawn broker must be served over TCP (rather than a project-mounted
+/// Unix socket) for this `primitive`.
+///
+/// Own-kernel microVM primitives (`microsandbox`, `clawk`) share the project tree
+/// over virtio-fs, which exposes the socket *file* but not its AF_UNIX endpoint —
+/// an in-guest `connect()` is refused. Those guests reach the host over TCP (their
+/// default gateway) instead. `local` and shared-kernel `docker` see the real
+/// socket through the bind mount, so they keep the Unix-socket transport.
+///
+/// NB: docker-on-a-VM (Colima / Docker Desktop) has the same virtio-fs limitation
+/// as a microVM, but varda cannot portably tell a VM-backed docker host from a
+/// native-Linux one, so `docker` stays on the unix socket here; a VM-backed docker
+/// host that needs the broker should use `microsandbox`/`clawk`.
+pub fn primitive_needs_tcp_broker(primitive: &str) -> bool {
+    matches!(primitive, "microsandbox" | "clawk")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
