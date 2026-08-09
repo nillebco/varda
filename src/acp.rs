@@ -24,9 +24,16 @@ use crate::sandbox::{
 };
 
 /// Guest-visible path the staged task prompt lands at inside a non-`local`
-/// sandbox (matches the providers' `/home/agent` HOME). Advertised to the agent
-/// via `VARDA_PROMPT_FILE` (M13a §5).
-const GUEST_PROMPT_FILE: &str = "/home/agent/.varda-prompt.txt";
+/// sandbox. Advertised to the agent via `VARDA_PROMPT_FILE` (M13a §5).
+///
+/// MUST live OUTSIDE the agent's `/home/agent` HOME: microsandbox's `--copy-file`
+/// creates the destination's parent dir as **root-owned** in the guest overlay,
+/// so staging into `$HOME` re-owns HOME to root and the uid-1001 `agent` can no
+/// longer write `~/.claude` (Claude Code then fails every Bash call and its own
+/// config/transcript writes with `EACCES: mkdir '/home/agent/.claude'`). Staging
+/// under `/opt/varda` keeps HOME image-owned and writable; the file lands
+/// root-owned `0644`, still world-readable so the agent can `cat` it.
+const GUEST_PROMPT_FILE: &str = "/opt/varda/prompt.txt";
 
 /// Guest-visible hostname that resolves to the HOST machine from inside an
 /// own-kernel microVM guest (`microsandbox`/`clawk`). The broker BINDS to host
