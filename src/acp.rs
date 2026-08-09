@@ -28,6 +28,16 @@ use crate::sandbox::{
 /// via `VARDA_PROMPT_FILE` (M13a §5).
 const GUEST_PROMPT_FILE: &str = "/home/agent/.varda-prompt.txt";
 
+/// Guest-visible hostname that resolves to the HOST machine from inside an
+/// own-kernel microVM guest (`microsandbox`/`clawk`). The broker BINDS to host
+/// loopback (`127.0.0.1`), but the guest's own `127.0.0.1` is NOT the host — the
+/// guest reaches the host's loopback service by dialing `host.microsandbox.internal`
+/// instead. So for a VM-backed primitive the guest-visible broker host is this
+/// name (paired with `VARDA_MCP_PORT`), distinct from the host bind address.
+/// (msb DENIES host access by default, so the `host` net-rule group must also be
+/// allowed — see `MicrosandboxSession::wrap`.)
+const GUEST_BROKER_HOST: &str = "host.microsandbox.internal";
+
 /// M11-ext — stage every file-target credential the identity resolved
 /// ([`SandboxSession::identity_files`]) into the guest via `stage_credential_file`,
 /// so the value lands as a READ-ONLY file inside the box in BOTH launch modes
@@ -1460,8 +1470,7 @@ fn env_for_request(
     // `local`/`docker` guest reaches it through the bind-mounted Unix socket
     // (`VARDA_MCP_SOCKET`); an own-kernel microVM guest (microsandbox/clawk) cannot
     // `connect()` that socket and instead dials the host over TCP, so it gets
-    // `VARDA_MCP_ADDR` (host:port) plus `VARDA_MCP_PORT` (the port alone, for a
-    // guest bridge that pairs it with its own discovered default gateway).
+    // `VARDA_MCP_ADDR` (host:port) plus `VARDA_MCP_PORT` (the port alone).
     if let Some(socket) = request.orchestration_socket_path.as_deref() {
         out.insert("VARDA_MCP_SOCKET".to_owned(), socket.to_owned());
     }
@@ -1470,6 +1479,13 @@ fn env_for_request(
         if let Some((_host, port)) = addr.rsplit_once(':') {
             out.insert("VARDA_MCP_PORT".to_owned(), port.to_owned());
         }
+        // Guest-visible broker HOST ≠ the host bind address. `orchestration_addr`
+        // is set only for a VM-backed TCP broker (`primitive_needs_tcp_broker`),
+        // whose broker binds host loopback — which is NOT the guest's own loopback.
+        // The guest bridge dials `host.microsandbox.internal:$VARDA_MCP_PORT`, so
+        // advertise that name as the connect host (the port stays the real bound
+        // ephemeral port from `VARDA_MCP_ADDR`).
+        out.insert("VARDA_MCP_HOST".to_owned(), GUEST_BROKER_HOST.to_owned());
     }
     out
 }
@@ -1863,6 +1879,26 @@ mod tests {
         assert_eq!(env["VARDA_MCP_ADDR"], "172.16.0.177:54321");
         assert_eq!(env["VARDA_MCP_PORT"], "54321");
         assert!(!env.contains_key("VARDA_MCP_SOCKET"));
+    }
+
+    #[test]
+    fn env_for_request_advertises_host_microsandbox_internal_for_vm_broker() {
+        // #546 last-mile: the guest connect HOST must be `host.microsandbox.internal`
+        // (which resolves to the HOST from inside the guest), NOT a loopback host —
+        // the broker binds host loopback, but the guest's own loopback is not the
+        // host. The port stays the real bound ephemeral port from `VARDA_MCP_ADDR`.
+        let mut vm = docker_request("/srv/app", "vm-broker-host");
+        vm.orchestration_addr = Some("127.0.0.1:54321".to_owned());
+        let env = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &vm);
+        assert_eq!(env["VARDA_MCP_HOST"], "host.microsandbox.internal");
+        assert_eq!(env["VARDA_MCP_PORT"], "54321");
+        assert_ne!(env["VARDA_MCP_HOST"], "127.0.0.1");
+
+        // A `local`/`docker` guest (socket transport) gets no `VARDA_MCP_HOST`.
+        let mut sock = docker_request("/srv/app", "sock-broker");
+        sock.orchestration_socket_path = Some("/srv/app/.varda-mcp/root.sock".to_owned());
+        let sock_env = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &sock);
+        assert!(!sock_env.contains_key("VARDA_MCP_HOST"));
     }
 
     /// M5: build a sandbox image from `testdata/Dockerfile.rust` (a trivial
