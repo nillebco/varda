@@ -1373,10 +1373,25 @@ struct OrchestratedAgentClient<C: AgentClient = acp::AcpSubprocessClient> {
 /// orchestration isolation invariants — the broker is capability-gated, so the
 /// port grants no capability, but it is still never exposed on `0.0.0.0`.
 fn broker_bind_ip() -> std::net::IpAddr {
+    let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
     std::env::var("VARDA_BROKER_BIND_IP")
         .ok()
-        .and_then(|raw| raw.trim().parse().ok())
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        .and_then(|raw| raw.trim().parse::<std::net::IpAddr>().ok())
+        // REJECT wildcard/unspecified addresses (`0.0.0.0`, `::`): binding there
+        // would expose the capability-gated broker on ALL interfaces (public/LAN),
+        // violating the host-only invariant. A misconfigured env var must not widen
+        // exposure — fall back to loopback.
+        .filter(|ip| {
+            if ip.is_unspecified() {
+                eprintln!(
+                    "warning: VARDA_BROKER_BIND_IP={ip} is a wildcard address; refusing to bind the broker on all interfaces — falling back to loopback. Set it to the per-sandbox gateway IP instead."
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .unwrap_or(loopback)
 }
 
 /// Resolve the effective sandbox primitive for the run at `project_path`, used to
