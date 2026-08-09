@@ -568,6 +568,16 @@ pub trait SandboxSession: Send + Sync {
     /// returns the `docker create …` invocation; the actual TTY-attached process
     /// is produced by [`begin_interactive`](Self::begin_interactive).
     fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec>;
+    /// Whether a BATCH task prompt must be delivered as a staged guest FILE
+    /// (redirected into the agent's stdin in-guest by [`wrap`](Self::wrap))
+    /// instead of being piped to the child process's stdin. True for microVM
+    /// primitives whose `run` does NOT forward host stdin into the guest (msb),
+    /// where a batch agent reading stdin (`claude -p`) would otherwise hang and
+    /// exit "no stdin data received". Default false — `local`/`docker` forward
+    /// stdin, so the pipe works and no file staging is needed.
+    fn prompt_via_file(&self) -> bool {
+        false
+    }
     /// Stage a host-provided file so it is visible INSIDE the guest before the
     /// interactive process starts (M13a §3, §5). Returns the guest-visible path
     /// the caller should advertise (e.g. via `VARDA_PROMPT_FILE`).
@@ -2076,6 +2086,19 @@ impl SandboxSession for MicrosandboxSession {
         // parsed by `msb`.
         args.push(self.image.clone());
         args.push("--".to_owned());
+        // msb does not forward host stdin into the guest, so a batch agent that
+        // reads its prompt from stdin (`claude -p`) would hang. When the prompt
+        // was staged as a guest file (`VARDA_PROMPT_FILE` present, batch mode),
+        // redirect that file into the agent's stdin IN-GUEST. The
+        // `sh -c 'exec "$0" "$@" < "$F"' program args...` form preserves the
+        // program + args verbatim (no re-quoting) and `exec` keeps the agent as
+        // the process msb waits on. Interactive mode already reads the file via
+        // its own `sh -c '<agent> "$(cat $VARDA_PROMPT_FILE)"'`, so it is untouched.
+        if matches!(mode, LaunchMode::Batch) && env.contains_key("VARDA_PROMPT_FILE") {
+            args.push("sh".to_owned());
+            args.push("-c".to_owned());
+            args.push(r#"exec "$0" "$@" < "$VARDA_PROMPT_FILE""#.to_owned());
+        }
         args.push(spec.program);
         args.extend(spec.args);
 
@@ -2121,6 +2144,13 @@ impl SandboxSession for MicrosandboxSession {
         // Guest HOME lives in VM storage during the run; it only reaches the host
         // after `extract_session_store`, so discovery must run post-exit.
         false
+    }
+
+    fn prompt_via_file(&self) -> bool {
+        // `msb run` does not forward host stdin into the guest (verified: a piped
+        // `msb run … -- cat` reads nothing), so a batch `claude -p` reading stdin
+        // hangs. Deliver the prompt as a staged guest file + in-guest redirect.
+        true
     }
 
     fn validate_mounts(&self) -> Result<()> {
@@ -3907,6 +3937,91 @@ mod tests {
             "non-broker run must NOT allow the host group; argv: {:?}",
             wrapped.args
         );
+    }
+
+    /// Batch prompt delivery: `msb run` does not forward host stdin into the
+    /// guest, so a batch prompt staged as a guest file (`VARDA_PROMPT_FILE` set)
+    /// must be redirected into the agent's stdin IN-GUEST via
+    /// `sh -c 'exec "$0" "$@" < "$VARDA_PROMPT_FILE"' <program> <args>`. Batch
+    /// WITHOUT a staged prompt, and interactive mode, keep the bare command.
+    #[test]
+    fn microsandbox_batch_redirects_staged_prompt_into_stdin() {
+        let make = || MicrosandboxSession {
+            image: "varda-agents:latest".to_owned(),
+            project_root: PathBuf::from("/ws"),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-prompt".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        assert!(make().prompt_via_file(), "msb must deliver batch prompt by file");
+
+        let cmd_tail = |wrapped: &CommandSpec| -> Vec<String> {
+            let sep = wrapped
+                .args
+                .iter()
+                .position(|a| a == "--")
+                .expect("msb argv must have a `--` separator");
+            wrapped.args[sep + 1..].to_vec()
+        };
+        let redirect = r#"exec "$0" "$@" < "$VARDA_PROMPT_FILE""#.to_owned();
+
+        // Batch + staged prompt file -> sh -c redirect wraps the agent command.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "VARDA_PROMPT_FILE".to_owned(),
+            "/opt/varda/prompt.txt".to_owned(),
+        );
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec!["-p".to_owned(), "--add-dir".to_owned(), "/ws".to_owned()],
+            env,
+            cwd: None,
+        };
+        let wrapped = make().wrap(spec, LaunchMode::Batch).unwrap();
+        assert_eq!(
+            cmd_tail(&wrapped),
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                redirect.clone(),
+                "claude".to_owned(),
+                "-p".to_owned(),
+                "--add-dir".to_owned(),
+                "/ws".to_owned(),
+            ],
+            "batch staged prompt must redirect stdin in-guest",
+        );
+
+        // Batch WITHOUT a staged prompt -> bare command, no redirect.
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec!["-p".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = make().wrap(spec, LaunchMode::Batch).unwrap();
+        assert_eq!(cmd_tail(&wrapped), vec!["claude".to_owned(), "-p".to_owned()]);
+
+        // Interactive with VARDA_PROMPT_FILE -> NOT wrapped (its command reads the
+        // file itself); the batch redirect must be batch-only.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "VARDA_PROMPT_FILE".to_owned(),
+            "/opt/varda/prompt.txt".to_owned(),
+        );
+        let inner = "claude \"$(cat $VARDA_PROMPT_FILE)\"".to_owned();
+        let spec = CommandSpec {
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), inner.clone()],
+            env,
+            cwd: None,
+        };
+        let wrapped = make().wrap(spec, LaunchMode::Interactive).unwrap();
+        assert_eq!(cmd_tail(&wrapped), vec!["sh".to_owned(), "-c".to_owned(), inner]);
     }
 
     /// #535 iteration 2 regression: the live-captured failure was TWO `--mount-dir`

@@ -274,7 +274,7 @@ impl AcpSubprocessClient {
         // Resolve the invocation, then let the sandbox provider rewrite it. For
         // the `local` provider this is the identity, so the spawn below is
         // byte-for-byte the same command as before providers existed.
-        let spec = CommandSpec {
+        let mut spec = CommandSpec {
             program: command.clone(),
             args: args.clone(),
             env: env.clone(),
@@ -317,6 +317,19 @@ impl AcpSubprocessClient {
         // before wrap bakes the argv. env-target credentials fold in via the
         // provider's `guest_env()` at wrap; file targets need the live session.
         stage_identity_files(session, self.sandbox.name())?;
+        // microVM sandboxes (msb) do NOT forward host stdin into the guest, so a
+        // batch agent that reads its prompt from stdin (e.g. `claude -p`) would
+        // wait, warn "no stdin data received", and exit 1. For those, stage the
+        // prompt as a guest FILE (via `--copy-file`) and let `wrap` redirect it
+        // into the agent's stdin IN-GUEST; the host-side stdin pipe goes unused.
+        let batch_prompt_via_file = session.prompt_via_file();
+        if batch_prompt_via_file {
+            let guest_prompt = session
+                .stage_file(&prompt, GUEST_PROMPT_FILE)
+                .context("failed to stage batch task prompt file")?;
+            spec.env
+                .insert("VARDA_PROMPT_FILE".to_owned(), guest_prompt);
+        }
         // Live stores (local) are polled while the agent runs; extracted stores
         // (docker volume + `docker cp`) are only discovered post-exit.
         let store_is_live = session.store_is_live();
@@ -357,12 +370,19 @@ impl AcpSubprocessClient {
             )
         })?;
 
-        let mut stdin = child.stdin.take().context("failed to open agent stdin")?;
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .context("failed to write task prompt to agent stdin")?;
-        drop(stdin);
+        if batch_prompt_via_file {
+            // Prompt reaches the agent via the staged guest file + in-guest stdin
+            // redirect (see `prompt_via_file`); the host-side stdin pipe is unused
+            // because msb does not forward it. Close it so nothing waits on it.
+            drop(child.stdin.take());
+        } else {
+            let mut stdin = child.stdin.take().context("failed to open agent stdin")?;
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .context("failed to write task prompt to agent stdin")?;
+            drop(stdin);
+        }
 
         // Resume-capture depends on reaching the agent's session store on the
         // host. For a LIVE store (host `$HOME` for `local`) discovery polls while
