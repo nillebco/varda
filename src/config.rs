@@ -33,7 +33,15 @@ pub const DEFAULT_SANDBOX_PROVIDER: &str = "local";
 /// no wildcard/suffix matching, so a look-alike like `api.openai.com.attacker.com`
 /// stays denied.
 ///
-pub const CLAUDE_RESIDENT_EGRESS_ALLOWLIST: &[&str] = &["api.anthropic.com"];
+/// `platform.claude.com` is required from Claude Code v2.x onward: startup runs a
+/// hard connectivity/entitlement preflight against it and aborts (exit 1,
+/// "Unable to connect to Anthropic services") if it is unreachable. It is
+/// Anthropic-owned — the same trust surface as `api.anthropic.com`, NOT a
+/// git-push/exfil vector like `github.com` — so allowing it keeps the resident's
+/// "LLM-provider endpoints only" posture intact. (msb enforces egress by SNI, so
+/// this host is denied even though it shares Anthropic's edge IP with the API host.)
+pub const CLAUDE_RESIDENT_EGRESS_ALLOWLIST: &[&str] =
+    &["api.anthropic.com", "platform.claude.com"];
 
 /// The ONLY hosts a Codex/OpenAI net-restricted sandboxed resident may reach.
 pub const CODEX_RESIDENT_EGRESS_ALLOWLIST: &[&str] =
@@ -86,7 +94,7 @@ agents = ["codex"]
 # [sandboxes.orchestration]
 # image = "your-dev-image:latest"
 # primitive = "microsandbox"    # strict egress enforcement — NEVER "local"; docker may only be used with egress = []
-# egress = ["api.anthropic.com"]  # resident agent's exact LLM endpoints ONLY — no wildcard/github.com
+# egress = ["api.anthropic.com", "platform.claude.com"]  # resident agent's exact LLM endpoints ONLY — no wildcard/github.com
 #
 # [[routes]]
 # glob = "/path/to/orchestration/workspace/**"
