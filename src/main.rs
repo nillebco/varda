@@ -1228,6 +1228,23 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.project_path.clone());
         let assignee = req.agent.as_deref().unwrap_or(&self.fallback_agent);
+
+        // Preflight route resolution BEFORE creating/spawning the subtask. A
+        // spawned worker is run through normal route resolution, which enforces
+        // the route's `agents` allowlist and sandbox. If the requested agent
+        // isn't runnable at the target path, fail the spawn LOUDLY here so the
+        // master's `spawn_subtask` call returns an error it can react to —
+        // otherwise the subtask sits at `ready` forever and an `await_subtasks`
+        // on it deadlocks (the resident route listing only `claude-resident`
+        // while the broker spawns `claude` workers did exactly this).
+        routing::match_route(&self.config, &project, Some(assignee)).with_context(|| {
+            format!(
+                "cannot spawn subtask: agent '{assignee}' is not runnable at '{}'. \
+                 Add it to that route's `agents`, or request a permitted agent.",
+                project.display()
+            )
+        })?;
+
         let short = uuid::Uuid::new_v4().to_string();
         let task_name = format!("spawned-subtask-{}", &short[..8]);
         let task_path = task::create_task(
@@ -1257,8 +1274,17 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
         let path = task_path.clone();
         let child_id = subtask_id.clone();
         let child_handle = tokio::spawn(async move {
-            if let Err(error) = run_task_path_for_parallel(config, path, Some(lineage)).await {
+            if let Err(error) = run_task_path_for_parallel(config, path.clone(), Some(lineage)).await
+            {
                 eprintln!("warning: spawned subtask {child_id} failed: {error:#}");
+                // Force a TERMINAL status so an awaiting master observes completion
+                // instead of hanging on a subtask stuck at `ready`/`running`.
+                if let Ok(mut doc) = task::load_task(&path) {
+                    if !matches!(doc.frontmatter.status, task::TaskStatus::Done) {
+                        doc.set_status(task::TaskStatus::Failed);
+                        let _ = task::write_task(&doc);
+                    }
+                }
             }
         });
         self.spawn_state
