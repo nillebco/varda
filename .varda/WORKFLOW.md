@@ -76,6 +76,13 @@ control loop is:
    file footprints are disjoint enough to parallelize.
 2. Fan out one sandboxed worker per task with `spawn_subtask`. Each worker runs
    on its own worktree/branch. Respect the depth-1, fanout, and budget caps.
+   - ALWAYS call `spawn_subtask` with `agent="claude"` and `sandbox="worker"`.
+     The `worker` sandbox has the broader egress workers need (crates.io,
+     github.com) to fetch deps and build/test; the default (no sandbox) would put
+     the worker in the resident's LLM-only `orchestrate` sandbox, where any
+     `cargo`/dependency fetch fails. `agent="claude"` must be permitted on the
+     workspace route (it is) — omitting it or naming an unlisted agent makes the
+     spawn fail loudly rather than run.
 3. Await the wave with `await_subtasks`, then read each terminal result via
    `subtask_result` (`status`, `files_touched`, `blocked_commands`, `recap`).
 4. For each finished worker, spawn a cross-reviewer using the OTHER agent.
