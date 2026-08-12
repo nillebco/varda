@@ -921,15 +921,26 @@ async fn interpret_interactive_session(
         .unwrap_or(agent_name);
 
     let log_excerpt = read_session_log_excerpt(session_log_path)?;
+    // Agents like Copilot/Codex do their real work in their OWN transcript file
+    // (recorded as `external_session_log=<path>` in the session log). The
+    // interpreter pass is a sandboxed agent scoped to `{project}` and usually
+    // CANNOT open those paths (under `~/.copilot`/`~/.codex`) — it reports
+    // "Permission denied" and degrades to `needs_user`. Varda runs UNSANDBOXED and
+    // can read them, so it inlines each transcript here; the interpreter then never
+    // needs filesystem access to them.
+    let external_transcripts = read_external_transcripts(session_log_path);
     let body = format!(
         "An interactive Varda session for this task just finished. Read the session log content below \
-        (and any referenced external transcripts at the listed paths if your tools allow you to open them) \
-        and produce the Varda recap. Do not perform any new work.\n\n\
+        AND the embedded external transcript(s) — the transcript holds the agent's actual actions and \
+        outcomes — then produce the Varda recap. Varda has already inlined any referenced external \
+        transcripts below because the interpreter is sandboxed and may not be able to open them; do NOT \
+        try to open files under ~/.copilot or ~/.codex yourself. Do not perform any new work.\n\n\
         ## Original task body\n\n{task_body}\n\n\
-        ## Session log\n\nPath: {log_path}\n\n```\n{log_excerpt}\n```\n",
+        ## Session log\n\nPath: {log_path}\n\n```\n{log_excerpt}\n```\n{external_transcripts}",
         task_body = task.body,
         log_path = session_log_path.display(),
         log_excerpt = log_excerpt,
+        external_transcripts = external_transcripts,
     );
 
     let request = AgentRunRequest {
@@ -1085,11 +1096,108 @@ fn read_session_log_excerpt(path: &Path) -> Result<String> {
     ))
 }
 
+/// Maximum bytes embedded per referenced external transcript.
+const EXTERNAL_TRANSCRIPT_BUDGET: usize = 96 * 1024;
+
+/// Read + format the external transcripts a session log references so the
+/// interpreter never needs filesystem access to them.
+///
+/// varda's session log records `external_session_log=<path>` for agents (Copilot,
+/// Codex, …) whose real work lives in their own transcript file. The interpreter
+/// agent is scoped to `{project}` and typically CANNOT open those paths (they sit
+/// under `~/.copilot`/`~/.codex`), so it would report "Permission denied" and
+/// degrade to `needs_user`. varda runs UNSANDBOXED, so it inlines a budgeted TAIL
+/// (the most recent events = the outcome) of each readable transcript. Returns an
+/// empty string when there are no references. A reference that cannot be read is
+/// noted inline rather than silently dropped.
+fn read_external_transcripts(session_log_path: &Path) -> String {
+    let Ok(log) = fs::read_to_string(session_log_path) else {
+        return String::new();
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut sections = String::new();
+    for line in log.lines() {
+        let Some(path) = line.trim().strip_prefix("external_session_log=") else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() || !seen.insert(path.to_owned()) {
+            continue;
+        }
+        match fs::read_to_string(path) {
+            Ok(content) => sections.push_str(&format!(
+                "\n## External transcript\n\nPath: {path}\n\n```\n{}\n```\n",
+                tail_excerpt(&content, EXTERNAL_TRANSCRIPT_BUDGET)
+            )),
+            Err(error) => sections.push_str(&format!(
+                "\n## External transcript\n\nPath: {path}\n\n(varda could not read this transcript: {error})\n"
+            )),
+        }
+    }
+    sections
+}
+
+/// Return the last `budget` bytes of `content` on a char boundary, prefixed with a
+/// truncation note when trimmed. Tail (not head) because the recent events carry
+/// the session's outcome.
+fn tail_excerpt(content: &str, budget: usize) -> String {
+    if content.len() <= budget {
+        return content.to_owned();
+    }
+    let mut start = content.len() - budget;
+    while start < content.len() && !content.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "[truncated: showing last {} bytes of {} byte transcript]\n\n{}",
+        content.len() - start,
+        content.len(),
+        &content[start..]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use async_trait::async_trait;
+
+    #[test]
+    fn embeds_referenced_external_transcripts_so_interpreter_needs_no_fs_access() {
+        let dir = std::env::temp_dir().join("varda-ext-transcript-test-abc123");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // An external transcript varda can read (the interpreter could not).
+        let transcript = dir.join("events.jsonl");
+        std::fs::write(&transcript, "{\"event\":\"edit\",\"file\":\"a.tf\"}\nOUTCOME-MARKER\n").unwrap();
+        // A referenced transcript that does NOT exist -> noted, not dropped.
+        let missing = dir.join("gone.jsonl");
+        let log = dir.join("session.log");
+        std::fs::write(
+            &log,
+            format!(
+                "command=copilot\nexternal_session_log={}\nexternal_session_log={}\n\
+                 external_session_log={}\nstatus=exit status: 0\n",
+                transcript.display(),
+                transcript.display(), // duplicate -> embedded once
+                missing.display(),
+            ),
+        )
+        .unwrap();
+
+        let out = super::read_external_transcripts(&log);
+        assert!(out.contains("OUTCOME-MARKER"), "transcript content must be inlined: {out}");
+        assert_eq!(out.matches("## External transcript").count(), 2, "dedup + note the missing one: {out}");
+        assert!(out.contains("could not read this transcript"), "missing ref noted: {out}");
+
+        // tail_excerpt keeps the END (outcome) when over budget.
+        let big = format!("HEAD{}TAIL-OUTCOME", "x".repeat(200_000));
+        let tail = super::tail_excerpt(&big, 64 * 1024);
+        assert!(tail.contains("TAIL-OUTCOME") && !tail.contains("HEAD"), "tail keeps the end");
+        assert!(tail.starts_with("[truncated"), "notes truncation");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// M10: `None` ceiling (`max_seconds = "none"`) runs unbounded — no hard kill;
     /// a finite ceiling that elapses returns `Err`, the timeout path.
