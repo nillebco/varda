@@ -225,6 +225,89 @@ pub fn write_task(task: &TaskDocument) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of [`fold_project`].
+#[derive(Debug, Default)]
+pub struct FoldReport {
+    /// Task records re-keyed and relocated into the mother's store folder.
+    pub moved: Vec<u64>,
+    /// Filenames skipped because the mother store already had that name.
+    pub collisions: Vec<String>,
+    /// Source store folders removed because they became empty.
+    pub removed_dirs: Vec<String>,
+}
+
+/// Fold every task whose `project` equals `workspace` into the `mother` project:
+/// rewrite the record's `project` to the mother's canonical path and relocate the
+/// file into the mother's store folder. A merged worktree's tasks thus become the
+/// mother's history instead of a separate dashboard project.
+///
+/// `workspace` is matched as a path STRING (trailing slash ignored) — the worktree
+/// may already be deleted after a merge, so it is deliberately NOT canonicalized.
+/// `mother` must exist (it is canonicalized). With `dry_run`, nothing is written.
+pub fn fold_project(
+    config: &Config,
+    workspace: &str,
+    mother: &Path,
+    dry_run: bool,
+) -> Result<FoldReport> {
+    let task_root = Path::new(&config.defaults.operations_dir).join("tasks");
+    let mother = normalize_project_path(mother)?;
+    let mother_str = mother.to_string_lossy().into_owned();
+    let mother_dir = task_root.join(project_task_folder(&mother)?);
+    let want = workspace.trim_end_matches('/');
+    if want == mother_str.trim_end_matches('/') {
+        bail!("refusing to fold a project into itself: {want}");
+    }
+
+    let mut summaries = Vec::new();
+    if task_root.exists() {
+        collect_all_tasks(&task_root, &mut summaries)?;
+    }
+    let mut report = FoldReport::default();
+    let mut source_dirs = std::collections::BTreeSet::new();
+    for summary in summaries {
+        if summary.project.as_deref().map(|p| p.trim_end_matches('/')) != Some(want) {
+            continue;
+        }
+        let src = summary.path.clone();
+        if let Some(parent) = src.parent() {
+            source_dirs.insert(parent.to_path_buf());
+        }
+        let filename = src.file_name().unwrap_or_default().to_owned();
+        let dst = mother_dir.join(&filename);
+        if dst != src && dst.exists() {
+            report.collisions.push(filename.to_string_lossy().into_owned());
+            continue;
+        }
+        report.moved.extend(summary.id);
+        if dry_run {
+            continue;
+        }
+        let mut doc = load_task(&src)?;
+        doc.frontmatter.project = Some(mother_str.clone());
+        doc.path = dst.clone();
+        fs::create_dir_all(&mother_dir).with_context(|| {
+            format!("failed to create mother store {}", mother_dir.display())
+        })?;
+        write_task(&doc)?;
+        if dst != src {
+            fs::remove_file(&src)
+                .with_context(|| format!("failed to remove folded record {}", src.display()))?;
+        }
+    }
+    if !dry_run {
+        for dir in source_dirs {
+            if dir != mother_dir
+                && fs::read_dir(&dir).map(|mut e| e.next().is_none()).unwrap_or(false)
+            {
+                let _ = fs::remove_dir(&dir);
+                report.removed_dirs.push(dir.to_string_lossy().into_owned());
+            }
+        }
+    }
+    Ok(report)
+}
+
 /// Directory name a repository uses to carry its own committed task DEFINITIONS
 /// and workflow rules (`<repo>/.varda/`). Distinct from the untrusted sandbox
 /// `.varda` FILE handled in `config.rs`: a directory named `.varda` and a file

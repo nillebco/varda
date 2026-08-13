@@ -273,6 +273,22 @@ enum ProjectCommand {
         #[arg(long, value_delimiter = ',', required = true)]
         agents: Vec<String>,
     },
+    /// Fold a finished workspace's tasks into a mother project (post-merge cleanup).
+    ///
+    /// Re-keys every task whose `project` is WORKSPACE to the mother and relocates
+    /// the records into the mother's store, so a merged worktree stops being a
+    /// separate dashboard project. WORKSPACE is matched as a path string — the
+    /// worktree may already be removed.
+    Fold {
+        /// The workspace/worktree project path whose tasks to fold.
+        workspace: String,
+        /// The mother project to fold into (must exist).
+        #[arg(long)]
+        into: PathBuf,
+        /// Preview what would move without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -535,6 +551,30 @@ async fn main() -> Result<()> {
                     glob,
                     agents.join(",")
                 );
+            }
+            ProjectCommand::Fold {
+                workspace,
+                into,
+                dry_run,
+            } => {
+                let config = config::load_config(&config::config_file()?)?;
+                let report = task::fold_project(&config, &workspace, &into, dry_run)?;
+                let verb = if dry_run { "would fold" } else { "folded" };
+                println!(
+                    "{verb} {} task(s) from {} into {}",
+                    report.moved.len(),
+                    workspace,
+                    into.display()
+                );
+                if !report.collisions.is_empty() {
+                    println!(
+                        "  left in place (name already in mother store): {}",
+                        report.collisions.join(", ")
+                    );
+                }
+                for dir in &report.removed_dirs {
+                    println!("  removed empty store folder {dir}");
+                }
             }
         },
         Command::Skill { command } => match command {
@@ -2070,6 +2110,9 @@ struct DashboardPayload {
     scope: String,
     generated_at: u64,
     default_project: Option<String>,
+    /// Host `$HOME`, so the UI can abbreviate it to `~` in displayed paths while
+    /// keeping absolute paths as the data/API keys.
+    home: Option<String>,
     tasks: Vec<DashboardTask>,
     projects: Vec<String>,
     statuses: Vec<&'static str>,
@@ -2318,6 +2361,7 @@ fn load_dashboard_payload(
         scope,
         generated_at: unix_timestamp()?,
         default_project: Some(default_project),
+        home: std::env::var("HOME").ok(),
         tasks,
         projects,
         statuses: vec![
@@ -2459,7 +2503,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <div id="updated" class="meta"></div>
   </header>
   <section class="filters">
-    <label>Project <select id="projectFilter"><option value="">All projects</option></select></label>
+    <label>Project <input id="projectFilter" list="projectOptions" placeholder="All projects — type to search" autocomplete="off" /><datalist id="projectOptions"></datalist></label>
     <label>Status <select id="statusFilter"><option value="">All statuses</option></select></label>
   </section>
   <main>
@@ -2476,6 +2520,18 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function label(value) {
       return value.replaceAll("_", " ");
+    }
+
+    function homePrefix() {
+      const h = payload.home || "";
+      return h.endsWith("/") ? h.slice(0, -1) : h;
+    }
+    // Display paths under $HOME as ~/… ; keep absolute paths as the data/API keys.
+    function abbreviate(p) {
+      if (!p) return p;
+      const h = homePrefix();
+      if (h && (p === h || p.startsWith(h + "/"))) return "~" + p.slice(h.length);
+      return p;
     }
 
     function projectHue(name) {
@@ -2501,9 +2557,12 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function taskMatches(task) {
-      const project = document.getElementById("projectFilter").value;
+      // Case-insensitive SUBSTRING search over the ~-abbreviated project path, so
+      // "461", "sandbox", or a full "~/dev/…" path all filter as expected.
+      const query = document.getElementById("projectFilter").value.trim().toLowerCase();
       const status = document.getElementById("statusFilter").value;
-      return (!project || task.project === project) && (!status || task.status === status);
+      const projectOk = !query || (task.project && abbreviate(task.project).toLowerCase().includes(query));
+      return projectOk && (!status || task.status === status);
     }
 
     function closeDetails() {
@@ -2517,12 +2576,20 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function renderBoard() {
-      optionList(document.getElementById("projectFilter"), payload.projects, "All projects");
+      // Project filter is a searchable input backed by a datalist of ~-abbreviated
+      // paths; status stays a plain select.
+      const projectOptions = document.getElementById("projectOptions");
+      projectOptions.innerHTML = "";
+      for (const project of payload.projects) {
+        const option = document.createElement("option");
+        option.value = abbreviate(project);
+        projectOptions.appendChild(option);
+      }
       optionList(document.getElementById("statusFilter"), payload.statuses || statuses, "All statuses");
       if (!initializedFilters) {
         const defaultProject = payload.default_project || "";
         if (payload.projects.includes(defaultProject)) {
-          document.getElementById("projectFilter").value = defaultProject;
+          document.getElementById("projectFilter").value = abbreviate(defaultProject);
         }
         initializedFilters = true;
       }
@@ -2718,6 +2785,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     document.getElementById("projectFilter").addEventListener("change", renderBoard);
+    document.getElementById("projectFilter").addEventListener("input", renderBoard);
     document.getElementById("statusFilter").addEventListener("change", renderBoard);
     refresh().catch(error => {
       document.getElementById("details").textContent = `Failed to load dashboard: ${error}`;
