@@ -715,6 +715,10 @@ fn migrate_pending_in_dir(path: &Path, changed: &mut usize) -> Result<()> {
 /// body never triggers a rewrite. A trailing inline comment on the status line is
 /// preserved; bare and quoted (`"pending"`/`'pending'`) values are handled.
 fn rewrite_legacy_pending_status(content: &str) -> Option<String> {
+    // A valid frontmatter block requires BOTH an opening `---` fence on the very
+    // first line AND a closing `---` fence on a later line. Locate both before
+    // touching anything: a file with no closing fence is left byte-for-byte
+    // unchanged, even if it contains a `status: pending` line.
     let mut start = 0usize;
     let mut first = true;
     loop {
@@ -732,9 +736,37 @@ fn rewrite_legacy_pending_status(content: &str) -> Option<String> {
             }
             first = false;
         } else if line.trim() == "---" {
-            // Closing fence reached with no legacy status line: leave unchanged.
-            return None;
-        } else if let Some(replaced) = replace_pending_status_value(line) {
+            // Closing fence located: the frontmatter block spans the bytes
+            // between the opening fence and `start` (this closing fence line).
+            // Scan only that region for the legacy status line.
+            return rewrite_pending_within_block(content, start);
+        }
+
+        match rel_newline {
+            Some(index) => start += index + 1,
+            // Reached EOF without a closing fence: not a complete frontmatter
+            // block, so leave the file untouched.
+            None => return None,
+        }
+    }
+}
+
+/// Scan the frontmatter block bytes in `content[..block_end]` (everything after
+/// the opening fence up to, but excluding, the closing fence line at
+/// `block_end`) for a legacy `status: pending` line and rewrite only its value.
+/// Returns `None` when no such line exists in the block.
+fn rewrite_pending_within_block(content: &str, block_end: usize) -> Option<String> {
+    // Skip the opening fence line.
+    let mut start = content.find('\n').map(|i| i + 1)?;
+    while start < block_end {
+        let rel_newline = content[start..block_end].find('\n');
+        let end = match rel_newline {
+            Some(index) => start + index,
+            None => block_end,
+        };
+        let line = &content[start..end];
+
+        if let Some(replaced) = replace_pending_status_value(line) {
             let mut result = String::with_capacity(content.len());
             result.push_str(&content[..start]);
             result.push_str(&replaced);
@@ -744,10 +776,10 @@ fn rewrite_legacy_pending_status(content: &str) -> Option<String> {
 
         match rel_newline {
             Some(index) => start += index + 1,
-            // No newline and no closing fence found: not a migratable file.
-            None => return None,
+            None => break,
         }
     }
+    None
 }
 
 /// If `line` is a frontmatter `status:` entry whose value is the legacy
@@ -1795,6 +1827,22 @@ requires_user: false
         assert_eq!(changed_again, 0);
 
         fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn migration_leaves_file_without_closing_fence_untouched() {
+        // A file that opens with `---` and carries a `status: pending` line but
+        // never closes the frontmatter block. Because there is no complete
+        // block (no closing `---` fence), the helper must leave it byte-for-byte
+        // unchanged rather than rewrite the stray `pending`.
+        let original = "---\nid: 9\nstatus: pending\nassignee: claude\n\n# Body without a closing fence\n";
+        assert!(
+            rewrite_legacy_pending_status(original).is_none(),
+            "a file missing its closing frontmatter fence must not be rewritten"
+        );
+
+        // Only-the-opening-fence file (no other lines) is likewise untouched.
+        assert!(rewrite_legacy_pending_status("---\nstatus: pending\n").is_none());
     }
 
     #[test]
