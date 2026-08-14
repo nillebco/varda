@@ -34,6 +34,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install -g @anthropic-ai/claude-code @openai/codex \
     && npm cache clean --force
 
+# opencode — Go binary, installed via the official installer (not an npm package).
+# The installer puts it in /root/.opencode/bin; copy + chmod so it's on PATH for all users.
+RUN curl -fsSL https://opencode.ai/install | bash \
+    && cp /root/.opencode/bin/opencode /usr/local/bin/opencode \
+    && chmod +x /usr/local/bin/opencode
+
 # Unprivileged agent user — the box IS the boundary; agents never run as root.
 RUN useradd -ms /bin/bash agent
 USER agent
@@ -51,4 +57,4 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
 
 # Fail the build loudly if any expected tool is missing.
-RUN claude --version && codex --version && cargo --version && rustc --version
+RUN claude --version && codex --version && opencode --version && cargo --version && rustc --version

@@ -253,6 +253,7 @@ pub struct SpawnLedger {
 }
 
 impl SpawnLedger {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -603,6 +604,7 @@ pub struct SpawnBroker<L: SubtaskLauncher> {
 impl<L: SubtaskLauncher> SpawnBroker<L> {
     /// Create a broker for a root run. `root_id` is the master task id; it is
     /// registered at depth 0 so its spawns land at depth 1.
+    #[cfg(test)]
     pub fn new(policy: OrchestrationPolicy, root_id: impl Into<SubtaskId>, launcher: L) -> Self {
         Self::with_shared_state(policy, root_id, 0, SharedSpawnState::new(), launcher)
     }
@@ -646,6 +648,7 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
     /// `await_subtask*`. Builder style; used by tests to keep the never-terminal
     /// bound check fast, and available to the run path to cap by a caller's
     /// `max_seconds` when desired.
+    #[cfg(test)]
     pub fn with_poll_timing(mut self, poll_interval: Duration, max_wait: Duration) -> Self {
         self.poll_interval = poll_interval;
         self.max_wait = max_wait;
