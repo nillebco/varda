@@ -607,7 +607,7 @@ pub async fn run_task(
     {
         TaskStatus::Failed
     } else {
-        TaskStatus::Pending
+        TaskStatus::Review
     };
 
     task.set_status(status);
@@ -750,7 +750,7 @@ pub async fn resume_interactive_task(
     {
         TaskStatus::Failed
     } else {
-        TaskStatus::Pending
+        TaskStatus::Review
     };
 
     task.set_status(status);
@@ -1356,7 +1356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_task_marks_successful_task_pending_and_writes_recap() {
+    async fn run_task_marks_successful_task_review_and_writes_recap() {
         let root = std::env::temp_dir().join(format!("varda-run-{}", std::process::id()));
         let operations_dir = root.join("operations");
         let task_dir = operations_dir.join("tasks/codex");
@@ -1393,8 +1393,8 @@ Do it.
         let updated = fs::read_to_string(&task_path).expect("task should be readable");
         let recap = fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
 
-        assert_eq!(outcome.status, TaskStatus::Pending);
-        assert!(updated.contains("status: pending"));
+        assert_eq!(outcome.status, TaskStatus::Review);
+        assert!(updated.contains("status: review"));
         assert!(updated.contains("recaps:"));
         assert!(updated.contains("agent_session_ids:"));
         assert!(updated.contains("agent_session_logs:"));
@@ -1645,7 +1645,7 @@ Help interactively.
         );
         assert!(recorded[1].body.contains("Session log"));
         assert!(recorded[1].body.contains("interactive Varda session"));
-        assert_eq!(outcome.status, TaskStatus::Pending);
+        assert_eq!(outcome.status, TaskStatus::Review);
         assert!(recap.contains("Interpreted Recap"));
         assert!(recap.contains("Did the work."));
     }
@@ -1830,7 +1830,7 @@ Help interactively.
         assert!(recorded[0].interactive);
         assert!(!recorded[0].interpret);
 
-        assert_eq!(outcome.status, TaskStatus::Pending);
+        assert_eq!(outcome.status, TaskStatus::Review);
         let recap = fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
         assert!(
             recap.contains("interactive shell session"),
@@ -1970,7 +1970,7 @@ Help interactively.
         assert!(!recorded[1].interactive);
         assert!(recorded[1].interpret);
         assert!(recorded[1].body.contains("Session log"));
-        assert_eq!(outcome.status, TaskStatus::Pending);
+        assert_eq!(outcome.status, TaskStatus::Review);
     }
 
     /// A client that replays a scripted list of responses, one per session call,
@@ -2060,7 +2060,7 @@ Help interactively.
 
         assert_eq!(
             outcome.status,
-            TaskStatus::Pending,
+            TaskStatus::Review,
             "a stitched run completes"
         );
         let task = crate::task::load_task(&task_path).expect("task loads");
@@ -2123,7 +2123,7 @@ Help interactively.
     /// Regression: with auto-resume OFF (the default `max_continuations = 0`), a
     /// normally-completed agent whose session is RESUMABLE (`resume_command = Some`,
     /// exactly what real codex/copilot produce on every completion) is DONE — one
-    /// session marked `pending`, NOT looped to a cap or marked `needs_user`. Guards
+    /// session marked `review`, NOT looped to a cap or marked `needs_user`. Guards
     /// against the resume-capture fix un-masking a spurious multi-hop loop.
     #[tokio::test]
     async fn completed_resumable_agent_does_not_loop_when_autoresume_off() {
@@ -2140,7 +2140,7 @@ Help interactively.
             .expect("single completed run");
         assert_eq!(
             outcome.status,
-            TaskStatus::Pending,
+            TaskStatus::Review,
             "a completed resumable session must NOT loop or become needs_user when auto-resume is off"
         );
         let task = crate::task::load_task(&task_path).expect("task loads");

@@ -74,7 +74,7 @@ The important files are:
 17. The agent must follow project instructions from `CLAUDE.md`, `AGENTS.md`, and `copilot-instructions.md` when those files exist.
 18. The agent must produce a recap before it finishes, including a `Files touched` section that lists every created, modified, or deleted file as an absolute path.
 19. Varda writes the recap under the global operations folder.
-20. Varda updates the original task to `pending`, `needs_user`, or `failed`.
+20. Varda updates the original task to `review`, `needs_user`, or `failed`.
 21. Varda commits the task update and recap with git.
 
 ## Add Project Routes
@@ -458,20 +458,30 @@ varda run --task 1
 Tasks move through a small state machine:
 
 ```text
-ready -> running -> pending
+ready -> running -> review
 ready -> running -> needs_user
 ready -> running -> failed
-pending -> done
+review -> done
 ```
 
 Status meanings:
 
 - `ready`: Varda may process the task.
 - `running`: Varda has started processing the task.
-- `pending`: the agent produced a recap and the task is ready for a later follow-up.
+- `review`: the agent completed a run, produced a recap, and the task is waiting for human review / follow-up. (Formerly `pending`; see migration below.)
 - `needs_user`: the agent needs human input before work can continue.
 - `failed`: the agent failed, timed out, or returned unusable output.
 - `done`: the task has been reviewed or archived after completion.
+
+### Migrating legacy `pending` task files
+
+`review` was previously called `pending`. Reading a legacy `status: pending` task file still works (it loads as `review`), and `varda task update --set-status pending …` is accepted as an alias for `review`. To rewrite existing control-plane state files in place, run:
+
+```bash
+varda task migrate-status
+```
+
+It rewrites every `status: pending` file under the configured operations task directory to `status: review`, preserves all other frontmatter and the task body, is idempotent, and reports how many files were changed.
 
 ## Resume A Task
 
@@ -988,7 +998,7 @@ The host-side policy engine and the live broker both live in `src/orchestration.
 
 - **Policy engine** — `OrchestrationPolicy` + `SpawnLedger::authorize`/`authorize_and_record`. Every cap is a **hard error** (`SpawnDenied`), never a silent truncation. Safe defaults: spawning is **disabled**, and the `local` (no-isolation) sandbox is denied so a spawned subtask cannot escape the box.
 - **Broker** — `SpawnBroker` uses shared spawn state containing the ledger plus a **lineage registry** (task id → tree depth), a host `SubtaskLauncher` seam, and a host `SubtaskResults` seam (the collect side). It speaks MCP JSON-RPC (`handle_rpc`): `tools/list` advertises exactly `spawn_subtask`, `await_subtask`, `await_subtasks`, and `subtask_result`, and each `spawn_subtask` call is gated through `authorize_and_record` **before** the host is asked to launch. A denial comes back as an MCP tool error (`isError: true`) carrying the `SpawnDenied` reason. The caller **never supplies its own depth** — the broker looks it up from the lineage registry, so a compromised master cannot claim a shallow depth to dodge the recursion cap, and an unknown caller cannot spawn at all. If the host launch fails after authorization, the ledger is rolled back (`SpawnLedger::unrecord`) so a failed attempt consumes no budget.
-- **Collect channel** — `await_subtask*` **block** by polling the `SubtaskResults` seam on a ~1s interval until the child reaches a **terminal** status (`done`/`failed`/`needs_user`/`pending`), bounded by an absolute ceiling (30 min) so a wedged child returns a timeout error rather than hanging forever. `subtask_result` resolves the child's recap and parses its `Files touched` / `Blocked commands` sections (the same `parse_files_touched`/`parse_blocked_commands` the runner uses) — it returns no resume command, since resuming is a resident host action, not a worker's. The concrete host `SubtaskResults` (`VardaSubtaskResults`) resolves a subtask id → home STATE via `task::lookup_task_state` and reads the recap file; the resident (un-sandboxed) host reuses the same impl directly.
+- **Collect channel** — `await_subtask*` **block** by polling the `SubtaskResults` seam on a ~1s interval until the child reaches a **terminal** status (`done`/`failed`/`needs_user`/`review`), bounded by an absolute ceiling (30 min) so a wedged child returns a timeout error rather than hanging forever. `subtask_result` resolves the child's recap and parses its `Files touched` / `Blocked commands` sections (the same `parse_files_touched`/`parse_blocked_commands` the runner uses) — it returns no resume command, since resuming is a resident host action, not a worker's. The concrete host `SubtaskResults` (`VardaSubtaskResults`) resolves a subtask id → home STATE via `task::lookup_task_state` and reads the recap file; the resident (un-sandboxed) host reuses the same impl directly.
 - **Transport** — when the effective orchestration policy is enabled for a task, the run path starts a per-session MCP transport (`src/mcp_transport.rs`) that speaks newline-delimited JSON-RPC and dispatches into the live broker; no host process or docker capability is handed to the agent. Spawn authorization holds the shared broker state only while checking and recording policy, then releases it before the synchronous child run starts, so other MCP connections are not blocked on the global broker state for the whole child run. **The transport is selected by the sandbox primitive** (`config::primitive_needs_tcp_broker`):
   - `local`/`docker` (shared kernel) — a per-session **Unix socket** under the mounted project tree (`{project}/.varda-mcp/{session}.sock`), passed to the sandbox as `VARDA_MCP_SOCKET`. The guest reaches it through the bind mount.
   - `microsandbox`/`clawk` (own-kernel microVM) — the project bind mount shares the socket *file* over virtio-fs but **not** its AF_UNIX endpoint, so an in-guest `connect()` is refused. Instead the broker binds a **host TCP** listener on an ephemeral port and advertises it to the guest as `VARDA_MCP_ADDR` (host:port) plus `VARDA_MCP_PORT` (the port alone). The broker BINDS to **host loopback** (`127.0.0.1`) by default — but the guest's own `127.0.0.1` is *not* the host, so the guest-visible connect host is exported separately as **`VARDA_MCP_HOST=host.microsandbox.internal`** (a name msb resolves to the host machine). The guest bridge dials `host.microsandbox.internal:$VARDA_MCP_PORT`. The listener binds a **host-only** interface — loopback by default, overridable via `VARDA_BROKER_BIND_IP` — never `0.0.0.0`; it is ephemeral and torn down with the session, and the broker is capability-gated regardless of reachability, so a reachable port grants no capability the socket did not.
@@ -1261,4 +1271,4 @@ make install
 
 - The Codex integration is a subprocess POC, not a full ACP protocol client yet.
 - Notification is file-backed JSON plus terminal output, with a best-effort macOS native signal for tasks that need user input.
-- Task handoff to another agent is represented by `pending` plus recap metadata, but automatic reassignment is not implemented yet.
+- Task handoff to another agent is represented by `review` plus recap metadata, but automatic reassignment is not implemented yet.

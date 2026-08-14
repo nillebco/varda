@@ -442,13 +442,13 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30 * 60);
 
 /// A terminal status is one a subtask run has actually settled on: the runner
-/// writes exactly `Done`/`Failed`/`NeedsUser`/`Pending` when a headless run ends
+/// writes exactly `Done`/`Failed`/`NeedsUser`/`Review` when a headless run ends
 /// (`runner::run_task`). `Ready`/`Running`/`Backlog` mean "still in flight", so
 /// the collect channel keeps polling.
 fn is_terminal(status: TaskStatus) -> bool {
     matches!(
         status,
-        TaskStatus::Done | TaskStatus::Failed | TaskStatus::NeedsUser | TaskStatus::Pending
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::NeedsUser | TaskStatus::Review
     )
 }
 

@@ -219,7 +219,7 @@ enum TaskCommand {
     },
     /// Set the status of a task directly.
     SetStatus {
-        /// New status (backlog, ready, running, pending, needs_user, failed, done).
+        /// New status (backlog, ready, running, review, needs_user, failed, done). Legacy `pending` is accepted as an alias for `review`.
         status: String,
         /// Markdown task file or task id to update.
         task: PathBuf,
@@ -233,7 +233,7 @@ enum TaskCommand {
     Update {
         /// Task file or task id to update. Omit to use filter flags for bulk selection.
         task: Option<PathBuf>,
-        /// Set the task status (backlog, ready, running, pending, needs_user, failed, done).
+        /// Set the task status (backlog, ready, running, review, needs_user, failed, done). Legacy `pending` is accepted as an alias for `review`.
         #[arg(long, value_name = "STATUS")]
         set_status: Option<String>,
         /// Set the task assignee.
@@ -255,6 +255,13 @@ enum TaskCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Rewrite legacy `status: pending` task state files to `status: review`.
+    ///
+    /// Operates on the configured Varda operations task directory, preserves all
+    /// other frontmatter and task body, is idempotent, and reports how many files
+    /// were changed. Legacy `pending` parsing stays supported afterwards, so task
+    /// files from another machine or branch still load.
+    MigrateStatus,
 }
 
 #[derive(Debug, Subcommand)]
@@ -540,6 +547,11 @@ async fn main() -> Result<()> {
                     all,
                     yes,
                 )?;
+            }
+            TaskCommand::MigrateStatus => {
+                let config = config::load_config(&config::config_file()?)?;
+                let changed = task::migrate_pending_status(&config)?;
+                println!("migrated {changed} task file(s) from `pending` to `review`");
             }
         },
         Command::Project { command } => match command {
@@ -2370,7 +2382,7 @@ fn load_dashboard_payload(
             "running",
             "needs_user",
             "failed",
-            "pending",
+            "review",
             "done",
         ],
     })
@@ -2511,7 +2523,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <aside id="details" class="empty"></aside>
   </main>
   <script>
-    const statuses = ["backlog", "ready", "running", "needs_user", "failed", "pending", "done"];
+    const statuses = ["backlog", "ready", "running", "needs_user", "failed", "review", "done"];
     let payload = { tasks: [], projects: [], statuses };
     let selectedPath = "";
     let selectedDetail = null;
@@ -2819,7 +2831,7 @@ fn print_task_dashboard(scope: &str, tasks: &[task::TaskSummary]) {
         task::TaskStatus::Running,
         task::TaskStatus::NeedsUser,
         task::TaskStatus::Failed,
-        task::TaskStatus::Pending,
+        task::TaskStatus::Review,
         task::TaskStatus::Done,
     ] {
         println!("## {}", status.as_str());
@@ -3188,7 +3200,7 @@ Stop and signal `needs_user` when the workflow calls for a human decision.
 /// Ensure the resident task at `task_path` is runnable before `run_task_command`
 /// hands it to `runner::run_task` (which refuses anything but `Ready`). A prior
 /// `orchestrate` launch can leave the resident task in a terminal state
-/// (Failed/Pending/Done/NeedsUser/Running); reset it to `Ready` so each new
+/// (Failed/Review/Done/NeedsUser/Running); reset it to `Ready` so each new
 /// `varda orchestrate` invocation can relaunch the same resident task without a
 /// manual `varda task set-status ready` workaround. Recap/session history in the
 /// frontmatter and the task body are left untouched — only the status field flips.
@@ -4167,7 +4179,7 @@ deny_sandboxes = ["local"]
         assert!(err.to_string().contains("isolating sandbox"), "{err}");
     }
 
-    /// #522 regression: a resident task left in a terminal state (Failed / Pending /
+    /// #522 regression: a resident task left in a terminal state (Failed / Review /
     /// Done / NeedsUser / Running) by a prior `orchestrate` launch must be reset to
     /// `Ready` so the next launch does not hit `run_task_command`'s "task ... is not
     /// ready" bail — without a manual `varda task set-status ready` workaround. Prior
@@ -4183,7 +4195,7 @@ deny_sandboxes = ["local"]
 
         for status in [
             task::TaskStatus::Failed,
-            task::TaskStatus::Pending,
+            task::TaskStatus::Review,
             task::TaskStatus::Done,
             task::TaskStatus::NeedsUser,
             task::TaskStatus::Running,
@@ -4339,7 +4351,7 @@ deny_sandboxes = ["local"]
         for status in [
             TaskStatus::Ready,
             TaskStatus::Running,
-            TaskStatus::Pending,
+            TaskStatus::Review,
             TaskStatus::NeedsUser,
             TaskStatus::Failed,
         ] {

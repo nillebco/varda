@@ -144,7 +144,13 @@ pub enum TaskStatus {
     Backlog,
     Ready,
     Running,
-    Pending,
+    // The post-agent review state: a run completed, produced a recap, and the
+    // task is waiting for human review / follow-up. Serialized as `review`; the
+    // `alias` keeps legacy `status: pending` STATE files (from another machine or
+    // branch) loading without error. See `migrate_pending_status` for the one-shot
+    // rewrite of existing control-plane files.
+    #[serde(alias = "pending")]
+    Review,
     NeedsUser,
     Failed,
     Done,
@@ -156,7 +162,7 @@ impl TaskStatus {
             Self::Backlog => "backlog",
             Self::Ready => "ready",
             Self::Running => "running",
-            Self::Pending => "pending",
+            Self::Review => "review",
             Self::NeedsUser => "needs_user",
             Self::Failed => "failed",
             Self::Done => "done",
@@ -172,12 +178,14 @@ impl std::str::FromStr for TaskStatus {
             "backlog" => Ok(Self::Backlog),
             "ready" => Ok(Self::Ready),
             "running" => Ok(Self::Running),
-            "pending" => Ok(Self::Pending),
+            "review" => Ok(Self::Review),
+            // Legacy alias: accept the old `pending` spelling and map it to `review`.
+            "pending" => Ok(Self::Review),
             "needs_user" => Ok(Self::NeedsUser),
             "failed" => Ok(Self::Failed),
             "done" => Ok(Self::Done),
             _ => anyhow::bail!(
-                "unknown status '{}'; expected one of: backlog, ready, running, pending, needs_user, failed, done",
+                "unknown status '{}'; expected one of: backlog, ready, running, review, needs_user, failed, done (legacy alias: pending -> review)",
                 s
             ),
         }
@@ -638,6 +646,92 @@ pub fn lookup_task_state(config: &Config, id: u64) -> Result<Option<(TaskStatus,
     Ok(Some((doc.frontmatter.status, recap_path)))
 }
 
+/// Rewrite every control-plane task STATE file under the configured operations
+/// task directory whose `status` is the legacy `pending` spelling to the new
+/// `review`. All other frontmatter and the task body are preserved. Idempotent:
+/// a file already at `review` (or any other status) is left untouched, so a
+/// second run reports 0 changes. Legacy read compatibility (the `pending` serde
+/// alias and `FromStr` alias) stays in place afterwards, so task files from
+/// another machine or branch that still say `pending` keep loading. Returns the
+/// number of files rewritten.
+pub fn migrate_pending_status(config: &Config) -> Result<usize> {
+    let task_root = Path::new(&config.defaults.operations_dir).join("tasks");
+    if !task_root.exists() {
+        return Ok(0);
+    }
+    let mut changed = 0;
+    migrate_pending_in_dir(&task_root, &mut changed)?;
+    Ok(changed)
+}
+
+fn migrate_pending_in_dir(path: &Path, changed: &mut usize) -> Result<()> {
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("failed to read task directory {}", path.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read task directory {}", path.display()))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry_path.display()))?;
+
+        if file_type.is_dir() {
+            migrate_pending_in_dir(&entry_path, changed)?;
+            continue;
+        }
+
+        if entry_path
+            .extension()
+            .is_none_or(|extension| extension != "md")
+        {
+            continue;
+        }
+
+        let content = fs::read_to_string(&entry_path)
+            .with_context(|| format!("failed to read task at {}", entry_path.display()))?;
+        // Only touch files whose frontmatter still carries the legacy spelling,
+        // so the pass is idempotent and does not reformat unrelated task files.
+        if !has_legacy_pending_status(&content) {
+            continue;
+        }
+
+        let mut task = match load_task(&entry_path) {
+            Ok(task) => task,
+            Err(error) => {
+                eprintln!("warning: skipped {}: {error:#}", entry_path.display());
+                continue;
+            }
+        };
+        // The alias loads `pending` as `Review`; rewriting serializes it as
+        // `review`. set_status is explicit for clarity even though the value
+        // already round-trips to `review`.
+        task.set_status(TaskStatus::Review);
+        write_task(&task)?;
+        *changed += 1;
+    }
+
+    Ok(())
+}
+
+/// True when the YAML frontmatter block (between the first two `---` fences)
+/// carries the legacy `status: pending`. Scans only the frontmatter so a stray
+/// `pending` elsewhere in the body never triggers a rewrite.
+fn has_legacy_pending_status(content: &str) -> bool {
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return false;
+    }
+    for line in lines {
+        if line.trim() == "---" {
+            break;
+        }
+        if line.trim() == "status: pending" {
+            return true;
+        }
+    }
+    false
+}
+
 fn find_task_by_id(config: &Config, id: u64) -> Result<Option<PathBuf>> {
     let task_dir = Path::new(&config.defaults.operations_dir).join("tasks");
     if !task_dir.exists() {
@@ -1093,7 +1187,7 @@ Body.
             body: "# Task\n\nDo the work.\n".to_owned(),
         };
 
-        task.set_status(TaskStatus::Pending);
+        task.set_status(TaskStatus::Review);
         task.set_recap(".varda/operations/recaps/run.md");
         task.frontmatter
             .agent_session_ids
@@ -1105,7 +1199,7 @@ Body.
         let frontmatter =
             serde_yaml::to_string(&task.frontmatter).expect("frontmatter should serialize");
 
-        assert!(frontmatter.contains("status: pending"));
+        assert!(frontmatter.contains("status: review"));
         assert!(frontmatter.contains("recaps:"));
         assert!(frontmatter.contains(".varda/operations/recaps/run.md"));
         assert!(frontmatter.contains("agent_session_ids:"));
@@ -1121,7 +1215,7 @@ Body.
             frontmatter: TaskFrontmatter {
                 bounds: crate::task::TaskBounds::default(),
                 id: Some(7),
-                status: TaskStatus::Pending,
+                status: TaskStatus::Review,
                 project: None,
                 assignee: Some("codex".to_owned()),
                 sandbox: None,
@@ -1144,7 +1238,7 @@ Body.
         fs::remove_file(path).expect("task file should be removable");
 
         assert!(written.starts_with("---\n"));
-        assert!(written.contains("status: pending"));
+        assert!(written.contains("status: review"));
         assert!(written.contains("# Task"));
     }
 
@@ -1534,6 +1628,73 @@ requires_user: false
     }
 
     #[test]
+    fn parses_review_status_and_legacy_pending_alias() {
+        use std::str::FromStr;
+
+        // The new canonical spelling.
+        assert_eq!(TaskStatus::from_str("review").unwrap(), TaskStatus::Review);
+        // The legacy alias still parses, mapping to the same variant.
+        assert_eq!(TaskStatus::from_str("pending").unwrap(), TaskStatus::Review);
+        // An unknown status still errors, and the message now names `review`.
+        let err = TaskStatus::from_str("bogus").unwrap_err().to_string();
+        assert!(err.contains("review"), "message: {err}");
+
+        // `review` round-trips through serde as `review`…
+        assert_eq!(TaskStatus::Review.as_str(), "review");
+        let yaml = serde_yaml::to_string(&TaskStatus::Review).unwrap();
+        assert!(yaml.contains("review"), "yaml: {yaml}");
+        // …and a legacy `pending` value still deserializes via the serde alias.
+        let from_legacy: TaskStatus = serde_yaml::from_str("pending").unwrap();
+        assert_eq!(from_legacy, TaskStatus::Review);
+    }
+
+    #[test]
+    fn migrates_legacy_pending_state_files_idempotently() {
+        let root = std::env::temp_dir().join(format!("varda-migrate-review-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/project");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+
+        // A legacy `pending` STATE file that must be rewritten.
+        fs::write(
+            task_dir.join("legacy.md"),
+            "---\nid: 1\nstatus: pending\nproject: /work/p\nassignee: claude\nrequires_user: false\n---\n\n# Legacy\n\nBody stays.\n",
+        )
+        .expect("legacy task should write");
+        // An already-`review` file that must be left untouched (idempotency).
+        fs::write(
+            task_dir.join("fresh.md"),
+            "---\nid: 2\nstatus: review\nrequires_user: false\n---\n\n# Fresh\n",
+        )
+        .expect("fresh task should write");
+        // A `ready` file that must not be affected.
+        fs::write(
+            task_dir.join("ready.md"),
+            "---\nid: 3\nstatus: ready\nrequires_user: false\n---\n\n# Ready\n",
+        )
+        .expect("ready task should write");
+
+        let config = test_config(&operations_dir);
+
+        let changed = migrate_pending_status(&config).expect("migration should run");
+        assert_eq!(changed, 1, "only the one legacy file should be rewritten");
+
+        let migrated =
+            fs::read_to_string(task_dir.join("legacy.md")).expect("legacy should be readable");
+        assert!(migrated.contains("status: review"), "content: {migrated}");
+        assert!(!migrated.contains("status: pending"), "content: {migrated}");
+        // Other frontmatter and body survive the rewrite.
+        assert!(migrated.contains("assignee: claude"));
+        assert!(migrated.contains("Body stays."));
+
+        // Idempotent: a second pass rewrites nothing.
+        let changed_again = migrate_pending_status(&config).expect("migration should run again");
+        assert_eq!(changed_again, 0);
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
     fn slugifies_task_name() {
         assert_eq!(
             slugify_task_name("Write README Please").expect("name should slugify"),
@@ -1604,7 +1765,9 @@ requires_user: false
 
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, Some(2));
-        assert_eq!(tasks[0].status, TaskStatus::Pending);
+        // The task file was written with the legacy `status: pending`; the serde
+        // alias must load it as `Review` without error.
+        assert_eq!(tasks[0].status, TaskStatus::Review);
         assert_eq!(tasks[0].title, "Mine");
         fs::remove_dir_all(root).expect("test directory should be removable");
     }
