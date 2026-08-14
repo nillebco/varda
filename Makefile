@@ -1,8 +1,10 @@
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 CARGO ?= cargo
+DOCKER ?= docker
+AGENTS_IMAGE ?= varda-agents:latest
 
-.PHONY: build release install test fmt clean
+.PHONY: build release install test fmt clean agents-image
 
 build:
 	$(CARGO) build
@@ -27,3 +29,9 @@ fmt:
 
 clean:
 	$(CARGO) clean
+
+# Build the resident/worker sandbox image (claude+codex CLIs + Rust toolchain)
+# and load it into microsandbox. See Dockerfile.agents.
+agents-image:
+	$(DOCKER) build -f Dockerfile.agents -t $(AGENTS_IMAGE) .
+	$(DOCKER) save $(AGENTS_IMAGE) | msb image load
