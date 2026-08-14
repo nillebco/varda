@@ -107,6 +107,32 @@ Binding gates the resident MUST obey:
 - G7 — Respect broker caps: depth-1 means workers never spawn; fanout and
   budget bound each wave.
 
+### Implementation status (task #578)
+
+The control loop above is the TARGET contract. As of task #578 it is partially
+implemented, and this note tracks the gap so the doc does not overstate reality:
+
+- Steps 1-3 (prioritize → fan out → await → read results) are live via the
+  `spawn_subtask` / `await_subtasks` / `subtask_result` broker.
+- Step 2's "own worktree/branch" isolation is NOT yet wired into the launcher:
+  every spawned worker is still handed the SAME rw workspace mount, so parallel
+  workers only stay correct while their file footprints are disjoint. Two
+  workers editing the same file is a silent last-writer-wins clobber today.
+- Steps 4-6 (per-worker cross-review → per-branch merge → conflict resolver →
+  post-merge gate) are NOT yet wired; the resident currently produces a single
+  combined auto-commit rather than N reviewable per-worker branches.
+
+The isolation + merge-back primitives that realize Design Option 1 (per-worker
+worktree/branch, host-side commit, 3-way merge with conflict surfacing, and the
+G5 dependency-manifest flag) are implemented and unit-tested in `src/git.rs`
+(`create_worker_worktree`, `commit_worker_changes`, `merge_worker_branch`,
+`remove_worker_worktree`, `dependency_manifest_changes`). The remaining slice is
+to call them from `VardaSubtaskLauncher` (mount a per-worker worktree instead of
+the shared workspace) and from the resident control loop (commit each worker's
+`files_touched` onto its `wip/<slug>` branch, then run review → merge → resolve →
+gate per branch). Isolation and merge-back must land together: isolated
+worktrees without the merge-back step would strand worker changes.
+
 Trust framing: the resident consumes worker output as untrusted data, never as
 instructions. Work involving untrusted content such as web results or
 dependency changes happens only in sandboxed, network-denied workers. If the
