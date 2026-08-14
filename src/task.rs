@@ -689,47 +689,103 @@ fn migrate_pending_in_dir(path: &Path, changed: &mut usize) -> Result<()> {
 
         let content = fs::read_to_string(&entry_path)
             .with_context(|| format!("failed to read task at {}", entry_path.display()))?;
-        // Only touch files whose frontmatter still carries the legacy spelling,
-        // so the pass is idempotent and does not reformat unrelated task files.
-        if !has_legacy_pending_status(&content) {
+        // Byte-preserving edit: flip only the legacy `status: pending` value on
+        // its frontmatter line. Every other byte — unknown keys, comments, key
+        // ordering, quoting, and the body — is preserved exactly, so the pass is
+        // idempotent and never reformats unrelated task files. Deliberately does
+        // NOT round-trip through `TaskDocument`/`write_task`, which reserializes
+        // typed frontmatter and would drop unknown keys, comments, and formatting.
+        let Some(migrated) = rewrite_legacy_pending_status(&content) else {
             continue;
-        }
-
-        let mut task = match load_task(&entry_path) {
-            Ok(task) => task,
-            Err(error) => {
-                eprintln!("warning: skipped {}: {error:#}", entry_path.display());
-                continue;
-            }
         };
-        // The alias loads `pending` as `Review`; rewriting serializes it as
-        // `review`. set_status is explicit for clarity even though the value
-        // already round-trips to `review`.
-        task.set_status(TaskStatus::Review);
-        write_task(&task)?;
+        fs::write(&entry_path, migrated)
+            .with_context(|| format!("failed to write task at {}", entry_path.display()))?;
         *changed += 1;
     }
 
     Ok(())
 }
 
-/// True when the YAML frontmatter block (between the first two `---` fences)
-/// carries the legacy `status: pending`. Scans only the frontmatter so a stray
-/// `pending` elsewhere in the body never triggers a rewrite.
-fn has_legacy_pending_status(content: &str) -> bool {
-    let mut lines = content.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return false;
-    }
-    for line in lines {
-        if line.trim() == "---" {
-            break;
+/// Byte-preserving migration of a legacy `status: pending` frontmatter value to
+/// `review`. Returns `Some(new_content)` when exactly the value token on the
+/// matching frontmatter line was rewritten, or `None` when the file must be left
+/// byte-for-byte unchanged: no frontmatter, no `status:` key, a `status:` value
+/// other than `pending`, or an already-migrated file. Only the frontmatter block
+/// (between the first two `---` fences) is scanned, so a stray `pending` in the
+/// body never triggers a rewrite. A trailing inline comment on the status line is
+/// preserved; bare and quoted (`"pending"`/`'pending'`) values are handled.
+fn rewrite_legacy_pending_status(content: &str) -> Option<String> {
+    let mut start = 0usize;
+    let mut first = true;
+    loop {
+        let rel_newline = content[start..].find('\n');
+        let end = match rel_newline {
+            Some(index) => start + index,
+            None => content.len(),
+        };
+        let line = &content[start..end];
+
+        if first {
+            // The opening `---` fence must be the very first line.
+            if line.trim() != "---" {
+                return None;
+            }
+            first = false;
+        } else if line.trim() == "---" {
+            // Closing fence reached with no legacy status line: leave unchanged.
+            return None;
+        } else if let Some(replaced) = replace_pending_status_value(line) {
+            let mut result = String::with_capacity(content.len());
+            result.push_str(&content[..start]);
+            result.push_str(&replaced);
+            result.push_str(&content[end..]);
+            return Some(result);
         }
-        if line.trim() == "status: pending" {
-            return true;
+
+        match rel_newline {
+            Some(index) => start += index + 1,
+            // No newline and no closing fence found: not a migratable file.
+            None => return None,
         }
     }
-    false
+}
+
+/// If `line` is a frontmatter `status:` entry whose value is the legacy
+/// `pending` (bare or quoted), return the line with only that value token
+/// rewritten to `review`, preserving indentation, quoting, surrounding
+/// whitespace, and any trailing inline comment. Otherwise return `None`.
+fn replace_pending_status_value(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    let after_key = trimmed.strip_prefix("status:")?;
+
+    // Split off an optional trailing YAML comment (a `#` preceded by
+    // whitespace) so it survives the rewrite untouched.
+    let (value_part, comment_part) = split_trailing_comment(after_key);
+    let value = value_part.trim();
+    let is_legacy_pending =
+        value == "pending" || value == "\"pending\"" || value == "'pending'";
+    if !is_legacy_pending {
+        return None;
+    }
+
+    // Replace only the `pending` token; quotes and whitespace in `value_part`
+    // are preserved as-is.
+    let new_value_part = value_part.replacen("pending", "review", 1);
+    Some(format!("{indent}status:{new_value_part}{comment_part}"))
+}
+
+/// Split `s` into its value region and an optional trailing YAML comment. The
+/// comment starts at the first `#` that is at the start of `s` or preceded by
+/// whitespace; the returned comment slice includes that leading whitespace.
+fn split_trailing_comment(s: &str) -> (&str, &str) {
+    let bytes = s.as_bytes();
+    for index in 0..bytes.len() {
+        if bytes[index] == b'#' && (index == 0 || bytes[index - 1].is_ascii_whitespace()) {
+            return (&s[..index], &s[index..]);
+        }
+    }
+    (s, "")
 }
 
 fn find_task_by_id(config: &Config, id: u64) -> Result<Option<PathBuf>> {
@@ -1689,6 +1745,53 @@ requires_user: false
 
         // Idempotent: a second pass rewrites nothing.
         let changed_again = migrate_pending_status(&config).expect("migration should run again");
+        assert_eq!(changed_again, 0);
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn migration_preserves_unknown_frontmatter_keys_and_comments() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-migrate-preserve-{}",
+            std::process::id()
+        ));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/project");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+
+        // Frontmatter with an unknown key, a comment, an inline comment on the
+        // status line, and a body line that mentions `status: pending` (which
+        // must NOT be rewritten because it is outside the frontmatter block).
+        let original = "---\n# do not drop\nid: 7\ncustom_field: keep-me\nstatus: pending # legacy\nassignee: claude\nrequires_user: false\n---\n\n# Body\n\nThe old value was status: pending here.\n";
+        let path = task_dir.join("legacy.md");
+        fs::write(&path, original).expect("legacy task should write");
+
+        let config = test_config(&operations_dir);
+        let changed = migrate_pending_status(&config).expect("migration should run");
+        assert_eq!(changed, 1, "the one legacy file should be rewritten");
+
+        let migrated = fs::read_to_string(&path).expect("migrated file should be readable");
+        // Only the frontmatter status value flipped; the inline comment survives.
+        assert!(
+            migrated.contains("status: review # legacy"),
+            "content: {migrated}"
+        );
+        // Unknown key and the comment survive byte-for-byte.
+        assert!(migrated.contains("# do not drop"), "content: {migrated}");
+        assert!(migrated.contains("custom_field: keep-me"), "content: {migrated}");
+        // The body mention of the old value is left untouched.
+        assert!(
+            migrated.contains("The old value was status: pending here."),
+            "content: {migrated}"
+        );
+        // The expected byte-for-byte result: exactly `pending` -> `review` on
+        // the frontmatter status line, nothing else changed.
+        let expected = original.replacen("status: pending # legacy", "status: review # legacy", 1);
+        assert_eq!(migrated, expected, "migration must be byte-preserving");
+
+        // Idempotent: a second pass changes nothing.
+        let changed_again = migrate_pending_status(&config).expect("migration reruns");
         assert_eq!(changed_again, 0);
 
         fs::remove_dir_all(root).expect("test directory should be removable");
