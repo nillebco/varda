@@ -136,6 +136,25 @@ interactive_command = "sh"
 interactive_args = ["-c", "copilot \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home}"]
 resume_command_template = "copilot --resume={external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --allow-all-tools"
 
+[agents.opencode]
+kind = "acp"
+# opencode reads AGENTS.md natively as project instructions. `--auto` auto-approves
+# permissions (headless/unsupervised) — the equivalent of claude bypassPermissions /
+# copilot --allow-all-tools. The prompt is piped on stdin and passed as the positional
+# message via "$(cat)" (mirrors the copilot launcher). opencode supports a single
+# working dir via `--dir`; there is no `--add-dir` equivalent, so {varda_project} /
+# {varda_home} are not mounted in this first pass.
+command = "sh"
+args = ["-c", "opencode run --auto --dir {project} \"$(cat)\""]
+interactive_command = "sh"
+interactive_args = ["-c", "opencode run -i \"$(cat $VARDA_PROMPT_FILE)\" --dir {project} --auto"]
+# Resume is unwired in this first pass: opencode stores sessions in a SQLite database
+# (~/.local/share/opencode/opencode.db), not per-session JSONL files, so Varda can't
+# discover the session id by scanning the filesystem the way it does for claude/codex/
+# copilot. Use `opencode run --continue` (last session) or `opencode session` to list
+# and resume manually. Uncomment once FS-based (or JSON-output) session discovery lands:
+# resume_command_template = "opencode run --session {external_session_id} --dir {project} --auto"
+
 [agents.shell]
 kind = "acp"
 command = "sh"

@@ -118,6 +118,19 @@ COPILOT_CUSTOM_VALUE = "enabled"
 
 `command`, `args`, `working_dir`, and environment variable values support `{project}` and `{task}` placeholders.
 
+### Supported agents
+
+`varda init` ships default `[agents.*]` blocks for four agents; add any of them to a route's `--agents` list to use them:
+
+| Agent | Backend | Permission model | Resume |
+|---|---|---|---|
+| `codex`    | OpenAI Codex CLI    | `--sandbox workspace-write` | yes (`codex resume`) |
+| `claude`   | Claude Code CLI     | `--permission-mode acceptEdits` | yes (`--resume`) |
+| `copilot`  | GitHub Copilot CLI  | `--allow-all-tools` | yes (`--resume=`) |
+| `opencode` | [opencode](https://opencode.ai) | `--auto` (auto-approve) | no (see below) |
+
+`opencode` reads `AGENTS.md` natively as project instructions. Its default headless launcher pipes the prompt on stdin and runs `opencode run --auto --dir {project} "$(cat)"`; interactive sessions use `opencode run -i`. Two current limitations: opencode supports a single working directory (`--dir`, no `--add-dir` equivalent), and it stores sessions in a SQLite database rather than per-session files, so Varda cannot discover its session id for automatic resume — resume manually with `opencode run --continue` or `opencode session`.
+
 Agents can also declare an optional prompt budget:
 
 ```toml
@@ -202,14 +215,15 @@ The interactive prompt also drops the structured recap requirements (file lists,
 
 When the interpreter pass starts, Varda prints a notice on stderr so you don't mistake the wait for a hang. During the post-session storage phase, Ctrl-C is temporarily disabled so Varda can persist the resume command, run the interpreter pass, write the recap, and update the task metadata without leaving the task half-recorded. On Unix, the interpreter subprocess also runs outside Varda's terminal process group so terminal Ctrl-C does not interrupt recap generation.
 
-If the agent the route resolves to has a `resume_command_template` set in `config.toml`, Varda also captures the agent's own session id from its on-disk session storage (claude -> `~/.claude/projects/...`, codex -> `~/.codex/sessions/...`, copilot -> `~/.copilot/session-state/...`) and stores a ready-to-run resume command on the task in the `agent_resume_commands:` frontmatter list. A later `varda task resume` can offer to use that command instead of starting over.
+If the agent the route resolves to has a `resume_command_template` set in `config.toml`, Varda also captures the agent's own session id from its on-disk session storage (claude -> `~/.claude/projects/...`, codex -> `~/.codex/sessions/...`, copilot -> `~/.copilot/session-state/...`) and stores a ready-to-run resume command on the task in the `agent_resume_commands:` frontmatter list. A later `varda task resume` can offer to use that command instead of starting over. `opencode` is the exception: it keeps sessions in a SQLite database (`~/.local/share/opencode/opencode.db`) rather than per-session files, so Varda can't scan the filesystem for its session id — resume is unwired for opencode in this first pass (use `opencode run --continue` or `opencode session` to resume manually).
 
-`make install` also installs three convenience wrappers next to the `varda` binary:
+`make install` also installs four convenience wrappers next to the `varda` binary:
 
 ```sh
-vclaude  "Task name" "Optional task description"
-vcodex   "Task name" "Optional task description"
-vcopilot "Task name" "Optional task description"
+vclaude   "Task name" "Optional task description"
+vcodex    "Task name" "Optional task description"
+vcopilot  "Task name" "Optional task description"
+vopencode "Task name" "Optional task description"
 ```
 
 Each one is a thin shell alias for `varda task add --agent <agent> --exec --interactive`, so the call above is equivalent to:
@@ -1133,7 +1147,7 @@ At run time Varda translates `allow_commands` into the backend's permission conf
 - **Scoped** — only the declared commands are authorized; a command *not* on the list still blocks. This is **not** `--dangerously-skip-permissions`; no global bypass is ever introduced.
 - **Per-task** — the grant lives on the task, not on the agent config or a shared route, so one task's allowance does not widen another's.
 
-> Backend coverage: this targets the Claude Code backend, whose headless permission model is the one that blocks un-approved commands. The `codex` (`--sandbox workspace-write`) and `copilot` (`--allow-all-tools`) backends already grant broad non-interactive execution, so `allow_commands` is a no-op there.
+> Backend coverage: this targets the Claude Code backend, whose headless permission model is the one that blocks un-approved commands. The `codex` (`--sandbox workspace-write`), `copilot` (`--allow-all-tools`), and `opencode` (`--auto`) backends already grant broad non-interactive execution, so `allow_commands` is a no-op there.
 
 #### Actionable denial (scripted re-run)
 
