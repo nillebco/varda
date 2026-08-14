@@ -329,6 +329,14 @@ pub fn commit_worker_changes(
 /// resident's integration branch). Never leaves a half-merged tree behind: on
 /// conflict it records the conflicted paths and runs `git merge --abort`, so the
 /// caller can route those files to a resolver worker (WORKFLOW.md step 5).
+///
+/// A merge can also fail without producing any unmerged paths — e.g. a pre-merge
+/// hook rejection or a refusal before any tree merge. That is not a content
+/// conflict a resolver can work through, so it is surfaced as an `Err` rather
+/// than a `MergeOutcome` with an empty conflict list (which the caller would
+/// otherwise be unable to distinguish from a clean merge's empty list). If the
+/// `git merge --abort` cleanup itself fails, that too is an `Err` including
+/// stderr, so a half-merged tree is never silently left behind.
 #[allow(dead_code)]
 pub fn merge_worker_branch(
     integration_worktree: &Path,
@@ -346,6 +354,7 @@ pub fn merge_worker_branch(
             conflicted_files: Vec::new(),
         });
     }
+    let merge_stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
 
     let unmerged = Command::new("git")
         .arg("-C")
@@ -359,12 +368,48 @@ pub fn merge_worker_branch(
         .filter(|l| !l.is_empty())
         .collect();
 
-    // Abort so the integration worktree is left clean for the resolver flow.
-    let _ = Command::new("git")
+    // Only abort when a merge is actually in progress (MERGE_HEAD set). Both a
+    // content conflict and a pre-merge hook rejection leave MERGE_HEAD, whereas
+    // a merge that refuses before touching the index (e.g. unrelated histories,
+    // dirty tree) does not — aborting that would spuriously fail with
+    // "no merge to abort".
+    let merge_in_progress = Command::new("git")
         .arg("-C")
         .arg(integration_worktree)
-        .args(["merge", "--abort"])
-        .output();
+        .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .output()
+        .context("failed to check for an in-progress merge")?
+        .status
+        .success();
+    if merge_in_progress {
+        // Abort so the integration worktree is left clean for the resolver flow.
+        // A failed abort must never be swallowed: it can leave a half-merged
+        // tree, so surface stderr to the caller.
+        let abort = Command::new("git")
+            .arg("-C")
+            .arg(integration_worktree)
+            .args(["merge", "--abort"])
+            .output()
+            .context("failed to run git merge --abort")?;
+        if !abort.status.success() {
+            bail!(
+                "git merge --abort failed after a failed merge of {worker_branch}; \
+                 the integration worktree may be left half-merged; stderr: {}",
+                String::from_utf8_lossy(&abort.stderr).trim()
+            );
+        }
+    }
+
+    // A merge that fails without unmerged paths is not a content conflict the
+    // resolver can work through (e.g. a pre-merge hook rejection). Report it as
+    // an error so the caller never mistakes an empty conflict list for a clean
+    // or resolvable merge.
+    if conflicted_files.is_empty() {
+        bail!(
+            "git merge of {worker_branch} failed without unmerged paths \
+             (not a content conflict); stderr: {merge_stderr}"
+        );
+    }
 
     Ok(MergeOutcome {
         clean: false,
@@ -373,17 +418,38 @@ pub fn merge_worker_branch(
 }
 
 /// Remove a worker worktree once its branch has been integrated (or abandoned).
-/// Uses `--force` because the worktree may hold uncommitted scratch. The branch
-/// ref is left intact for post-hoc review; prune it separately if desired.
+/// Uses `--force` because the worktree may hold uncommitted scratch.
+///
+/// When `delete_branch` is `true`, the `wip/<slug>` branch is also deleted
+/// (`git branch -D`) after the worktree is removed — use this once the branch
+/// has been merged (or abandoned) and no longer needs post-hoc review. When
+/// `false`, the branch ref is left intact so it can be inspected or pruned
+/// later. The branch can only be deleted after its worktree is gone, since git
+/// refuses to delete a branch that is still checked out somewhere.
 #[allow(dead_code)]
-pub fn remove_worker_worktree(mother_repo: &Path, checkout: &WorkerCheckout) -> Result<()> {
+pub fn remove_worker_worktree(
+    mother_repo: &Path,
+    checkout: &WorkerCheckout,
+    delete_branch: bool,
+) -> Result<()> {
     let repo = repo_root_for_path(mother_repo)?;
     let path_str = checkout
         .path
         .to_str()
         .with_context(|| format!("worktree path {} is not valid UTF-8", checkout.path.display()))?;
     run_git_in(&repo, ["worktree", "remove", "--force", path_str])
-        .with_context(|| format!("failed to remove worker worktree {}", checkout.path.display()))
+        .with_context(|| format!("failed to remove worker worktree {}", checkout.path.display()))?;
+
+    if delete_branch {
+        run_git_in(&repo, ["branch", "-D", &checkout.branch]).with_context(|| {
+            format!(
+                "failed to delete worker branch {} after removing its worktree",
+                checkout.branch
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Dependency-manifest files among `files`, for the G5 gate: manifest and
@@ -692,7 +758,123 @@ mod tests {
         assert_eq!(second.conflicted_files, vec!["shared.txt".to_owned()]);
 
         for wt in [&a, &b, &integration] {
-            let _ = remove_worker_worktree(&repo, wt);
+            let _ = remove_worker_worktree(&repo, wt, false);
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn unique_worktree_path(repo: &Path, label: &str) -> PathBuf {
+        repo.parent().unwrap().join(format!(
+            "wt-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "-q", "--verify", &format!("refs/heads/{branch}")])
+            .output()
+            .expect("git rev-parse should run")
+            .status
+            .success()
+    }
+
+    #[test]
+    fn remove_worker_worktree_optionally_deletes_branch() {
+        let repo = init_test_repo("worktree-branch-delete");
+        seed_commit(&repo, "file.txt", "base\n");
+
+        // delete_branch = false: worktree gone, branch preserved.
+        let kept_path = unique_worktree_path(&repo, "keep");
+        let kept = create_worker_worktree(&repo, "keep", &kept_path).expect("worktree keep");
+        assert!(branch_exists(&repo, &kept.branch));
+        remove_worker_worktree(&repo, &kept, false).expect("remove keep");
+        assert!(!kept.path.exists(), "worktree dir should be gone");
+        assert!(
+            branch_exists(&repo, &kept.branch),
+            "branch should survive delete_branch = false"
+        );
+
+        // delete_branch = true: worktree and branch both gone.
+        let gone_path = unique_worktree_path(&repo, "gone");
+        let gone = create_worker_worktree(&repo, "gone", &gone_path).expect("worktree gone");
+        assert!(branch_exists(&repo, &gone.branch));
+        remove_worker_worktree(&repo, &gone, true).expect("remove gone");
+        assert!(!gone.path.exists(), "worktree dir should be gone");
+        assert!(
+            !branch_exists(&repo, &gone.branch),
+            "branch should be deleted with delete_branch = true"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn merge_worker_branch_errors_when_merge_fails_without_conflicts() {
+        let repo = init_test_repo("merge-no-conflict-failure");
+        seed_commit(&repo, "file.txt", "base\n");
+
+        // A worker branch with a clean, non-conflicting change.
+        let worker_path = unique_worktree_path(&repo, "worker");
+        let worker = create_worker_worktree(&repo, "worker", &worker_path).expect("worktree");
+        std::fs::write(worker.path.join("other.txt"), "worker\n").expect("write");
+        assert!(commit_worker_changes(&worker, &[worker.path.join("other.txt")], "worker")
+            .expect("commit worker"));
+
+        // Integration worktree whose git dir carries a pre-merge-commit hook that
+        // rejects the merge. The trees merge cleanly (no unmerged paths) but the
+        // merge still fails — this must be surfaced as an error, not a conflict.
+        let int_path = unique_worktree_path(&repo, "int");
+        let integration = create_worker_worktree(&repo, "integration", &int_path).expect("int wt");
+        // Hooks live in the common git dir shared by all worktrees, not the
+        // per-worktree gitdir, so install pre-merge-commit there.
+        let common_dir = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&integration.path)
+                .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+                .output()
+                .expect("rev-parse git common dir")
+                .stdout,
+        )
+        .expect("utf8 git dir");
+        let hooks_dir = PathBuf::from(common_dir.trim()).join("hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+        let hook = hooks_dir.join("pre-merge-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod hook");
+        }
+
+        let err = merge_worker_branch(&integration.path, &worker.branch)
+            .expect_err("merge should error when it fails without unmerged paths");
+        assert!(
+            err.to_string().contains("without unmerged paths"),
+            "unexpected error: {err}"
+        );
+
+        // The abort cleanup ran: no merge should be left in progress.
+        let merge_in_progress = Command::new("git")
+            .arg("-C")
+            .arg(&integration.path)
+            .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .output()
+            .expect("rev-parse MERGE_HEAD")
+            .status
+            .success();
+        assert!(!merge_in_progress, "merge should have been aborted");
+
+        for wt in [&worker, &integration] {
+            let _ = remove_worker_worktree(&repo, wt, false);
         }
         let _ = std::fs::remove_dir_all(&repo);
     }
