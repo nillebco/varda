@@ -1726,6 +1726,7 @@ mod tests {
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("echo", &config);
 
@@ -1832,6 +1833,7 @@ mod tests {
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         };
         let sandbox_config = crate::config::SandboxConfig {
             image: Some("busybox:latest".to_owned()),
@@ -1951,6 +1953,7 @@ mod tests {
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         };
         let provider = std::sync::Arc::new(
             crate::sandbox::DockerProvider::from_config(
@@ -2106,6 +2109,7 @@ mod tests {
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         };
         let sandbox_config = crate::config::SandboxConfig {
             image: Some("busybox:latest".to_owned()),
@@ -2155,6 +2159,7 @@ mod tests {
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         };
         let sandbox_config = crate::config::SandboxConfig {
             image: Some(image.to_owned()),
@@ -2248,6 +2253,7 @@ mod tests {
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -2323,6 +2329,7 @@ mod tests {
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -2393,6 +2400,7 @@ mod tests {
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -2613,6 +2621,7 @@ mod tests {
                 "claude --resume {external_session_id} --add-dir {project}".to_owned(),
             ),
             interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("claude", &config);
         let request = sample_request("claude", "/work/project");
@@ -2643,6 +2652,7 @@ mod tests {
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("claude", &config);
         let request = sample_request("claude", "/work/project");
@@ -2801,6 +2811,7 @@ mod tests {
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         }
     }
 

@@ -668,6 +668,14 @@ interactive_command = "sh"
 interactive_args = ["-c", "copilot \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home}"]
 resume_command_template = "copilot --resume={external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --allow-all-tools"
 
+[agents.shell]
+kind = "acp"
+command = "sh"
+args = ["-c", "cat"]
+interactive_command = "sh"
+interactive_args = ["-i"]
+skip_recap = true  # bare interactive shell (vmsbsh/vdocksh): no Varda recap to produce, so skip the interpreter pass
+
 [roles.tester]
 backend = "codex"
 instructions = """
@@ -691,6 +699,7 @@ These are the main config knobs that shape execution. The shipped default config
 | Knob | One-line example |
 |---|---|
 | Interactive interpreter agent | `interpreter_agent = "codex"` on `[agents.claude]` makes Codex produce the post-interactive Varda recap. |
+| Skip interpreter/recap pass | `skip_recap = true` on `[agents.shell]` (used by `vmsbsh`/`vdocksh`) skips the post-interactive interpreter pass entirely — no agent is invoked to interpret a bare shell session. |
 | Agent output streaming | `streams_output = true` is set for Codex; leave it unset or `false` for buffered print-mode agents. |
 | Agent static env | `[agents.claude.env] STATIC_TOOL_VALUE = "enabled"` injects a non-secret agent-specific value. |
 | Per-route env | `env = { GCLOUD_PROJECT = "example-project" }` on `[[routes]]` injects trusted project constants. |

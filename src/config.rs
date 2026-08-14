@@ -136,6 +136,14 @@ interactive_command = "sh"
 interactive_args = ["-c", "copilot \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {project} --add-dir {varda_project} --add-dir {varda_home}"]
 resume_command_template = "copilot --resume={external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --allow-all-tools"
 
+[agents.shell]
+kind = "acp"
+command = "sh"
+args = ["-c", "cat"]
+interactive_command = "sh"
+interactive_args = ["-i"]
+skip_recap = true  # bare interactive shell (vmsbsh/vdocksh): no Varda recap to produce, so skip the interpreter pass
+
 # Scoped credential examples: sources are host env vars, named secrets, or
 # host-minted command output; targets are in-box env vars or read-only files.
 # Secret NAMES only here — never paste a resolved secret value into config.toml.
@@ -954,6 +962,15 @@ pub struct AgentConfig {
     /// that drove the interactive session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interpreter_agent: Option<String>,
+    /// When `true`, skip the post-interactive interpreter/recap pass entirely for
+    /// this agent — no `interpreter_agent` (or fallback) is invoked, and the task
+    /// closes with a minimal, non-LLM-produced note. Intended for bare interactive
+    /// shells (e.g. the `shell` agent behind `vmsbsh`/`vdocksh`), which have no
+    /// Varda recap to produce, so spending an agent invocation on "interpreting"
+    /// them is wasted, needs auth, and produces pointless output. Defaults to
+    /// `false`, so existing agents keep running the interpreter pass unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_recap: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1859,6 +1876,7 @@ mod tests {
             interactive_args: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         }
     }
 
@@ -2104,6 +2122,16 @@ operations_dir = "operations"
         // Normalization must fold the varda dirs into the copilot interactive arg.
         assert!(copilot_interactive[1].contains("--add-dir {varda_project}"));
         assert!(copilot_interactive[1].contains("--add-dir {varda_home}"));
+        // The `shell` agent (vmsbsh/vdocksh) drives a bare interactive shell with no
+        // Varda recap to produce, so it must opt out of the interpreter pass.
+        assert!(config.agents["shell"].skip_recap);
+        assert_eq!(
+            config.agents["shell"].interactive_command.as_deref(),
+            Some("sh")
+        );
+        assert!(!config.agents["codex"].skip_recap);
+        assert!(!config.agents["claude"].skip_recap);
+        assert!(!config.agents["copilot"].skip_recap);
         assert_eq!(config.agents["codex"].max_prompt_tokens, None);
         assert!(
             !config.agents["codex"]

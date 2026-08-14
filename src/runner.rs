@@ -543,35 +543,39 @@ pub async fn run_task(
                 write_task(&task)?;
                 eprintln!("captured resume command: {resume}");
             }
-            match interpret_interactive_session(
-                config,
-                client,
-                agent_name,
-                role_instructions,
-                task_path,
-                &task,
-                &session_id,
-                &session_log_path,
-                timeout,
-            )
-            .await
-            {
-                Ok(interpreted) => interpreted,
-                Err(error) => {
-                    append_session_log(
-                        &session_log_path,
-                        &format!("\ninterpretation_error:\n{error:#}\n"),
-                    )?;
-                    AgentRunResult {
-                        recap: format!(
-                            "# Interactive Session Completed\n\nThe interactive session ended successfully but Varda's interpreter pass failed: {error}\n\nFalling back to the agent's session-end output.\n\n{}\n\nSession log: [{}]({})\n\nrequires_user: false",
-                            session_result.recap,
-                            session_log_path.display(),
-                            session_log_path.display()
-                        ),
-                        requires_user: false,
-                        suggested_agent: None,
-                        resume_command: None,
+            if agent_skips_recap(config, agent_name) {
+                skip_recap_result(&session_log_path)
+            } else {
+                match interpret_interactive_session(
+                    config,
+                    client,
+                    agent_name,
+                    role_instructions,
+                    task_path,
+                    &task,
+                    &session_id,
+                    &session_log_path,
+                    timeout,
+                )
+                .await
+                {
+                    Ok(interpreted) => interpreted,
+                    Err(error) => {
+                        append_session_log(
+                            &session_log_path,
+                            &format!("\ninterpretation_error:\n{error:#}\n"),
+                        )?;
+                        AgentRunResult {
+                            recap: format!(
+                                "# Interactive Session Completed\n\nThe interactive session ended successfully but Varda's interpreter pass failed: {error}\n\nFalling back to the agent's session-end output.\n\n{}\n\nSession log: [{}]({})\n\nrequires_user: false",
+                                session_result.recap,
+                                session_log_path.display(),
+                                session_log_path.display()
+                            ),
+                            requires_user: false,
+                            suggested_agent: None,
+                            resume_command: None,
+                        }
                     }
                 }
             }
@@ -695,35 +699,39 @@ pub async fn resume_interactive_task(
         eprintln!("captured resume command: {resume}");
     }
 
-    let result = match interpret_interactive_session(
-        config,
-        client,
-        agent_name,
-        role_instructions,
-        task_path,
-        &task,
-        &session_id,
-        &session_log_path,
-        timeout,
-    )
-    .await
-    {
-        Ok(interpreted) => interpreted,
-        Err(error) => {
-            append_session_log(
-                &session_log_path,
-                &format!("\ninterpretation_error:\n{error:#}\n"),
-            )?;
-            AgentRunResult {
-                recap: format!(
-                    "# Interactive Session Completed\n\nThe resumed interactive session ended successfully but Varda's interpreter pass failed: {error}\n\nFalling back to the agent's session-end output.\n\n{}\n\nSession log: [{}]({})\n\nrequires_user: false",
-                    session_result.recap,
-                    session_log_path.display(),
-                    session_log_path.display()
-                ),
-                requires_user: false,
-                suggested_agent: None,
-                resume_command: None,
+    let result = if agent_skips_recap(config, agent_name) {
+        skip_recap_result(&session_log_path)
+    } else {
+        match interpret_interactive_session(
+            config,
+            client,
+            agent_name,
+            role_instructions,
+            task_path,
+            &task,
+            &session_id,
+            &session_log_path,
+            timeout,
+        )
+        .await
+        {
+            Ok(interpreted) => interpreted,
+            Err(error) => {
+                append_session_log(
+                    &session_log_path,
+                    &format!("\ninterpretation_error:\n{error:#}\n"),
+                )?;
+                AgentRunResult {
+                    recap: format!(
+                        "# Interactive Session Completed\n\nThe resumed interactive session ended successfully but Varda's interpreter pass failed: {error}\n\nFalling back to the agent's session-end output.\n\n{}\n\nSession log: [{}]({})\n\nrequires_user: false",
+                        session_result.recap,
+                        session_log_path.display(),
+                        session_log_path.display()
+                    ),
+                    requires_user: false,
+                    suggested_agent: None,
+                    resume_command: None,
+                }
             }
         }
     };
@@ -882,6 +890,33 @@ fn append_session_log(path: &Path, content: &str) -> Result<()> {
         .with_context(|| format!("failed to open session log at {}", path.display()))?;
     file.write_all(content.as_bytes())
         .with_context(|| format!("failed to append session log at {}", path.display()))
+}
+
+/// Whether `agent_name`'s config opts out of the post-interactive interpreter/recap
+/// pass (M13a §7 skip). Set on bare interactive shells (e.g. the `shell` agent
+/// behind `vmsbsh`/`vdocksh`), which have no Varda recap to produce, so spending an
+/// agent invocation on "interpreting" them is wasted, needs auth, and produces
+/// pointless output.
+fn agent_skips_recap(config: &Config, agent_name: &str) -> bool {
+    config
+        .agents
+        .get(agent_name)
+        .is_some_and(|agent| agent.skip_recap)
+}
+
+/// Minimal, non-LLM-produced recap used in place of the interpreter pass when
+/// `skip_recap` is set — no agent is invoked to summarize a bare shell session.
+fn skip_recap_result(session_log_path: &Path) -> AgentRunResult {
+    AgentRunResult {
+        recap: format!(
+            "# Interactive Shell Session\n\ninteractive shell session\n\nSession log: [{}]({})\n\nrequires_user: false",
+            session_log_path.display(),
+            session_log_path.display()
+        ),
+        requires_user: false,
+        suggested_agent: None,
+        resume_command: None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1726,6 +1761,88 @@ Help interactively.
     }
 
     #[tokio::test]
+    async fn skip_recap_agent_does_not_invoke_interpreter_pass() {
+        let root =
+            std::env::temp_dir().join(format!("varda-run-skip-recap-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/shell");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: shell
+requires_user: false
+---
+
+# Task
+
+Help interactively.
+"#,
+        )
+        .expect("task should be written");
+
+        let mut config = test_config(operations_dir.display().to_string());
+        config.git.auto_commit = false;
+        // `skip_recap = true` must skip the interpreter pass entirely — no
+        // `interpreter_agent` fallback, no self-interpretation via the driving agent.
+        let base = config.agents.get("codex").cloned().expect("codex agent");
+        config.agents.insert(
+            "shell".to_owned(),
+            AgentConfig {
+                command: "sh".to_owned(),
+                skip_recap: true,
+                ..base
+            },
+        );
+
+        let client = RecordingAgentClient {
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            session_response: AgentRunResult {
+                recap: "Interactive session completed.".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+            // Never returned: with `skip_recap` set, no interpretation call of any
+            // kind should happen, so this response must never surface.
+            interpretation_response: AgentRunResult {
+                recap: "SHOULD_NOT_BE_USED".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+        };
+
+        let outcome = run_task(&config, "shell", None, &task_path, &client, true, false)
+            .await
+            .expect("interactive task should run and close without an interpreter pass");
+
+        let recorded = client.requests.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "skip_recap must prevent any interpreter-pass agent invocation"
+        );
+        assert_eq!(recorded[0].agent_name, "shell");
+        assert!(recorded[0].interactive);
+        assert!(!recorded[0].interpret);
+
+        assert_eq!(outcome.status, TaskStatus::Pending);
+        let recap = fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
+        assert!(
+            recap.contains("interactive shell session"),
+            "skip_recap must produce a minimal non-LLM recap note, got:\n{recap}"
+        );
+        assert!(
+            !recap.contains("SHOULD_NOT_BE_USED"),
+            "skip_recap must not dispatch any interpretation call, got:\n{recap}"
+        );
+    }
+
+    #[tokio::test]
     async fn interactive_run_persists_resume_command_in_frontmatter() {
         let root = std::env::temp_dir().join(format!(
             "varda-run-interactive-resume-{}",
@@ -2163,6 +2280,7 @@ Help interactively.
                     streams_output: Some(true),
                     resume_command_template: None,
                     interpreter_agent: None,
+                    skip_recap: false,
                 },
             )]),
             roles: std::collections::BTreeMap::new(),

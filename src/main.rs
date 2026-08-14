@@ -3185,6 +3185,24 @@ performed on the host. \
 Stop and signal `needs_user` when the workflow calls for a human decision.
 ";
 
+/// Ensure the resident task at `task_path` is runnable before `run_task_command`
+/// hands it to `runner::run_task` (which refuses anything but `Ready`). A prior
+/// `orchestrate` launch can leave the resident task in a terminal state
+/// (Failed/Pending/Done/NeedsUser/Running); reset it to `Ready` so each new
+/// `varda orchestrate` invocation can relaunch the same resident task without a
+/// manual `varda task set-status ready` workaround. Recap/session history in the
+/// frontmatter and the task body are left untouched — only the status field flips.
+fn ensure_resident_task_ready(task_path: &Path) -> Result<()> {
+    let mut task_doc = task::load_task(task_path)?;
+    if task_doc.frontmatter.status != task::TaskStatus::Ready
+        && task_doc.frontmatter.status != task::TaskStatus::Backlog
+    {
+        task_doc.set_status(task::TaskStatus::Ready);
+        task::write_task(&task_doc)?;
+    }
+    Ok(())
+}
+
 /// Resolve or scaffold the RESIDENT task for `workspace`. Reuses an existing
 /// `resident-orchestrator` task under the workspace project when present; otherwise
 /// scaffolds a minimal one whose body points at `.varda/WORKFLOW.md`.
@@ -3266,6 +3284,7 @@ async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Res
     );
 
     let task_path = resolve_or_scaffold_resident_task(&config, &workspace, &launch.agent)?;
+    ensure_resident_task_ready(&task_path)?;
     println!("orchestrate: resident task {}", task_path.display());
     println!();
 
@@ -4148,6 +4167,114 @@ deny_sandboxes = ["local"]
         assert!(err.to_string().contains("isolating sandbox"), "{err}");
     }
 
+    /// #522 regression: a resident task left in a terminal state (Failed / Pending /
+    /// Done / NeedsUser / Running) by a prior `orchestrate` launch must be reset to
+    /// `Ready` so the next launch does not hit `run_task_command`'s "task ... is not
+    /// ready" bail — without a manual `varda task set-status ready` workaround. Prior
+    /// recap history must survive the reset; only the status field flips.
+    #[test]
+    fn ensure_resident_task_ready_resets_terminal_statuses() {
+        let ws = resident_tmp("ensure-ready");
+        let mut config = resident_config(&ws, "docker", "");
+        config.defaults.operations_dir = ws.join("operations").display().to_string();
+
+        let task_path = resolve_or_scaffold_resident_task(&config, &ws, "claude")
+            .expect("resident task should scaffold");
+
+        for status in [
+            task::TaskStatus::Failed,
+            task::TaskStatus::Pending,
+            task::TaskStatus::Done,
+            task::TaskStatus::NeedsUser,
+            task::TaskStatus::Running,
+        ] {
+            let mut task_doc = task::load_task(&task_path).unwrap();
+            task_doc.set_status(status);
+            task_doc.set_recap(format!("prior run left task {status:?}"));
+            task::write_task(&task_doc).unwrap();
+
+            ensure_resident_task_ready(&task_path)
+                .unwrap_or_else(|err| panic!("resetting {status:?} should succeed: {err}"));
+
+            let reloaded = task::load_task(&task_path).unwrap();
+            assert_eq!(
+                reloaded.frontmatter.status,
+                task::TaskStatus::Ready,
+                "status {status:?} should have been reset to ready"
+            );
+            assert_eq!(
+                reloaded.frontmatter.recaps.last(),
+                Some(&format!("prior run left task {status:?}")),
+                "recap history must be preserved across the reset"
+            );
+        }
+    }
+
+    /// #522 regression: a fresh first-time scaffold (already `Ready`) must be left
+    /// unchanged by `ensure_resident_task_ready`.
+    #[test]
+    fn ensure_resident_task_ready_leaves_fresh_scaffold_unchanged() {
+        let ws = resident_tmp("ensure-ready-fresh");
+        let mut config = resident_config(&ws, "docker", "");
+        config.defaults.operations_dir = ws.join("operations").display().to_string();
+
+        let task_path = resolve_or_scaffold_resident_task(&config, &ws, "claude")
+            .expect("resident task should scaffold");
+        let before = task::load_task(&task_path).unwrap();
+        assert_eq!(before.frontmatter.status, task::TaskStatus::Ready);
+
+        ensure_resident_task_ready(&task_path).expect("ready check should succeed");
+
+        let after = task::load_task(&task_path).unwrap();
+        assert_eq!(after.frontmatter.status, task::TaskStatus::Ready);
+        assert_eq!(after.body, before.body, "task body must be untouched");
+        assert!(
+            after.frontmatter.recaps.is_empty(),
+            "a fresh scaffold has no recap history to preserve"
+        );
+    }
+
+    /// #522 end-to-end: simulates two `varda orchestrate` launches back to back. The
+    /// second launch must reuse (not duplicate) the same resident task and must
+    /// recover it from `Failed` to `Ready` without operator intervention.
+    #[test]
+    fn orchestrate_resident_relaunch_recovers_from_failed_status() {
+        let ws = resident_tmp("relaunch");
+        let mut config = resident_config(&ws, "docker", "");
+        config.defaults.operations_dir = ws.join("operations").display().to_string();
+
+        let first_path = resolve_or_scaffold_resident_task(&config, &ws, "claude")
+            .expect("first launch should scaffold the resident task");
+        ensure_resident_task_ready(&first_path).expect("first launch should be ready to run");
+        assert_eq!(
+            task::load_task(&first_path).unwrap().frontmatter.status,
+            task::TaskStatus::Ready
+        );
+
+        // Simulate a prior run that failed (e.g. the sandbox lost network mid-run).
+        let mut failed = task::load_task(&first_path).unwrap();
+        failed.set_status(task::TaskStatus::Failed);
+        failed.set_recap("first run failed: network egress denied");
+        task::write_task(&failed).unwrap();
+
+        let second_path = resolve_or_scaffold_resident_task(&config, &ws, "claude")
+            .expect("second launch should resolve the existing resident task");
+        assert_eq!(
+            second_path, first_path,
+            "the resident task must be reused, not duplicated, across launches"
+        );
+        ensure_resident_task_ready(&second_path)
+            .expect("second launch should recover the task to ready");
+
+        let reloaded = task::load_task(&second_path).unwrap();
+        assert_eq!(reloaded.frontmatter.status, task::TaskStatus::Ready);
+        assert_eq!(
+            reloaded.frontmatter.recaps,
+            vec!["first run failed: network egress denied".to_string()],
+            "the failure recap must survive the automatic reset"
+        );
+    }
+
     /// Live end-to-end of the sandboxed-resident model. Requires a working docker
     /// daemon, so it is `#[ignore]` in the deterministic suite; run with
     /// `cargo test -- --ignored orchestrate_live_resident`.
@@ -4684,6 +4811,7 @@ deny_sandboxes = ["local"]
             streams_output: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         };
         let mut resolved = config::ResolvedSandbox {
             name: "inline".to_owned(),
@@ -4720,6 +4848,7 @@ deny_sandboxes = ["local"]
             interactive_args: None,
             resume_command_template: None,
             interpreter_agent: None,
+            skip_recap: false,
         }
     }
 
