@@ -742,7 +742,7 @@ These are the main config knobs that shape execution. The shipped default config
 | Route orchestration override | `[routes.orchestration] enabled = false` disables spawning for that matched route. |
 | Repo-local tasks and config | `.varda/tasks/<id>-<slug>.md` stores committed task definitions; `.varda/config.toml` can carry repo workflow rules while runtime state remains in `$VARDA_HOME`. |
 
-Credential entries must name exactly one source (`from_env`, `from_secret`, or `command`) and one target (`env` or `file`). Store secret names, not resolved secret values, in config.
+Credential entries must name exactly one source (`from_env`, `from_secret`, `from_fnox`, or `command`) and one target (`env` or `file`). Store secret names, not resolved secret values, in config.
 
 ### Sandbox providers
 
