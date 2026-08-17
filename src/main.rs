@@ -1610,6 +1610,9 @@ fn build_client(
     // whichever provider is selected. `local` ignores them (no boundary to cross).
     let identity = resolve_sandbox_identity(config, agent_config)?;
     let mut static_env = std::collections::BTreeMap::new();
+    // Keys from the UNTRUSTED `.varda` origin, retained so `resolve_env_secrets`
+    // refuses a fnox binding from repo-committed config (see its doc).
+    let mut untrusted_env_keys: Vec<String> = Vec::new();
     let provider = match project_path {
         Some(project_path) => {
             let routing_root = routing_root_for(project_path);
@@ -1628,6 +1631,7 @@ fn build_client(
                 &resolved.route_mounts,
                 &resolved.varda_mounts,
             );
+            untrusted_env_keys = resolved.varda_env_keys.clone();
             static_env = resolved.env;
             sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &identity)?
         }
@@ -1639,9 +1643,15 @@ fn build_client(
             sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?
         }
     };
+    // Resolve `${fnox:NAME}` bindings on the HOST at prepare time, injecting only the
+    // resolved value. Static env carries the (possibly untrusted `.varda`) sandbox/route
+    // origins; agent env is always a trusted central origin, so no key is untrusted.
+    resolve_env_secrets(&mut static_env, &untrusted_env_keys)?;
+    let mut agent_config = agent_config.clone();
+    resolve_env_secrets(&mut agent_config.env, &[])?;
     Ok(acp::AcpSubprocessClient::with_sandbox_env(
         display_name,
-        agent_config,
+        &agent_config,
         provider,
         static_env,
     ))
@@ -1811,6 +1821,48 @@ fn resolve_credential_value(source: &config::CredentialSource<'_>) -> Result<Opt
             Ok(Some(value))
         }
     }
+}
+
+/// Resolve `${fnox:NAME}` bindings in a static env map on the HOST at prepare time,
+/// replacing each sentinel value in place with the value `fnox get NAME` returns. Only
+/// the resolved VALUE crosses the boundary; the agent/sandbox never contacts fnox and
+/// never sees the sentinel. Non-sentinel values are left untouched.
+///
+/// `untrusted_keys` names env keys that originate from the repo-committed (UNTRUSTED)
+/// `.varda` origin. A fnox binding on one of those is REFUSED: untrusted config must not
+/// be able to bind an arbitrary host secret and exfiltrate it through the agent's env.
+/// Trusted origins (central `[sandboxes.X].env`/`[[routes]].env`, `[agents.X].env`) may
+/// bind freely. Missing/failed/empty fnox resolution fails the run loudly (redacted:
+/// only the key and secret NAME are surfaced, never the value).
+fn resolve_env_secrets(
+    env: &mut std::collections::BTreeMap<String, String>,
+    untrusted_keys: &[String],
+) -> Result<()> {
+    for (key, value) in env.iter_mut() {
+        let Some(secret) = config::fnox_env_ref(value) else {
+            continue;
+        };
+        let secret = secret.to_owned();
+        if untrusted_keys.iter().any(|k| k == key) {
+            anyhow::bail!(
+                "env key '{key}' from an untrusted `.varda` binds fnox secret '{secret}'; \
+                 fnox env bindings are only allowed from trusted central config"
+            );
+        }
+        let resolved =
+            run_host_credential_command("fnox", &["get", &secret]).with_context(|| {
+                format!(
+                    "failed to resolve env '{key}' from the host secret store (`fnox get {secret}`)"
+                )
+            })?;
+        if resolved.is_empty() {
+            anyhow::bail!(
+                "env '{key}' fnox secret '{secret}' resolved to an empty value on the host"
+            );
+        }
+        *value = resolved;
+    }
+    Ok(())
 }
 
 /// Run a host-side credential minting command and return its stdout with the
@@ -4003,6 +4055,33 @@ mod tests {
     use super::*;
     use gray_matter::{Matter, engine::YAML};
     use serde::Deserialize;
+
+    #[test]
+    fn resolve_env_secrets_leaves_non_sentinel_values_untouched() {
+        // No `${fnox:...}` binding ⇒ nothing is resolved (fnox is never invoked), and
+        // literal values pass through verbatim regardless of trusted/untrusted origin.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("PLAIN".to_owned(), "literal".to_owned());
+        env.insert("TILDE".to_owned(), "~/path".to_owned());
+        resolve_env_secrets(&mut env, &["PLAIN".to_owned()]).expect("no bindings must pass");
+        assert_eq!(env.get("PLAIN").unwrap(), "literal");
+        assert_eq!(env.get("TILDE").unwrap(), "~/path");
+    }
+
+    #[test]
+    fn resolve_env_secrets_refuses_untrusted_varda_binding() {
+        // A fnox binding on a key from the untrusted `.varda` origin is refused BEFORE
+        // any host resolution — repo config must not exfiltrate arbitrary host secrets.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("EXFIL".to_owned(), "${fnox:aws-prod-key}".to_owned());
+        let err = resolve_env_secrets(&mut env, &["EXFIL".to_owned()])
+            .expect_err("untrusted fnox binding must error");
+        let msg = err.to_string();
+        assert!(msg.contains("untrusted"), "error must name the untrusted origin: {msg}");
+        assert!(msg.contains("EXFIL"), "error must name the key: {msg}");
+        // The sentinel is left in place; no value was resolved.
+        assert_eq!(env.get("EXFIL").unwrap(), "${fnox:aws-prod-key}");
+    }
 
     #[derive(Debug, Deserialize)]
     struct PlanMetadata {

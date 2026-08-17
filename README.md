@@ -884,6 +884,7 @@ At `prepare`, Varda reads `$CLAUDE_SANDBOX_TOKEN` on the host and re-exports its
 |---|---|---|
 | **source** (one) | `from_env = "NAME"` | value of a HOST env var |
 | | `from_secret = "name"` | a named secret from the host store (`fnox get name`) |
+| | `from_fnox = "name"` | explicit alias of `from_secret` — same `fnox get name` resolution; prefer it when standardizing on fnox as the store |
 | | `command = "…"` | run on the HOST at `prepare`; stdout (newline-trimmed) is the value — for host-minted, least-privilege, short-lived tokens |
 | **target** (one) | `env = "IN_BOX_VAR"` | scoped `-e IN_BOX_VAR=…` (default) |
 | | `file = "/guest/abs/path"` | the minimal value is staged as a **read-only** (`0o400`) file in the guest — in **both** batch and interactive runs (docker `cp` / msb `--copy-file`), and both the host temp and the guest copy are removed on teardown |
@@ -927,6 +928,20 @@ env = "AZURE_TENANT_ID"
 command = "az account get-access-token --query accessToken -o tsv"
 env = "AZURE_TOKEN"
 ```
+
+**fnox-bound static env vars.** A plain static env var — in `[agents.X].env`, `[sandboxes.X].env`, or a `[[routes]].env` — can be **bound to a fnox secret** instead of carrying a literal value, using the whole-value sentinel `"${fnox:NAME}"`. fnox lives on the **exterior**, side-by-side with Varda: at `prepare` Varda resolves the secret on the host (`fnox get NAME`) and injects **only the resolved value** into the box. The agent/sandbox never contacts fnox, never sees the sentinel, and `~/.config/fnox` is never mounted — same isolation model as credential injection, extended to the static env maps.
+
+```toml
+# The value is resolved from fnox on the host; the box sees only NPM_TOKEN=<value>.
+[sandboxes.build.env]
+NPM_TOKEN = "${fnox:npm-publish-token}"
+
+[[routes]]
+glob = "infra/**"
+env = { HCLOUD_TOKEN = "${fnox:hcloud-token}" }
+```
+
+Only a **whole-value** `"${fnox:NAME}"` is a binding (never a substring of a larger literal), so the resolved secret is never embedded in — nor logged as part of — a bigger string. A missing/failed/empty fnox resolution **fails the run loudly** (redacted: only the key and secret *name* are surfaced, never the value). A fnox binding declared by an **untrusted `.varda`** is **refused** — repo-committed config must not be able to bind an arbitrary host secret and exfiltrate it through the agent's env; use the trusted central `config.toml` for fnox-bound env.
 
 **2. Git identity via SSH-agent forwarding (channel 2).** Forward the host **SSH agent socket** so `git push` signs/authenticates on the host and **private keys never enter the box** (`ls ~/.ssh` in-guest stays empty). The read-only git identity is forwarded as `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env so commits are attributed correctly without mounting `~/.gitconfig`.
 

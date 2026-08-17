@@ -492,14 +492,42 @@ pub enum EgressMode {
     /// Name-resolution allow-list only (docker `--dns 0.0.0.0` + `--add-host`). Blocks
     /// non-allow-listed HOSTNAMES but NOT direct-IP egress. Must be opted into explicitly.
     DnsPin,
+    /// Allow-listing forward-proxy sidecar (docker only). The sandbox is confined to
+    /// an INTERNAL docker network with no route to the internet; its only reachable
+    /// peer is a dual-homed forward proxy that forwards HTTP(S) CONNECT to the
+    /// allow-listed hosts ONLY. Real enforcement (a denied host is genuinely
+    /// unroutable, not just DNS-broken) and works with apps that do their own DNS
+    /// (claude-code, codex). Covers proxy-aware HTTP(S) traffic only — raw non-proxy
+    /// TCP is not forwarded. Needs no `NET_ADMIN`. For docker, `Strict` also resolves
+    /// to this mode (see [`egress_is_enforced`]).
+    Proxy,
 }
 
-/// Whether a sandbox `primitive` can enforce a non-empty egress allow-list at the IP
-/// level (a real firewall), as opposed to only pinning hostnames. `microsandbox` and
-/// `clawk` firewall egress via their net-rule backends; `docker` cannot do so
-/// portably (its allow-list is DNS-pin only); `local` has no isolation at all.
-pub fn primitive_enforces_strict_egress(primitive: &str) -> bool {
-    matches!(primitive, "microsandbox" | "clawk")
+/// Whether `(primitive, mode)` provides REAL egress enforcement — a non-allow-listed
+/// host is genuinely unreachable, not merely unresolvable by name.
+///
+/// - `microsandbox`/`clawk` firewall egress in-guest/natively at the IP level under
+///   any strict mode.
+/// - `docker` enforces via an allow-listing forward-proxy sidecar (see
+///   [`EgressMode::Proxy`]) under `Strict` or `Proxy`: the sandbox is confined to an
+///   internal network whose only route out is the proxy. `Strict` maps to the proxy
+///   sidecar so a docker strict allow-list is enforced rather than refused.
+/// - `DnsPin` is name-pin only (direct-IP bypassable) and never counts as enforced.
+/// - `local` has no network isolation at all.
+pub fn egress_is_enforced(primitive: &str, mode: EgressMode) -> bool {
+    match mode {
+        EgressMode::DnsPin => false,
+        EgressMode::Strict | EgressMode::Proxy => {
+            matches!(primitive, "microsandbox" | "clawk" | "docker")
+        }
+    }
+}
+
+/// Whether `(primitive, mode)` selects the docker allow-listing forward-proxy
+/// sidecar for a NON-EMPTY egress allow-list. Only `docker` under `Strict`/`Proxy`
+/// uses the proxy; `DnsPin` keeps the legacy `--add-host` pins.
+pub fn docker_uses_egress_proxy(primitive: &str, mode: EgressMode) -> bool {
+    primitive == "docker" && matches!(mode, EgressMode::Strict | EgressMode::Proxy)
 }
 
 /// Whether the spawn broker must be served over TCP (rather than a project-mounted
@@ -552,12 +580,18 @@ pub struct SandboxConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<String>,
-    /// How `egress` is ENFORCED. Defaults to [`EgressMode::Strict`] (fail-closed): a
-    /// non-empty allow-list under a provider that cannot IP-firewall (docker) is
-    /// refused at build time rather than silently treated as a DNS-only allow-list.
-    /// Set `egress_mode = "dns-pin"` to explicitly accept the name-only guarantee.
+    /// How `egress` is ENFORCED. Defaults to [`EgressMode::Strict`]: for docker a
+    /// non-empty strict allow-list is enforced by an allow-listing forward-proxy
+    /// sidecar (see [`EgressMode::Proxy`]). Set `egress_mode = "dns-pin"` to opt into
+    /// the legacy name-only (direct-IP-bypassable) guarantee.
     #[serde(default)]
     pub egress_mode: EgressMode,
+    /// Docker forward-proxy image for [`EgressMode::Proxy`]/`Strict` egress. The
+    /// image must run an allow-listing HTTP(S) forward proxy; varda passes it a
+    /// generated tinyproxy config (default image is tinyproxy-compatible). Ignored
+    /// for non-docker primitives and for `dns-pin`/empty egress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_proxy_image: Option<String>,
 }
 
 /// Default isolation primitive when a `[sandboxes.<name>]` entry omits one.
@@ -911,6 +945,19 @@ fn merge_static_env(
     env
 }
 
+/// The whole-value sentinel that binds a static env var to a HOST `fnox` secret:
+/// `MY_VAR = "${fnox:secret-name}"`. Returns the secret NAME when `value` is exactly
+/// such a binding, else `None`.
+///
+/// Only WHOLE-value bindings are recognized (not substrings of a larger literal), so
+/// the resolved secret is never embedded in — nor logged as part of — a bigger string.
+/// varda resolves the returned name on the exterior (next to fnox) at prepare time and
+/// injects only the resolved value; the agent/sandbox never sees this sentinel or fnox.
+pub fn fnox_env_ref(value: &str) -> Option<&str> {
+    let inner = value.strip_prefix("${fnox:")?.strip_suffix('}')?;
+    (!inner.is_empty()).then_some(inner)
+}
+
 pub fn is_reserved_varda_env_key(key: &str) -> bool {
     matches!(
         key,
@@ -1016,6 +1063,11 @@ pub struct CredentialConfig {
     /// (`fnox` / Proton Pass), resolved by `fnox get <name>` at prepare time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_secret: Option<String>,
+    /// SOURCE: alias of [`Self::from_secret`] that names the host secret store
+    /// explicitly. Resolved identically (`fnox get <name>` on the host at prepare
+    /// time); prefer this spelling when standardizing on fnox as the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_fnox: Option<String>,
     /// SOURCE: run this command on the HOST at prepare time and use its stdout
     /// (trailing newline trimmed) — for host-minted, least-privilege short-lived
     /// tokens. The minting identity stays on the host; the box only sees the result.
@@ -1060,20 +1112,23 @@ impl CredentialConfig {
     pub fn source(&self) -> Result<CredentialSource<'_>> {
         let set = self.from_env.is_some() as u8
             + self.from_secret.is_some() as u8
+            + self.from_fnox.is_some() as u8
             + self.command.is_some() as u8;
         if set == 0 {
             bail!(
-                "credential entry has no source: set exactly one of `from_env`, `from_secret`, or `command`"
+                "credential entry has no source: set exactly one of `from_env`, `from_secret`, `from_fnox`, or `command`"
             );
         }
         if set > 1 {
             bail!(
-                "credential entry sets multiple sources: use exactly one of `from_env`, `from_secret`, or `command`"
+                "credential entry sets multiple sources: use exactly one of `from_env`, `from_secret`, `from_fnox`, or `command`"
             );
         }
         if let Some(name) = &self.from_env {
             Ok(CredentialSource::Env(name))
         } else if let Some(name) = &self.from_secret {
+            Ok(CredentialSource::Secret(name))
+        } else if let Some(name) = &self.from_fnox {
             Ok(CredentialSource::Secret(name))
         } else {
             Ok(CredentialSource::Command(
@@ -1477,20 +1532,20 @@ pub fn enforce_resident_launch(
     // blocks undeclared hostnames but still permits raw direct-IP egress on the
     // bridge network. For residents, do not silently downgrade that guarantee.
     if !sandbox.egress.is_empty() {
-        if sandbox.egress_mode != EgressMode::Strict {
+        if sandbox.egress_mode == EgressMode::DnsPin {
             bail!(
                 "resident sandbox '{sandbox_name}' declares non-empty egress with `egress_mode = \"dns-pin\"`; \
-                 residents require strict/clawk-parity egress semantics because DNS pinning still allows \
-                 direct-IP bypass. Use `microsandbox`/`clawk`, or set `egress = []` for fully offline."
+                 residents require enforced egress because DNS pinning still allows direct-IP bypass. Use \
+                 `microsandbox`/`clawk`, docker under strict/proxy egress, or set `egress = []` for fully offline."
             );
         }
-        if !primitive_enforces_strict_egress(&sandbox.primitive) {
+        if !egress_is_enforced(&sandbox.primitive, sandbox.egress_mode) {
             bail!(
-                "resident sandbox '{sandbox_name}' uses primitive '{}' with non-empty egress in strict mode, \
-                 but this provider cannot enforce an IP-level firewall. Docker's DNS-pin allow-list can be \
-                 bypassed by direct-IP egress, so the resident launch is refused rather than downgraded. \
-                 Use `microsandbox`/`clawk`, or set `egress = []` for fully offline.",
-                sandbox.primitive
+                "resident sandbox '{sandbox_name}' uses primitive '{}' with non-empty egress in `{:?}` mode, \
+                 but this provider cannot enforce egress. Use `microsandbox`/`clawk`, docker (enforced via an \
+                 allow-listing forward-proxy sidecar), or set `egress = []` for fully offline.",
+                sandbox.primitive,
+                sandbox.egress_mode
             );
         }
     }
@@ -1934,6 +1989,37 @@ mod tests {
             ..Default::default()
         };
         assert!(two_targets.target().is_err(), "both targets must error");
+
+        // `from_fnox` is an explicit alias of `from_secret`: same resolved source.
+        let fnox = CredentialConfig {
+            from_fnox: Some("vault/key".to_owned()),
+            env: Some("IN_BOX".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(fnox.source().unwrap(), CredentialSource::Secret("vault/key"));
+        // ...and it counts as a source, so combining it with another errors.
+        let fnox_plus = CredentialConfig {
+            from_fnox: Some("vault/key".to_owned()),
+            from_env: Some("A".to_owned()),
+            env: Some("X".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            fnox_plus.source().is_err(),
+            "from_fnox plus another source must error"
+        );
+    }
+
+    #[test]
+    fn fnox_env_ref_recognizes_whole_value_bindings_only() {
+        assert_eq!(fnox_env_ref("${fnox:tfc-token}"), Some("tfc-token"));
+        assert_eq!(fnox_env_ref("${fnox:vault/key}"), Some("vault/key"));
+        // Not a whole-value binding / not a binding at all ⇒ left untouched.
+        assert_eq!(fnox_env_ref("plain-literal"), None);
+        assert_eq!(fnox_env_ref("Bearer ${fnox:token}"), None);
+        assert_eq!(fnox_env_ref("${fnox:}"), None);
+        assert_eq!(fnox_env_ref("${env:token}"), None);
+        assert_eq!(fnox_env_ref("${fnox:token"), None);
     }
 
     #[test]
