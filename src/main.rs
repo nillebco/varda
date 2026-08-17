@@ -4239,14 +4239,15 @@ deny_sandboxes = ["local"]
     }
 
     #[test]
-    fn resolve_resident_launch_rejects_docker_non_empty_egress() {
+    fn resolve_resident_launch_allows_docker_proxy_egress() {
+        // Docker strict egress is now enforced by the forward-proxy sidecar, so a
+        // docker resident limited to its LLM endpoint resolves rather than being
+        // refused as an unenforceable downgrade.
         let ws = resident_tmp("docker-net");
         let config = resident_config(&ws, "docker", "\"api.anthropic.com\"");
-        let err = resolve_resident_launch(&config, &ws)
-            .expect_err("docker resident egress must not silently downgrade to DNS pinning");
-        let msg = err.to_string();
-        assert!(msg.contains("direct-IP"), "{msg}");
-        assert!(msg.contains("refused rather than downgraded"), "{msg}");
+        let launch = resolve_resident_launch(&config, &ws)
+            .expect("docker proxy-enforced egress to an LLM endpoint must resolve");
+        assert_eq!(launch.sandbox, "orchestration");
     }
 
     #[test]

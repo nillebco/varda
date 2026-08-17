@@ -1849,6 +1849,84 @@ mod tests {
         AcpSubprocessClient::with_sandbox("shell", &config, provider)
     }
 
+    /// Like [`docker_client_cfg`] but runs the given `image` under PROXY egress mode
+    /// (`egress_mode = "proxy"`): the box is confined to the internal network and
+    /// reaches `egress` hosts only via the forward-proxy sidecar.
+    fn docker_client_proxy(
+        command: &str,
+        args: &[&str],
+        image: &str,
+        egress: Vec<String>,
+    ) -> AcpSubprocessClient {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: command.to_owned(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let sandbox_config = crate::config::SandboxConfig {
+            image: Some(image.to_owned()),
+            egress,
+            egress_mode: crate::config::EgressMode::Proxy,
+            ..Default::default()
+        };
+        let provider = std::sync::Arc::new(
+            crate::sandbox::DockerProvider::from_config("docker", &sandbox_config, Vec::new())
+                .expect("docker provider"),
+        );
+        AcpSubprocessClient::with_sandbox("shell", &config, provider)
+    }
+
+    /// #536 exit criterion (msb-parity for docker): with the forward-proxy egress
+    /// mode, an allow-listed host is REACHABLE through the proxy while any other host
+    /// is genuinely UNROUTABLE (not merely DNS-broken) — and it works with a client
+    /// that does its own DNS. `curl` exits 0 on any HTTP response (a 401 counts as
+    /// reached); a denied host fails the CONNECT at the proxy (non-zero).
+    ///
+    /// Requires a docker daemon, outbound network, and an image with `sh` + `curl`
+    /// (default `alpine/curl`) plus the tinyproxy proxy image to be pullable. Run
+    /// with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon, outbound network, and pullable proxy/curl images"]
+    async fn docker_agent_proxy_egress_enforces_allow_list() {
+        let client = docker_client_proxy(
+            "sh",
+            &[
+                "-c",
+                "if curl -sS -o /dev/null -m 12 https://api.anthropic.com/; then echo ALLOWED_REACHED; else echo ALLOWED_UNREACHABLE; fi; \
+                 if curl -sS -o /dev/null -m 12 https://github.com/; then echo BLOCKED_REACHED; else echo BLOCKED_DENIED; fi; \
+                 echo; echo 'requires_user: false'",
+            ],
+            "alpine/curl:latest",
+            vec!["api.anthropic.com".to_owned()],
+        );
+        let result = client
+            .run_task(docker_request("/tmp", "docker-proxy-egress"))
+            .await
+            .expect("docker agent should run the proxy egress probe");
+        assert!(
+            result.recap.contains("ALLOWED_REACHED"),
+            "allow-listed host must be reachable via the proxy; recap was: {}",
+            result.recap
+        );
+        assert!(
+            result.recap.contains("BLOCKED_DENIED") && !result.recap.contains("BLOCKED_REACHED"),
+            "non-allow-listed host must be unroutable; recap was: {}",
+            result.recap
+        );
+    }
+
     #[test]
     fn env_for_request_merges_static_env_after_agent_env_and_expands_values() {
         let mut agent_env = BTreeMap::new();

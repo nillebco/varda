@@ -15,7 +15,9 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::config::{AgentKind, EgressMode, SandboxConfig, primitive_enforces_strict_egress};
+use crate::config::{
+    AgentKind, EgressMode, SandboxConfig, docker_uses_egress_proxy, egress_is_enforced,
+};
 
 /// Where a mount declaration came from. Mounts compose across origins (effective
 /// set = their union). In M6a both origins are the trusted central
@@ -719,13 +721,30 @@ pub struct DockerProvider {
     /// (`Route`) mounts, de-duplicated by target at wrap time.
     mounts: Vec<(MountOrigin, String)>,
     /// Egress allow-list of hostnames. Empty ⇒ the container is fully offline
-    /// (`--network none`); non-empty is allowed only in explicit DNS-pin mode
-    /// because docker cannot enforce an IP-level firewall portably.
+    /// (`--network none`). Non-empty is enforced by an allow-listing forward-proxy
+    /// sidecar (`egress_mode` `strict`/`proxy`) or, legacy, by DNS-pin.
     egress: Vec<String>,
+    /// How `egress` is enforced. `dns-pin` keeps the legacy `--add-host` pins;
+    /// `strict`/`proxy` route the box through the forward-proxy sidecar.
+    egress_mode: EgressMode,
+    /// Forward-proxy image used in `strict`/`proxy` egress mode (see
+    /// [`DEFAULT_EGRESS_PROXY_IMAGE`]).
+    egress_proxy_image: String,
     /// M11 identity/auth channels forwarded into the box (curated identity files,
     /// SSH-agent socket, git identity, scoped auth token). Empty ⇒ pre-M11 argv.
     identity: SandboxIdentity,
 }
+
+/// Default docker forward-proxy image for [`EgressMode::Proxy`]/`Strict` egress.
+/// A tinyproxy-compatible image: varda mounts a generated tinyproxy config that
+/// default-denies and allow-lists exactly the declared egress hosts. Override per
+/// sandbox with `egress_proxy_image`.
+pub const DEFAULT_EGRESS_PROXY_IMAGE: &str = "vimagick/tinyproxy";
+
+/// In-container port the forward proxy listens on, and its network alias on the
+/// internal docker network. The sandbox reaches it via `http://<alias>:<port>`.
+const EGRESS_PROXY_PORT: u16 = 8888;
+const EGRESS_PROXY_ALIAS: &str = "egress-proxy";
 
 impl DockerProvider {
     /// Attach the M11 identity/auth bundle to a provider (builder). Kept separate
@@ -746,15 +765,6 @@ impl DockerProvider {
         config: &SandboxConfig,
         mounts: Vec<(MountOrigin, String)>,
     ) -> Result<Self> {
-        if !config.egress.is_empty() && config.egress_mode != EgressMode::DnsPin {
-            bail!(
-                "sandbox '{name}' uses docker with non-empty `egress` in strict mode, but docker cannot \
-                 enforce an IP-level egress firewall portably. Its legacy allow-list is DNS-pin only \
-                 (`--dns 0.0.0.0` + `--add-host`) and can be bypassed by direct-IP egress. Set \
-                 `egress_mode = \"dns-pin\"` to explicitly accept that compatibility behavior, use \
-                 `microsandbox`/`clawk` for strict enforcement, or set `egress = []` for `--network none`."
-            );
-        }
         let image = config.image.clone().filter(|image| !image.is_empty());
         let build = config.build.clone().filter(|build| !build.is_empty());
         let image_from = config
@@ -773,6 +783,12 @@ impl DockerProvider {
             image_from,
             mounts,
             egress: config.egress.clone(),
+            egress_mode: config.egress_mode,
+            egress_proxy_image: config
+                .egress_proxy_image
+                .clone()
+                .filter(|image| !image.is_empty())
+                .unwrap_or_else(|| DEFAULT_EGRESS_PROXY_IMAGE.to_owned()),
             identity: SandboxIdentity::default(),
         })
     }
@@ -814,6 +830,8 @@ impl DockerProvider {
                 .map(|m| (MountOrigin::Sandbox, m.to_string()))
                 .collect(),
             egress: egress.iter().map(|e| e.to_string()).collect(),
+            egress_mode: EgressMode::DnsPin,
+            egress_proxy_image: DEFAULT_EGRESS_PROXY_IMAGE.to_owned(),
             identity: SandboxIdentity::default(),
         }
     }
@@ -1182,18 +1200,28 @@ impl SandboxProvider for DockerProvider {
     }
 
     async fn prepare(&self, ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
-        // Resolve each allow-listed hostname to a concrete IP on the host so the
-        // container can be pinned to exactly those addresses via `--add-host`
-        // while ambient DNS is disabled (default-deny by name resolution).
-        let mut egress_pins = Vec::with_capacity(self.egress.len());
-        for host in &self.egress {
-            let ip = resolve_host(host).await.with_context(|| {
-                format!(
-                    "failed to resolve egress-allow-listed host '{host}' for sandbox '{}'",
-                    self.name
-                )
-            })?;
-            egress_pins.push((host.clone(), ip));
+        // Non-empty egress is enforced one of two ways. `strict`/`proxy` route the
+        // box through an allow-listing forward-proxy sidecar (real enforcement,
+        // works with apps that do their own DNS); the raw hostnames go to the proxy
+        // filter and NO IPs are pinned. `dns-pin` (legacy) resolves each host to a
+        // concrete IP and pins it via `--add-host` while ambient DNS is disabled.
+        let use_proxy =
+            !self.egress.is_empty() && docker_uses_egress_proxy("docker", self.egress_mode);
+        let mut egress_pins = Vec::new();
+        let mut egress_hosts = Vec::new();
+        if use_proxy {
+            egress_hosts = self.egress.clone();
+        } else {
+            egress_pins = Vec::with_capacity(self.egress.len());
+            for host in &self.egress {
+                let ip = resolve_host(host).await.with_context(|| {
+                    format!(
+                        "failed to resolve egress-allow-listed host '{host}' for sandbox '{}'",
+                        self.name
+                    )
+                })?;
+                egress_pins.push((host.clone(), ip));
+            }
         }
         // Give the container a dedicated HOME backed by a PER-SESSION DOCKER
         // NAMED VOLUME (not a host bind mount). The volume lives in the daemon/VM
@@ -1215,11 +1243,24 @@ impl SandboxProvider for DockerProvider {
         // Dockerfile here (once, content-addressed) rather than at config load;
         // a devcontainer source discovers `.devcontainer/` under the project root.
         let image = self.resolve_image(ctx.project_root).await?;
+        // Proxy egress: stand up the internal network + allow-listing forward proxy
+        // BEFORE the sandbox is wrapped/started so its only route out already
+        // exists. Teardown removes both (best-effort, idempotent by name).
+        if !egress_hosts.is_empty() {
+            setup_egress_proxy(
+                &handle,
+                &egress_hosts,
+                &self.egress_proxy_image,
+                &session_store,
+            )
+            .await?;
+        }
         Ok(Box::new(DockerSession {
             image,
             project_root: ctx.project_root.to_path_buf(),
             mounts: self.mounts.clone(),
             egress_pins,
+            egress_hosts,
             session_store,
             volume: format!("varda-sbx-{handle}"),
             container: format!("varda-sbx-{handle}"),
@@ -1228,6 +1269,126 @@ impl SandboxProvider for DockerProvider {
             staged_files: std::sync::Mutex::new(Vec::new()),
         }))
     }
+}
+
+/// Deterministic per-session names for the forward-proxy sidecar resources, derived
+/// from the sandbox handle so [`DockerSession`] can address/tear them down without
+/// threading extra state.
+fn egress_proxy_network(handle: &str) -> String {
+    format!("varda-egnet-{handle}")
+}
+fn egress_proxy_container(handle: &str) -> String {
+    format!("varda-eproxy-{handle}")
+}
+
+/// Build the tinyproxy config that default-denies and allow-lists exactly `hosts`.
+/// `FilterDefaultDeny Yes` + a per-host anchored regex means a non-allow-listed
+/// CONNECT/GET is refused at the proxy — real enforcement, not just DNS breakage.
+/// A leading-dot alternative (`(^|\.)host$`) also admits subdomains of a listed host.
+fn tinyproxy_filter(hosts: &[String]) -> String {
+    hosts
+        .iter()
+        .map(|h| format!("(^|\\.){}$", h.replace('.', "\\.")))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+fn tinyproxy_conf() -> String {
+    format!(
+        "Port {EGRESS_PROXY_PORT}\n\
+         Listen 0.0.0.0\n\
+         Timeout 600\n\
+         Allow 0.0.0.0/0\n\
+         ConnectPort 443\n\
+         ConnectPort 563\n\
+         FilterExtended On\n\
+         FilterCaseSensitive Off\n\
+         FilterDefaultDeny Yes\n\
+         Filter \"/etc/varda-proxy/filter\"\n"
+    )
+}
+
+/// Stand up the allow-listing forward-proxy sidecar for `hosts`:
+/// 1. an `--internal` docker network (no route to the internet) the sandbox joins;
+/// 2. the proxy container on that network (alias [`EGRESS_PROXY_ALIAS`]) with the
+///    generated tinyproxy config mounted read-only;
+/// 3. the proxy ALSO connected to the default `bridge` so IT — and only it — can
+///    reach the allow-listed hosts on the sandbox's behalf.
+///
+/// Idempotent by name: re-running `network create`/`run` for an existing resource
+/// is tolerated. Best-effort mirror in [`DockerSession::teardown`].
+async fn setup_egress_proxy(
+    handle: &str,
+    hosts: &[String],
+    image: &str,
+    session_store: &Path,
+) -> Result<()> {
+    let network = egress_proxy_network(handle);
+    let container = egress_proxy_container(handle);
+    // 1. Internal network: containers on it have NO default route to the internet.
+    let out = tokio::process::Command::new("docker")
+        .args(["network", "create", "--internal", &network])
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn `docker network create {network}`"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.contains("already exists") {
+            bail!("`docker network create --internal {network}` failed; stderr: {stderr}");
+        }
+    }
+    // 2. Write the proxy config + filter into a host dir mounted read-only into the
+    //    proxy. Lives under the session store so it is cleaned with the session.
+    let cfg_dir = session_store.join("egress-proxy");
+    std::fs::create_dir_all(&cfg_dir)
+        .with_context(|| format!("failed to create proxy config dir {}", cfg_dir.display()))?;
+    std::fs::write(cfg_dir.join("tinyproxy.conf"), tinyproxy_conf())
+        .with_context(|| "failed to write tinyproxy.conf".to_string())?;
+    std::fs::write(cfg_dir.join("filter"), tinyproxy_filter(hosts))
+        .with_context(|| "failed to write proxy filter".to_string())?;
+    let mount = format!("{}:/etc/varda-proxy:ro", cfg_dir.display());
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &container,
+            "--network",
+            &network,
+            "--network-alias",
+            EGRESS_PROXY_ALIAS,
+            "-v",
+            &mount,
+            image,
+            "tinyproxy",
+            "-d",
+            "-c",
+            "/etc/varda-proxy/tinyproxy.conf",
+        ])
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn proxy container `{container}`"))?;
+    if !out.status.success() {
+        bail!(
+            "`docker run` for egress proxy '{container}' (image '{image}') failed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // 3. Give the proxy — and only the proxy — a route to the internet.
+    let out = tokio::process::Command::new("docker")
+        .args(["network", "connect", "bridge", &container])
+        .output()
+        .await
+        .with_context(|| format!("failed to connect proxy '{container}' to bridge"))?;
+    if !out.status.success() {
+        bail!(
+            "`docker network connect bridge {container}` failed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Host directory under which per-session sandbox HOME dirs are created.
@@ -1347,8 +1508,13 @@ pub struct DockerSession {
     /// Extra host mounts (origin-tagged, `source[:target][:mode]` grammar),
     /// merged and de-duplicated by target at wrap time.
     mounts: Vec<(MountOrigin, String)>,
-    /// Resolved `(hostname, ip)` egress allow-list. Empty ⇒ `--network none`.
+    /// Resolved `(hostname, ip)` egress allow-list for legacy DNS-pin mode. Empty in
+    /// proxy mode and when offline.
     egress_pins: Vec<(String, String)>,
+    /// Raw egress hostnames for PROXY mode (`strict`/`proxy`). Non-empty ⇒ the box is
+    /// confined to the internal network and reaches these hosts only via the
+    /// forward-proxy sidecar. Empty in DNS-pin mode and when offline.
+    egress_hosts: Vec<String>,
     /// Host dir into which the agent's session store is `docker cp`-ed AFTER the
     /// run (never bind-mounted). Resume-capture reads this back from the host.
     session_store: PathBuf,
@@ -1370,6 +1536,15 @@ pub struct DockerSession {
 }
 
 impl DockerSession {
+    /// The sanitized session handle, recovered from the `varda-sbx-<handle>`
+    /// container name so the proxy sidecar's network/container names can be derived
+    /// without carrying extra state.
+    fn session_handle(&self) -> &str {
+        self.container
+            .strip_prefix("varda-sbx-")
+            .unwrap_or(&self.container)
+    }
+
     /// Write `content` to a host temp (read-only when `read_only`) and record the
     /// `(host_temp, guest_path)` pair for a DEFERRED `docker cp`: the container
     /// does not exist until the create → cp → start lifecycle runs. Returns the
@@ -1504,7 +1679,16 @@ impl SandboxSession for DockerSession {
             tty_flag.to_owned(),
             "--network".to_owned(),
         ];
-        if self.egress_pins.is_empty() {
+        if !self.egress_hosts.is_empty() {
+            // Proxy mode (`strict`/`proxy`): confine the box to the INTERNAL network
+            // (no route to the internet). Its only reachable peer is the forward
+            // proxy (alias `egress-proxy`), which forwards HTTP(S) to the
+            // allow-listed hosts ONLY. A denied host is genuinely unroutable, and
+            // apps that do their own DNS still work (the proxy resolves). The
+            // `HTTP(S)_PROXY` env below points HTTP(S) clients at the proxy.
+            let handle = self.session_handle();
+            args.push(egress_proxy_network(handle));
+        } else if self.egress_pins.is_empty() {
             // No allow-list ⇒ fully offline: nothing outbound is reachable.
             args.push("none".to_owned());
         } else {
@@ -1604,6 +1788,19 @@ impl SandboxSession for DockerSession {
         let mut env = spec.env;
         env.extend(self.identity.guest_env());
         env.insert("HOME".to_owned(), self.home.clone());
+        // Proxy mode: point HTTP(S) clients (claude, codex, git-over-https, package
+        // managers) at the forward proxy. Both upper- and lower-case spellings are
+        // set because tools honour one or the other; `NO_PROXY` keeps loopback/the
+        // proxy alias itself direct. Egress is enforced at the proxy, not here.
+        if !self.egress_hosts.is_empty() {
+            let url = format!("http://{EGRESS_PROXY_ALIAS}:{EGRESS_PROXY_PORT}");
+            let no_proxy = format!("localhost,127.0.0.1,{EGRESS_PROXY_ALIAS}");
+            for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+                env.insert(key.to_owned(), url.clone());
+            }
+            env.insert("NO_PROXY".to_owned(), no_proxy.clone());
+            env.insert("no_proxy".to_owned(), no_proxy);
+        }
         for (key, value) in &env {
             args.push("-e".to_owned());
             args.push(format!("{key}={value}"));
@@ -1764,6 +1961,23 @@ impl SandboxSession for DockerSession {
             .stderr(std::process::Stdio::null())
             .status()
             .await;
+        // Proxy egress: remove the sidecar container and its internal network. Both
+        // are best-effort and no-ops when this session did not use proxy mode.
+        if !self.egress_hosts.is_empty() {
+            let handle = self.session_handle().to_owned();
+            let _ = tokio::process::Command::new("docker")
+                .args(["rm", "-f", &egress_proxy_container(&handle)])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+            let _ = tokio::process::Command::new("docker")
+                .args(["network", "rm", &egress_proxy_network(&handle)])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        }
         Ok(())
     }
 }
@@ -2573,14 +2787,15 @@ pub fn provider_from_config(
         );
     }
     if !config.egress.is_empty()
-        && config.egress_mode == EgressMode::Strict
-        && !primitive_enforces_strict_egress(&config.primitive)
+        && config.egress_mode != EgressMode::DnsPin
+        && !egress_is_enforced(&config.primitive, config.egress_mode)
     {
         bail!(
-            "sandbox '{name}' declares non-empty `egress` in strict mode, but primitive '{}' cannot \
-             prove IP-level egress enforcement. Strict mode refuses to silently downgrade to a DNS \
-             allow-list because direct-IP egress would bypass it. Use `microsandbox`/`clawk`, set \
-             `egress_mode = \"dns-pin\"` for docker compatibility, or set `egress = []` for offline.",
+            "sandbox '{name}' declares non-empty `egress` in `{:?}` mode, but primitive '{}' cannot \
+             enforce egress. Docker enforces strict/proxy egress via an allow-listing forward-proxy \
+             sidecar; `microsandbox`/`clawk` firewall natively. Set `egress_mode = \"dns-pin\"` for the \
+             legacy docker name-pin, or set `egress = []` for offline.",
+            config.egress_mode,
             config.primitive
         );
     }
@@ -2621,6 +2836,7 @@ impl DockerSession {
             project_root: PathBuf::from(project_root),
             mounts,
             egress_pins,
+            egress_hosts: Vec::new(),
             session_store: PathBuf::from(session_store),
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
@@ -2783,6 +2999,7 @@ mod tests {
             project_root: PathBuf::from("/proj"),
             mounts: vec![],
             egress_pins: vec![],
+            egress_hosts: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
@@ -2873,6 +3090,7 @@ mod tests {
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![],
             egress_pins: vec![],
+            egress_hosts: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
@@ -2913,6 +3131,7 @@ mod tests {
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![(MountOrigin::Sandbox, "/opt/cache".to_owned())],
             egress_pins: vec![],
+            egress_hosts: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
@@ -3481,6 +3700,7 @@ mod tests {
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![],
             egress_pins: vec![],
+            egress_hosts: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
@@ -3517,6 +3737,7 @@ mod tests {
                 ("api.example.com".to_owned(), "93.184.216.34".to_owned()),
                 ("cdn.example.com".to_owned(), "203.0.113.7".to_owned()),
             ],
+            egress_hosts: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
@@ -3555,44 +3776,84 @@ mod tests {
         );
     }
 
+    /// Proxy mode: the box joins the per-session INTERNAL network (no direct route
+    /// out) and gets `HTTP(S)_PROXY` pointing at the forward-proxy alias, so a denied
+    /// host is genuinely unroutable while allow-listed hosts reach the proxy. No
+    /// `--dns`/`--add-host` (the proxy resolves on the box's behalf).
     #[test]
-    fn docker_non_empty_egress_requires_explicit_dns_pin_mode() {
-        let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
-        sandboxes.insert(
-            "docker".to_owned(),
-            SandboxConfig {
-                image: Some("varda:latest".to_owned()),
-                egress: vec!["api.example.com".to_owned()],
-                ..Default::default()
-            },
-        );
-        let err = match provider_for("docker", &sandboxes, &[], &SandboxIdentity::default()) {
-            Ok(provider) => panic!(
-                "strict docker egress must fail closed, got provider '{}'",
-                provider.name()
-            ),
-            Err(err) => err,
+    fn docker_wrap_proxy_mode_confines_to_internal_net_and_sets_proxy_env() {
+        let session = DockerSession {
+            image: "img".to_owned(),
+            project_root: PathBuf::from("/srv/app"),
+            mounts: vec![],
+            egress_pins: vec![],
+            egress_hosts: vec!["api.anthropic.com".to_owned()],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
         };
-        let msg = err.to_string();
-        assert!(msg.contains("strict mode"), "{msg}");
-        assert!(msg.contains("direct-IP"), "{msg}");
-        assert!(msg.contains("egress_mode = \"dns-pin\""), "{msg}");
+        let wrapped = session
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+        let n = wrapped.args.iter().position(|a| a == "--network").unwrap();
+        assert_eq!(wrapped.args[n + 1], "varda-egnet-s1");
+        assert!(!wrapped.args.iter().any(|a| a == "--dns"));
+        assert!(!wrapped.args.iter().any(|a| a == "--add-host"));
+        // HTTP(S)_PROXY (both cases) point at the forward-proxy alias.
+        let envs: Vec<&String> = wrapped
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && wrapped.args[i - 1] == "-e")
+            .map(|(_, v)| v)
+            .collect();
+        for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+            assert!(
+                envs.contains(&&format!("{key}=http://egress-proxy:8888")),
+                "missing {key}; got {envs:?}"
+            );
+        }
+        assert!(
+            envs.iter().any(|e| e.starts_with("NO_PROXY=")),
+            "missing NO_PROXY; got {envs:?}"
+        );
+    }
 
-        sandboxes.insert(
-            "docker".to_owned(),
-            SandboxConfig {
-                image: Some("varda:latest".to_owned()),
-                egress: vec!["api.example.com".to_owned()],
-                egress_mode: EgressMode::DnsPin,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            provider_for("docker", &sandboxes, &[], &SandboxIdentity::default())
-                .expect("explicit dns-pin mode should preserve docker compatibility")
-                .name(),
-            "docker"
-        );
+    /// Docker now accepts a non-empty egress allow-list in EVERY mode: `strict`/
+    /// `proxy` build the forward-proxy sidecar provider, `dns-pin` keeps the legacy
+    /// `--add-host` pins. None of them is refused at build time.
+    #[test]
+    fn docker_non_empty_egress_builds_in_all_modes() {
+        for mode in [EgressMode::Strict, EgressMode::Proxy, EgressMode::DnsPin] {
+            let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
+            sandboxes.insert(
+                "docker".to_owned(),
+                SandboxConfig {
+                    image: Some("varda:latest".to_owned()),
+                    egress: vec!["api.example.com".to_owned()],
+                    egress_mode: mode,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                provider_for("docker", &sandboxes, &[], &SandboxIdentity::default())
+                    .unwrap_or_else(|e| panic!("docker egress in {mode:?} must build: {e}"))
+                    .name(),
+                "docker",
+                "mode {mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -5329,6 +5590,7 @@ mod tests {
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![(MountOrigin::Route, "/ctx/adb:ro".to_owned())],
             egress_pins: vec![],
+            egress_hosts: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
@@ -5366,6 +5628,7 @@ mod tests {
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![(MountOrigin::Route, "/host/adb:/context/adb".to_owned())],
             egress_pins: vec![],
+            egress_hosts: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
@@ -5404,6 +5667,7 @@ mod tests {
                 (MountOrigin::Route, "subdir:ro".to_owned()),
             ],
             egress_pins: vec![],
+            egress_hosts: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
@@ -5453,6 +5717,7 @@ mod tests {
                 (MountOrigin::Route, "/extra:ro".to_owned()),
             ],
             egress_pins: vec![],
+            egress_hosts: vec![],
             session_store: PathBuf::from("/var/varda/sessions/s1"),
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),

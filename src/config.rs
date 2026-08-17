@@ -929,6 +929,7 @@ impl Default for SandboxConfig {
             env: BTreeMap::new(),
             egress: Vec::new(),
             egress_mode: EgressMode::Strict,
+            egress_proxy_image: None,
         }
     }
 }
@@ -3350,14 +3351,47 @@ mod resident_tests {
         );
     }
 
+    /// Docker under strict egress is now ENFORCED via the forward-proxy sidecar, so a
+    /// resident whose allow-list is exactly its agent's LLM endpoint is ACCEPTED (the
+    /// endpoint allowlist, no-push, and workspace gates still apply).
     #[test]
-    fn rejects_docker_resident_non_empty_egress_in_strict_mode() {
+    fn accepts_docker_resident_proxy_enforced_egress() {
         let ws = tmp("docker-strict");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        for mode in [EgressMode::Strict, EgressMode::Proxy] {
+            let sandbox = SandboxConfig {
+                image: Some("dev:latest".to_owned()),
+                primitive: "docker".to_owned(),
+                egress: vec!["api.anthropic.com".to_owned()],
+                egress_mode: mode,
+                ..SandboxConfig::default()
+            };
+            enforce_resident_launch(
+                "claude-resident",
+                "orchestration",
+                &sandbox,
+                &mounts,
+                &ws,
+                &[],
+                &no_env(),
+                false,
+                &resident_policy(),
+            )
+            .unwrap_or_else(|e| panic!("docker proxy-enforced resident ({mode:?}) must pass: {e}"));
+        }
+    }
+
+    /// A docker resident whose allow-list includes a host OUTSIDE its agent's LLM
+    /// endpoints is still refused even under proxy enforcement (no exfil/push).
+    #[test]
+    fn rejects_docker_resident_proxy_egress_to_non_llm_host() {
+        let ws = tmp("docker-proxy-github");
         let mounts = vec![format!("{}:/workspace:rw", ws.display())];
         let sandbox = SandboxConfig {
             image: Some("dev:latest".to_owned()),
             primitive: "docker".to_owned(),
-            egress: vec!["api.anthropic.com".to_owned()],
+            egress: vec!["api.anthropic.com".to_owned(), "github.com".to_owned()],
+            egress_mode: EgressMode::Strict,
             ..SandboxConfig::default()
         };
         let err = enforce_resident_launch(
@@ -3372,10 +3406,7 @@ mod resident_tests {
             &resident_policy(),
         )
         .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("direct-IP"), "{msg}");
-        assert!(msg.contains("refused rather than downgraded"), "{msg}");
-        assert!(msg.contains("microsandbox"), "{msg}");
+        assert!(err.to_string().contains("github.com"), "{err}");
     }
 
     #[test]
@@ -3404,7 +3435,7 @@ mod resident_tests {
         let msg = err.to_string();
         assert!(msg.contains("dns-pin"), "{msg}");
         assert!(msg.contains("direct-IP bypass"), "{msg}");
-        assert!(msg.contains("residents require strict"), "{msg}");
+        assert!(msg.contains("residents require enforced egress"), "{msg}");
     }
 
     #[test]
