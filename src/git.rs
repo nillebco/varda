@@ -1038,6 +1038,19 @@ mod tests {
             .success();
         assert!(!merge_in_progress, "conflict should have been aborted");
 
+        // Prove the index/worktree is truly clean, not just that MERGE_HEAD is gone.
+        let porcelain = Command::new("git")
+            .arg("-C")
+            .arg(&integration.path)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status --porcelain");
+        assert!(
+            porcelain.stdout.is_empty(),
+            "aborted conflict should leave a clean working tree, got: {}",
+            String::from_utf8_lossy(&porcelain.stdout)
+        );
+
         for wt in [&a, &b, &c, &integration] {
             let _ = remove_worker_worktree(&repo, wt, false);
         }
