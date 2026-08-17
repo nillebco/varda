@@ -484,6 +484,80 @@ pub fn dependency_manifest_changes(files: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A worker's harvested output, ready for host-side integration: the isolated
+/// checkout it worked in ([`create_worker_worktree`]) plus the `files_touched`
+/// paths it reported in its recap. The recap text is untrusted (WORKFLOW.md G4),
+/// so only these two structured fields cross into the merge-back loop.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct WorkerHarvest {
+    /// The isolated worktree/branch the worker edited.
+    pub checkout: WorkerCheckout,
+    /// Paths the worker reported under `Files touched`. Paths outside its
+    /// worktree are skipped by [`commit_worker_changes`].
+    pub files_touched: Vec<PathBuf>,
+}
+
+/// Per-worker result of the merge-back loop, for the resident to act on.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct WorkerIntegration {
+    /// The worker's `wip/<slug>` branch.
+    pub branch: String,
+    /// Whether the worker produced a commit. `false` = empty/no-op worker (its
+    /// `files_touched` were all empty or outside the worktree); no merge was run.
+    pub committed: bool,
+    /// Merge result onto the integration branch. `None` when `committed` is
+    /// `false`. A non-`clean` outcome carries the conflicted paths the resident
+    /// routes to a resolver (WORKFLOW.md step 5).
+    pub merge: Option<MergeOutcome>,
+    /// Dependency-manifest files this worker touched — the G5 flag the resident
+    /// must surface before any human push.
+    pub dependency_manifests: Vec<PathBuf>,
+}
+
+/// Run the WORKFLOW.md step-5 merge-back loop host-side over a wave of harvested
+/// workers: for each, commit its `files_touched` onto its own `wip/<slug>`
+/// branch ([`commit_worker_changes`]) and merge that branch onto the branch
+/// checked out at `integration_worktree` ([`merge_worker_branch`]).
+///
+/// This is deterministic glue, not policy: it never resolves conflicts, never
+/// pushes, and never aborts the wave on a *content* conflict — a conflicting
+/// merge is recorded (aborted so the integration tree stays clean) and reported
+/// as the resolver's work queue, so later workers in the wave still integrate.
+/// A merge that fails *without* unmerged paths (e.g. a pre-merge hook rejection)
+/// is a hard error the primitive surfaces, and it propagates here. Each worker's
+/// dependency-manifest touches are flagged (G5) for the resident to relay to the
+/// human before any push (G3).
+#[allow(dead_code)]
+pub fn integrate_worker_branches(
+    integration_worktree: &Path,
+    workers: &[WorkerHarvest],
+    commit_message_prefix: &str,
+) -> Result<Vec<WorkerIntegration>> {
+    let mut integrations = Vec::with_capacity(workers.len());
+    for worker in workers {
+        let branch = worker.checkout.branch.clone();
+        let committed = commit_worker_changes(
+            &worker.checkout,
+            &worker.files_touched,
+            &format!("{commit_message_prefix} {branch}"),
+        )?;
+        let merge = if committed {
+            Some(merge_worker_branch(integration_worktree, &branch)?)
+        } else {
+            None
+        };
+        integrations.push(WorkerIntegration {
+            branch,
+            committed,
+            merge,
+            dependency_manifests: dependency_manifest_changes(&worker.files_touched),
+        });
+    }
+    Ok(integrations)
+}
+
 pub(crate) fn repo_root_for_path(path: &Path) -> Result<PathBuf> {
     let git_dir = if path.is_dir() {
         path
@@ -874,6 +948,97 @@ mod tests {
         assert!(!merge_in_progress, "merge should have been aborted");
 
         for wt in [&worker, &integration] {
+            let _ = remove_worker_worktree(&repo, wt, false);
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn integrate_worker_branches_merges_clean_flags_manifests_and_queues_conflicts() {
+        let repo = init_test_repo("integrate-worker-branches");
+        seed_commit(&repo, "shared.txt", "base\n");
+
+        // Worker A: disjoint new file + a dependency manifest (G5).
+        let a_path = unique_worktree_path(&repo, "int-a");
+        let a = create_worker_worktree(&repo, "int-a", &a_path).expect("worktree a");
+        std::fs::write(a.path.join("a.txt"), "from-a\n").expect("write a");
+        std::fs::write(a.path.join("Cargo.toml"), "[package]\n").expect("write manifest a");
+
+        // Worker B: edits the shared file — will conflict once A's version merges.
+        let b_path = unique_worktree_path(&repo, "int-b");
+        let b = create_worker_worktree(&repo, "int-b", &b_path).expect("worktree b");
+        std::fs::write(b.path.join("shared.txt"), "from-b\n").expect("write b");
+
+        // Worker C: reports no files — a no-op worker that must not commit or merge.
+        let c_path = unique_worktree_path(&repo, "int-c");
+        let c = create_worker_worktree(&repo, "int-c", &c_path).expect("worktree c");
+
+        // Integration worktree. Seed a conflicting edit on shared.txt so B collides.
+        let int_path = unique_worktree_path(&repo, "int-target");
+        let integration =
+            create_worker_worktree(&repo, "int-target", &int_path).expect("integration worktree");
+        std::fs::write(integration.path.join("shared.txt"), "from-integration\n")
+            .expect("write integration");
+        assert!(commit_worker_changes(
+            &integration,
+            &[integration.path.join("shared.txt")],
+            "integration base",
+        )
+        .expect("commit integration base"));
+
+        let workers = vec![
+            WorkerHarvest {
+                checkout: a.clone(),
+                files_touched: vec![a.path.join("a.txt"), a.path.join("Cargo.toml")],
+            },
+            WorkerHarvest {
+                checkout: b.clone(),
+                files_touched: vec![b.path.join("shared.txt")],
+            },
+            WorkerHarvest {
+                checkout: c.clone(),
+                files_touched: vec![],
+            },
+        ];
+
+        let results = integrate_worker_branches(&integration.path, &workers, "merge worker")
+            .expect("integration loop should not error on a content conflict");
+        assert_eq!(results.len(), 3);
+
+        // A: clean merge + G5 manifest flag.
+        assert_eq!(results[0].branch, "wip/int-a");
+        assert!(results[0].committed);
+        assert!(results[0].merge.as_ref().expect("a merged").clean);
+        assert_eq!(
+            results[0].dependency_manifests,
+            vec![a.path.join("Cargo.toml")]
+        );
+
+        // B: conflict surfaced as the resolver's work queue, wave not aborted.
+        assert_eq!(results[1].branch, "wip/int-b");
+        assert!(results[1].committed);
+        let b_merge = results[1].merge.as_ref().expect("b merge attempted");
+        assert!(!b_merge.clean);
+        assert_eq!(b_merge.conflicted_files, vec!["shared.txt".to_owned()]);
+        assert!(results[1].dependency_manifests.is_empty());
+
+        // C: no files → no commit, no merge.
+        assert_eq!(results[2].branch, "wip/int-c");
+        assert!(!results[2].committed);
+        assert!(results[2].merge.is_none());
+
+        // The aborted conflict left the integration tree clean (A's merge intact).
+        let merge_in_progress = Command::new("git")
+            .arg("-C")
+            .arg(&integration.path)
+            .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .output()
+            .expect("rev-parse MERGE_HEAD")
+            .status
+            .success();
+        assert!(!merge_in_progress, "conflict should have been aborted");
+
+        for wt in [&a, &b, &c, &integration] {
             let _ = remove_worker_worktree(&repo, wt, false);
         }
         let _ = std::fs::remove_dir_all(&repo);

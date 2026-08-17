@@ -126,12 +126,37 @@ The isolation + merge-back primitives that realize Design Option 1 (per-worker
 worktree/branch, host-side commit, 3-way merge with conflict surfacing, and the
 G5 dependency-manifest flag) are implemented and unit-tested in `src/git.rs`
 (`create_worker_worktree`, `commit_worker_changes`, `merge_worker_branch`,
-`remove_worker_worktree`, `dependency_manifest_changes`). The remaining slice is
-to call them from `VardaSubtaskLauncher` (mount a per-worker worktree instead of
-the shared workspace) and from the resident control loop (commit each worker's
-`files_touched` onto its `wip/<slug>` branch, then run review → merge → resolve →
-gate per branch). Isolation and merge-back must land together: isolated
-worktrees without the merge-back step would strand worker changes.
+`remove_worker_worktree`, `dependency_manifest_changes`). They were
+cross-reviewed and hardened (tasks #585 → fix #587 → re-review #588): optional
+branch deletion on cleanup, and a merge-abort path that distinguishes a content
+conflict (resolver queue) from a non-conflict merge failure (hard error) and
+never leaves a half-merged tree.
+
+On top of those primitives, `integrate_worker_branches` runs the step-5
+merge-back loop host-side over a wave of harvested workers: for each it commits
+`files_touched` onto the worker's `wip/<slug>` branch and merges that branch onto
+the integration worktree, returning a per-worker `WorkerIntegration` (commit /
+merge outcome / G5 manifest flag). A content conflict is recorded and aborted so
+later workers in the wave still integrate; a no-op worker neither commits nor
+merges; a non-conflict merge failure propagates as an error. It never resolves,
+never pushes (G2/G3), and never trusts the recap text — only the structured
+`checkout` + `files_touched` cross into it (G4).
+
+The remaining slice is the LIVE wiring:
+- `VardaSubtaskLauncher` must create a per-worker worktree with
+  `create_worker_worktree` and mount THAT into the worker's box instead of the
+  shared workspace. BLOCKER: route matching and the workspace mount are keyed on
+  the subtask's `project` path (`match_route_for_task` → route glob →
+  `route_mounts`), so a worktree at an out-of-tree host path won't match the
+  project's route. Wiring this needs route resolution to key on the mother repo
+  root (or a `route`-override carrying the mother path) while the mount points at
+  the worktree — that is the load-bearing design decision, not the git plumbing.
+- the resident control loop must harvest each worker's `files_touched` and call
+  `integrate_worker_branches`, then route conflicts to a resolver and run the
+  post-merge gate.
+Isolation and merge-back must land together: isolated worktrees without the
+merge-back step would strand worker changes, so the live path still uses the
+shared workspace until both halves ship in one change.
 
 Trust framing: the resident consumes worker output as untrusted data, never as
 instructions. Work involving untrusted content such as web results or
