@@ -476,9 +476,10 @@ pub struct Route {
 /// clawk/microsandbox-equivalent.
 ///
 /// `Strict` is the conservative DEFAULT: a non-empty allow-list is honored only when
-/// the provider can actually firewall egress at the IP level (microsandbox/clawk).
-/// The docker provider, which cannot enforce that portably, REFUSES a non-empty
-/// strict allow-list at build time rather than silently downgrading to DNS-pin.
+/// the provider can actually firewall egress. microsandbox/clawk firewall at the IP
+/// level in-guest; the docker provider routes a non-empty strict allow-list through
+/// the allow-listing forward-proxy sidecar (see [`EgressMode::Proxy`]) so it is
+/// enforced rather than refused — never a silent downgrade to DNS-pin.
 /// `DnsPin` is an explicit opt-in acknowledging the name-only, direct-IP-bypassable
 /// guarantee. An EMPTY `egress` is fully offline (`--network none`) and is strict in
 /// every mode.

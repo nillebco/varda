@@ -1284,11 +1284,13 @@ fn egress_proxy_container(handle: &str) -> String {
 /// Build the tinyproxy config that default-denies and allow-lists exactly `hosts`.
 /// `FilterDefaultDeny Yes` + a per-host anchored regex means a non-allow-listed
 /// CONNECT/GET is refused at the proxy — real enforcement, not just DNS breakage.
-/// A leading-dot alternative (`(^|\.)host$`) also admits subdomains of a listed host.
+/// The regex is exact-host only (`^host$`): declaring `api.anthropic.com` allows
+/// ONLY that host, never a subdomain (`evil.api.anthropic.com`) or a suffix-match
+/// impostor (`api.anthropic.com.evil.com`).
 fn tinyproxy_filter(hosts: &[String]) -> String {
     hosts
         .iter()
-        .map(|h| format!("(^|\\.){}$", h.replace('.', "\\.")))
+        .map(|h| format!("^{}$", h.replace('.', "\\.")))
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
@@ -6084,5 +6086,41 @@ mod tests {
         let out = harden_varda_mount(&ok, &root, false, Path::new("/x/.varda")).unwrap();
         assert!(!out.writable);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tinyproxy_filter_is_exact_host_only() {
+        let filter = tinyproxy_filter(&["api.anthropic.com".to_owned()]);
+        // Each declared host becomes an exact-anchored ERE line: `.` is escaped to a
+        // literal dot and the pattern is anchored at BOTH ends (`^…$`) so tinyproxy's
+        // extended-regex filter admits ONLY the literal host — never a subdomain or a
+        // suffix-match impostor. A leading-dot alternative (`(^|\.)host$`) would admit
+        // subdomains; anchoring at `^` forbids that.
+        assert_eq!(filter, "^api\\.anthropic\\.com$\n");
+
+        // Emulate the full-string ERE match tinyproxy performs for our exact-anchored
+        // patterns: an `^…$` pattern with every `.` escaped matches iff the candidate
+        // equals the literal host (unescape `\.`, drop the `^`/`$`, compare whole string).
+        let ere_full_match = |pattern: &str, candidate: &str| -> bool {
+            let literal = pattern
+                .trim_start_matches('^')
+                .trim_end_matches('$')
+                .replace("\\.", ".");
+            candidate == literal
+        };
+        let pattern = filter.trim_end();
+
+        // The exact declared host is allowed.
+        assert!(ere_full_match(pattern, "api.anthropic.com"));
+        // A subdomain of a declared host is NOT allowed.
+        assert!(!ere_full_match(pattern, "evil.api.anthropic.com"));
+        // A suffix-match impostor is NOT allowed.
+        assert!(!ere_full_match(pattern, "api.anthropic.com.evil.com"));
+        // An unrelated host is NOT allowed.
+        assert!(!ere_full_match(pattern, "example.com"));
+
+        // Multiple declared hosts produce one exact-anchored line each.
+        let multi = tinyproxy_filter(&["a.example.com".to_owned(), "b.example.com".to_owned()]);
+        assert_eq!(multi, "^a\\.example\\.com$\n^b\\.example\\.com$\n");
     }
 }
