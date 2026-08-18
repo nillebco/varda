@@ -1,4 +1,10 @@
 #!/bin/sh
 # Interactive shell inside a microsandbox microVM over the current directory.
 # Forces the `msbshell` sandbox regardless of route, and the `shell` agent.
-exec varda task add "msb shell" --agent shell --sandbox msbshell --exec --interactive "$@"
+#
+# Optional first arg = task NAME (distinct name => distinct, resumable task file):
+#   vmsbsh                 # default name "msb shell"
+#   vmsbsh "poke at build" # named session
+# --reuse resumes a same-named existing task (fresh) instead of colliding.
+TASK_NAME="${1:-msb shell}"
+exec varda task add "$TASK_NAME" --agent shell --sandbox msbshell --exec --interactive --reuse

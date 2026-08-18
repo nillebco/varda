@@ -397,6 +397,17 @@ fn write_definition(store: &Path, slug: &str, task: &TaskDocument) -> Result<Pat
     Ok(path)
 }
 
+/// Compute the home-store STATE file path for a `(project, taskname)` pair WITHOUT
+/// creating anything. Uses the same folder + name slugging as [`create_task`], so an
+/// existence check here matches exactly what `create_task` would refuse to overwrite.
+/// Used by `task add --reuse` to decide resume-vs-create.
+pub fn task_file_path(config: &Config, project_path: &Path, taskname: &str) -> Result<PathBuf> {
+    let task_root = Path::new(&config.defaults.operations_dir).join("tasks");
+    let task_dir = task_root.join(project_task_folder(project_path)?);
+    let slug = slugify_task_name(taskname)?;
+    Ok(task_dir.join(format!("{slug}.md")))
+}
+
 pub fn create_task(
     config: &Config,
     taskname: &str,

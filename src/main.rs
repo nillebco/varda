@@ -135,6 +135,12 @@ enum TaskCommand {
         /// Set the task status to ready after creation (skips backlog).
         #[arg(long)]
         ready: bool,
+        /// Resume-or-create: if a task with this name already exists for the project,
+        /// resume it (fresh session) instead of erroring. Only acts with `--exec`;
+        /// intended for the interactive shell aliases (vadc/vtgg/…) so repeated
+        /// launches reuse one task per (project, name) rather than colliding.
+        #[arg(long)]
+        reuse: bool,
     },
     /// List markdown tasks for a project.
     List {
@@ -348,6 +354,7 @@ async fn main() -> Result<()> {
                 interactive,
                 quiet,
                 ready,
+                reuse,
             } => {
                 use std::io::IsTerminal as _;
                 let (taskname, description) = if let Some(file_path) = file {
@@ -390,6 +397,21 @@ async fn main() -> Result<()> {
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
+                // --reuse (with --exec): if this (project, name) task already exists,
+                // resume it with a fresh interactive session instead of erroring on the
+                // collision. Lets the shell aliases be launched repeatedly without a
+                // stuck fixed-name task blocking the next run. Skips creation entirely;
+                // the existing task keeps its stored assignee/sandbox.
+                if reuse && exec {
+                    let existing = task::task_file_path(&config, &project_path, &taskname)?;
+                    if existing.exists() {
+                        println!(
+                            "task {} already exists — resuming (fresh, interactive)",
+                            existing.display()
+                        );
+                        return resume_task_command(&existing, true, interactive).await;
+                    }
+                }
                 // Validate the pinned sandbox up front so `--sandbox typo` fails at
                 // creation time rather than only at run time. `local` is always valid.
                 if let Some(name) = sandbox.as_deref() {
