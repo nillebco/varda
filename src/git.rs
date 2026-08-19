@@ -192,6 +192,85 @@ pub fn commit_task_files(task_paths: &[&Path], message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stage and commit the removal of task files that have ALREADY been deleted from
+/// disk. Unlike [`commit_task_files`], this never canonicalizes the (now-missing)
+/// paths — it derives each repo-relative path from its still-present parent
+/// directory, then `git add`s it so the deletion is recorded in the index.
+pub fn commit_task_deletions(deleted_paths: &[&Path], message: &str) -> Result<()> {
+    if deleted_paths.is_empty() {
+        return Ok(());
+    }
+    let repo = repo_root_for_path(deleted_paths[0])?;
+    let absolute_repo = repo
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", repo.display()))?;
+
+    let rel_paths: Vec<String> = deleted_paths
+        .iter()
+        .map(|p| deleted_repo_relative_path(&absolute_repo, p))
+        .collect::<Result<_>>()?;
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .arg("add")
+        .args(&rel_paths)
+        .output()
+        .context("failed to stage deleted task files")?;
+
+    if !output.status.success() {
+        bail!(
+            "git add failed; stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    if !has_staged_changes(&repo)? {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["commit", "-m", message])
+        .output()
+        .context("failed to commit deleted task files")?;
+
+    if !output.status.success() {
+        bail!(
+            "git commit failed; stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+/// Repo-relative path for a file that may no longer exist: canonicalize the
+/// (still-present) parent directory and re-attach the file name, so a deleted
+/// file still maps into the repo without `canonicalize` failing on the missing
+/// leaf.
+fn deleted_repo_relative_path(absolute_repo: &Path, path: &Path) -> Result<String> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("path {} has no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("path {} has no file name", path.display()))?;
+    let absolute_parent = parent
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", parent.display()))?;
+    let absolute_path = absolute_parent.join(file_name);
+    let relative = absolute_path.strip_prefix(absolute_repo).with_context(|| {
+        format!(
+            "{} is not inside git repository {}",
+            absolute_path.display(),
+            absolute_repo.display()
+        )
+    })?;
+    Ok(relative.to_string_lossy().into_owned())
+}
+
 /// An isolated per-worker checkout: a dedicated git worktree with its own
 /// `wip/<slug>` branch, checked out at [`WorkerCheckout::path`]. This is the
 /// isolation primitive behind the orchestrate resident's fan-out (task #578):

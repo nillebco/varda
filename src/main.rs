@@ -235,6 +235,17 @@ enum TaskCommand {
         /// Markdown task file or task id to resolve.
         task: PathBuf,
     },
+    /// Delete a task's runtime state file (and its recaps) from the home store.
+    Delete {
+        /// Markdown task file or task id to delete.
+        task: PathBuf,
+        /// Delete without prompting for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Keep the task's recap files instead of removing them alongside the task.
+        #[arg(long)]
+        keep_recaps: bool,
+    },
     /// Update task properties for a single task or in bulk.
     Update {
         /// Task file or task id to update. Omit to use filter flags for bulk selection.
@@ -548,6 +559,13 @@ async fn main() -> Result<()> {
                 let config = config::load_config(&config_path)?;
                 let resolved = task::resolve_task_reference(&config, &task)?;
                 println!("{}", resolved.display());
+            }
+            TaskCommand::Delete {
+                task,
+                yes,
+                keep_recaps,
+            } => {
+                delete_task_command(&task, yes, keep_recaps)?;
             }
             TaskCommand::Update {
                 task,
@@ -3867,6 +3885,62 @@ fn update_tasks_command(
     if config.git.auto_commit {
         let paths_ref: Vec<&Path> = task_paths.iter().map(|p| p.as_path()).collect();
         git::commit_task_files(&paths_ref, "Update tasks")?;
+        println!("committed changes");
+    }
+
+    Ok(())
+}
+
+fn delete_task_command(task_ref: &Path, yes: bool, keep_recaps: bool) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let task_path = task::resolve_task_reference(&config, task_ref)?;
+    let doc = task::load_task(&task_path)?;
+
+    // Collect the recap artifacts that belong to this task so they don't linger
+    // in the home store after the task record is gone.
+    let recap_paths: Vec<PathBuf> = if keep_recaps {
+        Vec::new()
+    } else {
+        doc.frontmatter
+            .recaps
+            .iter()
+            .map(|recap| resolve_recap_path(recap, &task_path))
+            .filter(|path| path.exists())
+            .collect()
+    };
+
+    if !yes {
+        println!("will delete task {}:", task_path.display());
+        println!("  title  → {}", doc.title());
+        println!("  status → {}", doc.frontmatter.status.as_str());
+        for recap in &recap_paths {
+            println!("  recap  → {}", recap.display());
+        }
+        if !prompt_yes_no("Proceed?", false)? {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
+    let mut removed: Vec<PathBuf> = Vec::new();
+    for recap in &recap_paths {
+        fs::remove_file(recap)
+            .with_context(|| format!("failed to remove recap {}", recap.display()))?;
+        removed.push(recap.clone());
+    }
+    fs::remove_file(&task_path)
+        .with_context(|| format!("failed to remove task {}", task_path.display()))?;
+    removed.push(task_path.clone());
+
+    println!("deleted task {}", task_path.display());
+    if !recap_paths.is_empty() {
+        println!("removed {} recap file(s)", recap_paths.len());
+    }
+
+    if config.git.auto_commit {
+        let paths_ref: Vec<&Path> = removed.iter().map(|p| p.as_path()).collect();
+        git::commit_task_deletions(&paths_ref, "Delete task")?;
         println!("committed changes");
     }
 
