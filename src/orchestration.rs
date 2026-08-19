@@ -417,6 +417,11 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 
 /// Name of the single spawn tool exposed into the sandbox. Nothing else crosses.
 pub const SPAWN_SUBTASK_TOOL: &str = "spawn_subtask";
+/// Run an EXISTING task (by id) instead of minting a fresh one from a brief. Same
+/// host-mediation and policy gate as [`SPAWN_SUBTASK_TOOL`]; avoids the duplicate
+/// task doc a master would otherwise create by re-describing a task it already
+/// planned. See [`SpawnBroker::run_subtask`].
+pub const RUN_SUBTASK_TOOL: &str = "run_subtask";
 /// Collect-side read-back tools (result plumbing). A master spawns with
 /// [`SPAWN_SUBTASK_TOOL`], then blocks on one of these to harvest the child's
 /// terminal status and recap once the host STATE store records them.
@@ -503,6 +508,22 @@ impl SubtaskResults for NoSubtaskResults {
 /// the caller's sandbox (invariant 3). Returns the new subtask id.
 pub trait SubtaskLauncher {
     fn launch(&mut self, req: &SpawnRequest, grant: &SpawnGrant) -> anyhow::Result<SubtaskId>;
+
+    /// Run an EXISTING task (identified by `task_id`) in its own sibling sandbox —
+    /// the `run_subtask` path. Unlike [`launch`](Self::launch), no task doc is
+    /// created; the host resolves the id to its existing task, RE-VALIDATES that
+    /// task's own placement (route/agent/sandbox) through normal route resolution
+    /// exactly as `launch` does (the id is caller-supplied and never trusted), and
+    /// normalizes its status so any prior state is runnable without a separate
+    /// "prepare the task" tool. Implementations MUST refuse to re-run a task that
+    /// is already executing in-process (a live [`JoinHandle`]) so a second run can
+    /// never orphan the first. `grant` carries the authorized child depth so
+    /// lineage is recorded identically to a fresh spawn. Returns the task id.
+    fn run_existing(
+        &mut self,
+        task_id: &str,
+        grant: &SpawnGrant,
+    ) -> anyhow::Result<SubtaskId>;
 }
 
 /// Why a `spawn_subtask` call failed, distinguishing a policy denial (a hard
@@ -573,6 +594,20 @@ impl SharedSpawnState {
         std::mem::take(&mut self.0.lock().expect("spawn state mutex poisoned").handles)
             .into_iter()
             .collect()
+    }
+
+    /// Whether a LIVE (not-yet-finished) detached run exists for `id` in this root
+    /// run. The `run_subtask` path consults this to refuse re-running a task that
+    /// is currently executing in-process, which would clobber its [`JoinHandle`]
+    /// and orphan the running child. A finished-but-undrained handle is NOT live:
+    /// a completed or crashed prior run may be safely re-run.
+    pub fn has_live_handle(&self, id: &str) -> bool {
+        self.0
+            .lock()
+            .expect("spawn state mutex poisoned")
+            .handles
+            .get(id)
+            .is_some_and(|handle| !handle.is_finished())
     }
 
     #[cfg(test)]
@@ -687,7 +722,61 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
         parent_id: &str,
         req: SpawnRequest,
     ) -> Result<SubtaskId, BrokerError> {
-        let (ctx, grant) = {
+        self.gated_launch(parent_id, &req, |grant| {
+            self.launcher
+                .lock()
+                .expect("subtask launcher mutex poisoned")
+                .launch(&req, grant)
+        })
+    }
+
+    /// Handle one `run_subtask` request from `parent_id`: run an EXISTING task
+    /// (chosen by `task_id`) in its own sibling sandbox, instead of minting a fresh
+    /// task from a brief. This is the anti-duplication path — a master that already
+    /// planned a task runs it directly rather than re-describing it into a second
+    /// doc. It goes through the IDENTICAL structural gate as [`spawn_subtask`]
+    /// (lineage + depth/fan-out/budget) via [`gated_launch`], so the two paths can
+    /// never drift on policy. The launcher re-validates the existing task's own
+    /// route/agent/sandbox (the definitive placement enforcement) and normalizes
+    /// its status, so any prior state is runnable with no separate "prepare" tool.
+    pub fn run_subtask(
+        &self,
+        parent_id: &str,
+        task_id: &str,
+    ) -> Result<SubtaskId, BrokerError> {
+        // The structural gate needs no requested placement: the launcher re-resolves
+        // and re-validates the existing task's own route/agent/sandbox (exactly as
+        // the spawn path relies on route resolution for definitive enforcement).
+        // Depth, fan-out and budget are all the ledger reads from the request here.
+        let req = SpawnRequest {
+            brief: String::new(),
+            route: None,
+            agent: None,
+            sandbox: None,
+            approved: false,
+        };
+        self.gated_launch(parent_id, &req, |grant| {
+            self.launcher
+                .lock()
+                .expect("subtask launcher mutex poisoned")
+                .run_existing(task_id, grant)
+        })
+    }
+
+    /// Shared gate for BOTH spawn paths (`spawn_subtask` / `run_subtask`): resolve
+    /// the caller's depth (lineage guard — the caller never supplies its own
+    /// depth), run the SAME [`SpawnLedger::authorize_and_record`] structural gate,
+    /// then invoke `launch` to actually start the child. On a launch failure the
+    /// ledger reservation is rolled back so a failed attempt never permanently
+    /// consumes fan-out / global budget. Keeping ONE gate is why the fresh-brief
+    /// and existing-task paths can never diverge on policy.
+    fn gated_launch(
+        &self,
+        parent_id: &str,
+        req: &SpawnRequest,
+        launch: impl FnOnce(&SpawnGrant) -> anyhow::Result<SubtaskId>,
+    ) -> Result<SubtaskId, BrokerError> {
+        let grant = {
             let mut state = self.state.0.lock().expect("spawn state mutex poisoned");
             let parent_depth = state
                 .depths
@@ -698,19 +787,13 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                 parent_id: parent_id.to_owned(),
                 parent_depth,
             };
-            let grant = state
+            state
                 .ledger
-                .authorize_and_record(&self.policy, &ctx, &req)
-                .map_err(BrokerError::Denied)?;
-            (ctx, grant)
+                .authorize_and_record(&self.policy, &ctx, req)
+                .map_err(BrokerError::Denied)?
         };
 
-        let launch = self
-            .launcher
-            .lock()
-            .expect("subtask launcher mutex poisoned")
-            .launch(&req, &grant);
-        match launch {
+        match launch(&grant) {
             Ok(child_id) => {
                 self.state
                     .0
@@ -728,7 +811,7 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                     .lock()
                     .expect("spawn state mutex poisoned")
                     .ledger
-                    .unrecord(&ctx.parent_id);
+                    .unrecord(parent_id);
                 Err(BrokerError::Launch(e.to_string()))
             }
         }
@@ -826,6 +909,17 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                         }
                     }
                 },
+                {
+                    "name": RUN_SUBTASK_TOOL,
+                    "description": "Request the host to run an EXISTING task (by id) in its own sibling sandbox, instead of creating a new one from a brief. Use this to run a task you already planned rather than re-describing it (which would duplicate it). Host-mediated and policy-gated identically to spawn_subtask; the task's own route/agent/sandbox are re-validated and its status is reset so any prior state is runnable. Returns the task id or a denial reason.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["task_id"],
+                        "properties": {
+                            "task_id": {"type": "string", "description": "Id of an existing task to run, regardless of its current status."}
+                        }
+                    }
+                },
                 {"name": AWAIT_SUBTASK_TOOL, "description": "Block until a spawned sub-task reaches a terminal status; returns {subtask_id, status}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
                 {"name": AWAIT_SUBTASKS_TOOL, "description": "Block until ALL listed sub-tasks reach a terminal status; returns [{subtask_id, status}]. The wave primitive.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}},
                 {"name": SUBTASK_RESULT_TOOL, "description": "Fetch a finished sub-task's result: {status, files_touched, blocked_commands, recap}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}}
@@ -876,6 +970,17 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                     approved: false,
                 };
                 match self.spawn_subtask(parent_id, req) {
+                    Ok(child_id) => {
+                        rpc_result(id, tool_text(&format!("subtask_id: {child_id}"), false))
+                    }
+                    Err(e) => rpc_result(id, tool_text(&e.to_string(), true)),
+                }
+            }
+            RUN_SUBTASK_TOOL => {
+                let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+                    return rpc_error(id, -32602, "run_subtask requires a `task_id`");
+                };
+                match self.run_subtask(parent_id, task_id) {
                     Ok(child_id) => {
                         rpc_result(id, tool_text(&format!("subtask_id: {child_id}"), false))
                     }
@@ -1368,6 +1473,8 @@ deny_sandboxes = ["local"]
         prefix: String,
         next: u32,
         launched: Vec<(SpawnRequest, u32)>,
+        /// Existing-task runs the broker asked for: (task_id, granted depth).
+        ran: Vec<(String, u32)>,
         fail: bool,
     }
     impl MockLauncher {
@@ -1379,6 +1486,7 @@ deny_sandboxes = ["local"]
                 prefix: prefix.to_owned(),
                 next: 0,
                 launched: Vec::new(),
+                ran: Vec::new(),
                 fail: false,
             }
         }
@@ -1387,6 +1495,7 @@ deny_sandboxes = ["local"]
                 prefix: "sub".to_owned(),
                 next: 0,
                 launched: Vec::new(),
+                ran: Vec::new(),
                 fail: true,
             }
         }
@@ -1399,6 +1508,19 @@ deny_sandboxes = ["local"]
             self.launched.push((req.clone(), grant.child_depth));
             self.next += 1;
             Ok(format!("{}-{}", self.prefix, self.next))
+        }
+
+        fn run_existing(
+            &mut self,
+            task_id: &str,
+            grant: &SpawnGrant,
+        ) -> anyhow::Result<SubtaskId> {
+            if self.fail {
+                anyhow::bail!("simulated host launch failure");
+            }
+            // The run path returns the EXISTING task's own id (no new doc minted).
+            self.ran.push((task_id.to_owned(), grant.child_depth));
+            Ok(task_id.to_owned())
         }
     }
 
@@ -1575,6 +1697,7 @@ deny_sandboxes = ["local"]
             names,
             vec![
                 SPAWN_SUBTASK_TOOL,
+                RUN_SUBTASK_TOOL,
                 AWAIT_SUBTASK_TOOL,
                 AWAIT_SUBTASKS_TOOL,
                 SUBTASK_RESULT_TOOL
@@ -1636,6 +1759,86 @@ deny_sandboxes = ["local"]
             text.contains("must run in an isolating sibling box"),
             "got {text}"
         );
+    }
+
+    // --- run_subtask (run an existing task, not a fresh brief) -------------
+
+    #[test]
+    fn run_subtask_returns_the_existing_task_id_and_records_lineage() {
+        // The run path reuses the EXISTING id (no new doc), and the broker registers
+        // that id at the granted depth exactly like a spawn.
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
+        let id = broker
+            .run_subtask("root", "task-42")
+            .expect("should run the existing task");
+        assert_eq!(id, "task-42");
+        assert_eq!(broker.depth_of("task-42"), Some(1));
+        assert_eq!(broker.global_spawned(), 1);
+    }
+
+    #[test]
+    fn run_subtask_shares_the_same_budget_gate_as_spawn() {
+        // budget = 3: two spawns + one run exhaust it, the 4th (a run) is denied —
+        // proof the two paths draw from ONE ledger, not separate gates.
+        let mut policy = base_policy();
+        policy.max_fanout = 10; // don't let fan-out trip first
+        let broker = SpawnBroker::new(policy, "root", MockLauncher::new());
+        broker.spawn_subtask("root", req()).unwrap();
+        broker.spawn_subtask("root", req()).unwrap();
+        broker.run_subtask("root", "task-7").unwrap();
+        match broker.run_subtask("root", "task-8") {
+            Err(BrokerError::Denied(SpawnDenied::BudgetExceeded { spent: 3, budget: 3 })) => {}
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+        assert_eq!(broker.global_spawned(), 3);
+    }
+
+    #[test]
+    fn run_subtask_from_unknown_parent_is_refused() {
+        // Same lineage guard as spawn: a caller not registered through the broker
+        // cannot run anything (its depth is unknown, so the recursion cap can't hold).
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
+        match broker.run_subtask("ghost", "task-1") {
+            Err(BrokerError::UnknownParent(id)) => assert_eq!(id, "ghost"),
+            other => panic!("expected UnknownParent, got {other:?}"),
+        }
+        assert_eq!(broker.global_spawned(), 0);
+    }
+
+    #[test]
+    fn run_subtask_launch_failure_rolls_back_the_budget() {
+        // A host-side run failure must not permanently consume budget (unrecord),
+        // exactly like a failed spawn.
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::failing());
+        match broker.run_subtask("root", "task-1") {
+            Err(BrokerError::Launch(_)) => {}
+            other => panic!("expected Launch error, got {other:?}"),
+        }
+        assert_eq!(broker.global_spawned(), 0);
+    }
+
+    #[test]
+    fn rpc_run_call_returns_the_existing_task_id_on_success() {
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
+        let resp = broker.handle_rpc(
+            "root",
+            &json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                    "params": {"name": RUN_SUBTASK_TOOL, "arguments": {"task_id": "task-99"}}}),
+        );
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("subtask_id: task-99"), "got {text}");
+    }
+
+    #[test]
+    fn rpc_run_call_without_task_id_is_a_param_error() {
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new());
+        let resp = broker.handle_rpc(
+            "root",
+            &json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                    "params": {"name": RUN_SUBTASK_TOOL, "arguments": {}}}),
+        );
+        assert_eq!(resp["error"]["code"], json!(-32602));
     }
 
     // --- Collect channel (461a) --------------------------------------------

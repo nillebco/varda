@@ -4917,6 +4917,13 @@ mod tests {
             ) -> anyhow::Result<crate::orchestration::SubtaskId> {
                 Ok("child-1".to_owned())
             }
+            fn run_existing(
+                &mut self,
+                task_id: &str,
+                _grant: &crate::orchestration::SpawnGrant,
+            ) -> anyhow::Result<crate::orchestration::SubtaskId> {
+                Ok(task_id.to_owned())
+            }
         }
         let policy = crate::orchestration::OrchestrationPolicy {
             enabled: true,

@@ -174,6 +174,13 @@ mod tests {
         ) -> anyhow::Result<SubtaskId> {
             Ok("child-1".to_owned())
         }
+        fn run_existing(
+            &mut self,
+            task_id: &str,
+            _grant: &SpawnGrant,
+        ) -> anyhow::Result<SubtaskId> {
+            Ok(task_id.to_owned())
+        }
     }
 
     #[tokio::test]

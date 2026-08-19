@@ -1366,6 +1366,87 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
 
         Ok(subtask_id)
     }
+
+    fn run_existing(
+        &mut self,
+        task_id: &str,
+        grant: &orchestration::SpawnGrant,
+    ) -> anyhow::Result<orchestration::SubtaskId> {
+        let handle = tokio::runtime::Handle::try_current()
+            .context("run_subtask launch requires a Tokio runtime")?;
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+            anyhow::bail!("detached run_subtask launch requires Tokio's multi-thread runtime");
+        }
+
+        // Resolve the caller-supplied id to an EXISTING task's STATE file. A numeric
+        // id maps through the home store; anything that resolves to no task is a
+        // spoofed / out-of-scope id and fails LOUDLY here (never trusted).
+        let task_path = task::resolve_task_reference(&self.config, Path::new(task_id))
+            .with_context(|| format!("cannot run subtask: no task resolves to id '{task_id}'"))?;
+        let mut task_doc = task::load_task(&task_path)?;
+
+        // Preflight route resolution BEFORE running, exactly like `launch`: this
+        // re-validates the EXISTING task's own agent/sandbox against the route's
+        // `agents` allowlist and isolating-sandbox requirement, so an unrunnable
+        // placement surfaces as an error the master can react to instead of a
+        // subtask wedged at `ready`. The id is caller-supplied — its stored
+        // frontmatter is never trusted without this re-validation.
+        routing::match_route_for_task(&self.config, &task_doc, false).with_context(|| {
+            format!(
+                "cannot run subtask '{task_id}': its agent/sandbox is not runnable. \
+                 Fix the task's route/agent, or run a permitted task."
+            )
+        })?;
+
+        let subtask_id = task_doc
+            .frontmatter
+            .id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| task_path.display().to_string());
+
+        // Runtime collision guard: refuse to re-run a task that is CURRENTLY
+        // executing in this process — a second run would clobber its `JoinHandle`
+        // and orphan the live child. A finished/leftover handle (or a task merely
+        // marked `running` in frontmatter by a crashed prior run) is NOT live and
+        // may be re-run. Frontmatter status is otherwise irrelevant: it is
+        // normalized to `Ready` below, so the caller never needs a separate
+        // "prepare the task" tool — any state is runnable.
+        if self.spawn_state.has_live_handle(&subtask_id) {
+            anyhow::bail!(
+                "task '{subtask_id}' is already running in this session; refusing to double-run it"
+            );
+        }
+
+        task_doc.set_status(task::TaskStatus::Ready);
+        task::write_task(&task_doc)?;
+
+        let lineage = SpawnLineage {
+            root_id: subtask_id.clone(),
+            root_depth: grant.child_depth,
+            state: self.spawn_state.clone(),
+        };
+        let config = self.config.clone();
+        let path = task_path.clone();
+        let child_id = subtask_id.clone();
+        let child_handle = tokio::spawn(async move {
+            if let Err(error) = run_task_path_for_parallel(config, path.clone(), Some(lineage)).await
+            {
+                eprintln!("warning: run subtask {child_id} failed: {error:#}");
+                // Force a TERMINAL status so an awaiting master observes completion
+                // instead of hanging on a subtask stuck at `ready`/`running`.
+                if let Ok(mut doc) = task::load_task(&path) {
+                    if !matches!(doc.frontmatter.status, task::TaskStatus::Done) {
+                        doc.set_status(task::TaskStatus::Failed);
+                        let _ = task::write_task(&doc);
+                    }
+                }
+            }
+        });
+        self.spawn_state
+            .insert_handle(subtask_id.clone(), child_handle);
+
+        Ok(subtask_id)
+    }
 }
 
 async fn join_spawned_subtasks(spawn_state: &orchestration::SharedSpawnState) {
