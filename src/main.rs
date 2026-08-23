@@ -1356,6 +1356,21 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
         let orch_policy = self.config.resolve_orchestration_for(&project);
         let spawn_sandbox =
             orchestration::spawn_sandbox_override(req.sandbox.as_deref(), &orch_policy);
+
+        // `authorize_and_record` (in `gated_launch`) only re-checks `allow_agents`/
+        // `deny_agents`/`allow_sandboxes`/`deny_sandboxes` when the caller passed
+        // `req.agent`/`req.sandbox` explicitly. `assignee`/`spawn_sandbox` above may
+        // instead be a FALLBACK (`self.fallback_agent`, `default_worker_sandbox`)
+        // that policy never saw — re-run the same allow/deny check against the
+        // EFFECTIVE values so a fallback can never silently bypass `deny_sandboxes`
+        // (which defaults to denying `local`) or `deny_agents`.
+        orchestration::check_effective_placement(
+            &orch_policy,
+            assignee,
+            spawn_sandbox.as_deref(),
+        )
+        .map_err(|denied| anyhow::anyhow!("cannot spawn subtask: {denied}"))?;
+
         if let Some(sandbox) = &spawn_sandbox
             && !self.config.sandboxes.contains_key(sandbox)
         {
@@ -1460,7 +1475,7 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
                 // Force a TERMINAL status so an awaiting master observes completion
                 // instead of hanging on a subtask stuck at `ready`/`running`.
                 if let Ok(mut doc) = task::load_task(&path) {
-                    if !matches!(doc.frontmatter.status, task::TaskStatus::Done) {
+                    if !doc.frontmatter.status.is_terminal() {
                         doc.set_status(task::TaskStatus::Failed);
                         let _ = task::write_task(&doc);
                     }
@@ -1541,7 +1556,7 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
                 // Force a TERMINAL status so an awaiting master observes completion
                 // instead of hanging on a subtask stuck at `ready`/`running`.
                 if let Ok(mut doc) = task::load_task(&path) {
-                    if !matches!(doc.frontmatter.status, task::TaskStatus::Done) {
+                    if !doc.frontmatter.status.is_terminal() {
                         doc.set_status(task::TaskStatus::Failed);
                         let _ = task::write_task(&doc);
                     }

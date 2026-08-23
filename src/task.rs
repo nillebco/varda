@@ -191,6 +191,20 @@ impl TaskStatus {
             Self::Done => "done",
         }
     }
+
+    /// Whether this status is one a task run has actually SETTLED on:
+    /// `Done`/`Failed`/`NeedsUser`/`Review`. `Backlog`/`Ready`/`Running` mean
+    /// "still in flight" and may still legitimately change. Callers that force
+    /// a status on background failure (e.g. `VardaSubtaskLauncher::launch`)
+    /// must check this rather than special-casing `Done` alone, or a task that
+    /// already reached e.g. `NeedsUser`/`Review` gets clobbered back to
+    /// `Failed`, losing the real outcome.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Done | Self::Failed | Self::NeedsUser | Self::Review
+        )
+    }
 }
 
 impl std::str::FromStr for TaskStatus {
@@ -1772,6 +1786,17 @@ requires_user: false
         // …and a legacy `pending` value still deserializes via the serde alias.
         let from_legacy: TaskStatus = serde_yaml::from_str("pending").unwrap();
         assert_eq!(from_legacy, TaskStatus::Review);
+    }
+
+    #[test]
+    fn is_terminal_covers_every_settled_status_and_only_those() {
+        assert!(TaskStatus::Done.is_terminal());
+        assert!(TaskStatus::Failed.is_terminal());
+        assert!(TaskStatus::NeedsUser.is_terminal());
+        assert!(TaskStatus::Review.is_terminal());
+        assert!(!TaskStatus::Backlog.is_terminal());
+        assert!(!TaskStatus::Ready.is_terminal());
+        assert!(!TaskStatus::Running.is_terminal());
     }
 
     #[test]

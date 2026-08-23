@@ -209,6 +209,36 @@ pub fn spawn_sandbox_override(
         .or_else(|| policy.default_worker_sandbox.clone())
 }
 
+/// Validate the EFFECTIVE agent/sandbox a launcher is about to use — i.e. after
+/// resolving any fallback (`self.fallback_agent`, [`spawn_sandbox_override`]) —
+/// against the same `allow_agents`/`deny_agents`/`allow_sandboxes`/
+/// `deny_sandboxes` policy that [`SpawnLedger::authorize`] enforces on an
+/// EXPLICIT `req.agent`/`req.sandbox`. `authorize` only sees a value the caller
+/// supplied; a caller-omitted field resolves to a fallback further down the
+/// launch path that `authorize` never observes, so without this check a
+/// configured `default_worker_sandbox` (or fallback agent) could silently
+/// bypass `deny_sandboxes`/`deny_agents`. Call this AFTER fallback resolution
+/// and BEFORE the host actually launches the subtask.
+pub fn check_effective_placement(
+    policy: &OrchestrationPolicy,
+    agent: &str,
+    sandbox: Option<&str>,
+) -> Result<(), SpawnDenied> {
+    if !list_allows(&policy.allow_agents, &policy.deny_agents, agent) {
+        return Err(SpawnDenied::AgentNotAllowed {
+            agent: agent.to_owned(),
+        });
+    }
+    if let Some(sandbox) = sandbox
+        && !list_allows(&policy.allow_sandboxes, &policy.deny_sandboxes, sandbox)
+    {
+        return Err(SpawnDenied::SandboxNotAllowed {
+            sandbox: sandbox.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// A spawn request as it arrives from the sandboxed master through the broker.
 /// `route`/`agent`/`sandbox` are the *requested* placement; the host resolves and
 /// re-validates them — the master never picks the actual host command.
@@ -1760,6 +1790,36 @@ mod tests {
         );
         r.sandbox = Some("docker".to_owned());
         assert!(ledger.authorize(&policy, &ctx("root", 0), &r).is_ok());
+    }
+
+    #[test]
+    fn check_effective_placement_catches_a_fallback_sandbox_denied_by_policy() {
+        // `authorize` only re-checks `req.sandbox` when the CALLER supplied one
+        // explicitly. `default_worker_sandbox`/`fallback_agent` resolve to a
+        // value further down the launch path that `authorize` never sees — this
+        // is the seam `check_effective_placement` re-checks post-fallback.
+        let policy = base_policy(); // deny_sandboxes defaults to ["local"]
+        assert_eq!(
+            check_effective_placement(&policy, "claude", Some("local")),
+            Err(SpawnDenied::SandboxNotAllowed {
+                sandbox: "local".to_owned()
+            })
+        );
+        assert!(check_effective_placement(&policy, "claude", Some("docker")).is_ok());
+        assert!(check_effective_placement(&policy, "claude", None).is_ok());
+    }
+
+    #[test]
+    fn check_effective_placement_catches_a_denied_fallback_agent() {
+        let mut policy = base_policy();
+        policy.deny_agents = vec!["local-agent".to_owned()];
+        assert_eq!(
+            check_effective_placement(&policy, "local-agent", Some("docker")),
+            Err(SpawnDenied::AgentNotAllowed {
+                agent: "local-agent".to_owned()
+            })
+        );
+        assert!(check_effective_placement(&policy, "claude", Some("docker")).is_ok());
     }
 
     #[test]

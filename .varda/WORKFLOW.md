@@ -80,15 +80,14 @@ orchestration workspace mounted read/write and the spawn broker wired
    number that has no corresponding task DEFINITION it can actually read.
 2. Fan out one sandboxed worker per task with `spawn_subtask`. Each worker runs
    on its own worktree/branch. Respect the depth-1, fanout, and budget caps.
-   - ALWAYS call `spawn_subtask` with `agent="claude-worker"` and `sandbox="worker"`.
-     `claude-worker` is the sandboxed worker agent: it runs with bypassPermissions
-     (no in-box prompts/gating — the sandbox is the boundary) and gets the Claude
-     token injected. The `worker` sandbox has the broader egress workers need
-     (crates.io, github.com) to fetch deps and build/test; the default (no sandbox)
-     would put the worker in the resident's LLM-only `orchestrate` sandbox, where any
-     `cargo`/dependency fetch fails. `agent="claude-worker"` must be permitted on the
-     workspace route (it is) — omitting it or naming an unlisted agent makes the
-     spawn fail loudly rather than run.
+   Pin `agent="claude-worker"` and `sandbox="worker"` explicitly on every
+   `spawn_subtask` call — this is the documented default placement for a
+   worker, and it removes any ambiguity about which route/agent/sandbox the
+   task lands in. Policy DOES now carry a `default_worker_sandbox` fallback
+   (see "Implementation status" below) that a launcher falls back to when
+   `sandbox` is omitted, but that fallback exists to keep older or
+   less-careful callers safe — it is not a substitute for the explicit pin,
+   which stays the resident's documented default.
 3. Await the wave with `await_subtasks`, then read each terminal result via
    `subtask_result` (`status`, `files_touched`, `blocked_commands`, `recap`).
 4. For each finished worker, spawn a cross-reviewer using the OTHER agent.
