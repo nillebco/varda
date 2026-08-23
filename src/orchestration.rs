@@ -144,6 +144,15 @@ pub struct OrchestrationPolicy {
     /// before the host will launch them (e.g. `Some(1)` gates the first level).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_approval_at_depth: Option<u32>,
+    /// Sandbox a broker-spawned subtask runs in when it does not request one
+    /// explicitly. WITHOUT this a spawn falls through to the *route's* sandbox —
+    /// on the orchestrate route that is the LLM-only resident box, so a worker
+    /// can't fetch crates / build / reach non-Anthropic model APIs (the failure
+    /// that stranded subtasks #642/#649/#636). Point it at the worker sandbox so
+    /// spawns land where real work can happen, without the resident having to
+    /// pass `sandbox=` on every call. An explicit request still wins over this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_worker_sandbox: Option<String>,
 }
 
 fn default_max_depth() -> u32 {
@@ -182,8 +191,22 @@ impl Default for OrchestrationPolicy {
             allow_sandboxes: Vec::new(),
             deny_sandboxes: default_deny_sandboxes(),
             require_approval_at_depth: None,
+            default_worker_sandbox: None,
         }
     }
+}
+
+/// The sandbox a broker spawn should pin onto its subtask: an explicit `sandbox=`
+/// request wins; otherwise the route's configured `default_worker_sandbox`;
+/// otherwise `None` (fall through to normal route resolution). Pure so the
+/// precedence is unit-testable without a live launcher. See #636.
+pub fn spawn_sandbox_override(
+    requested: Option<&str>,
+    policy: &OrchestrationPolicy,
+) -> Option<String> {
+    requested
+        .map(str::to_owned)
+        .or_else(|| policy.default_worker_sandbox.clone())
 }
 
 /// A spawn request as it arrives from the sandboxed master through the broker.
@@ -2145,6 +2168,26 @@ deny_sandboxes = ["local"]
                 GET_TASK_TOOL,
                 SET_TASK_STATUS_TOOL
             ]
+        );
+    }
+
+    #[test]
+    fn spawn_sandbox_override_prefers_request_then_default() {
+        let mut policy = OrchestrationPolicy::default();
+        // No request and no configured default → None (fall through to the route).
+        assert_eq!(spawn_sandbox_override(None, &policy), None);
+        // The configured default applies when the spawn requests no sandbox — this
+        // is what makes a worker land in the `worker` box without the resident
+        // having to remember `sandbox=` on every call (#636).
+        policy.default_worker_sandbox = Some("worker".to_owned());
+        assert_eq!(
+            spawn_sandbox_override(None, &policy).as_deref(),
+            Some("worker")
+        );
+        // An explicit request wins over the default.
+        assert_eq!(
+            spawn_sandbox_override(Some("adc"), &policy).as_deref(),
+            Some("adc")
         );
     }
 

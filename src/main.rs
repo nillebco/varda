@@ -1345,6 +1345,28 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
             )
         })?;
 
+        // Resolve + preflight the worker sandbox BEFORE creating anything, so a
+        // misconfigured sandbox fails the spawn LOUDLY (like the agent check above)
+        // instead of stranding a task/worktree. An explicit `sandbox=` request wins;
+        // else the route's `default_worker_sandbox`; else `None` (route resolution).
+        // Pinning it onto the subtask's frontmatter (below) takes highest precedence
+        // in `resolve_sandbox_for`, so the worker lands in a box that can actually
+        // build/reach its model API rather than the route's LLM-only resident box —
+        // the failure that stranded #642/#649/#636.
+        let orch_policy = self.config.resolve_orchestration_for(&project);
+        let spawn_sandbox =
+            orchestration::spawn_sandbox_override(req.sandbox.as_deref(), &orch_policy);
+        if let Some(sandbox) = &spawn_sandbox
+            && !self.config.sandboxes.contains_key(sandbox)
+        {
+            anyhow::bail!(
+                "cannot spawn subtask: worker sandbox '{sandbox}' is not defined as a central \
+                 [sandboxes.{sandbox}] (from the spawn request or \
+                 [routes.orchestration].default_worker_sandbox). Define it, or request a sandbox \
+                 that exists."
+            );
+        }
+
         let short = uuid::Uuid::new_v4().to_string();
         let task_name = format!("spawned-subtask-{}", &short[..8]);
         // `create_task` is ALWAYS called with the MOTHER path (`project`): it uses
@@ -1364,6 +1386,13 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
         )
         .context("failed to create spawned subtask")?;
         let mut task_doc = task::load_task(&task_path)?;
+
+        // Pin the resolved sandbox onto the subtask (highest precedence in
+        // `resolve_sandbox_for`) so it overrides the route's sandbox. Preflighted
+        // above, so this name is known to resolve. See #636.
+        if let Some(sandbox) = spawn_sandbox {
+            task_doc.frontmatter.sandbox = Some(sandbox);
+        }
 
         // §2 — per-worker isolation. Create a `git worktree add -b wip/<slug>` off
         // the mother's HEAD at a distinct out-of-tree host path, mount THAT into
