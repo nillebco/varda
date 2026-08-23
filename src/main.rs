@@ -1610,6 +1610,91 @@ impl orchestration::SubtaskResults for VardaSubtaskResults {
     }
 }
 
+/// Host-side task control-plane seam (task #640): resolves `list_tasks` /
+/// `get_task` / `set_task_status` against the `~/.varda` home store through
+/// the `task::` helpers. The broker calls this ONLY with the caller's own
+/// `project_path` (never attacker-supplied — see
+/// `orchestration::SpawnBroker::with_task_control_plane`), so scoping is
+/// enforced by construction: every method reuses `task::list_tasks`, which
+/// already filters by project.
+#[derive(Clone)]
+pub struct VardaTaskControlPlane {
+    config: config::Config,
+}
+
+impl VardaTaskControlPlane {
+    pub fn new(config: config::Config) -> Self {
+        Self { config }
+    }
+
+    fn find(&self, project_path: &Path, id: u64) -> Option<task::TaskSummary> {
+        task::list_tasks(&self.config, project_path)
+            .ok()?
+            .into_iter()
+            .find(|t| t.id == Some(id))
+    }
+}
+
+/// The task-file basename minus its extension, used as the caller-facing
+/// `slug` for a task (the home store names STATE files `<slug>.md`, with no
+/// id prefix — unlike the repo-local `<id>-<slug>.md` DEFINITION naming).
+fn task_slug(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+impl orchestration::TaskControlPlane for VardaTaskControlPlane {
+    fn list_tasks(
+        &self,
+        project_path: &Path,
+        status: Option<task::TaskStatus>,
+    ) -> Vec<orchestration::TaskListEntry> {
+        let Ok(summaries) = task::list_tasks(&self.config, project_path) else {
+            return Vec::new();
+        };
+        summaries
+            .into_iter()
+            .filter(|t| t.id.is_some())
+            .filter(|t| status.is_none_or(|status| t.status == status))
+            .map(|t| orchestration::TaskListEntry {
+                id: t.id.expect("filtered to Some above"),
+                slug: task_slug(&t.path),
+                status: t.status.as_str().to_owned(),
+                title: t.title,
+                assignee: t.assignee,
+            })
+            .collect()
+    }
+
+    fn get_task(&self, project_path: &Path, id: u64) -> Option<orchestration::TaskDetail> {
+        let summary = self.find(project_path, id)?;
+        let doc = task::load_task(&summary.path).ok()?;
+        Some(orchestration::TaskDetail {
+            id,
+            slug: task_slug(&summary.path),
+            status: doc.frontmatter.status.as_str().to_owned(),
+            title: doc.title(),
+            assignee: doc.frontmatter.assignee.clone(),
+            body: doc.body.clone(),
+        })
+    }
+
+    fn set_task_status(
+        &self,
+        project_path: &Path,
+        id: u64,
+        status: task::TaskStatus,
+    ) -> Result<(), String> {
+        let summary = self
+            .find(project_path, id)
+            .ok_or_else(|| format!("task '{id}' not found in this project"))?;
+        let mut doc = task::load_task(&summary.path).map_err(|error| error.to_string())?;
+        doc.set_status(status);
+        task::write_task(&doc).map_err(|error| error.to_string())
+    }
+}
+
 struct OrchestratedAgentClient<C: AgentClient = acp::AcpSubprocessClient> {
     inner: C,
     config: config::Config,
@@ -1727,7 +1812,13 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
             // The resident's own mounted workspace is the integration worktree each
             // worker branch is merged onto (WORKFLOW.md step 5). Merge-back is
             // local-only: the resident has no push credentials (G2/G3).
-            .with_integration(worker_registry, self.project_path.clone()),
+            .with_integration(worker_registry, self.project_path.clone())
+            // Task control-plane tools (task #640): scoped to this run's OWN
+            // project, exactly like the integration worktree above.
+            .with_task_control_plane(
+                VardaTaskControlPlane::new(self.config.clone()),
+                self.project_path.clone(),
+            ),
         );
         // Transport selection by primitive. Own-kernel microVMs (microsandbox/clawk)
         // share the project tree over virtio-fs, which exposes the socket FILE but

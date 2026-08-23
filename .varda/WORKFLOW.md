@@ -69,11 +69,15 @@ keyed by `{repo, task_id}`. Only DEFINITIONS (`.varda/tasks/*.md`) and rules
 
 The resident orchestrator is a sandboxed interactive agent with the dedicated
 orchestration workspace mounted read/write and the spawn broker wired
-(`spawn_subtask`, `await_subtask`, `await_subtasks`, `subtask_result`). Its
-control loop is:
+(`spawn_subtask`, `await_subtask`, `await_subtasks`, `subtask_result`,
+`list_tasks`, `get_task`, `set_task_status`). Its control loop is:
 
 1. Prioritize the backlog into the next wave, selecting tasks whose expected
-   file footprints are disjoint enough to parallelize.
+   file footprints are disjoint enough to parallelize. Discover work via the
+   broker's `list_tasks`/`get_task` tools (or by reading `.varda/tasks/*.md`
+   directly in the mounted workspace) — the resident has no GitHub egress and
+   no `varda` CLI inside the box (M8), so it must never chase an issue/PR
+   number that has no corresponding task DEFINITION it can actually read.
 2. Fan out one sandboxed worker per task with `spawn_subtask`. Each worker runs
    on its own worktree/branch. Respect the depth-1, fanout, and budget caps.
    - ALWAYS call `spawn_subtask` with `agent="claude-worker"` and `sandbox="worker"`.
@@ -142,6 +146,14 @@ merge-back wiring is LIVE; this note tracks what ships where.
 - Steps 4/6 (per-worker cross-review, resolver spawn, post-merge gate) remain the
   resident agent's own loop driven from these tool outputs; they are agent
   behaviour, not additional host plumbing.
+- Task #640 closes the status-drift gap: `list_tasks`/`get_task` let any
+  sandboxed agent (resident or worker) see its own project's task board
+  without an `~/.varda` mount, and `set_task_status` lets the agent that
+  FINISHES a task mark it `done`/`needs_user`/`failed` itself instead of
+  leaving it at `backlog`/`review` until a human runs `varda task set-status`
+  by hand. It is self-only (an agent may set only its OWN task id) and
+  `review -> done` is refused outright — that transition stays a human-only
+  gate.
 
 The `project` frontmatter field previously conflated POLICY (route/sandbox/
 orchestration key) with MOUNT/cwd. Task #598 split them: a new optional

@@ -36,7 +36,7 @@
 // broker over the sandbox-visible Unix-socket MCP transport in `mcp_transport`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -473,6 +473,12 @@ pub const AWAIT_SUBTASK_TOOL: &str = "await_subtask";
 pub const SUBTASK_RESULT_TOOL: &str = "subtask_result";
 /// Wave primitive: block until EVERY listed subtask reaches a terminal status.
 pub const AWAIT_SUBTASKS_TOOL: &str = "await_subtasks";
+/// Task control-plane read/write tools (task #640): let a sandboxed agent see
+/// and update its OWN project's tasks without any `~/.varda` mount. See
+/// [`TaskControlPlane`] for the gating.
+pub const LIST_TASKS_TOOL: &str = "list_tasks";
+pub const GET_TASK_TOOL: &str = "get_task";
+pub const SET_TASK_STATUS_TOOL: &str = "set_task_status";
 
 /// Tool error returned by `await_subtask*`/`subtask_result` when no collect
 /// channel is wired ([`NoSubtaskResults`]): the pre-collect stub semantics,
@@ -541,6 +547,118 @@ impl SubtaskResults for NoSubtaskResults {
     }
     fn is_available(&self) -> bool {
         false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task control-plane read/write tools — `list_tasks` / `get_task` /
+// `set_task_status`. Same host-mediation shape as the spawn/collect tools
+// above: a sandboxed agent has no mount of `~/.varda` (M8), so it can only
+// SEE or UPDATE its own project's tasks by asking the host through this
+// narrow, scoped seam. See `SpawnBroker::list_tasks`/`get_task`/
+// `set_task_status` for the gating; `TaskControlPlane` is the host-side I/O
+// the run path injects (`main::VardaTaskControlPlane`, backed by `task::`).
+// ---------------------------------------------------------------------------
+
+/// Redacted task-board entry returned by `list_tasks`. Only the fields a
+/// caller needs to see its project's board — never a host filesystem path,
+/// recap, run log, or credential (M8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskListEntry {
+    pub id: u64,
+    pub slug: String,
+    pub status: String,
+    pub title: String,
+    pub assignee: Option<String>,
+}
+
+/// Redacted task detail returned by `get_task`: the definition body plus its
+/// status/assignee. Deliberately excludes recaps, run-log paths, and session
+/// ids/logs — those are host filesystem paths that would leak the
+/// control-plane layout through the broker (see
+/// `TaskFrontmatter::sanitized_for_prompt`, the same redaction principle
+/// applied here).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskDetail {
+    pub id: u64,
+    pub slug: String,
+    pub status: String,
+    pub title: String,
+    pub assignee: Option<String>,
+    pub body: String,
+}
+
+/// Host-side seam the task control-plane tools read/write through. The
+/// broker never touches `~/.varda` itself — it calls this trait, and the run
+/// path injects a concrete impl (`main::VardaTaskControlPlane`) that wraps
+/// the `task::` helpers. Every method is scoped by the CALLER'S OWN
+/// `project_path`, which the broker resolves itself from how it was wired
+/// (never attacker-supplied) — see [`SpawnBroker::with_task_control_plane`].
+pub trait TaskControlPlane: Send + Sync {
+    /// The tasks belonging to `project_path`, optionally filtered by status.
+    fn list_tasks(&self, project_path: &Path, status: Option<TaskStatus>) -> Vec<TaskListEntry>;
+    /// One task by id, scoped to `project_path`. `None` if `id` does not
+    /// belong to that project (including a real id from ANOTHER project —
+    /// this is how cross-project reads are refused).
+    fn get_task(&self, project_path: &Path, id: u64) -> Option<TaskDetail>;
+    /// Write a new status for `id`, scoped to `project_path`. Callers MUST
+    /// have already validated the transition (see
+    /// [`validate_self_status_transition`]) — this is the low-level write,
+    /// not a gate. `Err` carries a human-readable reason (e.g. unknown id).
+    fn set_task_status(&self, project_path: &Path, id: u64, status: TaskStatus) -> Result<(), String>;
+}
+
+/// Default control-plane seam: no host wiring. Used until the run path
+/// injects a real impl via [`SpawnBroker::with_task_control_plane`], mirroring
+/// [`NoSubtaskResults`].
+struct NoTaskControlPlane;
+
+impl TaskControlPlane for NoTaskControlPlane {
+    fn list_tasks(&self, _project_path: &Path, _status: Option<TaskStatus>) -> Vec<TaskListEntry> {
+        Vec::new()
+    }
+    fn get_task(&self, _project_path: &Path, _id: u64) -> Option<TaskDetail> {
+        None
+    }
+    fn set_task_status(&self, _project_path: &Path, _id: u64, _status: TaskStatus) -> Result<(), String> {
+        Err(RESULTS_UNAVAILABLE.to_owned())
+    }
+}
+
+/// Validate a `set_task_status` request BEFORE it reaches the control-plane
+/// write. Two rules, both hard (never a silent no-op):
+///
+/// 1. Guests may only land on a TERMINAL self-report status: `done`,
+///    `needs_user`, or `failed`. `backlog`/`ready`/`running`/`review` are
+///    host-managed transitions a guest may never assert.
+/// 2. The task must currently be `running`. In particular `review -> done`
+///    is a human review gate: forbidden here rather than allowed-with-a-flag,
+///    so a self-marked completion can never be confused with a reviewed one
+///    (task #640's chosen option — simpler than threading an
+///    "agent-asserted" bit through the frontmatter/CLI for the same
+///    guarantee: a guest simply cannot move a task out of `review`).
+fn validate_self_status_transition(current: TaskStatus, requested: TaskStatus) -> Result<(), String> {
+    if !matches!(
+        requested,
+        TaskStatus::Done | TaskStatus::NeedsUser | TaskStatus::Failed
+    ) {
+        return Err(format!(
+            "set_task_status denied: guests may only set 'done', 'needs_user', or 'failed' (not '{}')",
+            requested.as_str()
+        ));
+    }
+    match current {
+        TaskStatus::Running => Ok(()),
+        TaskStatus::Review => Err(
+            "set_task_status denied: task is in 'review' — review -> done is a human-only gate \
+             and cannot be self-asserted by a guest agent"
+                .to_owned(),
+        ),
+        other => Err(format!(
+            "set_task_status denied: task is '{}', not 'running' — set_task_status only closes \
+             out an in-flight run",
+            other.as_str()
+        )),
     }
 }
 
@@ -687,6 +805,14 @@ pub struct SpawnBroker<L: SubtaskLauncher> {
     /// checked out here. `None` disables merge-back (the tool reports unavailable),
     /// keeping the resident purely advisory until the run path wires it.
     integration_worktree: Option<PathBuf>,
+    /// Task control-plane seam (task #640). Defaults to [`NoTaskControlPlane`];
+    /// the run path swaps in a real impl via
+    /// [`SpawnBroker::with_task_control_plane`].
+    task_control_plane: Box<dyn TaskControlPlane>,
+    /// The CALLER'S OWN project, scoping every `list_tasks`/`get_task`/
+    /// `set_task_status` call. `None` until wired — the tools then behave as
+    /// unavailable rather than reading/writing an arbitrary project.
+    task_control_plane_project: Option<PathBuf>,
 }
 
 impl<L: SubtaskLauncher> SpawnBroker<L> {
@@ -721,6 +847,8 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
             max_wait: DEFAULT_MAX_WAIT,
             worker_registry: WorkerRegistry::new(),
             integration_worktree: None,
+            task_control_plane: Box::new(NoTaskControlPlane),
+            task_control_plane_project: None,
         }
     }
 
@@ -736,6 +864,21 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
     ) -> Self {
         self.worker_registry = worker_registry;
         self.integration_worktree = Some(integration_worktree);
+        self
+    }
+
+    /// Wire the task control-plane capability (task #640): the host-side
+    /// [`TaskControlPlane`] impl plus the CALLER'S OWN `project_path`, which
+    /// scopes every `list_tasks`/`get_task`/`set_task_status` call. Until this
+    /// is called those tools report "not available on this channel". Builder
+    /// style, mirroring [`with_results`](Self::with_results).
+    pub fn with_task_control_plane(
+        mut self,
+        control_plane: impl TaskControlPlane + 'static,
+        project_path: PathBuf,
+    ) -> Self {
+        self.task_control_plane = Box::new(control_plane);
+        self.task_control_plane_project = Some(project_path);
         self
     }
 
@@ -1051,6 +1194,62 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
         Ok(json!({ "integrations": results }))
     }
 
+    /// `list_tasks`: the caller's OWN project's tasks, optionally filtered by
+    /// status. Empty (never an error) when the control plane is unwired or
+    /// the project is empty — `list_tasks` is advisory, unlike the write
+    /// path, so there is nothing to refuse here.
+    fn list_tasks(&self, status: Option<TaskStatus>) -> Vec<TaskListEntry> {
+        let Some(project) = &self.task_control_plane_project else {
+            return Vec::new();
+        };
+        self.task_control_plane.list_tasks(project, status)
+    }
+
+    /// `get_task`: one task by id, scoped to the caller's OWN project. `None`
+    /// both when the control plane is unwired AND when `id` belongs to a
+    /// different project — the caller cannot distinguish "doesn't exist" from
+    /// "not yours", which is the point (no project-existence oracle).
+    fn get_task(&self, id: u64) -> Option<TaskDetail> {
+        let project = self.task_control_plane_project.as_ref()?;
+        self.task_control_plane.get_task(project, id)
+    }
+
+    /// `set_task_status`: the write side that closes the status-drift loop.
+    /// Two structural gates run BEFORE the control-plane write, both hard
+    /// errors (never a silent no-op):
+    ///
+    /// 1. Self-only — `parent_id` (the id of the task that owns this broker
+    ///    channel; host-known, never attacker-supplied — see
+    ///    [`SpawnBroker::gated_launch`] for the same lineage-guard pattern)
+    ///    must equal `id`. A guest may close out only its OWN task, never a
+    ///    sibling's or an arbitrary id — even one in the same project.
+    /// 2. [`validate_self_status_transition`] — target must be a terminal
+    ///    self-report status and the task must currently be `running`.
+    fn set_task_status(&self, parent_id: &str, id: u64, status: TaskStatus) -> Result<(), String> {
+        let project = self
+            .task_control_plane_project
+            .as_ref()
+            .ok_or_else(|| RESULTS_UNAVAILABLE.to_owned())?;
+        if parent_id.parse::<u64>().ok() != Some(id) {
+            return Err(format!(
+                "set_task_status denied: caller '{parent_id}' may only set the status of its own \
+                 task, not '{id}'"
+            ));
+        }
+        let current = self
+            .task_control_plane
+            .get_task(project, id)
+            .ok_or_else(|| format!("set_task_status denied: task '{id}' not found in this project"))?;
+        let current_status: TaskStatus = current.status.parse().map_err(|_| {
+            format!(
+                "set_task_status denied: task '{id}' has an unrecognized status '{}'",
+                current.status
+            )
+        })?;
+        validate_self_status_transition(current_status, status)?;
+        self.task_control_plane.set_task_status(project, id, status)
+    }
+
     /// The MCP `tools/list` manifest: exactly the narrow spawn tool plus the
     /// collect-side read-backs. Nothing else is advertised across the boundary.
     pub fn tool_manifest() -> Value {
@@ -1084,7 +1283,10 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                 {"name": AWAIT_SUBTASK_TOOL, "description": "Block until a spawned sub-task reaches a terminal status; returns {subtask_id, status}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
                 {"name": AWAIT_SUBTASKS_TOOL, "description": "Block until ALL listed sub-tasks reach a terminal status; returns [{subtask_id, status}]. The wave primitive.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}},
                 {"name": SUBTASK_RESULT_TOOL, "description": "Fetch a finished sub-task's result: {status, files_touched, blocked_commands, recap}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
-                {"name": INTEGRATE_SUBTASKS_TOOL, "description": "Merge a wave of finished sub-tasks' isolated worktree branches onto the integration workspace. Commits each worker's files_touched onto its wip/ branch host-side and 3-way merges it, returning per-worker {branch, committed, clean, conflicted_files, dependency_manifests}. A non-clean merge lists the conflicted files for a resolver; dependency_manifests flags Cargo.toml/package.json/lockfile changes (G5). Never pushes (G2/G3). Call after await_subtasks.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}}
+                {"name": INTEGRATE_SUBTASKS_TOOL, "description": "Merge a wave of finished sub-tasks' isolated worktree branches onto the integration workspace. Commits each worker's files_touched onto its wip/ branch host-side and 3-way merges it, returning per-worker {branch, committed, clean, conflicted_files, dependency_manifests}. A non-clean merge lists the conflicted files for a resolver; dependency_manifests flags Cargo.toml/package.json/lockfile changes (G5). Never pushes (G2/G3). Call after await_subtasks.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}},
+                {"name": LIST_TASKS_TOOL, "description": "List YOUR OWN project's tasks: [{id, slug, status, title, assignee}]. Host-mediated; never crosses into another project. Use this (or `.varda/tasks/*.md` in the workspace) to discover work — there is no GitHub egress and no `varda` CLI inside the box.", "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "description": "Optional status filter: backlog, ready, running, review, needs_user, failed, or done."}}}},
+                {"name": GET_TASK_TOOL, "description": "Read one of your project's tasks by id: {id, slug, status, title, assignee, body}. Returns not-found for any id outside your own project (cross-project ids are never distinguishable from unknown ones).", "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "integer", "description": "Numeric task id."}}}},
+                {"name": SET_TASK_STATUS_TOOL, "description": "Close out YOUR OWN task once you are finished: set its status to done, needs_user, or failed. Only allowed for the caller's own task id, and only from 'running' — a task in 'review' is a human-only gate and cannot be self-marked done.", "inputSchema": {"type": "object", "required": ["id", "status"], "properties": {"id": {"type": "integer", "description": "Must be the caller's own task id."}, "status": {"type": "string", "enum": ["done", "needs_user", "failed"]}}}}
             ]
         })
     }
@@ -1267,6 +1469,49 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                             true,
                         ),
                     ),
+                }
+            }
+            LIST_TASKS_TOOL => {
+                let status = match str_arg(&args, "status").map(|s| s.parse::<TaskStatus>()) {
+                    None => None,
+                    Some(Ok(status)) => Some(status),
+                    Some(Err(error)) => return rpc_result(id, tool_text(&error.to_string(), true)),
+                };
+                let entries = self.list_tasks(status);
+                rpc_result(id, tool_text(&json!(entries).to_string(), false))
+            }
+            GET_TASK_TOOL => {
+                let Some(task_id) = args.get("id").and_then(Value::as_u64) else {
+                    return rpc_error(id, -32602, "get_task requires an integer `id`");
+                };
+                match self.get_task(task_id) {
+                    Some(detail) => rpc_result(id, tool_text(&json!(detail).to_string(), false)),
+                    None => rpc_result(
+                        id,
+                        tool_text(&format!("no task '{task_id}' found in this project"), true),
+                    ),
+                }
+            }
+            SET_TASK_STATUS_TOOL => {
+                let Some(task_id) = args.get("id").and_then(Value::as_u64) else {
+                    return rpc_error(id, -32602, "set_task_status requires an integer `id`");
+                };
+                let Some(status_str) = args.get("status").and_then(Value::as_str) else {
+                    return rpc_error(id, -32602, "set_task_status requires a `status`");
+                };
+                let status = match status_str.parse::<TaskStatus>() {
+                    Ok(status) => status,
+                    Err(error) => return rpc_result(id, tool_text(&error.to_string(), true)),
+                };
+                match self.set_task_status(parent_id, task_id, status) {
+                    Ok(()) => rpc_result(
+                        id,
+                        tool_text(
+                            &format!("task '{task_id}' set to {}", status.as_str()),
+                            false,
+                        ),
+                    ),
+                    Err(error) => rpc_result(id, tool_text(&error, true)),
                 }
             }
             other => rpc_error(id, -32601, &format!("unknown tool: {other}")),
@@ -1895,7 +2140,10 @@ deny_sandboxes = ["local"]
                 AWAIT_SUBTASK_TOOL,
                 AWAIT_SUBTASKS_TOOL,
                 SUBTASK_RESULT_TOOL,
-                INTEGRATE_SUBTASKS_TOOL
+                INTEGRATE_SUBTASKS_TOOL,
+                LIST_TASKS_TOOL,
+                GET_TASK_TOOL,
+                SET_TASK_STATUS_TOOL
             ]
         );
     }
@@ -2441,5 +2689,186 @@ deny_sandboxes = ["local"]
 
         let _ = git::remove_worker_worktree(&repo, &integration, false);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // -----------------------------------------------------------------
+    // Task control-plane tools (task #640).
+    // -----------------------------------------------------------------
+
+    /// In-memory [`TaskControlPlane`] keyed by `(project, id)`, so tests can
+    /// assert cross-project scoping without touching the filesystem.
+    struct StubControlPlane {
+        tasks: BTreeMap<(String, u64), TaskDetail>,
+    }
+
+    impl StubControlPlane {
+        fn new() -> Self {
+            Self {
+                tasks: BTreeMap::new(),
+            }
+        }
+
+        fn with_task(mut self, project: &str, detail: TaskDetail) -> Self {
+            self.tasks.insert((project.to_owned(), detail.id), detail);
+            self
+        }
+    }
+
+    impl TaskControlPlane for StubControlPlane {
+        fn list_tasks(&self, project_path: &Path, status: Option<TaskStatus>) -> Vec<TaskListEntry> {
+            let project = project_path.display().to_string();
+            self.tasks
+                .iter()
+                .filter(|((p, _), _)| p == &project)
+                .filter(|(_, detail)| {
+                    status.is_none_or(|status| detail.status == status.as_str())
+                })
+                .map(|(_, detail)| TaskListEntry {
+                    id: detail.id,
+                    slug: detail.slug.clone(),
+                    status: detail.status.clone(),
+                    title: detail.title.clone(),
+                    assignee: detail.assignee.clone(),
+                })
+                .collect()
+        }
+
+        fn get_task(&self, project_path: &Path, id: u64) -> Option<TaskDetail> {
+            let project = project_path.display().to_string();
+            self.tasks.get(&(project, id)).cloned()
+        }
+
+        fn set_task_status(
+            &self,
+            project_path: &Path,
+            id: u64,
+            _status: TaskStatus,
+        ) -> Result<(), String> {
+            let project = project_path.display().to_string();
+            if self.tasks.contains_key(&(project, id)) {
+                Ok(())
+            } else {
+                Err(format!("task '{id}' not found"))
+            }
+        }
+    }
+
+    fn task_detail(id: u64, status: TaskStatus) -> TaskDetail {
+        TaskDetail {
+            id,
+            slug: format!("task-{id}"),
+            status: status.as_str().to_owned(),
+            title: format!("Task {id}"),
+            assignee: Some("claude".to_owned()),
+            body: "do the thing".to_owned(),
+        }
+    }
+
+    /// (c) `list_tasks` returns only the caller's own project's tasks, never
+    /// another project's, even though the control plane holds both.
+    #[test]
+    fn list_tasks_returns_only_the_callers_own_project() {
+        let plane = StubControlPlane::new()
+            .with_task("/proj/a", task_detail(1, TaskStatus::Running))
+            .with_task("/proj/a", task_detail(2, TaskStatus::Done))
+            .with_task("/proj/b", task_detail(99, TaskStatus::Running));
+
+        let broker = SpawnBroker::new(base_policy(), "1", MockLauncher::new())
+            .with_task_control_plane(plane, PathBuf::from("/proj/a"));
+
+        let entries = broker.list_tasks(None);
+        let ids: Vec<u64> = entries.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert!(
+            entries.iter().all(|e| e.id != 99),
+            "a sibling project's task id must never appear"
+        );
+
+        let running_only = broker.list_tasks(Some(TaskStatus::Running));
+        assert_eq!(running_only.len(), 1);
+        assert_eq!(running_only[0].id, 1);
+    }
+
+    /// (a) A cross-project id is refused: `get_task` for an id that exists
+    /// but belongs to a DIFFERENT project than the caller's must report
+    /// not-found, exactly like an unknown id — never leak that it exists
+    /// elsewhere.
+    #[test]
+    fn get_task_refuses_a_cross_project_id() {
+        let plane = StubControlPlane::new()
+            .with_task("/proj/a", task_detail(1, TaskStatus::Running))
+            .with_task("/proj/b", task_detail(99, TaskStatus::Running));
+
+        let broker = SpawnBroker::new(base_policy(), "1", MockLauncher::new())
+            .with_task_control_plane(plane, PathBuf::from("/proj/a"));
+
+        assert!(broker.get_task(1).is_some(), "own-project id must resolve");
+        assert!(
+            broker.get_task(99).is_none(),
+            "a real id from ANOTHER project must be refused, not leaked"
+        );
+        assert!(broker.get_task(12345).is_none(), "unknown id must also refuse");
+    }
+
+    /// (b) Forbidden status transitions are refused: guests may not move a
+    /// task out of `review` (the human gate), and may not self-target a
+    /// task that is not their own.
+    #[test]
+    fn set_task_status_refuses_forbidden_transitions() {
+        let plane = StubControlPlane::new()
+            .with_task("/proj/a", task_detail(1, TaskStatus::Running))
+            .with_task("/proj/a", task_detail(2, TaskStatus::Review));
+
+        let broker = SpawnBroker::new(base_policy(), "1", MockLauncher::new())
+            .with_task_control_plane(plane, PathBuf::from("/proj/a"));
+
+        // Self, running -> done: allowed.
+        assert!(broker.set_task_status("1", 1, TaskStatus::Done).is_ok());
+
+        // review -> done is a human-only gate, even for the task's own caller.
+        let broker2 = SpawnBroker::new(base_policy(), "2", MockLauncher::new())
+            .with_task_control_plane(
+                StubControlPlane::new()
+                    .with_task("/proj/a", task_detail(1, TaskStatus::Running))
+                    .with_task("/proj/a", task_detail(2, TaskStatus::Review)),
+                PathBuf::from("/proj/a"),
+            );
+        let err = broker2
+            .set_task_status("2", 2, TaskStatus::Done)
+            .expect_err("review -> done must be refused");
+        assert!(err.contains("review"), "got {err}");
+
+        // A caller may never set another task's (even its own project's) status.
+        let err = broker
+            .set_task_status("1", 2, TaskStatus::Done)
+            .expect_err("setting a non-self task must be refused");
+        assert!(err.contains("own"), "got {err}");
+
+        // Guests may never target a non-terminal status.
+        let broker3 = SpawnBroker::new(base_policy(), "3", MockLauncher::new())
+            .with_task_control_plane(
+                StubControlPlane::new().with_task("/proj/a", task_detail(3, TaskStatus::Running)),
+                PathBuf::from("/proj/a"),
+            );
+        let err = broker3
+            .set_task_status("3", 3, TaskStatus::Running)
+            .expect_err("non-terminal target status must be refused");
+        assert!(err.contains("guests may only set"), "got {err}");
+    }
+
+    #[test]
+    fn rpc_set_task_status_denial_is_a_tool_error() {
+        let plane = StubControlPlane::new().with_task("/proj/a", task_detail(5, TaskStatus::Review));
+        let broker = SpawnBroker::new(base_policy(), "5", MockLauncher::new())
+            .with_task_control_plane(plane, PathBuf::from("/proj/a"));
+
+        let resp = broker.handle_rpc(
+            "5",
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": SET_TASK_STATUS_TOOL, "arguments": {"id": 5, "status": "done"}}}),
+        );
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("review"), "got {text}");
     }
 }
