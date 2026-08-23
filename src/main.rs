@@ -1468,20 +1468,9 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
         let config = self.config.clone();
         let path = task_path.clone();
         let child_id = subtask_id.clone();
-        let child_handle = tokio::spawn(async move {
-            if let Err(error) = run_task_path_for_parallel(config, path.clone(), Some(lineage)).await
-            {
-                eprintln!("warning: spawned subtask {child_id} failed: {error:#}");
-                // Force a TERMINAL status so an awaiting master observes completion
-                // instead of hanging on a subtask stuck at `ready`/`running`.
-                if let Ok(mut doc) = task::load_task(&path) {
-                    if !doc.frontmatter.status.is_terminal() {
-                        doc.set_status(task::TaskStatus::Failed);
-                        let _ = task::write_task(&doc);
-                    }
-                }
-            }
-        });
+        let child_handle = tokio::spawn(run_spawned_subtask_settling(
+            config, path, lineage, child_id, "spawned",
+        ));
         self.spawn_state
             .insert_handle(subtask_id.clone(), child_handle);
 
@@ -1549,20 +1538,9 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
         let config = self.config.clone();
         let path = task_path.clone();
         let child_id = subtask_id.clone();
-        let child_handle = tokio::spawn(async move {
-            if let Err(error) = run_task_path_for_parallel(config, path.clone(), Some(lineage)).await
-            {
-                eprintln!("warning: run subtask {child_id} failed: {error:#}");
-                // Force a TERMINAL status so an awaiting master observes completion
-                // instead of hanging on a subtask stuck at `ready`/`running`.
-                if let Ok(mut doc) = task::load_task(&path) {
-                    if !doc.frontmatter.status.is_terminal() {
-                        doc.set_status(task::TaskStatus::Failed);
-                        let _ = task::write_task(&doc);
-                    }
-                }
-            }
-        });
+        let child_handle = tokio::spawn(run_spawned_subtask_settling(
+            config, path, lineage, child_id, "run",
+        ));
         self.spawn_state
             .insert_handle(subtask_id.clone(), child_handle);
 
@@ -2382,6 +2360,57 @@ async fn run_task_path_for_parallel(
         outcome,
         project: task_document.frontmatter.project.clone(),
     })
+}
+
+/// Hard ceiling for a broker-spawned subtask's ENTIRE run (agent + interpreter +
+/// teardown). A backstop far above the agent's own budget/idle-watchdog, so a wedged
+/// box or a teardown that never returns cannot strand the subtask — and the master's
+/// `await_subtask` — forever.
+const SPAWNED_SUBTASK_HARD_CEILING: Duration = Duration::from_secs(60 * 60);
+
+/// Run a broker-spawned subtask to completion and GUARANTEE it settles on a terminal
+/// status, so an awaiting master never hangs. `runner::run_task` writes a terminal
+/// status on a clean finish; this backstops every path that never reaches that write:
+/// an uncaught `Err`, a PANIC (which unwinds past a plain `if let Err`), an abort, or a
+/// wedged run/teardown that returns nothing. On any non-success it forces `Failed` when
+/// the status is still non-terminal (never clobbering a real Done/Review/NeedsUser).
+/// Observed live: spawned reviews/checks whose agent had already exited (box `stopped`)
+/// yet stayed `running`, wedging the resident's `await_subtask` until hand-reconciled.
+async fn run_spawned_subtask_settling(
+    config: config::Config,
+    path: PathBuf,
+    lineage: SpawnLineage,
+    child_id: String,
+    label: &'static str,
+) {
+    let run = tokio::spawn(run_task_path_for_parallel(config, path.clone(), Some(lineage)));
+    let abort = run.abort_handle();
+    let settled_ok = match tokio::time::timeout(SPAWNED_SUBTASK_HARD_CEILING, run).await {
+        Ok(Ok(Ok(_report))) => true, // run_task wrote a terminal status on a clean finish
+        Ok(Ok(Err(error))) => {
+            eprintln!("warning: {label} subtask {child_id} failed: {error:#}");
+            false
+        }
+        Ok(Err(join)) => {
+            eprintln!("warning: {label} subtask {child_id} panicked/aborted: {join}");
+            false
+        }
+        Err(_elapsed) => {
+            abort.abort(); // stop the wedged run so it can't leak in the background
+            eprintln!(
+                "warning: {label} subtask {child_id} exceeded the {}s hard ceiling; forcing terminal",
+                SPAWNED_SUBTASK_HARD_CEILING.as_secs()
+            );
+            false
+        }
+    };
+    if !settled_ok
+        && let Ok(mut doc) = task::load_task(&path)
+        && !doc.frontmatter.status.is_terminal()
+    {
+        doc.set_status(task::TaskStatus::Failed);
+        let _ = task::write_task(&doc);
+    }
 }
 
 fn show_task_command(task_path: &Path) -> Result<()> {
