@@ -36,6 +36,7 @@
 // broker over the sandbox-visible Unix-socket MCP transport in `mcp_transport`.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,7 +46,50 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use crate::agent::{parse_blocked_commands, parse_files_touched};
+use crate::git::{self, WorkerCheckout, WorkerHarvest};
 use crate::task::TaskStatus;
+
+/// Merge-back tool: harvest a wave of finished workers' isolated worktrees and
+/// integrate each `wip/<slug>` branch onto the resident's integration worktree,
+/// surfacing per-worker conflicts (resolver queue) and G5 manifest flags. This is
+/// the host-side step-5 wiring (WORKFLOW.md); it never trusts recap TEXT — only
+/// the structured `files_touched` and the launcher-recorded `WorkerCheckout`
+/// cross into it (G4).
+pub const INTEGRATE_SUBTASKS_TOOL: &str = "integrate_subtasks";
+
+/// Launcher-side registry mapping an accepted subtask id to the isolated
+/// [`WorkerCheckout`] the launcher created for it (worktree host path + `wip/`
+/// branch). The launcher is the ONLY component that knows a worker's worktree
+/// path, so it records it here; the broker's `integrate_subtasks` tool reads it
+/// back to run the host-side merge. Shared (`Arc<Mutex<_>>`) so the detached
+/// launcher and the broker observe the same map. A subtask absent from the map
+/// ran WITHOUT isolation (non-git mother → shared-mount degrade), so it has no
+/// branch to integrate and `integrate_subtasks` skips it.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerRegistry(Arc<Mutex<BTreeMap<SubtaskId, WorkerCheckout>>>);
+
+impl WorkerRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the isolated checkout the launcher created for `id`.
+    pub fn record(&self, id: SubtaskId, checkout: WorkerCheckout) {
+        self.0
+            .lock()
+            .expect("worker registry mutex poisoned")
+            .insert(id, checkout);
+    }
+
+    /// The checkout recorded for `id`, if the worker got an isolated worktree.
+    pub fn get(&self, id: &str) -> Option<WorkerCheckout> {
+        self.0
+            .lock()
+            .expect("worker registry mutex poisoned")
+            .get(id)
+            .cloned()
+    }
+}
 
 /// Identifier of a task in the spawn tree. The root master task has some id; each
 /// accepted subtask gets its own. Used to attribute fan-out and depth.
@@ -634,6 +678,15 @@ pub struct SpawnBroker<L: SubtaskLauncher> {
     poll_interval: Duration,
     /// Absolute ceiling on one `await_subtask*` call before it times out.
     max_wait: Duration,
+    /// Launcher-side registry of isolated worker checkouts (subtask id →
+    /// worktree/branch). Populated as the launcher creates worktrees; read by
+    /// `integrate_subtasks` to run the host-side merge-back. Empty until wired.
+    worker_registry: WorkerRegistry,
+    /// The resident's own integration worktree — its mounted workspace root.
+    /// `integrate_subtasks` commits + merges each worker branch onto the branch
+    /// checked out here. `None` disables merge-back (the tool reports unavailable),
+    /// keeping the resident purely advisory until the run path wires it.
+    integration_worktree: Option<PathBuf>,
 }
 
 impl<L: SubtaskLauncher> SpawnBroker<L> {
@@ -666,7 +719,24 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
             results: Box::new(NoSubtaskResults),
             poll_interval: DEFAULT_POLL_INTERVAL,
             max_wait: DEFAULT_MAX_WAIT,
+            worker_registry: WorkerRegistry::new(),
+            integration_worktree: None,
         }
+    }
+
+    /// Wire the merge-back capability: the launcher-side [`WorkerRegistry`] the
+    /// tool harvests worktrees from, and the resident's `integration_worktree`
+    /// (its mounted workspace) each worker branch is merged onto. Until this is
+    /// called, `integrate_subtasks` reports "not available on this channel".
+    /// Builder style, mirroring [`with_results`](Self::with_results).
+    pub fn with_integration(
+        mut self,
+        worker_registry: WorkerRegistry,
+        integration_worktree: PathBuf,
+    ) -> Self {
+        self.worker_registry = worker_registry;
+        self.integration_worktree = Some(integration_worktree);
+        self
     }
 
     /// Inject the collect-side [`SubtaskResults`] seam. Consumes and returns the
@@ -890,6 +960,97 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
         }))
     }
 
+    /// Host-side merge-back (WORKFLOW.md step 5): for each finished subtask id,
+    /// harvest its isolated [`WorkerCheckout`] from the launcher registry, parse
+    /// its `files_touched` HOST-side from the recap (structured fields only —
+    /// never the recap text, G4), and run [`git::integrate_worker_branches`]
+    /// against the resident's `integration_worktree`. Returns per-worker
+    /// `{subtask_id, branch, committed, clean, conflicted_files,
+    /// dependency_manifests}` so the resident routes conflicts to a resolver and
+    /// surfaces the G5 flag. Never resolves, never pushes (G2/G3).
+    ///
+    /// A subtask absent from the registry ran WITHOUT isolation (non-git mother →
+    /// shared-mount degrade); it is reported as `skipped` so the resident knows no
+    /// branch was integrated for it. This never blocks — the master `await`s
+    /// first.
+    ///
+    /// CLEANUP OWNERSHIP (task #598 open question, resolved here): this tool does
+    /// NOT remove worktrees or delete `wip/<slug>` branches. Deleting a branch at
+    /// integration time would destroy the very reviewable unit the isolation
+    /// exists to produce — the resident routes conflicts to a resolver and the
+    /// human reviews per-branch diffs AFTER merge-back. So the checkout and its
+    /// branch outlive integration; teardown belongs to the run-path lifecycle
+    /// (after cross-review / at root-run completion), reusing
+    /// [`git::remove_worker_worktree`] with `delete_branch = true` only once the
+    /// branch is no longer needed for review. The registry therefore keeps each
+    /// entry for the whole root run rather than draining it here.
+    fn integrate_subtasks(&self, ids: &[String]) -> anyhow::Result<Value> {
+        let integration_worktree = self
+            .integration_worktree
+            .as_ref()
+            .expect("integrate_subtasks called without an integration worktree wired");
+
+        // Harvest structured inputs ONLY (G4): the launcher-recorded checkout and
+        // the recap-parsed files_touched. The recap TEXT never crosses into the
+        // merge. A subtask with no recorded checkout is skipped (shared-mount).
+        let mut harvested: Vec<(String, WorkerHarvest)> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for id in ids {
+            let Some(checkout) = self.worker_registry.get(id) else {
+                skipped.push(id.clone());
+                continue;
+            };
+            let files_touched: Vec<PathBuf> = self
+                .results
+                .recap(id)
+                .map(|recap| parse_files_touched(&recap))
+                .unwrap_or_default();
+            harvested.push((
+                id.clone(),
+                WorkerHarvest {
+                    checkout,
+                    files_touched,
+                },
+            ));
+        }
+
+        let workers: Vec<WorkerHarvest> = harvested.iter().map(|(_, w)| w.clone()).collect();
+        let integrations =
+            git::integrate_worker_branches(integration_worktree, &workers, "merge worker")?;
+
+        let mut results = Vec::with_capacity(integrations.len() + skipped.len());
+        for ((id, _), integration) in harvested.iter().zip(integrations.iter()) {
+            let (clean, conflicted_files) = match &integration.merge {
+                Some(outcome) => (
+                    Some(outcome.clean),
+                    outcome.conflicted_files.clone(),
+                ),
+                None => (None, Vec::new()),
+            };
+            let manifests: Vec<String> = integration
+                .dependency_manifests
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            results.push(json!({
+                "subtask_id": id,
+                "branch": integration.branch,
+                "committed": integration.committed,
+                "clean": clean,
+                "conflicted_files": conflicted_files,
+                "dependency_manifests": manifests,
+            }));
+        }
+        for id in skipped {
+            results.push(json!({
+                "subtask_id": id,
+                "skipped": true,
+                "reason": "no isolated worktree recorded (ran on the shared mount)",
+            }));
+        }
+        Ok(json!({ "integrations": results }))
+    }
+
     /// The MCP `tools/list` manifest: exactly the narrow spawn tool plus the
     /// collect-side read-backs. Nothing else is advertised across the boundary.
     pub fn tool_manifest() -> Value {
@@ -922,7 +1083,8 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                 },
                 {"name": AWAIT_SUBTASK_TOOL, "description": "Block until a spawned sub-task reaches a terminal status; returns {subtask_id, status}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
                 {"name": AWAIT_SUBTASKS_TOOL, "description": "Block until ALL listed sub-tasks reach a terminal status; returns [{subtask_id, status}]. The wave primitive.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}},
-                {"name": SUBTASK_RESULT_TOOL, "description": "Fetch a finished sub-task's result: {status, files_touched, blocked_commands, recap}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}}
+                {"name": SUBTASK_RESULT_TOOL, "description": "Fetch a finished sub-task's result: {status, files_touched, blocked_commands, recap}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
+                {"name": INTEGRATE_SUBTASKS_TOOL, "description": "Merge a wave of finished sub-tasks' isolated worktree branches onto the integration workspace. Commits each worker's files_touched onto its wip/ branch host-side and 3-way merges it, returning per-worker {branch, committed, clean, conflicted_files, dependency_manifests}. A non-clean merge lists the conflicted files for a resolver; dependency_manifests flags Cargo.toml/package.json/lockfile changes (G5). Never pushes (G2/G3). Call after await_subtasks.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}}
             ]
         })
     }
@@ -1070,6 +1232,38 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                             &format!(
                                 "no result available for subtask '{sid}': unknown id or no recap yet"
                             ),
+                            true,
+                        ),
+                    ),
+                }
+            }
+            INTEGRATE_SUBTASKS_TOOL => {
+                let ids: Vec<String> = args
+                    .get("subtask_ids")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if ids.is_empty() {
+                    return rpc_error(
+                        id,
+                        -32602,
+                        "integrate_subtasks requires a non-empty `subtask_ids` array",
+                    );
+                }
+                if self.integration_worktree.is_none() {
+                    return rpc_result(id, tool_text(RESULTS_UNAVAILABLE, true));
+                }
+                match self.integrate_subtasks(&ids) {
+                    Ok(result) => rpc_result(id, tool_text(&result.to_string(), false)),
+                    Err(error) => rpc_result(
+                        id,
+                        tool_text(
+                            &format!("integrate_subtasks failed: {error:#}"),
                             true,
                         ),
                     ),
@@ -1700,7 +1894,8 @@ deny_sandboxes = ["local"]
                 RUN_SUBTASK_TOOL,
                 AWAIT_SUBTASK_TOOL,
                 AWAIT_SUBTASKS_TOOL,
-                SUBTASK_RESULT_TOOL
+                SUBTASK_RESULT_TOOL,
+                INTEGRATE_SUBTASKS_TOOL
             ]
         );
     }
@@ -2065,5 +2260,186 @@ deny_sandboxes = ["local"]
         assert!(names.contains(&AWAIT_SUBTASK_TOOL));
         assert!(names.contains(&AWAIT_SUBTASKS_TOOL));
         assert!(names.contains(&SUBTASK_RESULT_TOOL));
+        assert!(names.contains(&INTEGRATE_SUBTASKS_TOOL));
+    }
+
+    // --- integrate_subtasks (task #598 merge-back) -------------------------
+
+    use std::path::Path;
+    use std::process::Command as StdCommand;
+
+    fn init_repo(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "varda-orch-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "--local", "user.email", "t@example.com"],
+            vec!["config", "--local", "user.name", "T"],
+            vec!["config", "--local", "commit.gpgsign", "false"],
+        ] {
+            assert!(
+                StdCommand::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(root.join("shared.txt"), "base\n").unwrap();
+        for args in [vec!["add", "shared.txt"], vec!["commit", "-m", "seed"]] {
+            assert!(
+                StdCommand::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        root
+    }
+
+    fn recap_with_files(files: &[&Path]) -> String {
+        let mut recap = String::from("# Done\n\n## Files touched\n");
+        for f in files {
+            recap.push_str(&f.display().to_string());
+            recap.push('\n');
+        }
+        recap.push_str("\nrequires_user: false\n");
+        recap
+    }
+
+    /// Two workers edit the SAME file in isolated worktrees. `integrate_subtasks`
+    /// must merge the first cleanly and surface the second as a REAL conflict
+    /// (routed to a resolver via `conflicted_files`), never a silent clobber.
+    #[test]
+    fn integrate_subtasks_surfaces_a_real_conflict_never_clobbers() {
+        let repo = init_repo("integrate-tool");
+
+        let wt_a = repo.parent().unwrap().join(format!(
+            "orch-wt-a-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let wt_b = repo.parent().unwrap().join(format!(
+            "orch-wt-b-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(1)
+        ));
+        let a = git::create_worker_worktree(&repo, "worker-a", &wt_a).unwrap();
+        let b = git::create_worker_worktree(&repo, "worker-b", &wt_b).unwrap();
+
+        // Both edit the same file to conflicting contents in their own worktrees.
+        std::fs::write(a.path.join("shared.txt"), "from-a\n").unwrap();
+        std::fs::write(b.path.join("shared.txt"), "from-b\n").unwrap();
+
+        // The resident's integration worktree (its own branch off HEAD).
+        let int = repo.parent().unwrap().join(format!(
+            "orch-wt-int-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(2)
+        ));
+        let integration = git::create_worker_worktree(&repo, "integration", &int).unwrap();
+
+        // Registry: launcher recorded both isolated checkouts.
+        let registry = WorkerRegistry::new();
+        registry.record("a".to_owned(), a.clone());
+        registry.record("b".to_owned(), b.clone());
+
+        // Results seam feeds each worker's recap (structured files_touched only).
+        let a_files = a.path.join("shared.txt");
+        let b_files = b.path.join("shared.txt");
+        let recap_a = recap_with_files(&[a_files.as_path()]);
+        let recap_b = recap_with_files(&[b_files.as_path()]);
+        let results = MockResults::new(|_, _| Some(TaskStatus::Done))
+            .with_recap("a", &recap_a)
+            .with_recap("b", &recap_b);
+
+        let broker = SpawnBroker::new(base_policy(), "resident", MockLauncher::new())
+            .with_results(results)
+            .with_integration(registry, integration.path.clone());
+
+        let value = broker
+            .integrate_subtasks(&["a".to_owned(), "b".to_owned()])
+            .expect("integration loop should not error on a content conflict");
+        let integrations = value["integrations"].as_array().unwrap();
+        assert_eq!(integrations.len(), 2);
+
+        // First worker merged cleanly.
+        assert_eq!(integrations[0]["subtask_id"], json!("a"));
+        assert_eq!(integrations[0]["committed"], json!(true));
+        assert_eq!(integrations[0]["clean"], json!(true));
+        assert_eq!(integrations[0]["conflicted_files"], json!([] as [String; 0]));
+
+        // Second worker surfaced a REAL conflict on the shared file — the resolver
+        // queue — not a silent last-writer-wins overwrite.
+        assert_eq!(integrations[1]["subtask_id"], json!("b"));
+        assert_eq!(integrations[1]["committed"], json!(true));
+        assert_eq!(integrations[1]["clean"], json!(false));
+        assert_eq!(integrations[1]["conflicted_files"], json!(["shared.txt"]));
+
+        // The aborted conflict left the integration tree clean (A's merge intact).
+        let porcelain = StdCommand::new("git")
+            .arg("-C")
+            .arg(&integration.path)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            porcelain.stdout.is_empty(),
+            "conflict must be aborted, tree left clean; got {}",
+            String::from_utf8_lossy(&porcelain.stdout)
+        );
+
+        for wt in [&a, &b, &integration] {
+            let _ = git::remove_worker_worktree(&repo, wt, false);
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A subtask that was never recorded in the registry (non-git mother → shared
+    /// mount) is reported `skipped`, not merged.
+    #[test]
+    fn integrate_subtasks_skips_unregistered_shared_mount_workers() {
+        let repo = init_repo("integrate-skip");
+        let int = repo.parent().unwrap().join(format!(
+            "orch-skip-int-{}",
+            std::process::id()
+        ));
+        let integration = git::create_worker_worktree(&repo, "integration", &int).unwrap();
+
+        let broker = SpawnBroker::new(base_policy(), "resident", MockLauncher::new())
+            .with_results(MockResults::new(|_, _| Some(TaskStatus::Done)))
+            .with_integration(WorkerRegistry::new(), integration.path.clone());
+
+        let value = broker
+            .integrate_subtasks(&["ghost".to_owned()])
+            .expect("skip path should not error");
+        let integrations = value["integrations"].as_array().unwrap();
+        assert_eq!(integrations.len(), 1);
+        assert_eq!(integrations[0]["subtask_id"], json!("ghost"));
+        assert_eq!(integrations[0]["skipped"], json!(true));
+
+        let _ = git::remove_worker_worktree(&repo, &integration, false);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

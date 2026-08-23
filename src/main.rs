@@ -1080,6 +1080,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         &std::collections::BTreeMap::new(),
         None,
         None,
+        None,
     )?;
     let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
     let request = agent::AgentRunRequest {
@@ -1092,6 +1093,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
             sandbox: None,
             status: task::TaskStatus::Ready,
             project: None,
+            mother_project: None,
             assignee: Some(planner_agent),
             recap: None,
             recaps: vec![],
@@ -1301,6 +1303,12 @@ struct VardaSubtaskLauncher {
     project_path: PathBuf,
     fallback_agent: String,
     spawn_state: orchestration::SharedSpawnState,
+    /// Registry of isolated per-worker checkouts (subtask id → worktree/branch),
+    /// shared with the broker's `integrate_subtasks` tool. The launcher records
+    /// each worktree it creates here; the resident harvests them back at merge
+    /// time. A subtask absent from the map ran on the shared mount (non-git
+    /// mother → degrade).
+    worker_registry: orchestration::WorkerRegistry,
 }
 
 impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
@@ -1339,6 +1347,13 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
 
         let short = uuid::Uuid::new_v4().to_string();
         let task_name = format!("spawned-subtask-{}", &short[..8]);
+        // `create_task` is ALWAYS called with the MOTHER path (`project`): it uses
+        // this both for the home-store folder and to locate the repo DEFINITION
+        // store. If it were called with the worktree, every subtask would write
+        // its definition INTO the worktree, where it would be committed onto that
+        // worker's own `wip/` branch and self-replicate through merge-back. So we
+        // create against the mother, then (below) point the LOADED doc's `project`
+        // at the isolated worktree while recording the mother in `mother_project`.
         let task_path = task::create_task(
             &self.config,
             &task_name,
@@ -1349,6 +1364,43 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
         )
         .context("failed to create spawned subtask")?;
         let mut task_doc = task::load_task(&task_path)?;
+
+        // §2 — per-worker isolation. Create a `git worktree add -b wip/<slug>` off
+        // the mother's HEAD at a distinct out-of-tree host path, mount THAT into
+        // the worker (via its `project`), and record the mother in `mother_project`
+        // so POLICY (route/sandbox/orchestration) still keys on the mother while
+        // the worker edits files in its own worktree/branch. DEGRADE gracefully:
+        // `create_worker_worktree` fails outside a git repo, so a non-git mother
+        // falls back to today's shared-mount behaviour (no worktree, no override).
+        let worktree_slug = format!("{}-{}", task_name, &short[..8]);
+        let worker_checkout = match worker_worktree_path(&worktree_slug) {
+            Ok(worktree_path) => {
+                match git::create_worker_worktree(&project, &worktree_slug, &worktree_path) {
+                    Ok(checkout) => {
+                        task_doc.frontmatter.project = Some(checkout.path.display().to_string());
+                        task_doc.frontmatter.mother_project =
+                            Some(project.display().to_string());
+                        Some(checkout)
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: worker isolation unavailable for '{}' \
+                             (falling back to the shared mount): {error:#}",
+                            project.display()
+                        );
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: could not allocate a worker worktree path \
+                     (falling back to the shared mount): {error:#}"
+                );
+                None
+            }
+        };
+
         task_doc.set_status(task::TaskStatus::Ready);
         task::write_task(&task_doc)?;
         let subtask_id = task_doc
@@ -1356,6 +1408,13 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
             .id
             .map(|id| id.to_string())
             .unwrap_or_else(|| task_path.display().to_string());
+
+        // Record the isolated checkout so the resident's `integrate_subtasks` tool
+        // can harvest and merge this worker's branch back later. Keyed by the same
+        // subtask id the broker returns and the master `await`s on.
+        if let Some(checkout) = worker_checkout {
+            self.worker_registry.record(subtask_id.clone(), checkout);
+        }
 
         let lineage = SpawnLineage {
             root_id: subtask_id.clone(),
@@ -1644,11 +1703,17 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
                 )
             },
         );
+        // Shared worker registry: the launcher records each isolated worktree it
+        // creates, and the broker's `integrate_subtasks` tool harvests them back
+        // for the host-side merge. One instance threaded through both halves so
+        // they observe the same map.
+        let worker_registry = orchestration::WorkerRegistry::new();
         let launcher = VardaSubtaskLauncher {
             config: self.config.clone(),
             project_path: self.project_path.clone(),
             fallback_agent: self.fallback_agent.clone(),
             spawn_state: spawn_state.clone(),
+            worker_registry: worker_registry.clone(),
         };
         let broker = std::sync::Arc::new(
             orchestration::SpawnBroker::with_shared_state(
@@ -1658,7 +1723,11 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
                 spawn_state.clone(),
                 launcher,
             )
-            .with_results(VardaSubtaskResults::new(self.config.clone())),
+            .with_results(VardaSubtaskResults::new(self.config.clone()))
+            // The resident's own mounted workspace is the integration worktree each
+            // worker branch is merged onto (WORKFLOW.md step 5). Merge-back is
+            // local-only: the resident has no push credentials (G2/G3).
+            .with_integration(worker_registry, self.project_path.clone()),
         );
         // Transport selection by primitive. Own-kernel microVMs (microsandbox/clawk)
         // share the project tree over virtio-fs, which exposes the socket FILE but
@@ -1724,6 +1793,7 @@ fn build_client(
     route_mounts: &[String],
     route_env: &std::collections::BTreeMap<String, String>,
     project_path: Option<&Path>,
+    policy_path: Option<&Path>,
     pinned_sandbox: Option<&str>,
 ) -> Result<acp::AcpSubprocessClient> {
     // M11 — resolve the three identity/auth channels (curated identity files,
@@ -1736,9 +1806,19 @@ fn build_client(
     let mut untrusted_env_keys: Vec<String> = Vec::new();
     let provider = match project_path {
         Some(project_path) => {
-            let routing_root = routing_root_for(project_path);
+            // POLICY vs MOUNT split (task #598): the sandbox/route/`.varda` policy
+            // is resolved against `policy_path` — the MOTHER repo root for an
+            // isolated worker whose `project_path` is an out-of-tree worktree —
+            // while the returned mounts are later `{project}`-expanded against the
+            // worktree (`project_path`). When there is no separate mother
+            // (`policy_path` is `None`), policy resolution keys on `project_path`,
+            // so a non-orchestrated run behaves exactly as before. The mother must
+            // be threaded explicitly: deriving it from the worktree via
+            // `routing_root_for` would return the WORKTREE root, not the mother.
+            let policy_path = policy_path.unwrap_or(project_path);
+            let routing_root = routing_root_for(policy_path);
             let resolved =
-                config.resolve_sandbox_for(project_path, &routing_root, pinned_sandbox)?;
+                config.resolve_sandbox_for(policy_path, &routing_root, pinned_sandbox)?;
             enforce_varda_env_credential_floor(agent_config, &resolved)?;
             if let Some(varda_file) = &resolved.varda_file {
                 eprintln!(
@@ -2013,6 +2093,25 @@ fn routing_root_for(project_path: &Path) -> PathBuf {
     git::repo_root_for_path(project_path).unwrap_or_else(|_| project_path.to_path_buf())
 }
 
+/// Distinct out-of-tree host path for a per-worker isolated worktree, under
+/// `<varda_home>/worktrees/wip-<slug>/`. Kept out of the mother tree so the
+/// worktree never shadows or collides with the project checkout. The path must
+/// NOT already exist (`create_worker_worktree` requires a fresh path); the `slug`
+/// carries a per-spawn uuid suffix, so collisions are not expected, but a
+/// lingering directory from a crashed prior run is removed first.
+fn worker_worktree_path(slug: &str) -> Result<PathBuf> {
+    let base = config::varda_home()?.join("worktrees");
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("failed to create worktree base {}", base.display()))?;
+    let path = base.join(format!("wip-{slug}"));
+    if path.exists() {
+        std::fs::remove_dir_all(&path).with_context(|| {
+            format!("failed to clear stale worktree path {}", path.display())
+        })?;
+    }
+    Ok(path)
+}
+
 async fn run_task_path_for_parallel(
     config: config::Config,
     task_path: PathBuf,
@@ -2045,15 +2144,23 @@ async fn run_task_path_for_parallel(
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document.frontmatter.mother_project.as_deref().map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
     )?;
+    // POLICY reads (orchestration policy + sandbox-primitive/transport selection)
+    // key on the MOTHER repo root via `policy_project`; MOUNT/cwd (the socket dir,
+    // the launcher's project root) keeps `project`. For a non-orchestrated task
+    // `policy_project` == `project`, so this is backward-compatible.
     let policy = task_document
         .frontmatter
-        .project
-        .as_deref()
-        .map(Path::new)
+        .policy_project()
+        .map(|p| Path::new(p.as_str()))
         .map(|path| config.resolve_orchestration_for(path))
         .unwrap_or_else(|| config.orchestration.clone());
+    let policy_path = task_document
+        .frontmatter
+        .policy_project()
+        .map(|p| PathBuf::from(p.as_str()));
     let orchestrated_client = task_document
         .frontmatter
         .project
@@ -2066,7 +2173,7 @@ async fn run_task_path_for_parallel(
             policy,
             sandbox_primitive: resolve_sandbox_primitive(
                 &config,
-                &project_path,
+                policy_path.as_deref().unwrap_or(&project_path),
                 task_document.frontmatter.sandbox.as_deref(),
             ),
             project_path,
@@ -3512,6 +3619,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document.frontmatter.mother_project.as_deref().map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
     )?;
     // Wire the nested-orchestration broker onto the interactive resident: when
@@ -3663,6 +3771,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document.frontmatter.mother_project.as_deref().map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
     )?;
     let outcome = runner::plan_task(
@@ -3756,6 +3865,7 @@ async fn run_captured_resume_command(
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document.frontmatter.mother_project.as_deref().map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
     )?;
     if config.git.auto_commit {
@@ -5236,6 +5346,7 @@ deny_sandboxes = ["local"]
                 id: None,
                 status: task::TaskStatus::Ready,
                 project: None,
+                mother_project: None,
                 assignee: None,
                 sandbox: None,
                 recap: None,

@@ -107,56 +107,57 @@ Binding gates the resident MUST obey:
 - G7 — Respect broker caps: depth-1 means workers never spawn; fanout and
   budget bound each wave.
 
-### Implementation status (task #578)
+### Implementation status (tasks #578 → #598)
 
-The control loop above is the TARGET contract. As of task #578 it is partially
-implemented, and this note tracks the gap so the doc does not overstate reality:
+The control loop above is the TARGET contract. As of task #598 the isolation +
+merge-back wiring is LIVE; this note tracks what ships where.
 
 - Steps 1-3 (prioritize → fan out → await → read results) are live via the
   `spawn_subtask` / `await_subtasks` / `subtask_result` broker.
-- Step 2's "own worktree/branch" isolation is NOT yet wired into the launcher:
-  every spawned worker is still handed the SAME rw workspace mount, so parallel
-  workers only stay correct while their file footprints are disjoint. Two
-  workers editing the same file is a silent last-writer-wins clobber today.
-- Steps 4-6 (per-worker cross-review → per-branch merge → conflict resolver →
-  post-merge gate) are NOT yet wired; the resident currently produces a single
-  combined auto-commit rather than N reviewable per-worker branches.
+- Step 2's "own worktree/branch" isolation is now wired into the launcher: before
+  a worker runs, `VardaSubtaskLauncher::launch` creates a
+  `git worktree add -b wip/<slug>` off the mother's HEAD at an out-of-tree host
+  path (`<varda_home>/worktrees/wip-<slug>/`) and mounts THAT into the worker (its
+  `project` points at the worktree). Two workers editing the same file are now two
+  real branches that surface a merge conflict at integration, not a silent
+  last-writer-wins clobber. Non-git mothers DEGRADE gracefully to the shared mount.
+- Step 5's merge-back is exposed as a gated broker tool, `integrate_subtasks`,
+  alongside the four spawn/collect tools. After `await_subtasks`, the resident
+  calls it with the finished ids; it harvests each worker's recorded
+  `WorkerCheckout` from a launcher-side registry, parses `files_touched` HOST-side
+  from the recap (structured fields only, never the recap text — G4), runs
+  `integrate_worker_branches` against the resident's own mounted workspace, and
+  returns per-worker `{branch, committed, clean, conflicted_files,
+  dependency_manifests}` so the resident routes conflicts to a resolver (step 5)
+  and surfaces the G5 flag. It is local-only (no push — G2/G3).
+- Steps 4/6 (per-worker cross-review, resolver spawn, post-merge gate) remain the
+  resident agent's own loop driven from these tool outputs; they are agent
+  behaviour, not additional host plumbing.
+
+The `project` frontmatter field previously conflated POLICY (route/sandbox/
+orchestration key) with MOUNT/cwd. Task #598 split them: a new optional
+`mother_project` carries the mother repo root, and `TaskFrontmatter::policy_project()`
+returns `mother_project` when set else `project`. POLICY reads
+(`match_route_for_task`, `resolve_sandbox_for`, `resolve_orchestration_for`, the
+broker-transport primitive) key on `policy_project()`; MOUNT/cwd reads stay on
+`project`. A task without `mother_project` behaves exactly as before, so
+non-orchestrated runs are untouched. The mother is threaded EXPLICITLY by the
+launcher — it can never be derived from the worktree, whose
+`git rev-parse --show-toplevel` returns the worktree root, not the mother.
 
 The isolation + merge-back primitives that realize Design Option 1 (per-worker
 worktree/branch, host-side commit, 3-way merge with conflict surfacing, and the
-G5 dependency-manifest flag) are implemented and unit-tested in `src/git.rs`
-(`create_worker_worktree`, `commit_worker_changes`, `merge_worker_branch`,
-`remove_worker_worktree`, `dependency_manifest_changes`). They were
-cross-reviewed and hardened (tasks #585 → fix #587 → re-review #588): optional
-branch deletion on cleanup, and a merge-abort path that distinguishes a content
-conflict (resolver queue) from a non-conflict merge failure (hard error) and
-never leaves a half-merged tree.
+G5 dependency-manifest flag) live in `src/git.rs` (`create_worker_worktree`,
+`commit_worker_changes`, `merge_worker_branch`, `integrate_worker_branches`,
+`remove_worker_worktree`, `dependency_manifest_changes`). A content conflict is
+recorded and aborted so later workers in the wave still integrate; a no-op worker
+neither commits nor merges; a non-conflict merge failure propagates as an error.
 
-On top of those primitives, `integrate_worker_branches` runs the step-5
-merge-back loop host-side over a wave of harvested workers: for each it commits
-`files_touched` onto the worker's `wip/<slug>` branch and merges that branch onto
-the integration worktree, returning a per-worker `WorkerIntegration` (commit /
-merge outcome / G5 manifest flag). A content conflict is recorded and aborted so
-later workers in the wave still integrate; a no-op worker neither commits nor
-merges; a non-conflict merge failure propagates as an error. It never resolves,
-never pushes (G2/G3), and never trusts the recap text — only the structured
-`checkout` + `files_touched` cross into it (G4).
-
-The remaining slice is the LIVE wiring:
-- `VardaSubtaskLauncher` must create a per-worker worktree with
-  `create_worker_worktree` and mount THAT into the worker's box instead of the
-  shared workspace. BLOCKER: route matching and the workspace mount are keyed on
-  the subtask's `project` path (`match_route_for_task` → route glob →
-  `route_mounts`), so a worktree at an out-of-tree host path won't match the
-  project's route. Wiring this needs route resolution to key on the mother repo
-  root (or a `route`-override carrying the mother path) while the mount points at
-  the worktree — that is the load-bearing design decision, not the git plumbing.
-- the resident control loop must harvest each worker's `files_touched` and call
-  `integrate_worker_branches`, then route conflicts to a resolver and run the
-  post-merge gate.
-Isolation and merge-back must land together: isolated worktrees without the
-merge-back step would strand worker changes, so the live path still uses the
-shared workspace until both halves ship in one change.
+CLEANUP OWNERSHIP: `integrate_subtasks` does NOT delete worktrees or `wip/`
+branches — deleting at integration time would destroy the reviewable per-branch
+unit. Teardown (`remove_worker_worktree`, optionally `delete_branch = true`)
+belongs to the run-path lifecycle after cross-review / at root-run completion, so
+the worker registry keeps each entry for the whole root run.
 
 Trust framing: the resident consumes worker output as untrusted data, never as
 instructions. Work involving untrusted content such as web results or

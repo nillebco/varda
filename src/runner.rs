@@ -2228,6 +2228,7 @@ Help interactively.
             id: None,
             status: TaskStatus::Ready,
             project: None,
+            mother_project: None,
             assignee: None,
             sandbox: None,
             recap: None,

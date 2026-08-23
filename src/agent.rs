@@ -471,6 +471,7 @@ mod tests {
                     id: None,
                     status: TaskStatus::Ready,
                     project: Some("/work/project".to_owned()),
+                    mother_project: None,
                     assignee: Some("codex".to_owned()),
                     sandbox: None,
                     recap: None,

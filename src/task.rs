@@ -37,6 +37,19 @@ pub struct TaskFrontmatter {
     pub status: TaskStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// POLICY-only override of the project path for route/sandbox/orchestration
+    /// resolution. When a spawned worker runs in an isolated git worktree, its
+    /// `project` field points at the OUT-OF-TREE worktree host path (the MOUNT /
+    /// cwd), which no central route glob matches. `mother_project` carries the
+    /// original mother-repo root so POLICY reads (route matching, sandbox
+    /// resolution, orchestration policy) key on the mother while MOUNT/cwd reads
+    /// stay on `project`. Absent (the common case) ⇒ policy falls back to
+    /// `project`, so a non-orchestrated task behaves exactly as before. Never
+    /// derived implicitly (a worktree's `git rev-parse --show-toplevel` returns
+    /// the worktree, not the mother) — it must be threaded explicitly by the
+    /// launcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mother_project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
     /// Task-pinned sandbox override. When set (via `varda task add --sandbox
@@ -91,6 +104,16 @@ pub struct TaskFrontmatter {
 }
 
 impl TaskFrontmatter {
+    /// The project path POLICY resolution should key on: the `mother_project`
+    /// when set (an isolated worker running in an out-of-tree worktree), else the
+    /// `project` field. Route matching, sandbox resolution, and orchestration
+    /// policy read THIS; MOUNT / cwd reads stay on `project` so the worker still
+    /// edits files in its own worktree. Backward-compatible: a task without
+    /// `mother_project` returns exactly `project`.
+    pub fn policy_project(&self) -> Option<&String> {
+        self.mother_project.as_ref().or(self.project.as_ref())
+    }
+
     /// A copy with varda's internal run-bookkeeping cleared, for injection into an
     /// agent prompt. `recaps` / `agent_session_logs` are HOST filesystem paths
     /// (under `<varda_home>/operations/…`) that do not exist inside a sandbox —
@@ -445,6 +468,7 @@ pub fn create_task(
             id: Some(id),
             status: TaskStatus::Backlog,
             project: Some(project_path.display().to_string()),
+            mother_project: None,
             assignee: assignee.map(str::to_owned),
             sandbox: sandbox.map(str::to_owned),
             recap: None,
@@ -619,6 +643,7 @@ fn materialize_from_repo_definition(
 
     let mut frontmatter = TaskFrontmatter {
         project: Some(project),
+        mother_project: None,
         ..definition.frontmatter
     };
     // Definitions never carry runtime state, so `status` loads as the default
@@ -1270,6 +1295,7 @@ Body.
                 id: None,
                 status: TaskStatus::Running,
                 project: None,
+                mother_project: None,
                 assignee: Some("codex".to_owned()),
                 sandbox: None,
                 recap: None,
@@ -1316,6 +1342,7 @@ Body.
                 id: Some(7),
                 status: TaskStatus::Review,
                 project: None,
+                mother_project: None,
                 assignee: Some("codex".to_owned()),
                 sandbox: None,
                 recap: None,

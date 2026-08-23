@@ -75,11 +75,14 @@ pub fn match_route_for_task(
     task: &TaskDocument,
     planning: bool,
 ) -> Result<RouteMatch> {
+    // POLICY read: route matching keys on the MOTHER repo root (via
+    // `policy_project`), not the worktree the worker mounts. For a
+    // non-orchestrated task `policy_project` is exactly `project`, so this is
+    // backward-compatible.
     let project_path = task
         .frontmatter
-        .project
-        .as_deref()
-        .map(Path::new)
+        .policy_project()
+        .map(|p| Path::new(p.as_str()))
         .context("task frontmatter is missing project")?;
     let route = find_route(config, project_path)?;
     ensure_agents_exist(config, route)?;
@@ -657,6 +660,7 @@ mod tests {
                 id: Some(1),
                 status: crate::task::TaskStatus::Ready,
                 project: Some("/work/project".to_owned()),
+                mother_project: None,
                 assignee: None,
                 sandbox: None,
                 recap: None,
@@ -751,6 +755,7 @@ mod tests {
                 id: Some(1),
                 status: crate::task::TaskStatus::Ready,
                 project: Some("/work/project".to_owned()),
+                mother_project: None,
                 assignee: Some("small".to_owned()),
                 sandbox: None,
                 recap: None,
