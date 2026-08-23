@@ -45,8 +45,22 @@ RUN useradd -ms /bin/bash agent
 USER agent
 WORKDIR /home/agent
 
-# Pre-accept Claude Code onboarding so a headless run doesn't stall on the prompt.
-RUN printf '{"hasCompletedOnboarding":true,"theme":"dark"}\n' > /home/agent/.claude.json
+# Pre-accept Claude Code onboarding, the one-time "Bypass Permissions" warning
+# (`bypassPermissionsModeAccepted`, top-level — the resident + workers launch with
+# --permission-mode bypassPermissions and would otherwise prompt), AND the
+# per-project trust dialog so a headless run doesn't stall/abort (#635 item 1).
+# Trust is recorded per
+# absolute project path under `projects[<path>].hasTrustDialogAccepted` (shape
+# verified against the installed v2.1.x .claude.json). We seed the two guest paths
+# this image ever runs at:
+#   - /workspace                        : the orchestrate resident's rw mount
+#   - /Users/nilleb/dev/nillebco/varda  : the resident's host-path rw mount AND the
+#     worker worktrees — Claude keys a git worktree's trust on its MAIN repo path,
+#     so this one entry also trusts every wip/ worker worktree under ~/.varda/worktrees.
+# NOTE: the host path is dogfood-specific; the portable fix is to seed the guest
+# project path host-side at prepare() time (tracked in #635 item 1), which would
+# drop the hard-coded path from this tracked Dockerfile.
+RUN printf '%s\n' '{"hasCompletedOnboarding":true,"theme":"dark","bypassPermissionsModeAccepted":true,"projects":{"/workspace":{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true},"/Users/nilleb/dev/nillebco/varda":{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true}}}' > /home/agent/.claude.json
 
 # --- Rust toolchain (agent user; installs under $HOME/.cargo + $HOME/.rustup) ---
 ENV RUSTUP_HOME=/home/agent/.rustup \
