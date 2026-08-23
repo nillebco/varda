@@ -70,5 +70,16 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && /home/agent/.cargo/bin/rustup component add clippy rustfmt
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
 
+# codex ChatGPT-subscription auth home (#521). The `[agents.codex]` prelude decodes
+# the host's ChatGPT OAuth auth.json (injected as CODEX_AUTH_B64) into
+# $CODEX_HOME/auth.json at run time, and codex ALSO writes its sessions/rollouts/
+# history under $CODEX_HOME — so this dir must be AGENT-OWNED and writable. We
+# pre-create it here (agent-owned) so the mechanism never trips the msb `--copy-file`
+# root-reownership gotcha (staging a file into a dir re-owns the dir to root, which
+# would then block the uid-1001 agent from writing sessions). CODEX_HOME is pinned to
+# this path via `[agents.codex.env]`; the prelude writes auth.json itself (not a
+# file-target credential), so nothing here is ever root-owned.
+RUN mkdir -p /home/agent/.codex
+
 # Fail the build loudly if any expected tool is missing.
 RUN claude --version && codex --version && opencode --version && cargo --version && rustc --version

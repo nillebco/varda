@@ -1089,6 +1089,22 @@ to a `pass://` Proton Pass reference) and launch through `fnox exec` — fnox re
 host and varda copies it *scoped* into the box (fnox stays on the exterior; `~/.config/fnox`
 is never mounted). A ready `fnox.toml` ships in the orchestrate workspace.
 
+**codex on the ChatGPT subscription (#521).** A spawned `codex` worker lands in the `worker`
+sandbox (msb, `varda-agents:latest`, uid-1001 `agent`), which boots with no `~/.codex` and would
+hit `401 Unauthorized: Missing bearer` on `api.openai.com`. The `[agents.codex]` credential mints
+`CODEX_AUTH_B64` from the host's ChatGPT OAuth `~/.codex/auth.json` (id_token + long-lived
+refresh_token, `OPENAI_API_KEY: null`) and a small in-guest prelude decodes it into
+`$CODEX_HOME/auth.json` — **agent-owned and writable**, so codex refreshes the ~1h id_token in-run
+(over `auth.openai.com`) and writes its sessions/rollouts. The prelude is gated on the guest HOME
+(`/home/agent`), so an un-sandboxed local `vcodex` never runs it and never clobbers the operator's
+real `~/.codex`. A `file`-target credential would NOT work here: it stages `0o400` owned by the
+host uid, which the uid-1001 msb agent cannot read (docker agents like `adb-copilot` run as root, so
+file-target works there). No `OPENAI_API_KEY` / no per-token API spend. **Security:** the injected
+refresh_token is long-lived and powerful but bounded by the worker box — egress is OpenAI/Anthropic
+only with **no push credential**, so a compromised worker can burn ChatGPT quota but cannot
+exfiltrate the token to an attacker host. Time-boxing is weak (revoke = kill the ChatGPT
+session/device); for true short-TTL prefer the host-proxy model (box holds no credential).
+
 ```bash
 # Headless: run the resident autonomously until it terminates or signals needs_user.
 # `fnox exec` injects CLAUDE_CODE_OAUTH_TOKEN from the pass:// reference; run from the
