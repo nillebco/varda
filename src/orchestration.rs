@@ -524,6 +524,9 @@ pub const RUN_SUBTASK_TOOL: &str = "run_subtask";
 /// terminal status and recap once the host STATE store records them.
 pub const AWAIT_SUBTASK_TOOL: &str = "await_subtask";
 pub const SUBTASK_RESULT_TOOL: &str = "subtask_result";
+/// Host-computed unified diff of a finished subtask's worktree — the reviewer's
+/// window into the reviewed worker's actual changes (which it cannot reach itself).
+pub const SUBTASK_DIFF_TOOL: &str = "subtask_diff";
 /// Wave primitive: block until EVERY listed subtask reaches a terminal status.
 pub const AWAIT_SUBTASKS_TOOL: &str = "await_subtasks";
 /// Task control-plane read/write tools (task #640): let a sandboxed agent see
@@ -573,6 +576,15 @@ pub trait SubtaskResults: Send + Sync {
     /// Most recent recap TEXT for `id`, or `None` if the task is unknown or has
     /// not yet produced a recap.
     fn recap(&self, id: &str) -> Option<String>;
+    /// Unified diff of the finished subtask's WORKING-TREE changes — the worker's
+    /// actual output — computed HOST-side from its worktree. This is what a
+    /// cross-reviewer inspects: it cannot `git diff` the reviewed worker itself
+    /// (that worker's uncommitted changes live in its own out-of-tree worktree,
+    /// which is never mounted into another box — M8/#578), so the host hands it the
+    /// diff text. `None` when unavailable; default: none.
+    fn diff(&self, _id: &str) -> Option<String> {
+        None
+    }
     /// Whether a real collect channel is wired. A wired provider leaves the
     /// default `true`; the no-op [`NoSubtaskResults`] overrides to `false` so
     /// `await_subtask*`/`subtask_result` short-circuit INSTANTLY with the "not
@@ -1336,6 +1348,7 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                 {"name": AWAIT_SUBTASK_TOOL, "description": "Block until a spawned sub-task reaches a terminal status; returns {subtask_id, status}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
                 {"name": AWAIT_SUBTASKS_TOOL, "description": "Block until ALL listed sub-tasks reach a terminal status; returns [{subtask_id, status}]. The wave primitive.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}},
                 {"name": SUBTASK_RESULT_TOOL, "description": "Fetch a finished sub-task's result: {status, files_touched, blocked_commands, recap}.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
+                {"name": SUBTASK_DIFF_TOOL, "description": "Fetch the unified DIFF of a finished sub-task's working-tree changes (its actual code output), computed on the host. Use this to CROSS-REVIEW a worker: a reviewer cannot `git diff` the reviewed worker itself (its changes are uncommitted in an out-of-tree worktree that is never mounted into the reviewer's box), so get the diff here and hand it to the reviewer in the review brief. Empty string means no changes.", "inputSchema": {"type": "object", "required": ["subtask_id"], "properties": {"subtask_id": {"type": "string"}}}},
                 {"name": INTEGRATE_SUBTASKS_TOOL, "description": "Merge a wave of finished sub-tasks' isolated worktree branches onto the integration workspace. Commits each worker's files_touched onto its wip/ branch host-side and 3-way merges it, returning per-worker {branch, committed, clean, conflicted_files, dependency_manifests}. A non-clean merge lists the conflicted files for a resolver; dependency_manifests flags Cargo.toml/package.json/lockfile changes (G5). Never pushes (G2/G3). Call after await_subtasks.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}},
                 {"name": LIST_TASKS_TOOL, "description": "List YOUR OWN project's tasks: [{id, slug, status, title, assignee}]. Host-mediated; never crosses into another project. Use this (or `.varda/tasks/*.md` in the workspace) to discover work — there is no GitHub egress and no `varda` CLI inside the box.", "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "description": "Optional status filter: backlog, ready, running, review, needs_user, failed, or done."}}}},
                 {"name": GET_TASK_TOOL, "description": "Read one of your project's tasks by id: {id, slug, status, title, assignee, body}. Returns not-found for any id outside your own project (cross-project ids are never distinguishable from unknown ones).", "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "integer", "description": "Numeric task id."}}}},
@@ -1486,6 +1499,27 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                         tool_text(
                             &format!(
                                 "no result available for subtask '{sid}': unknown id or no recap yet"
+                            ),
+                            true,
+                        ),
+                    ),
+                }
+            }
+            SUBTASK_DIFF_TOOL => {
+                let Some(sid) = args.get("subtask_id").and_then(Value::as_str) else {
+                    return rpc_error(id, -32602, "subtask_diff requires a `subtask_id`");
+                };
+                if !self.results.is_available() {
+                    return rpc_result(id, tool_text(RESULTS_UNAVAILABLE, true));
+                }
+                match self.results.diff(sid) {
+                    Some(diff) => rpc_result(id, tool_text(&diff, false)),
+                    None => rpc_result(
+                        id,
+                        tool_text(
+                            &format!(
+                                "no diff available for subtask '{sid}': unknown id or its worktree \
+                                 could not be read"
                             ),
                             true,
                         ),
@@ -2223,6 +2257,7 @@ deny_sandboxes = ["local"]
                 AWAIT_SUBTASK_TOOL,
                 AWAIT_SUBTASKS_TOOL,
                 SUBTASK_RESULT_TOOL,
+                SUBTASK_DIFF_TOOL,
                 INTEGRATE_SUBTASKS_TOOL,
                 LIST_TASKS_TOOL,
                 GET_TASK_TOOL,

@@ -870,7 +870,7 @@ fn split_trailing_comment(s: &str) -> (&str, &str) {
     (s, "")
 }
 
-fn find_task_by_id(config: &Config, id: u64) -> Result<Option<PathBuf>> {
+pub fn find_task_by_id(config: &Config, id: u64) -> Result<Option<PathBuf>> {
     let task_dir = Path::new(&config.defaults.operations_dir).join("tasks");
     if !task_dir.exists() {
         return Ok(None);

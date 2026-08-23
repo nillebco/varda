@@ -1652,6 +1652,53 @@ impl orchestration::SubtaskResults for VardaSubtaskResults {
         let (_, recap_path) = self.state(id)?;
         std::fs::read_to_string(recap_path?).ok()
     }
+
+    /// Unified diff of the subtask's worktree (its uncommitted output). Resolves the
+    /// subtask's `project` (its isolated worktree) and diffs it HOST-side, where git
+    /// and the worktree are local — so a reviewer never needs git or a mount of the
+    /// reviewed worker's box.
+    fn diff(&self, id: &str) -> Option<String> {
+        let num = id.parse::<u64>().ok()?;
+        let path = task::find_task_by_id(&self.config, num).ok().flatten()?;
+        let fm = task::load_task(&path).ok()?.frontmatter;
+        subtask_worktree_diff(fm.project.as_deref()?, fm.mother_project.as_deref())
+    }
+}
+
+/// Compute the unified diff of a worker's full contribution — everything its
+/// worktree differs from the mother branch-point — INCLUDING new files. Diffs
+/// against `merge-base(worktree HEAD, mother HEAD)` so it captures the changes
+/// whether they are still uncommitted OR already committed onto the wip/ branch
+/// (integrate commits `files_touched` there); falls back to `HEAD` (uncommitted
+/// only) when the mother/merge-base can't be resolved. `add -N` renders untracked
+/// files; `reset` restores the index so nothing is left mutated for integration.
+fn subtask_worktree_diff(project: &str, mother: Option<&str>) -> Option<String> {
+    let git_out = |dir: &str, args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let base = mother
+        .and_then(|m| git_out(m, &["rev-parse", "HEAD"]))
+        .and_then(|head| git_out(project, &["merge-base", "HEAD", &head]))
+        .unwrap_or_else(|| "HEAD".to_owned());
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "git add -A -N >/dev/null 2>&1; git diff {base}; git reset -q >/dev/null 2>&1"
+        ))
+        .current_dir(project)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Host-side task control-plane seam (task #640): resolves `list_tasks` /
