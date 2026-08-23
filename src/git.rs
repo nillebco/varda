@@ -210,11 +210,22 @@ pub fn commit_task_deletions(deleted_paths: &[&Path], message: &str) -> Result<(
         .map(|p| deleted_repo_relative_path(&absolute_repo, p))
         .collect::<Result<_>>()?;
 
+    // Only paths git actually tracks can be `git add`ed once they are gone from
+    // the working tree. An untracked-and-now-deleted file — e.g. a recap that was
+    // never committed into `~/.varda` — makes `git add` abort the whole batch
+    // with "pathspec did not match any files", stranding even the tracked
+    // deletions alongside it. Stage just the tracked subset; if nothing here was
+    // ever tracked there is simply nothing to record.
+    let tracked = tracked_paths(&repo, &rel_paths)?;
+    if tracked.is_empty() {
+        return Ok(());
+    }
+
     let output = Command::new("git")
         .arg("-C")
         .arg(&repo)
         .arg("add")
-        .args(&rel_paths)
+        .args(&tracked)
         .output()
         .context("failed to stage deleted task files")?;
 
@@ -269,6 +280,41 @@ fn deleted_repo_relative_path(absolute_repo: &Path, path: &Path) -> Result<Strin
         )
     })?;
     Ok(relative.to_string_lossy().into_owned())
+}
+
+/// Filter `rel_paths` down to the subset git currently tracks, returning git's
+/// own view of each path. `git ls-files` reads the INDEX, not the working tree,
+/// so a file already removed from disk still resolves as long as it was
+/// committed — exactly what a deletion commit needs. Returning git's canonical
+/// paths (rather than intersecting our strings) keeps quoting/normalization in
+/// git's hands. Untracked paths simply do not appear in the output.
+fn tracked_paths(repo: &Path, rel_paths: &[String]) -> Result<Vec<String>> {
+    if rel_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "-z", "--"])
+        .args(rel_paths)
+        .output()
+        .context("failed to list tracked files")?;
+
+    if !output.status.success() {
+        bail!(
+            "git ls-files failed; stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let tracked = output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| String::from_utf8_lossy(segment).into_owned())
+        .collect();
+    Ok(tracked)
 }
 
 /// An isolated per-worker checkout: a dedicated git worktree with its own
@@ -835,6 +881,67 @@ mod tests {
             stdout.trim().is_empty(),
             "expected no commits, got {stdout}"
         );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn commit_task_deletions_ignores_untracked_paths() {
+        let repo = init_test_repo("delete-untracked");
+        // A tracked task file plus an untracked recap — the exact `varda task
+        // delete` shape where recaps live uncommitted in `~/.varda`.
+        seed_commit(&repo, "task.md", "tracked\n");
+        let untracked = repo.join("recap.md");
+        std::fs::write(&untracked, "never committed").expect("recap should be written");
+
+        // Both are removed from disk before the deletion commit, as the command
+        // does.
+        std::fs::remove_file(repo.join("task.md")).expect("task should be removed");
+        std::fs::remove_file(&untracked).expect("recap should be removed");
+
+        commit_task_deletions(&[&repo.join("task.md"), &untracked], "Delete task")
+            .expect("deletion should not fail on the untracked recap");
+
+        // The tracked deletion is recorded; the untracked path is silently skipped.
+        let log = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log should run");
+        let stdout = String::from_utf8_lossy(&log.stdout);
+        assert!(stdout.contains("Delete task"), "log was {stdout}");
+
+        let tracked = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["ls-files"])
+            .output()
+            .expect("git ls-files should run");
+        let files = String::from_utf8_lossy(&tracked.stdout);
+        assert!(!files.contains("task.md"), "task.md should be deleted: {files}");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn commit_task_deletions_is_noop_when_nothing_tracked() {
+        let repo = init_test_repo("delete-all-untracked");
+        seed_commit(&repo, "keep.md", "anchor\n");
+        let untracked = repo.join("recap.md");
+        std::fs::write(&untracked, "never committed").expect("recap should be written");
+        std::fs::remove_file(&untracked).expect("recap should be removed");
+
+        commit_task_deletions(&[&untracked], "Delete task").expect("noop should succeed");
+
+        // Only the seed commit exists — no empty "Delete task" commit was made.
+        let log = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log should run");
+        let stdout = String::from_utf8_lossy(&log.stdout);
+        assert!(!stdout.contains("Delete task"), "should not commit: {stdout}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
