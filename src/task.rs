@@ -1933,6 +1933,14 @@ requires_user: false
         let worker_checkout = root.join(".varda/worktrees/wip-task-661-dad41c7c");
         fs::create_dir_all(&mother).expect("mother project dir should be created");
         fs::create_dir_all(&worker_checkout).expect("worker checkout dir should be created");
+        // Canonicalize the fixture paths before they are written into the state file.
+        // On macOS `std::env::temp_dir()` yields `/var/folders/...` while canonicalization
+        // resolves the `/var -> /private/var` symlink, so a fixture that writes the raw
+        // path and asserts against `normalize_project_path` compares two spellings of the
+        // same directory and fails on the host while passing in a Linux sandbox.
+        let mother = fs::canonicalize(&mother).expect("mother should canonicalize");
+        let worker_checkout =
+            fs::canonicalize(&worker_checkout).expect("worker checkout should canonicalize");
 
         let task_dir = operations_dir
             .join("tasks")
