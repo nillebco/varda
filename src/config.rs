@@ -462,6 +462,13 @@ pub struct Route {
     /// the global default). Unset ⇒ inherit `Config::orchestration`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<crate::orchestration::OrchestrationPolicy>,
+    /// Host-side verification commands (#674) run before a worker's
+    /// `files_touched` is committed. Each entry is a full shell line executed
+    /// via `sh -c` in the project directory, in order; the first non-zero exit
+    /// gates the commit. Empty (the default) means no gate — the caller must
+    /// say so explicitly in the recap rather than implying verification ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify: Vec<String>,
 }
 
 /// How a sandbox's `egress` allow-list is ENFORCED — an explicit, honest name for
@@ -1771,6 +1778,7 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
             mounts: Vec::new(),
             env: BTreeMap::new(),
             orchestration: None,
+            verify: Vec::new(),
         },
     );
     save_config(path, &config)
@@ -2524,6 +2532,7 @@ deny_sandboxes = ["local"]
             mounts: Vec::new(),
             env: BTreeMap::new(),
             orchestration: None,
+            verify: Vec::new(),
         };
         assert_eq!(config.effective_sandbox(&route_with_sandbox), "firejail");
     }
@@ -2609,6 +2618,7 @@ mod m6b_tests {
             mounts: vec![],
             orchestration: None,
             env: BTreeMap::new(),
+            verify: Vec::new(),
         }];
         c
     }
@@ -3065,6 +3075,7 @@ agents = ["claude"]
                 mounts: vec![],
                 env: BTreeMap::new(),
                 orchestration: Some(strict.clone()),
+                verify: Vec::new(),
             },
             Route {
                 glob: "**".to_owned(),
@@ -3073,6 +3084,7 @@ agents = ["claude"]
                 mounts: vec![],
                 env: BTreeMap::new(),
                 orchestration: None,
+                verify: Vec::new(),
             },
         ];
 

@@ -2822,6 +2822,7 @@ Help interactively.
                 mounts: Vec::new(),
                 orchestration: None,
                 env: BTreeMap::new(),
+                verify: Vec::new(),
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),
