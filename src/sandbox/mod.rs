@@ -1318,15 +1318,31 @@ impl SandboxProvider for DockerProvider {
         // works with apps that do their own DNS); the raw hostnames go to the proxy
         // filter and NO IPs are pinned. `dns-pin` (legacy) resolves each host to a
         // concrete IP and pins it via `--add-host` while ambient DNS is disabled.
+        // `${env:NAME}` in an entry is resolved from the HOST env here, so a wrapper can
+        // pin a per-session port (the MCP broker's) without it living in config.
+        let egress: Vec<String> = self
+            .egress
+            .iter()
+            .filter_map(|entry| {
+                let expanded = expand_egress_entry(entry);
+                if expanded.is_none() {
+                    eprintln!(
+                        "sandbox: egress entry '{entry}' dropped — its ${{env:…}} variable is \
+                         unset or empty on the host; anything behind it is unreachable"
+                    );
+                }
+                expanded
+            })
+            .collect();
         let use_proxy =
-            !self.egress.is_empty() && docker_uses_egress_proxy("docker", self.egress_mode);
+            !egress.is_empty() && docker_uses_egress_proxy("docker", self.egress_mode);
         let mut egress_pins = Vec::new();
         let mut egress_hosts = Vec::new();
         if use_proxy {
-            egress_hosts = self.egress.clone();
+            egress_hosts = egress.clone();
         } else {
-            egress_pins = Vec::with_capacity(self.egress.len());
-            for host in &self.egress {
+            egress_pins = Vec::with_capacity(egress.len());
+            for host in &egress {
                 let host = split_egress_host(host).0;
                 let ip = resolve_host(host).await.with_context(|| {
                     format!(
@@ -1393,6 +1409,31 @@ fn egress_proxy_network(handle: &str) -> String {
 }
 fn egress_proxy_container(handle: &str) -> String {
     format!("varda-eproxy-{handle}")
+}
+
+/// Expand `${env:NAME}` inside an egress entry from the HOST env at prepare time.
+///
+/// Lets a wrapper pin a per-session port without hardcoding it in config — e.g.
+/// `"host.docker.internal:${env:DPT_MCP_PORT}"` follows whatever port the MCP broker
+/// came up on. Returns `None` when the variable is unset/empty or the entry is
+/// malformed: the entry is then DROPPED rather than allow-listing a literal
+/// `${env:...}` host, which would silently never match anything. Only trusted central
+/// config declares `egress`, and only host/port text is substituted — nothing crosses
+/// into the box.
+fn expand_egress_entry(entry: &str) -> Option<String> {
+    let mut out = String::with_capacity(entry.len());
+    let mut rest = entry;
+    while let Some(start) = rest.find("${env:") {
+        let (head, tail) = rest.split_at(start);
+        out.push_str(head);
+        let tail = &tail["${env:".len()..];
+        let end = tail.find('}')?;
+        let value = std::env::var(&tail[..end]).ok().filter(|v| !v.is_empty())?;
+        out.push_str(&value);
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// Split an egress entry into its host and optional explicit port (`host[:port]`).
@@ -4102,6 +4143,30 @@ mod tests {
         // A bare host list opens nothing beyond the defaults.
         let bare = tinyproxy_conf(&["api.github.com".to_owned()]);
         assert_eq!(bare.matches("ConnectPort").count(), 2, "{bare}");
+    }
+
+    /// `${env:NAME}` in an egress entry resolves from the host env; an unset variable
+    /// drops the entry rather than allow-listing a literal `${env:...}` hostname.
+    #[test]
+    fn egress_entry_expands_env_placeholders() {
+        // SAFETY: uniquely-named vars this test owns; set and removed within it.
+        unsafe { std::env::set_var("VARDA_TEST_EGRESS_PORT", "54321") };
+        assert_eq!(
+            expand_egress_entry("host.docker.internal:${env:VARDA_TEST_EGRESS_PORT}").as_deref(),
+            Some("host.docker.internal:54321")
+        );
+        unsafe { std::env::remove_var("VARDA_TEST_EGRESS_PORT") };
+        assert_eq!(
+            expand_egress_entry("host.docker.internal:${env:VARDA_TEST_EGRESS_PORT}"),
+            None
+        );
+        // Entries without a placeholder are untouched.
+        assert_eq!(
+            expand_egress_entry("api.github.com").as_deref(),
+            Some("api.github.com")
+        );
+        // Malformed placeholder drops rather than allow-listing garbage.
+        assert_eq!(expand_egress_entry("host:${env:UNCLOSED"), None);
     }
 
     /// A port suffix is stripped before DNS-pin resolution/pinning, so `dns-pin`
