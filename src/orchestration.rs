@@ -89,6 +89,16 @@ impl WorkerRegistry {
             .get(id)
             .cloned()
     }
+
+    /// Remove and return every checkout owned by this root run.
+    ///
+    /// Draining makes teardown idempotent and prevents a later cleanup pass from
+    /// touching paths that may have been reused after this run ended.
+    pub fn drain(&self) -> Vec<WorkerCheckout> {
+        std::mem::take(&mut *self.0.lock().expect("worker registry mutex poisoned"))
+            .into_values()
+            .collect()
+    }
 }
 
 /// Identifier of a task in the spawn tree. The root master task has some id; each
@@ -1222,7 +1232,7 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
     /// branch was integrated for it. This never blocks — the master `await`s
     /// first.
     ///
-    /// CLEANUP OWNERSHIP (task #598 open question, resolved here): this tool does
+    /// CLEANUP OWNERSHIP: this tool does
     /// NOT remove worktrees or delete `wip/<slug>` branches. Deleting a branch at
     /// integration time would destroy the very reviewable unit the isolation
     /// exists to produce — the resident routes conflicts to a resolver and the
@@ -1230,8 +1240,11 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
     /// branch outlive integration; teardown belongs to the run-path lifecycle
     /// (after cross-review / at root-run completion), reusing
     /// [`git::remove_worker_worktree`] with `delete_branch = true` only once the
-    /// branch is no longer needed for review. The registry therefore keeps each
-    /// entry for the whole root run rather than draining it here.
+    /// branch is no longer needed for review. Root-run teardown deletes every
+    /// registered checkout after all spawned workers have joined (or have been
+    /// aborted). Worker branches live only in the independent clones, so deleting
+    /// each clone also deletes its `wip/` branch. The registry therefore keeps
+    /// each entry for the whole root run rather than draining it here.
     fn integrate_subtasks(&self, ids: &[String]) -> anyhow::Result<Value> {
         let integration_worktree = self
             .integration_worktree

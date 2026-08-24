@@ -1640,6 +1640,8 @@ async fn abort_spawned_subtasks(spawn_state: &orchestration::SharedSpawnState) {
 
 async fn finish_spawned_subtasks(
     spawn_state: &orchestration::SharedSpawnState,
+    worker_registry: &orchestration::WorkerRegistry,
+    mother: &Path,
     is_root_run: bool,
     run_succeeded: bool,
 ) {
@@ -1649,6 +1651,21 @@ async fn finish_spawned_subtasks(
 
     if run_succeeded {
         join_spawned_subtasks(spawn_state).await;
+
+        // All worker processes are now joined, so none can still be using its
+        // checkout. Keep clones through integration/cross-review, then remove the
+        // complete root run's reviewable units here. `drain` scopes deletion to
+        // paths this launcher registered and makes repeated teardown harmless.
+        // Only reclaimed on a SUCCESSFUL root run — on failure the checkouts are
+        // left in place for a human to inspect/recover un-integrated work.
+        for checkout in worker_registry.drain() {
+            if let Err(error) = git::remove_worker_worktree(mother, &checkout, true) {
+                eprintln!(
+                    "warning: failed to remove worker checkout '{}' after root run: {error:#}",
+                    checkout.path.display()
+                );
+            }
+        }
     } else {
         abort_spawned_subtasks(spawn_state).await;
     }
@@ -1956,7 +1973,7 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
             // The resident's own mounted workspace is the integration worktree each
             // worker branch is merged onto (WORKFLOW.md step 5). Merge-back is
             // local-only: the resident has no push credentials (G2/G3).
-            .with_integration(worker_registry, self.project_path.clone())
+            .with_integration(worker_registry.clone(), self.project_path.clone())
             // Task control-plane tools (task #640): scoped to this run's OWN
             // project, exactly like the integration worktree above.
             .with_task_control_plane(
@@ -1998,7 +2015,14 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
 
         let is_root_run = self.lineage.is_none();
         let result = self.inner.run_task(request).await;
-        finish_spawned_subtasks(&spawn_state, is_root_run, result.is_ok()).await;
+        finish_spawned_subtasks(
+            &spawn_state,
+            &worker_registry,
+            &self.project_path,
+            is_root_run,
+            result.is_ok(),
+        )
+        .await;
         server.abort();
         if !use_tcp {
             let _ = std::fs::remove_file(&socket_path);
@@ -5268,12 +5292,17 @@ deny_sandboxes = ["local"]
         use tokio::time::timeout;
 
         let state = orchestration::SharedSpawnState::new();
+        let registry = orchestration::WorkerRegistry::new();
+        let mother = std::env::temp_dir();
         let child_state = state.clone();
+        let child_registry = registry.clone();
+        let child_mother = mother.clone();
         let terminal_written = Arc::new(AtomicBool::new(false));
         let child_terminal_written = terminal_written.clone();
 
         let child_handle = tokio::spawn(async move {
-            finish_spawned_subtasks(&child_state, false, true).await;
+            finish_spawned_subtasks(&child_state, &child_registry, &child_mother, false, true)
+                .await;
             child_terminal_written.store(true, Ordering::SeqCst);
         });
         state.insert_handle("child".to_owned(), child_handle);
@@ -5288,11 +5317,80 @@ deny_sandboxes = ["local"]
 
         timeout(
             Duration::from_millis(100),
-            finish_spawned_subtasks(&state, true, true),
+            finish_spawned_subtasks(&state, &registry, &mother, true, true),
         )
         .await
         .expect("root cleanup should join the completed child");
         assert_eq!(state.handle_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_root_run_removes_registered_worker_checkout_and_branch() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-root-worker-cleanup-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        seed_git_repo(&mother);
+        let checkout_path = root.join("worker");
+        let checkout = git::create_worker_worktree(&mother, "completed", &checkout_path)
+            .expect("worker checkout should be created");
+        let registry = orchestration::WorkerRegistry::new();
+        registry.record("worker-1".to_owned(), checkout.clone());
+
+        finish_spawned_subtasks(
+            &orchestration::SharedSpawnState::new(),
+            &registry,
+            &mother,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(!checkout.path.exists(), "worker clone should be removed");
+        assert!(
+            registry.get("worker-1").is_none(),
+            "registry should be drained"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_root_run_preserves_registered_worker_checkout() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-root-worker-cleanup-failed-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        seed_git_repo(&mother);
+        let checkout_path = root.join("worker");
+        let checkout = git::create_worker_worktree(&mother, "failed", &checkout_path)
+            .expect("worker checkout should be created");
+        let registry = orchestration::WorkerRegistry::new();
+        registry.record("worker-1".to_owned(), checkout.clone());
+
+        finish_spawned_subtasks(
+            &orchestration::SharedSpawnState::new(),
+            &registry,
+            &mother,
+            true,
+            false,
+        )
+        .await;
+
+        assert!(
+            checkout.path.exists(),
+            "worker clone must survive a failed root run for human recovery"
+        );
+        assert!(
+            registry.get("worker-1").is_some(),
+            "registry must not be drained on a failed root run"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Test double for `OrchestratedAgentClient`'s inner agent: it never spawns a
