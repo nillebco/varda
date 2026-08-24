@@ -1593,6 +1593,11 @@ fn sanitize_docker_name(session_id: &str) -> String {
         .collect()
 }
 
+/// Stable provider resource handle derived from a Varda session id.
+pub(crate) fn sanitize_session_handle(session_id: &str) -> String {
+    sanitize_docker_name(session_id)
+}
+
 /// Resolve `host` to a single IP address using the host's blocking resolver.
 ///
 /// Runs on the blocking pool so we don't need tokio's optional `net` feature.

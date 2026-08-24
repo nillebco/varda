@@ -2,6 +2,7 @@ mod acp;
 mod agent;
 mod capability;
 mod config;
+mod doctor;
 mod git;
 mod mcp_transport;
 mod notify;
@@ -221,6 +222,11 @@ enum TaskCommand {
     /// Show runtime diagnostics: agent config, route, session logs, and live processes.
     Inspect {
         /// Markdown task file or task id to inspect.
+        task: PathBuf,
+    },
+    /// Probe the latest run using sandbox and session-log authorities.
+    Doctor {
+        /// Markdown task file or task id to diagnose.
         task: PathBuf,
     },
     /// Set the status of a task directly.
@@ -547,6 +553,9 @@ async fn run_cli() -> Result<()> {
             }
             TaskCommand::Inspect { task } => {
                 inspect_task_command(&task)?;
+            }
+            TaskCommand::Doctor { task } => {
+                doctor::doctor_task_command(&task)?;
             }
             TaskCommand::SetStatus { status, task } => {
                 update_tasks_command(
@@ -2315,7 +2324,7 @@ fn run_host_credential_command(program: &str, args: &[&str]) -> Result<String> {
 
 /// Bound for the upward `.varda` walk: the git repository root of `project_path`,
 /// falling back to the project path itself when it is not inside a git repo.
-fn routing_root_for(project_path: &Path) -> PathBuf {
+pub(crate) fn routing_root_for(project_path: &Path) -> PathBuf {
     git::repo_root_for_path(project_path).unwrap_or_else(|_| project_path.to_path_buf())
 }
 
