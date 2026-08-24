@@ -428,19 +428,66 @@ fn copy_git_identity(source_repo: &Path, clone: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The outcome of attempting to commit a worker's `files_touched` onto its
+/// branch. Distinguishing [`CommitOutcome::AlreadyCommitted`] from
+/// [`CommitOutcome::NothingToCommit`] is what makes integration resumable
+/// (task #708): a worker with `AlreadyCommitted` — for example because a
+/// prior call already committed it before a later step failed — still has a
+/// commit that needs to be merged, whereas `NothingToCommit` (an empty or
+/// no-op worker) genuinely has nothing for the merge step to do.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// `files` was empty, or every path fell outside the worktree — there was
+    /// never anything for this worker to commit.
+    NothingToCommit,
+    /// A new commit was created by this call.
+    CommittedNow,
+    /// The reported files matched the worktree's current `HEAD` already (most
+    /// often because an earlier call already committed them) — no new commit
+    /// was needed, but a commit exists on the branch.
+    AlreadyCommitted,
+}
+
+#[allow(dead_code)]
+impl CommitOutcome {
+    /// Whether the worker branch carries a commit for its `files_touched`,
+    /// whether created just now or already present. Merge should be attempted
+    /// whenever this is `true` — "already committed" must not be read as
+    /// "already integrated".
+    pub fn has_commit(self) -> bool {
+        !matches!(self, CommitOutcome::NothingToCommit)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            CommitOutcome::NothingToCommit => "nothing_to_commit",
+            CommitOutcome::CommittedNow => "committed_now",
+            CommitOutcome::AlreadyCommitted => "already_committed",
+        }
+    }
+}
+
+impl std::fmt::Display for CommitOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Commit the worker's edited files onto its branch, host-side. `files` are the
 /// paths the worker reported under `Files touched`; paths outside the worktree
 /// are skipped with a warning (a careless recap can't break integration).
-/// Returns `true` when a commit was created, `false` when there was nothing to
-/// commit (an empty or no-op worker).
+/// Idempotent: calling this again after a successful commit reports
+/// [`CommitOutcome::AlreadyCommitted`] rather than silently doing nothing, so
+/// the caller can still resume the merge step (#708).
 #[allow(dead_code)]
 pub fn commit_worker_changes(
     checkout: &WorkerCheckout,
     files: &[PathBuf],
     message: &str,
-) -> Result<bool> {
+) -> Result<CommitOutcome> {
     if files.is_empty() {
-        return Ok(false);
+        return Ok(CommitOutcome::NothingToCommit);
     }
     let worktree = &checkout.path;
     let canonical = worktree
@@ -460,7 +507,7 @@ pub fn commit_worker_changes(
         }
     }
     if rel_paths.is_empty() {
-        return Ok(false);
+        return Ok(CommitOutcome::NothingToCommit);
     }
 
     let output = Command::new("git")
@@ -479,11 +526,11 @@ pub fn commit_worker_changes(
     }
 
     if !has_staged_changes(worktree)? {
-        return Ok(false);
+        return Ok(CommitOutcome::AlreadyCommitted);
     }
 
     run_git_in(worktree, ["commit", "-m", message]).context("failed to commit worker changes")?;
-    Ok(true)
+    Ok(CommitOutcome::CommittedNow)
 }
 
 /// Attempt to integrate `worker_branch` into the branch currently checked out at
@@ -662,16 +709,52 @@ pub struct WorkerHarvest {
 pub struct WorkerIntegration {
     /// The worker's `wip/<slug>` branch.
     pub branch: String,
-    /// Whether the worker produced a commit. `false` = empty/no-op worker (its
-    /// `files_touched` were all empty or outside the worktree); no merge was run.
-    pub committed: bool,
-    /// Merge result onto the integration branch. `None` when `committed` is
-    /// `false`. A non-`clean` outcome carries the conflicted paths the resident
-    /// routes to a resolver (WORKFLOW.md step 5).
+    /// Whether/how the worker's `files_touched` ended up committed onto its
+    /// branch this call. `NothingToCommit` = empty/no-op worker; the other two
+    /// variants both carry a commit, so merge is attempted for either (#708:
+    /// "already committed" must not be read as "already integrated").
+    pub commit_outcome: CommitOutcome,
+    /// Merge result onto the integration branch. `None` when `commit_outcome`
+    /// is `NothingToCommit` (merge not attempted). A non-`clean` outcome
+    /// carries the conflicted paths the resident routes to a resolver
+    /// (WORKFLOW.md step 5).
     pub merge: Option<MergeOutcome>,
     /// Dependency-manifest files this worker touched — the G5 flag the resident
     /// must surface before any human push.
     pub dependency_manifests: Vec<PathBuf>,
+}
+
+/// Repo-relative paths with local modifications to TRACKED content at
+/// `worktree` — staged changes, unstaged edits, deletions, or an in-progress
+/// merge/rebase (`git status --porcelain --untracked-files=no`, entries with
+/// no trailing newline filtered out). Untracked files are deliberately
+/// excluded: an integration worktree can permanently carry untracked local
+/// tooling (e.g. `.claude/`, `.mcp.json`) that AGENTS.md says does not belong
+/// in the repo, and flagging those as "dirty" would make every future
+/// integration refuse forever. Used as the pre-flight check before
+/// integration touches anything (#708 item 4): a dirty integration worktree
+/// is exactly what let a concurrent agent's uncommitted `src/config.rs` edit
+/// turn a mid-flow `git merge` failure into a stranded half-finished
+/// integration.
+fn worktree_dirty_paths(worktree: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .context("failed to check integration worktree status")?;
+    if !output.status.success() {
+        bail!(
+            "git status failed in integration worktree; stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        // porcelain lines are "XY <path>"; keep the path only.
+        .map(|l| l.get(3..).unwrap_or(l).to_owned())
+        .collect())
 }
 
 /// Run the WORKFLOW.md step-5 merge-back loop host-side over a wave of harvested
@@ -679,36 +762,57 @@ pub struct WorkerIntegration {
 /// branch ([`commit_worker_changes`]) and merge that branch onto the branch
 /// checked out at `integration_worktree` ([`merge_worker_branch`]).
 ///
-/// This is deterministic glue, not policy: it never resolves conflicts, never
-/// pushes, and never aborts the wave on a *content* conflict — a conflicting
-/// merge is recorded (aborted so the integration tree stays clean) and reported
-/// as the resolver's work queue, so later workers in the wave still integrate.
-/// A merge that fails *without* unmerged paths (e.g. a pre-merge hook rejection)
-/// is a hard error the primitive surfaces, and it propagates here. Each worker's
-/// dependency-manifest touches are flagged (G5) for the resident to relay to the
-/// human before any push (G3).
+/// Resumable (#708): each worker's commit and merge steps are evaluated
+/// independently. A worker whose branch already carries its commit — because
+/// an earlier call committed it before a later step failed — still gets its
+/// merge attempted; "already committed" is never read as "already integrated".
+///
+/// Refuses up front, before committing anything, if `integration_worktree`
+/// itself has local modifications ([`worktree_dirty_paths`]): letting `git
+/// merge` discover that mid-flow (after a worker's commit has already landed)
+/// is exactly the half-finished state #708 exists to prevent. The refusal
+/// names the offending paths so the caller can act on it, rather than a
+/// generic git failure the caller cannot see the cause of.
+///
+/// This is otherwise deterministic glue, not policy: it never resolves
+/// conflicts, never pushes, and never aborts the wave on a *content* conflict —
+/// a conflicting merge is recorded (aborted so the integration tree stays
+/// clean) and reported as the resolver's work queue, so later workers in the
+/// wave still integrate. A merge that fails *without* unmerged paths (e.g. a
+/// pre-merge hook rejection) is a hard error the primitive surfaces, and it
+/// propagates here. Each worker's dependency-manifest touches are flagged (G5)
+/// for the resident to relay to the human before any push (G3).
 #[allow(dead_code)]
 pub fn integrate_worker_branches(
     integration_worktree: &Path,
     workers: &[WorkerHarvest],
     commit_message_prefix: &str,
 ) -> Result<Vec<WorkerIntegration>> {
+    let dirty = worktree_dirty_paths(integration_worktree)?;
+    if !dirty.is_empty() {
+        bail!(
+            "integration worktree {} has local modifications and cannot be integrated into: {}",
+            integration_worktree.display(),
+            dirty.join(", ")
+        );
+    }
+
     let mut integrations = Vec::with_capacity(workers.len());
     for worker in workers {
         let branch = worker.checkout.branch.clone();
-        let committed = commit_worker_changes(
+        let commit_outcome = commit_worker_changes(
             &worker.checkout,
             &worker.files_touched,
             &format!("{commit_message_prefix} {branch}"),
         )?;
-        let merge = if committed {
+        let merge = if commit_outcome.has_commit() {
             Some(merge_worker_branch(integration_worktree, &worker.checkout)?)
         } else {
             None
         };
         integrations.push(WorkerIntegration {
             branch,
-            committed,
+            commit_outcome,
             merge,
             dependency_manifests: dependency_manifest_changes(&worker.files_touched),
         });
@@ -1033,10 +1137,14 @@ mod tests {
         std::fs::write(a.path.join("shared.txt"), "from-a\n").expect("write a");
         std::fs::write(b.path.join("shared.txt"), "from-b\n").expect("write b");
         assert!(
-            commit_worker_changes(&a, &[a.path.join("shared.txt")], "worker a").expect("commit a")
+            commit_worker_changes(&a, &[a.path.join("shared.txt")], "worker a")
+                .expect("commit a")
+                .has_commit()
         );
         assert!(
-            commit_worker_changes(&b, &[b.path.join("shared.txt")], "worker b").expect("commit b")
+            commit_worker_changes(&b, &[b.path.join("shared.txt")], "worker b")
+                .expect("commit b")
+                .has_commit()
         );
 
         // Integration worktree on a fresh integration branch.
@@ -1126,7 +1234,8 @@ mod tests {
         let worker = create_worker_worktree(&repo, "worker", &worker_path).expect("worktree");
         std::fs::write(worker.path.join("other.txt"), "worker\n").expect("write");
         assert!(commit_worker_changes(&worker, &[worker.path.join("other.txt")], "worker")
-            .expect("commit worker"));
+            .expect("commit worker")
+            .has_commit());
 
         // Integration clone whose git dir carries a pre-merge-commit hook that
         // rejects the merge. The trees merge cleanly (no unmerged paths) but the
@@ -1210,7 +1319,8 @@ mod tests {
             &[integration.path.join("shared.txt")],
             "integration base",
         )
-        .expect("commit integration base"));
+        .expect("commit integration base")
+        .has_commit());
 
         let workers = vec![
             WorkerHarvest {
@@ -1233,7 +1343,7 @@ mod tests {
 
         // A: clean merge + G5 manifest flag.
         assert_eq!(results[0].branch, "wip/int-a");
-        assert!(results[0].committed);
+        assert!(results[0].commit_outcome.has_commit());
         assert!(results[0].merge.as_ref().expect("a merged").clean);
         assert_eq!(
             results[0].dependency_manifests,
@@ -1242,7 +1352,7 @@ mod tests {
 
         // B: conflict surfaced as the resolver's work queue, wave not aborted.
         assert_eq!(results[1].branch, "wip/int-b");
-        assert!(results[1].committed);
+        assert!(results[1].commit_outcome.has_commit());
         let b_merge = results[1].merge.as_ref().expect("b merge attempted");
         assert!(!b_merge.clean);
         assert_eq!(b_merge.conflicted_files, vec!["shared.txt".to_owned()]);
@@ -1250,7 +1360,7 @@ mod tests {
 
         // C: no files → no commit, no merge.
         assert_eq!(results[2].branch, "wip/int-c");
-        assert!(!results[2].committed);
+        assert_eq!(results[2].commit_outcome, CommitOutcome::NothingToCommit);
         assert!(results[2].merge.is_none());
 
         // The aborted conflict left the integration tree clean (A's merge intact).
@@ -1278,6 +1388,90 @@ mod tests {
         );
 
         for wt in [&a, &b, &c, &integration] {
+            let _ = remove_worker_worktree(&repo, wt, false);
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn integrate_worker_branches_refuses_dirty_integration_worktree_before_committing() {
+        let repo = init_test_repo("integrate-dirty-tracked");
+        std::fs::create_dir_all(repo.join("src")).expect("create src dir");
+        seed_commit(&repo, "src/config.rs", "base\n");
+
+        let worker_path = unique_worktree_path(&repo, "worker");
+        let worker = create_worker_worktree(&repo, "worker", &worker_path).expect("worktree");
+        std::fs::write(worker.path.join("a.txt"), "from-worker\n").expect("write a");
+
+        let int_path = unique_worktree_path(&repo, "int-target");
+        let integration =
+            create_worker_worktree(&repo, "int-target", &int_path).expect("integration worktree");
+        // A concurrent agent's uncommitted edit to a TRACKED file — the exact
+        // shape of the original #708 incident.
+        std::fs::write(integration.path.join("src/config.rs"), "concurrent edit\n")
+            .expect("write concurrent edit");
+
+        let workers = vec![WorkerHarvest {
+            checkout: worker.clone(),
+            files_touched: vec![worker.path.join("a.txt")],
+        }];
+
+        let err = integrate_worker_branches(&integration.path, &workers, "merge worker")
+            .expect_err("dirty integration worktree must be refused before committing");
+        assert!(
+            err.to_string().contains("src/config.rs"),
+            "unexpected error: {err}"
+        );
+
+        // The pre-flight check ran before any worker commit was made: the
+        // worker's `a.txt` change is still unstaged in its worktree.
+        let worker_status = Command::new("git")
+            .arg("-C")
+            .arg(&worker.path)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status should run");
+        assert!(
+            String::from_utf8_lossy(&worker_status.stdout).contains("a.txt"),
+            "worker should not have been committed when the pre-flight check refuses"
+        );
+
+        for wt in [&worker, &integration] {
+            let _ = remove_worker_worktree(&repo, wt, false);
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn integrate_worker_branches_ignores_untracked_files_when_checking_dirty_worktree() {
+        let repo = init_test_repo("integrate-dirty-untracked");
+        seed_commit(&repo, "shared.txt", "base\n");
+
+        let worker_path = unique_worktree_path(&repo, "worker");
+        let worker = create_worker_worktree(&repo, "worker", &worker_path).expect("worktree");
+        std::fs::write(worker.path.join("a.txt"), "from-worker\n").expect("write a");
+
+        let int_path = unique_worktree_path(&repo, "int-target");
+        let integration =
+            create_worker_worktree(&repo, "int-target", &int_path).expect("integration worktree");
+        // Untracked local tooling files (e.g. `.claude/`, `.mcp.json`) that
+        // AGENTS.md says do not belong in the repo — must never block
+        // integration, unlike a modification to a tracked file.
+        std::fs::write(integration.path.join(".mcp.json"), "{}\n")
+            .expect("write untracked file");
+
+        let workers = vec![WorkerHarvest {
+            checkout: worker.clone(),
+            files_touched: vec![worker.path.join("a.txt")],
+        }];
+
+        let results = integrate_worker_branches(&integration.path, &workers, "merge worker")
+            .expect("an untracked file in the integration worktree must not be refused");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].commit_outcome.has_commit());
+        assert!(results[0].merge.as_ref().expect("merged").clean);
+
+        for wt in [&worker, &integration] {
             let _ = remove_worker_worktree(&repo, wt, false);
         }
         let _ = std::fs::remove_dir_all(&repo);
