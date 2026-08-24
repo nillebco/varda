@@ -2370,7 +2370,12 @@ pub struct MicrosandboxSession {
 }
 
 impl MicrosandboxSession {
-    const CREDENTIAL_ENV_FILE: &'static str = "/tmp/.varda-credential-env";
+    // NOT under /tmp: `--copy-file` lands the file BEFORE the guest boots, and the
+    // guest then mounts a fresh tmpfs over /tmp — which shadows anything staged
+    // there, so the wrapper's `. <file>` failed with "cannot open" and the agent
+    // exited 2 before doing any work. `/opt/varda` survives boot and is already
+    // where the prompt file is staged.
+    const CREDENTIAL_ENV_FILE: &'static str = "/opt/varda/.credential-env";
 
     /// Write `content` to a host temp (read-only when `read_only`) and record it so
     /// [`wrap`](Self::wrap) can emit a pre-boot `--copy-file host:guest` flag (msb
@@ -4472,7 +4477,8 @@ mod tests {
                 .any(|arg| arg.starts_with("ANTHROPIC_API_KEY="))
         );
         assert!(wrapped.args.iter().any(|arg| {
-            arg.contains(". /tmp/.varda-credential-env") && arg.contains("exec \"$0\" \"$@\"")
+            arg.contains(&format!(". {}", MicrosandboxSession::CREDENTIAL_ENV_FILE))
+                && arg.contains("exec \"$0\" \"$@\"")
         }));
 
         let staged = session.staged_files.lock().unwrap();
