@@ -1099,7 +1099,11 @@ fn collect_tasks(path: &Path, project_path: &Path, tasks: &mut Vec<TaskSummary>)
                 continue;
             }
         };
-        let Some(task_project) = task.frontmatter.project.as_deref() else {
+        // Key on `policy_project()` (the mother repo for an isolated worker),
+        // not the raw `project` (the worker's out-of-tree checkout) — else a
+        // spawned/run subtask's STATE file, which carries the worker's
+        // checkout path in `project`, never matches its mother's board.
+        let Some(task_project) = task.frontmatter.policy_project() else {
             continue;
         };
         if normalize_project_path(Path::new(task_project))? != project_path {
@@ -1110,7 +1114,7 @@ fn collect_tasks(path: &Path, project_path: &Path, tasks: &mut Vec<TaskSummary>)
             path: task.path,
             id: task.frontmatter.id,
             status: task.frontmatter.status,
-            project: task.frontmatter.project,
+            project: task.frontmatter.policy_project().cloned(),
             assignee: task.frontmatter.assignee,
             title: task_title(&task.body),
         });
@@ -1154,7 +1158,11 @@ fn collect_all_tasks(path: &Path, tasks: &mut Vec<TaskSummary>) -> Result<()> {
             path: task.path,
             id: task.frontmatter.id,
             status: task.frontmatter.status,
-            project: task.frontmatter.project,
+            // Same board-keying rule as `collect_tasks`: report the mother
+            // repo (when set) so the dashboard's "all projects" view and
+            // `varda task list` group an isolated worker's task under the
+            // repo it belongs to instead of its throwaway checkout.
+            project: task.frontmatter.policy_project().cloned(),
             assignee: task.frontmatter.assignee,
             title: task_title(&task.body),
         });
@@ -1907,6 +1915,58 @@ requires_user: false
         assert_eq!(tasks[0].id, Some(9));
         assert_eq!(tasks[0].status, TaskStatus::Backlog);
         assert_eq!(tasks[0].title, "Fresh Clone Task");
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn list_tasks_keys_on_mother_project_for_isolated_worker_state() {
+        // Reproduces #661's shape: a spawned/run subtask's STATE file carries
+        // the worker's out-of-tree checkout in `project` and the real repo in
+        // `mother_project`. The mother's board must still list it — both while
+        // running and after it settles to `done` — instead of it "emigrating"
+        // to a phantom project keyed on the throwaway checkout path.
+        let root = std::env::temp_dir()
+            .join(format!("varda-mother-project-list-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let mother = root.join("mother-repo");
+        let worker_checkout = root.join(".varda/worktrees/wip-task-661-dad41c7c");
+        fs::create_dir_all(&mother).expect("mother project dir should be created");
+        fs::create_dir_all(&worker_checkout).expect("worker checkout dir should be created");
+
+        let task_dir = operations_dir
+            .join("tasks")
+            .join(project_task_folder(&mother).expect("mother should slugify"));
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        fs::write(
+            task_dir.join("661-isolated.md"),
+            format!(
+                "---\nid: 661\nstatus: done\nproject: {}\nmother_project: {}\nassignee: codex\n---\n\n# Isolated Worker Task\n",
+                worker_checkout.display(),
+                mother.display()
+            ),
+        )
+        .expect("state file should write");
+
+        let config = test_config(&operations_dir);
+        let tasks = list_tasks(&config, &mother).expect("tasks should list");
+
+        assert_eq!(tasks.len(), 1, "task should still be filed under the mother's board");
+        assert_eq!(tasks[0].id, Some(661));
+        assert_eq!(tasks[0].status, TaskStatus::Done);
+        // The reported project is the mother, not the worker's throwaway checkout.
+        assert_eq!(
+            tasks[0].project.as_deref().map(Path::new),
+            normalize_project_path(&mother).ok().as_deref()
+        );
+
+        // And the worker checkout itself never surfaces as its own project.
+        let worker_tasks =
+            list_tasks(&config, &worker_checkout).expect("worker project listing should not fail");
+        assert!(
+            worker_tasks.is_empty(),
+            "the worker checkout must not appear as its own project on the board"
+        );
 
         fs::remove_dir_all(root).expect("test directory should be removable");
     }
