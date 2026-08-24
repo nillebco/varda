@@ -70,6 +70,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && /home/agent/.cargo/bin/rustup component add clippy rustfmt
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
 
+# Warm this project's locked crate graph into the image-owned Cargo home so cargo
+# can verify varda even when guest DNS or crates.io egress is unavailable. Copy
+# only the manifests to keep this layer reusable when application sources change.
+WORKDIR /tmp/varda-deps
+COPY --chown=agent:agent Cargo.toml Cargo.lock ./
+RUN cargo fetch --locked
+# Prevent ordinary worker checks from contacting the sparse index. Dependency
+# changes require rebuilding the agents image (or explicitly overriding this).
+ENV CARGO_NET_OFFLINE=true
+WORKDIR /home/agent
+
 # codex ChatGPT-subscription auth home (#521). The `[agents.codex]` prelude decodes
 # the host's ChatGPT OAuth auth.json (injected as CODEX_AUTH_B64) into
 # $CODEX_HOME/auth.json at run time, and codex ALSO writes its sessions/rollouts/
