@@ -1300,7 +1300,7 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
             results.push(json!({
                 "subtask_id": id,
                 "branch": integration.branch,
-                "committed": integration.committed,
+                "committed": integration.commit_outcome.has_commit(),
                 "clean": clean,
                 "conflicted_files": conflicted_files,
                 "dependency_manifests": manifests,
