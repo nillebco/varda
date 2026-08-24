@@ -440,6 +440,114 @@ pub fn parse_mount(raw: &str) -> Result<MountSpec> {
     }
 }
 
+/// Refuse to launch a checkout whose `.git` file points somewhere the guest
+/// cannot see. Git worktrees store an absolute `gitdir:` pointer into the mother
+/// repository; mounting only the worktree makes every git command fail inside
+/// the sandbox. A configured bind makes that pointer usable only when it maps
+/// the target back to the *same* absolute guest path.
+fn ensure_worktree_gitdir_visible(
+    project_root: &Path,
+    mounts: &[(MountOrigin, String)],
+) -> Result<()> {
+    let dot_git = project_root.join(".git");
+    if !dot_git.is_file() {
+        return Ok(());
+    }
+
+    let contents = std::fs::read_to_string(&dot_git)
+        .with_context(|| format!("failed to read worktree pointer {}", dot_git.display()))?;
+    let Some(raw_gitdir) = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:").map(str::trim))
+    else {
+        return Ok(());
+    };
+    let raw_gitdir = PathBuf::from(raw_gitdir);
+    let gitdir = if raw_gitdir.is_absolute() {
+        raw_gitdir
+    } else {
+        project_root.join(raw_gitdir)
+    };
+    let gitdir = normalize_absolute_path(&gitdir);
+    if !gitdir.is_dir() {
+        bail!("worktree gitdir {} does not exist", gitdir.display());
+    }
+
+    let commondir_file = gitdir.join("commondir");
+    let commondir = if commondir_file.is_file() {
+        let raw = std::fs::read_to_string(&commondir_file).with_context(|| {
+            format!("failed to read worktree common-dir pointer {}", commondir_file.display())
+        })?;
+        let raw = PathBuf::from(raw.trim());
+        let path = if raw.is_absolute() { raw } else { gitdir.join(raw) };
+        let path = normalize_absolute_path(&path);
+        if !path.is_dir() {
+            bail!("worktree common directory {} does not exist", path.display());
+        }
+        Some(path)
+    } else {
+        None
+    };
+
+    let visible_at_same_path = |required: &Path| -> Result<bool> {
+        if required.starts_with(project_root) {
+            return Ok(true);
+        }
+        for (_, raw) in mounts {
+            let spec = parse_mount(raw)
+                .with_context(|| format!("invalid mount '{raw}' while checking worktree gitdir"))?;
+            let source = expand_mount_path(&spec.source, project_root);
+            let target = expand_mount_path(&spec.target, project_root);
+            if let Ok(suffix) = required.strip_prefix(&source)
+                && target.join(suffix) == required
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+
+    if visible_at_same_path(&gitdir)?
+        && commondir
+            .as_deref()
+            .map(|path| visible_at_same_path(path))
+            .transpose()?
+            .unwrap_or(true)
+    {
+        return Ok(());
+    }
+
+    bail!(
+        "refusing to launch git worktree '{}': its .git pointer resolves to '{}', which is outside \
+         the project mount, or its shared Git common directory is unavailable there. Mounting the \
+         mother .git exposes its objects, refs, branches, and history; prefer a self-contained clone \
+         before enabling git for isolated workers",
+        project_root.display(),
+        gitdir.display()
+    )
+}
+
+/// Collapse `.` and `..` without resolving symlinks. Guest paths must retain
+/// their declared spelling: a bind and a worktree pointer may intentionally use
+/// the same symlinked absolute prefix even though the host canonical path differs.
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
 impl<'de> Deserialize<'de> for MountSpec {
     /// Serde helper accepting BOTH the string shorthand (parsed by
     /// [`parse_mount`]) and the canonical table form
@@ -1635,6 +1743,7 @@ impl DockerSession {
 #[async_trait]
 impl SandboxSession for DockerSession {
     fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec> {
+        ensure_worktree_gitdir_visible(&self.project_root, &self.mounts)?;
         // Mount the project at the SAME absolute path inside the container so
         // that `{project}`-style path expansions stay valid, and run there.
         let proj = self.project_root.display().to_string();
@@ -2136,6 +2245,7 @@ impl MicrosandboxSession {
 #[async_trait]
 impl SandboxSession for MicrosandboxSession {
     fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec> {
+        ensure_worktree_gitdir_visible(&self.project_root, &self.mounts)?;
         // Mount the project at the SAME absolute path inside the guest so
         // `{project}`-style expansions stay valid, and run there.
         let proj = self.project_root.display().to_string();
@@ -2512,6 +2622,7 @@ impl ClawkSession {
 #[async_trait]
 impl SandboxSession for ClawkSession {
     fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec> {
+        ensure_worktree_gitdir_visible(&self.project_root, &self.mounts)?;
         let proj = self.project_root.display().to_string();
         let cwd = spec
             .cwd
@@ -6093,6 +6204,105 @@ mod tests {
         let out = harden_varda_mount(&ok, &root, false, Path::new("/x/.varda")).unwrap();
         assert!(!out.writable);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_gitdir_must_be_visible_at_its_absolute_guest_path() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-worktree-gitdir-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother_git = root.join("mother/.git");
+        let project = root.join("worker");
+        let gitdir = mother_git.join("worktrees/worker");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+
+        let err = ensure_worktree_gitdir_visible(&project, &[])
+            .expect_err("the project mount alone cannot resolve an external gitdir");
+        assert!(err.to_string().contains("refusing to launch git worktree"));
+        assert!(err.to_string().contains(&gitdir.display().to_string()));
+
+        let same_path_mount = vec![(
+            MountOrigin::Sandbox,
+            format!("{}:{}:ro", mother_git.display(), mother_git.display()),
+        )];
+        ensure_worktree_gitdir_visible(&project, &same_path_mount)
+            .expect("a same-path mother .git mount makes the pointer resolvable");
+
+        let metadata_only_mount = vec![(
+            MountOrigin::Sandbox,
+            format!("{}:{}:ro", gitdir.display(), gitdir.display()),
+        )];
+        ensure_worktree_gitdir_visible(&project, &metadata_only_mount)
+            .expect_err("per-worktree metadata alone omits the shared object database and refs");
+
+        let remapped_mount = vec![(
+            MountOrigin::Sandbox,
+            format!("{}:/git:ro", mother_git.display()),
+        )];
+        ensure_worktree_gitdir_visible(&project, &remapped_mount)
+            .expect_err("mounting the content at another path does not satisfy the pointer");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ordinary_repository_does_not_trigger_worktree_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-ordinary-gitdir-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        ensure_worktree_gitdir_visible(&root, &[])
+            .expect("a self-contained .git directory is carried by the project mount");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_guard_preserves_symlinked_guest_path_spelling() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "varda-symlink-gitdir-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let real_mother = root.join("real");
+        let linked_mother = root.join("linked");
+        let project = root.join("worker");
+        let real_gitdir = real_mother.join(".git/worktrees/worker");
+        std::fs::create_dir_all(&real_gitdir).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        symlink(&real_mother, &linked_mother).unwrap();
+        let linked_gitdir = linked_mother.join(".git/worktrees/worker");
+        std::fs::write(linked_gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", linked_gitdir.display()),
+        )
+        .unwrap();
+        let mounts = vec![(
+            MountOrigin::Sandbox,
+            format!(
+                "{}:{}:ro",
+                linked_mother.join(".git").display(),
+                linked_mother.join(".git").display()
+            ),
+        )];
+
+        ensure_worktree_gitdir_visible(&project, &mounts)
+            .expect("matching symlinked host and guest spellings are resolvable in the guest");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
