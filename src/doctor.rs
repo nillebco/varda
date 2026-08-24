@@ -24,6 +24,12 @@ impl Probe {
 
 trait LogAuthority {
     fn logs(&self, source: &str, box_name: &str) -> std::io::Result<Output>;
+    /// Provider-reported lifecycle state for the box, e.g. `running` / `stopped` /
+    /// `crashed`, or `None` when the provider no longer has a record. Needed to turn
+    /// "the relay never connected" from a maybe into a verdict: a box that is still
+    /// running may simply be slow to boot, while one the provider has already settled
+    /// will never connect now.
+    fn box_state(&self, box_name: &str) -> std::io::Result<Output>;
 }
 
 struct Msb;
@@ -32,6 +38,10 @@ impl LogAuthority for Msb {
         Command::new("msb")
             .args(["logs", "--source", source, box_name])
             .output()
+    }
+
+    fn box_state(&self, _box_name: &str) -> std::io::Result<Output> {
+        Command::new("msb").arg("ls").output()
     }
 }
 
@@ -54,15 +64,63 @@ fn source_log(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Provider lifecycle state for `box_name`, parsed from the provider listing.
+/// `Ok(None)` means the provider has no record of the box at all.
+fn box_state(authority: &dyn LogAuthority, box_name: &str) -> Result<Option<String>, String> {
+    let output = authority
+        .box_state(box_name)
+        .map_err(|error| format!("could not invoke msb: {error}"))?;
+    if !output.status.success() {
+        let reason = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if reason.is_empty() {
+            format!("msb ls exited with {}", output.status)
+        } else {
+            format!("msb ls failed: {reason}")
+        });
+    }
+    let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(listing
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(box_name))
+        .and_then(|line| line.split_whitespace().nth(2).map(str::to_owned)))
+}
+
+/// True once the provider has settled the box: it will never connect its relay now.
+fn is_terminal_box_state(state: &str) -> bool {
+    matches!(state, "stopped" | "crashed" | "failed" | "exited")
+}
+
 fn boot_probe(authority: &dyn LogAuthority, box_name: &str) -> Probe {
     match source_log(authority, "system", box_name) {
         Ok(log) if log.contains("agent relay: client connected") => {
             Probe::Yes("sandbox agent relay connected".to_owned())
         }
-        Ok(log) if log.contains("entering VM") => Probe::Unknown(
-            "sandbox entered the VM but the relay has not connected; it may still be booting"
-                .to_owned(),
-        ),
+        Ok(log) if log.contains("entering VM") => {
+            // The relay never connected. Whether that is "not yet" or "never" is not
+            // knowable from the log alone — ask the provider whether the box has
+            // already settled. Getting this wrong is expensive: a box that never
+            // booted produces no stdout, no stderr and no exit status, which reads
+            // exactly like an agent that ran and said nothing.
+            match box_state(authority, box_name) {
+                Ok(Some(state)) if is_terminal_box_state(&state) => Probe::No(format!(
+                    "sandbox entered the VM but the relay never connected and the box is \
+                     already {state}; nothing ran inside it"
+                )),
+                Ok(Some(state)) => Probe::Unknown(format!(
+                    "sandbox entered the VM but the relay has not connected; box is {state}, \
+                     so it may still be booting"
+                )),
+                Ok(None) => Probe::Unknown(
+                    "sandbox entered the VM but the relay has not connected, and the provider \
+                     no longer has a record of the box"
+                        .to_owned(),
+                ),
+                Err(reason) => Probe::Unknown(format!(
+                    "sandbox entered the VM but the relay has not connected; box state \
+                     unavailable: {reason}"
+                )),
+            }
+        }
         Ok(_) => Probe::Unknown("system log has no recognized boot marker".to_owned()),
         Err(reason) => Probe::Unknown(reason),
     }
@@ -181,6 +239,29 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     struct Fake(Option<(&'static str, &'static str)>);
+
+    /// Fake with a provider listing too, so the boot probe's terminal-state branch is
+    /// exercised rather than inferred.
+    struct FakeWithState(Option<(&'static str, &'static str)>, Option<&'static str>);
+
+    impl LogAuthority for FakeWithState {
+        fn logs(&self, source: &str, box_name: &str) -> std::io::Result<Output> {
+            Fake(self.0).logs(source, box_name)
+        }
+
+        fn box_state(&self, _box_name: &str) -> std::io::Result<Output> {
+            let listing = match self.1 {
+                Some(state) => format!("NAME IMAGE STATUS CREATED\nbox img {state} now\n"),
+                None => "NAME IMAGE STATUS CREATED\n".to_owned(),
+            };
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: listing.into_bytes(),
+                stderr: vec![],
+            })
+        }
+    }
+
     impl LogAuthority for Fake {
         fn logs(&self, source: &str, _box_name: &str) -> std::io::Result<Output> {
             let Some((wanted, text)) = self.0 else {
@@ -199,6 +280,46 @@ mod tests {
                 stderr: vec![],
             })
         }
+
+        fn box_state(&self, _box_name: &str) -> std::io::Result<Output> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "msb unavailable",
+            ))
+        }
+    }
+
+    #[test]
+    fn a_settled_box_that_never_connected_its_relay_is_a_definite_no() {
+        // The case that matters: no stdout, no stderr, no exit status — identical to an
+        // agent that ran and said nothing, unless the provider state is consulted.
+        let never_booted = FakeWithState(Some(("system", "entering VM")), Some("crashed"));
+        match boot_probe(&never_booted, "box") {
+            Probe::No(detail) => {
+                assert!(detail.contains("crashed"), "verdict names the state: {detail}");
+                assert!(detail.contains("nothing ran"), "verdict is actionable: {detail}");
+            }
+            other => panic!("a settled box must be a definite no, got {other:?}"),
+        }
+
+        // Still running: genuinely unknowable, so it must NOT harden into a verdict.
+        assert!(matches!(
+            boot_probe(
+                &FakeWithState(Some(("system", "entering VM")), Some("running")),
+                "box"
+            ),
+            Probe::Unknown(_)
+        ));
+
+        // Provider has no record, and provider unavailable: both stay unknown (P2).
+        assert!(matches!(
+            boot_probe(&FakeWithState(Some(("system", "entering VM")), None), "box"),
+            Probe::Unknown(_)
+        ));
+        assert!(matches!(
+            boot_probe(&Fake(Some(("system", "entering VM"))), "box"),
+            Probe::Unknown(_)
+        ));
     }
 
     #[test]
