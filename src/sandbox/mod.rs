@@ -843,6 +843,10 @@ pub struct DockerProvider {
     /// Forward-proxy image used in `strict`/`proxy` egress mode (see
     /// [`DEFAULT_EGRESS_PROXY_IMAGE`]).
     egress_proxy_image: String,
+    /// Opt-in memory ceiling, docker `--memory` grammar. `None` ⇒ unbounded.
+    memory: Option<String>,
+    /// Opt-in CPU ceiling, docker `--cpus` grammar. `None` ⇒ unbounded.
+    cpus: Option<String>,
     /// M11 identity/auth channels forwarded into the box (curated identity files,
     /// SSH-agent socket, git identity, scoped auth token). Empty ⇒ pre-M11 argv.
     identity: SandboxIdentity,
@@ -902,6 +906,8 @@ impl DockerProvider {
                 .clone()
                 .filter(|image| !image.is_empty())
                 .unwrap_or_else(|| DEFAULT_EGRESS_PROXY_IMAGE.to_owned()),
+            memory: config.memory.clone().filter(|m| !m.is_empty()),
+            cpus: config.cpus.clone().filter(|c| !c.is_empty()),
             identity: SandboxIdentity::default(),
         })
     }
@@ -945,6 +951,8 @@ impl DockerProvider {
             egress: egress.iter().map(|e| e.to_string()).collect(),
             egress_mode: EgressMode::DnsPin,
             egress_proxy_image: DEFAULT_EGRESS_PROXY_IMAGE.to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
         }
     }
@@ -1395,6 +1403,8 @@ impl SandboxProvider for DockerProvider {
             volume: format!("varda-sbx-{handle}"),
             container: format!("varda-sbx-{handle}"),
             home: "/home/agent".to_owned(),
+            memory: self.memory.clone(),
+            cpus: self.cpus.clone(),
             identity: self.identity.clone(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         }))
@@ -1796,6 +1806,12 @@ pub struct DockerSession {
     container: String,
     /// In-container mount point for `volume`, used as the agent's `HOME`.
     home: String,
+    /// Opt-in memory ceiling, docker `--memory` grammar. `None` ⇒ unbounded
+    /// (today's behavior); emitted as `--memory`/`--memory-swap` (equal, so
+    /// docker does not silently grant swap equal to the limit again).
+    memory: Option<String>,
+    /// Opt-in CPU ceiling, docker `--cpus` grammar. `None` ⇒ unbounded.
+    cpus: Option<String>,
     /// M11 identity/auth channels applied at wrap time (curated identity file
     /// mounts, SSH-agent socket forward, git identity + scoped auth token env).
     identity: SandboxIdentity,
@@ -2076,6 +2092,19 @@ impl SandboxSession for DockerSession {
             args.push("-e".to_owned());
             args.push(format!("{key}={value}"));
         }
+        // Opt-in ceilings (absent ⇒ unbounded, unchanged argv). `--memory-swap`
+        // is set EQUAL to `--memory`: without it docker grants swap equal to the
+        // limit again, silently doubling the effective footprint.
+        if let Some(memory) = &self.memory {
+            args.push("--memory".to_owned());
+            args.push(memory.clone());
+            args.push("--memory-swap".to_owned());
+            args.push(memory.clone());
+        }
+        if let Some(cpus) = &self.cpus {
+            args.push("--cpus".to_owned());
+            args.push(cpus.clone());
+        }
         args.push(self.image.clone());
         args.push(spec.program);
         args.extend(spec.args);
@@ -2253,6 +2282,47 @@ impl SandboxSession for DockerSession {
     }
 }
 
+/// Parse a docker `--memory` value (`<number>[b|k|kb|m|mb|g|gb]`, no suffix ⇒
+/// bytes) and convert it to whole megabytes for `msb run --memory`, which takes
+/// a plain MB integer rather than docker's suffixed grammar. Returns `None` for
+/// anything that does not parse as that grammar (dropped with a warning by the
+/// caller rather than failing the run).
+fn docker_memory_to_msb_mb(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let split_at = trimmed
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(split_at);
+    let number: f64 = number.parse().ok()?;
+    if number <= 0.0 {
+        return None;
+    }
+    let bytes_per_unit = match unit {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1024.0,
+        "m" | "mb" => 1024.0 * 1024.0,
+        "g" | "gb" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    let mb = (number * bytes_per_unit / (1024.0 * 1024.0)).round() as u64;
+    Some(mb.max(1))
+}
+
+/// Parse a docker `--cpus` value (a decimal core count, e.g. `"1.5"`) and round
+/// it to the nearest whole core for `msb run --cpus`, which takes an integer
+/// count rather than docker's fractional grammar. Returns `None` for anything
+/// that does not parse as a positive number.
+fn docker_cpus_to_msb_count(raw: &str) -> Option<u32> {
+    let cores: f64 = raw.trim().parse().ok()?;
+    if cores <= 0.0 {
+        return None;
+    }
+    Some(cores.round().max(1.0) as u32)
+}
+
 /// microVM provider backed by the `msb` (microsandbox) CLI.
 ///
 /// Mirrors [`DockerProvider`] but shells to `msb` instead of `docker`, so the
@@ -2267,7 +2337,11 @@ impl SandboxSession for DockerSession {
 /// `--env K=V`; host binds via `--mount-dir SOURCE:DEST[:ro|:rw]`; egress via
 /// `--net-default[-egress] deny` + `--net-rule allow@<target>`; extraction via
 /// `msb cp <sandbox>:/abs/path <host>` (the sandbox persists in `stopped` state
-/// after a foreground run, so cp works before `msb rm`). Verified live: a
+/// after a foreground run, so cp works before `msb rm`). `--memory <MB>` /
+/// `--cpus <N>` (integer core count) are documented on `msb add`/`msb exe`
+/// (not independently confirmed against `msb run --help` at time of writing —
+/// see the M4 task notes on live verification) and are the mapping target for
+/// the shared `memory`/`cpus` config keys. Verified live: a
 /// `--mount-dir …:ro` blocks writes and the host `~/.aws` is not visible in the
 /// microVM. Spellings are centralized in [`MicrosandboxSession::wrap`] /
 /// [`MicrosandboxSession::extract_session_store`].
@@ -2285,6 +2359,12 @@ pub struct MicrosandboxProvider {
     /// Egress allow-list of hostnames. Empty ⇒ fully offline; non-empty ⇒
     /// default-deny with only these hosts permitted outbound.
     egress: Vec<String>,
+    /// Opt-in memory ceiling, docker `--memory` grammar (e.g. `"4g"`), converted
+    /// to `msb run`'s own `--memory` MB-integer argument at wrap time.
+    memory: Option<String>,
+    /// Opt-in CPU ceiling, docker `--cpus` grammar, rounded to `msb run`'s own
+    /// integer `--cpus` core count at wrap time.
+    cpus: Option<String>,
     /// M11 identity/auth channels forwarded into the microVM. Empty ⇒ pre-M11 argv.
     identity: SandboxIdentity,
 }
@@ -2318,6 +2398,8 @@ impl MicrosandboxProvider {
             build,
             mounts,
             egress: config.egress.clone(),
+            memory: config.memory.clone().filter(|m| !m.is_empty()),
+            cpus: config.cpus.clone().filter(|c| !c.is_empty()),
             identity: SandboxIdentity::default(),
         })
     }
@@ -2361,6 +2443,8 @@ impl SandboxProvider for MicrosandboxProvider {
             session_store,
             sandbox: format!("varda-sbx-{handle}"),
             home: "/home/agent".to_owned(),
+            memory: self.memory.clone(),
+            cpus: self.cpus.clone(),
             identity: self.identity.clone(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         }))
@@ -2380,6 +2464,12 @@ pub struct MicrosandboxSession {
     sandbox: String,
     /// In-guest HOME path; the agent writes its session store here.
     home: String,
+    /// Opt-in memory ceiling, docker `--memory` grammar; converted to `msb
+    /// run`'s own MB-integer `--memory` at wrap time. `None` ⇒ unbounded.
+    memory: Option<String>,
+    /// Opt-in CPU ceiling, docker `--cpus` grammar; rounded to `msb run`'s own
+    /// integer `--cpus` core count at wrap time. `None` ⇒ unbounded.
+    cpus: Option<String>,
     /// M11 identity/auth channels applied at wrap time.
     identity: SandboxIdentity,
     /// Interactive files staged via [`stage_file`], as `(host_temp, guest_path)`.
@@ -2611,6 +2701,37 @@ impl SandboxSession for MicrosandboxSession {
         for (key, value) in &env {
             args.push("--env".to_owned());
             args.push(format!("{key}={value}"));
+        }
+
+        // Opt-in ceilings, translated from the shared docker-grammar config keys
+        // onto `msb run`'s own `--memory` (MB integer) / `--cpus` (integer core
+        // count) flags. Absent ⇒ unbounded, unchanged argv. A value that fails to
+        // parse against docker's grammar is dropped with a warning rather than
+        // failing the run — msb DOES support ceilings, so this is a parse issue,
+        // not an unsupported-primitive one.
+        if let Some(memory) = &self.memory {
+            match docker_memory_to_msb_mb(memory) {
+                Some(mb) => {
+                    args.push("--memory".to_owned());
+                    args.push(mb.to_string());
+                }
+                None => eprintln!(
+                    "sandbox: memory limit '{memory}' is not valid docker `--memory` grammar; \
+                     ignoring it for the microsandbox primitive"
+                ),
+            }
+        }
+        if let Some(cpus) = &self.cpus {
+            match docker_cpus_to_msb_count(cpus) {
+                Some(count) => {
+                    args.push("--cpus".to_owned());
+                    args.push(count.to_string());
+                }
+                None => eprintln!(
+                    "sandbox: cpu limit '{cpus}' is not valid docker `--cpus` grammar; \
+                     ignoring it for the microsandbox primitive"
+                ),
+            }
         }
 
         // Image is positional, then the command after `--` so its flags are not
@@ -3207,6 +3328,8 @@ impl DockerSession {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         }
@@ -3355,6 +3478,71 @@ mod tests {
         assert!(wrapped.cwd.is_none());
     }
 
+    /// task-limits: an opt-in `memory`/`cpus` ceiling emits `--memory`,
+    /// `--memory-swap` (equal to `--memory`, so docker does not silently grant
+    /// swap equal to the limit again), and `--cpus`, positioned right before the
+    /// image. Byte-identical otherwise to [`docker_wrap_produces_exact_argv`].
+    #[test]
+    fn docker_wrap_emits_memory_and_cpus_ceilings() {
+        let session = DockerSession {
+            memory: Some("4g".to_owned()),
+            cpus: Some("2".to_owned()),
+            ..DockerSession::for_test("img", "/proj", vec![], vec![], "/store")
+        };
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+        assert_eq!(
+            wrapped.args,
+            vec![
+                "run",
+                "--name",
+                "varda-sbx-s1",
+                "--init",
+                "-i",
+                "--network",
+                "none",
+                "-v",
+                "/proj:/proj",
+                "-v",
+                "varda-sbx-s1:/home/agent",
+                "-w",
+                "/proj",
+                "-e",
+                "HOME=/home/agent",
+                "--memory",
+                "4g",
+                "--memory-swap",
+                "4g",
+                "--cpus",
+                "2",
+                "img",
+                "claude",
+            ]
+        );
+    }
+
+    /// task-limits: omitting `memory`/`cpus` produces argv byte-identical to
+    /// today's — no ceiling flags at all.
+    #[test]
+    fn docker_wrap_omits_ceiling_flags_when_unset() {
+        let session = DockerSession::for_test("img", "/proj", vec![], vec![], "/store");
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+        assert!(!wrapped.args.iter().any(|a| a == "--memory"
+            || a == "--memory-swap"
+            || a == "--cpus"));
+    }
+
     #[tokio::test]
     async fn docker_wrap_defaults_cwd_to_project_root() {
         let provider = DockerProvider::new_for_test("docker", "img", &[], &[]);
@@ -3386,6 +3574,8 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -3477,6 +3667,8 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -3518,6 +3710,8 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -3863,6 +4057,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-abc".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity {
                 auth_files,
                 ..Default::default()
@@ -4089,6 +4285,8 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4126,6 +4324,8 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4176,6 +4376,8 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4422,6 +4624,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-abc".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4463,6 +4667,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn docker_memory_to_msb_mb_converts_common_grammar() {
+        assert_eq!(docker_memory_to_msb_mb("4g"), Some(4096));
+        assert_eq!(docker_memory_to_msb_mb("4gb"), Some(4096));
+        assert_eq!(docker_memory_to_msb_mb("512m"), Some(512));
+        assert_eq!(docker_memory_to_msb_mb("512mb"), Some(512));
+        assert_eq!(docker_memory_to_msb_mb("1048576k"), Some(1024));
+        assert_eq!(docker_memory_to_msb_mb("1073741824"), Some(1024));
+        assert_eq!(docker_memory_to_msb_mb("not-a-size"), None);
+        assert_eq!(docker_memory_to_msb_mb(""), None);
+        assert_eq!(docker_memory_to_msb_mb("0g"), None);
+    }
+
+    #[test]
+    fn docker_cpus_to_msb_count_rounds_to_nearest_core() {
+        assert_eq!(docker_cpus_to_msb_count("2"), Some(2));
+        assert_eq!(docker_cpus_to_msb_count("1.5"), Some(2));
+        assert_eq!(docker_cpus_to_msb_count("1.2"), Some(1));
+        assert_eq!(docker_cpus_to_msb_count("0.1"), Some(1));
+        assert_eq!(docker_cpus_to_msb_count("0"), None);
+        assert_eq!(docker_cpus_to_msb_count("bogus"), None);
+    }
+
+    /// task-limits: `memory`/`cpus` translate from the shared docker grammar onto
+    /// `msb run`'s own MB-integer `--memory` and integer-core `--cpus`.
+    #[test]
+    fn microsandbox_wrap_emits_translated_memory_and_cpus() {
+        let session = MicrosandboxSession {
+            image: "busybox".to_owned(),
+            project_root: PathBuf::from("/proj"),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-abc".to_owned(),
+            home: "/home/agent".to_owned(),
+            memory: Some("4g".to_owned()),
+            cpus: Some("1.5".to_owned()),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+        let idx = wrapped
+            .args
+            .iter()
+            .position(|a| a == "--memory")
+            .expect("--memory present");
+        assert_eq!(wrapped.args[idx + 1], "4096");
+        let idx = wrapped
+            .args
+            .iter()
+            .position(|a| a == "--cpus")
+            .expect("--cpus present");
+        assert_eq!(wrapped.args[idx + 1], "2");
+    }
+
     /// Credential env values cross the microsandbox boundary in a private staged
     /// file, never in the ps-visible `msb run` argv. Ordinary env stays on argv.
     #[test]
@@ -4480,6 +4745,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-secret-test".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity {
                 auth_env,
                 ..Default::default()
@@ -4548,6 +4815,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-invalid-env".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity {
                 auth_env,
                 ..Default::default()
@@ -4592,6 +4861,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-res".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4683,6 +4954,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-broker".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4731,6 +5004,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-nobroker".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4766,6 +5041,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-prompt".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4859,6 +5136,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-src".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -5084,6 +5363,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-abc".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -5127,6 +5408,8 @@ mod tests {
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-abc".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -6162,6 +6445,8 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -6200,6 +6485,8 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -6239,6 +6526,8 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -6289,6 +6578,8 @@ mod tests {
             volume: "varda-sbx-s1".to_owned(),
             container: "varda-sbx-s1".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };

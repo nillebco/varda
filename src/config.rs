@@ -600,6 +600,17 @@ pub struct SandboxConfig {
     /// for non-docker primitives and for `dns-pin`/empty egress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_proxy_image: Option<String>,
+    /// Opt-in memory ceiling, docker `--memory` grammar (e.g. `"4g"`, `"512m"`).
+    /// Absent ⇒ unbounded, today's behavior. Docker emits it verbatim (plus a
+    /// matching `--memory-swap` so swap does not silently double the ceiling);
+    /// microsandbox converts it to `msb run`'s own `--memory` (MB integer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// Opt-in CPU ceiling, docker `--cpus` grammar (e.g. `"2"`, `"1.5"`). Absent
+    /// ⇒ unbounded. Docker emits it verbatim; microsandbox rounds it to `msb
+    /// run`'s integer `--cpus` core count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<String>,
 }
 
 /// Default isolation primitive when a `[sandboxes.<name>]` entry omits one.
@@ -938,6 +949,8 @@ impl Default for SandboxConfig {
             egress: Vec::new(),
             egress_mode: EgressMode::Strict,
             egress_proxy_image: None,
+            memory: None,
+            cpus: None,
         }
     }
 }
