@@ -167,6 +167,19 @@ fn end_cause(log: Result<&str, &str>) -> Probe {
     }
 }
 
+fn persisted_boot_probe(log: &str) -> Option<Probe> {
+    log.lines().rev().find_map(|line| match line {
+        "sandbox_relay_connected=true" => {
+            Some(Probe::Yes("sandbox agent relay connected (recorded at run time)".to_owned()))
+        }
+        "sandbox_relay_connected=false" => Some(Probe::No(
+            "sandbox entered the VM but its relay never connected (recorded at run time)"
+                .to_owned(),
+        )),
+        _ => None,
+    })
+}
+
 pub fn doctor_task_command(task_ref: &Path) -> Result<()> {
     let config = config::load_config(&config::config_file()?)?;
     let task_path = task::resolve_task_reference(&config, task_ref)?;
@@ -208,7 +221,11 @@ pub fn doctor_task_command(task_ref: &Path) -> Result<()> {
         Ok(provider) if provider.config.primitive == "microsandbox" => {
             let authority = Msb;
             println!("box: {box_name}");
-            println!("booted: {}", boot_probe(&authority, &box_name).render());
+            let recorded = log.as_deref().ok().and_then(persisted_boot_probe);
+            println!(
+                "booted: {}",
+                recorded.unwrap_or_else(|| boot_probe(&authority, &box_name)).render()
+            );
             println!(
                 "agent output: {}",
                 output_probe(&authority, &box_name).render()
@@ -369,5 +386,18 @@ mod tests {
             end_cause(Ok("\nbudget:\nsoft ceiling")),
             Probe::Yes("budget-expired".to_owned())
         );
+    }
+
+    #[test]
+    fn persisted_boot_state_survives_provider_reaping() {
+        assert!(matches!(
+            persisted_boot_probe("header\nsandbox_relay_connected=true\n"),
+            Some(Probe::Yes(_))
+        ));
+        assert!(matches!(
+            persisted_boot_probe("header\nsandbox_relay_connected=false\n"),
+            Some(Probe::No(_))
+        ));
+        assert_eq!(persisted_boot_probe("header\n"), None);
     }
 }

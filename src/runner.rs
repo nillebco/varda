@@ -265,6 +265,15 @@ fn combine_recaps(prior: &[String], last: &str) -> String {
     parts.join("\n\n---\n\n")
 }
 
+fn recorded_boot_state(log_path: &Path) -> Option<bool> {
+    let log = fs::read_to_string(log_path).ok()?;
+    log.lines().rev().find_map(|line| match line {
+        "sandbox_relay_connected=true" => Some(true),
+        "sandbox_relay_connected=false" => Some(false),
+        _ => None,
+    })
+}
+
 fn recap_reports_pending_verification(recap: &str) -> bool {
     let lower = recap.to_ascii_lowercase();
     let pending = [
@@ -315,6 +324,7 @@ async fn run_auto_resume_loop(
     let mut log_path = first_session_log;
     let mut request = first_request;
     let mut hop: u32 = 0;
+    let mut retried_never_booted = false;
     // `max_seconds` is a TOTAL budget across ALL continuation hops, so each hop gets
     // the budget MINUS the time already spent — not the full budget again (which would
     // let a task run max_seconds * (hops + 1)). When it reaches 0 the next session
@@ -330,9 +340,38 @@ async fn run_auto_resume_loop(
             remaining_secs,
             &log_path,
             streams_output,
-            client.run_task(request),
+            client.run_task(request.clone()),
         )
         .await;
+
+        let booted = recorded_boot_state(&log_path);
+        // A terminal microVM that entered the VM but never connected its relay
+        // ran no user code, so one fresh retry is safe and cannot duplicate work.
+        if booted == Some(false) && !retried_never_booted {
+            append_session_log(&log_path, "\nauto_retry=guest relay never connected\n")?;
+            sid = Uuid::new_v4().to_string();
+            log_path = session_log_path(config, &sid);
+            task.frontmatter.agent_session_ids.push(sid.clone());
+            task.frontmatter
+                .agent_session_logs
+                .push(log_path.display().to_string());
+            write_task(task)?;
+            write_session_log(
+                &log_path,
+                &format!(
+                    "session_id={sid}\nagent={agent_name}\ntask={}\n[auto_retry never_booted]\n",
+                    task_path.display()
+                ),
+            )?;
+            request = AgentRunRequest {
+                session_id: sid.clone(),
+                session_log_path: Some(log_path.display().to_string()),
+                frontmatter: task.frontmatter.clone(),
+                ..request
+            };
+            retried_never_booted = true;
+            continue;
+        }
 
         match single_session_outcome(agent_result, &sid, &log_path, task_path)? {
             Ok(result) => {
@@ -383,6 +422,7 @@ async fn run_auto_resume_loop(
                         orchestration_socket_path: None,
                         orchestration_addr: None,
                     };
+                    retried_never_booted = false;
                     continue;
                 }
 
@@ -1501,6 +1541,60 @@ Do it.
         assert!(updated.contains("agent_session_logs:"));
         assert!(outcome.session_log_path.exists());
         assert!(recap.contains("Completed."));
+    }
+
+    #[derive(Default)]
+    struct NeverBootedOnceClient(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl AgentClient for NeverBootedOnceClient {
+        async fn run_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
+            let attempt = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                append_session_log(
+                    Path::new(request.session_log_path.as_deref().expect("session log")),
+                    "\nsandbox_relay_connected=false\n",
+                )?;
+                anyhow::bail!("microsandbox crashed before the relay connected");
+            }
+            append_session_log(
+                Path::new(request.session_log_path.as_deref().expect("session log")),
+                "\nsandbox_relay_connected=true\n",
+            )?;
+            Ok(AgentRunResult {
+                recap: "# Recap\n\nCompleted after transparent retry.".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn never_booted_session_is_retried_once_and_recorded() {
+        let root = std::env::temp_dir().join(format!("varda-never-booted-{}", Uuid::new_v4()));
+        let operations_dir = root.join("operations");
+        let task_path = operations_dir.join("tasks/codex/example.md");
+        fs::create_dir_all(task_path.parent().expect("task parent")).expect("task directory");
+        fs::write(
+            &task_path,
+            "---\nstatus: ready\nproject: /work/project\nassignee: codex\nrequires_user: false\n---\n\n# Task\n\nDo it.\n",
+        )
+        .expect("task should be written");
+        let config = test_config(operations_dir.display().to_string());
+        let client = NeverBootedOnceClient::default();
+
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
+            .await
+            .expect("retry should complete");
+
+        assert_eq!(outcome.status, TaskStatus::Review);
+        assert_eq!(client.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let task = load_task(&task_path).expect("updated task");
+        assert_eq!(task.frontmatter.agent_session_ids.len(), 2);
+        let first_log = fs::read_to_string(&task.frontmatter.agent_session_logs[0]).unwrap();
+        assert!(first_log.contains("sandbox_relay_connected=false"));
+        assert!(first_log.contains("auto_retry=guest relay never connected"));
     }
 
     #[tokio::test]

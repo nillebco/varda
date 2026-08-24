@@ -448,6 +448,14 @@ impl AcpSubprocessClient {
         let (stdout, stderr, status) = tokio::try_join!(stdout_task, stderr_task, wait_task)
             .context("failed while waiting for agent subprocess")?;
 
+        let relay_connected = session.guest_relay_connected().await;
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let value =
+                relay_connected.map_or("unknown", |v| if v { "true" } else { "false" });
+            append_session_log(log_path, &format!("\nsandbox_relay_connected={value}\n"))
+                .context("failed to persist sandbox relay state")?;
+        }
+
         // Extracted stores (docker): the agent has exited, so materialize its
         // session store on the host (`docker cp` from the volume) and THEN run a
         // single discovery pass — the files already exist, so the first poll hits

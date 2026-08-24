@@ -769,6 +769,11 @@ pub trait SandboxSession: Send + Sync {
     async fn extract_session_store(&self) -> Result<()> {
         Ok(())
     }
+    /// Whether the guest reached the provider's agent relay. `None` means the
+    /// provider has no authoritative boot signal.
+    async fn guest_relay_connected(&self) -> Option<bool> {
+        None
+    }
     async fn teardown(self: Box<Self>) -> Result<()>;
 }
 
@@ -2542,6 +2547,41 @@ impl SandboxSession for MicrosandboxSession {
             );
         }
         Ok(())
+    }
+
+    async fn guest_relay_connected(&self) -> Option<bool> {
+        let logs = tokio::process::Command::new("msb")
+            .args(["logs", "--source", "system", &self.sandbox])
+            .output()
+            .await
+            .ok()?;
+        if !logs.status.success() {
+            return None;
+        }
+        let log = String::from_utf8_lossy(&logs.stdout);
+        if log.contains("agent relay: client connected") {
+            return Some(true);
+        }
+        if !log.contains("entering VM") {
+            return None;
+        }
+        let listing = tokio::process::Command::new("msb")
+            .arg("ls")
+            .output()
+            .await
+            .ok()?;
+        if !listing.status.success() {
+            return None;
+        }
+        let state = String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(self.sandbox.as_str()))
+            .and_then(|line| line.split_whitespace().nth(2))
+            .map(str::to_owned);
+        state
+            .as_deref()
+            .filter(|state| matches!(*state, "stopped" | "crashed" | "failed" | "exited"))
+            .map(|_| false)
     }
 
     async fn teardown(self: Box<Self>) -> Result<()> {
