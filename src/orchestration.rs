@@ -36,6 +36,7 @@
 // broker over the sandbox-visible Unix-socket MCP transport in `mcp_transport`.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -122,11 +123,18 @@ pub struct OrchestrationPolicy {
     /// rejected. Prevents recursive fork-bombing. Example: 2.
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
-    /// Maximum direct children a single parent may spawn. Bounds fan-out per node.
+    /// Maximum direct children a single parent may have LIVE (recorded but not
+    /// yet observed terminal) at once. A CONCURRENCY cap, not a lifetime one:
+    /// `SpawnLedger::release` frees a slot the first time `await_subtask`/
+    /// `await_subtasks` sees that child reach a terminal status, so a parent
+    /// whose prior children have all settled can spawn a fresh full wave (#716).
+    /// Use `global_child_budget` for a true lifetime/cost ceiling.
     #[serde(default = "default_max_fanout")]
     pub max_fanout: u32,
     /// Global cap on the total number of subtasks spawned across the WHOLE tree,
-    /// for one root run. The ultimate fork-bomb backstop.
+    /// for one root run. The ultimate fork-bomb backstop. Unlike `max_fanout`
+    /// this is a true monotonic lifetime tally — never decremented by a child
+    /// reaching a terminal status.
     #[serde(default = "default_global_child_budget")]
     pub global_child_budget: u32,
     /// Agents the master may spawn. Empty ⇒ any (minus `deny_agents`).
@@ -467,6 +475,23 @@ impl SpawnLedger {
         {
             *count -= 1;
             self.global_spawned = self.global_spawned.saturating_sub(1);
+        }
+    }
+
+    /// Free one of `parent`'s fan-out slots because a previously recorded child
+    /// has reached a terminal status (done/failed/needs_user/review). Unlike
+    /// [`unrecord`](Self::unrecord) this does NOT touch `global_spawned`: that
+    /// counter is the true lifetime/cost ceiling ([`OrchestrationPolicy::global_child_budget`])
+    /// and must stay monotonic. `max_fanout` instead tracks CONCURRENT children —
+    /// a parent that has spawned and fully settled `max_fanout` children can spawn
+    /// `max_fanout` more (#716). The caller (the live broker, on first observing a
+    /// child terminal via `await_subtask`/`await_subtasks`) is responsible for
+    /// calling this exactly once per child. Saturates at zero.
+    pub fn release(&mut self, parent: &str) {
+        if let Some(count) = self.children.get_mut(parent)
+            && *count > 0
+        {
+            *count -= 1;
         }
     }
 
@@ -830,6 +855,16 @@ struct SpawnTreeState {
     /// at its inherited depth for a spawned subtask run); each accepted child is
     /// registered at its granted depth so future brokers resolve depth correctly.
     depths: BTreeMap<SubtaskId, u32>,
+    /// Child task id → id of the parent that spawned it. Populated alongside
+    /// `depths` on every accepted launch; consulted by `release_fanout` so a
+    /// child observed terminal via `await_subtask`/`await_subtasks` frees its
+    /// slot against the RIGHT parent's fan-out tally (#716).
+    child_parent: BTreeMap<SubtaskId, SubtaskId>,
+    /// Child task ids whose fan-out slot has already been released because they
+    /// were observed terminal at least once. Guards `release_fanout` so a
+    /// repeated `await_subtask` on an already-settled child never double-frees
+    /// the same slot.
+    released: BTreeSet<SubtaskId>,
     /// Detached child runs still owned by this root orchestration run. The run
     /// path drains these on normal completion before tearing down the broker
     /// socket, or aborts them when the parent run itself errors/cancels.
@@ -1017,6 +1052,18 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
             .global_spawned()
     }
 
+    /// How many of `parent`'s children are currently live (recorded but not yet
+    /// observed terminal) — for observability/tests.
+    #[cfg(test)]
+    pub fn children_of(&self, parent: &str) -> u32 {
+        self.state
+            .0
+            .lock()
+            .expect("spawn state mutex poisoned")
+            .ledger
+            .children_of(parent)
+    }
+
     /// Depth of a known task, or `None` if it was never registered.
     #[cfg(test)]
     pub fn depth_of(&self, id: &str) -> Option<u32> {
@@ -1111,12 +1158,11 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
 
         match launch(&grant) {
             Ok(child_id) => {
-                self.state
-                    .0
-                    .lock()
-                    .expect("spawn state mutex poisoned")
-                    .depths
-                    .insert(child_id.clone(), grant.child_depth);
+                let mut state = self.state.0.lock().expect("spawn state mutex poisoned");
+                state.depths.insert(child_id.clone(), grant.child_depth);
+                state
+                    .child_parent
+                    .insert(child_id.clone(), parent_id.to_owned());
                 Ok(child_id)
             }
             Err(e) => {
@@ -1147,6 +1193,7 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
         loop {
             match self.results.status(id) {
                 SubtaskStatus::Found(status) if is_terminal(status) => {
+                    self.release_fanout(id);
                     return AwaitOutcome::Ready(status);
                 }
                 SubtaskStatus::Found(_) => {}
@@ -1158,6 +1205,22 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                 return AwaitOutcome::TimedOut;
             }
             std::thread::sleep(self.poll_interval);
+        }
+    }
+
+    /// Free `id`'s fan-out slot against its recorded parent, exactly once. Called
+    /// by `await_subtask`/`await_subtasks` the first time `id` is observed
+    /// terminal, so `max_fanout` bounds CONCURRENT children rather than a
+    /// lifetime tally (#716) — a parent whose prior children have all settled can
+    /// spawn a fresh full wave. Idempotent: a repeated await on an already-settled
+    /// child is a no-op here (guarded by `state.released`).
+    fn release_fanout(&self, id: &str) {
+        let mut state = self.state.0.lock().expect("spawn state mutex poisoned");
+        if !state.released.insert(id.to_owned()) {
+            return;
+        }
+        if let Some(parent) = state.child_parent.get(id).cloned() {
+            state.ledger.release(&parent);
         }
     }
 
@@ -1176,6 +1239,7 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
             for id in ids {
                 match self.results.status(id) {
                     SubtaskStatus::Found(status) if is_terminal(status) => {
+                        self.release_fanout(id);
                         settled.push((id.clone(), status));
                     }
                     SubtaskStatus::Found(_) => {}
@@ -2030,7 +2094,9 @@ mod tests {
     }
 
     #[test]
-    fn resident_max_fanout_sixteen_fits_full_wave_then_denies_seventeenth() {
+    fn resident_max_fanout_sixteen_concurrent_children_denies_seventeenth_while_all_live() {
+        // max_fanout bounds CONCURRENT children: 16 still-running children deny a
+        // 17th, exactly as before — this is the "wave still in flight" case.
         let policy = resident_policy();
         let mut ledger = SpawnLedger::new();
 
@@ -2054,6 +2120,71 @@ mod tests {
                 max: 16
             })
         );
+    }
+
+    #[test]
+    fn resident_max_fanout_sixteen_fits_a_fresh_wave_once_the_prior_wave_settles() {
+        // #716: a resident spawns a full 16-wide wave, ALL 16 children reach a
+        // terminal status (release() simulates the broker observing this via
+        // await_subtask/await_subtasks), and the resident must then be able to
+        // spawn a full fresh 16-wide wave rather than being permanently capped at
+        // 16 spawns for the rest of its lifetime.
+        let policy = resident_policy();
+        let mut ledger = SpawnLedger::new();
+
+        for _ in 0..16 {
+            ledger
+                .authorize_and_record(&policy, &ctx("resident", 0), &req())
+                .unwrap();
+        }
+        assert_eq!(ledger.children_of("resident"), 16);
+        assert_eq!(
+            ledger.authorize(&policy, &ctx("resident", 0), &req()),
+            Err(SpawnDenied::FanoutExceeded {
+                parent: "resident".to_owned(),
+                max: 16
+            })
+        );
+
+        // All 16 prior children settle (done/review/needs_user/failed).
+        for _ in 0..16 {
+            ledger.release("resident");
+        }
+        assert_eq!(ledger.children_of("resident"), 0);
+
+        // A fresh full wave is now allowed — max_fanout is not a lifetime cap.
+        for _ in 0..16 {
+            ledger
+                .authorize_and_record(&policy, &ctx("resident", 0), &req())
+                .unwrap();
+        }
+        assert_eq!(ledger.children_of("resident"), 16);
+
+        // global_child_budget is untouched by release(): it stays the true
+        // lifetime/cost ceiling, now at 32 total spawns across both waves.
+        assert_eq!(ledger.global_spawned(), 32);
+    }
+
+    #[test]
+    fn release_only_frees_the_named_parents_slot_and_saturates_at_zero() {
+        let policy = base_policy(); // max_fanout = 2
+        let mut ledger = SpawnLedger::new();
+        ledger
+            .authorize_and_record(&policy, &ctx("root", 0), &req())
+            .unwrap();
+
+        // Releasing a parent with zero live children is a no-op, not underflow.
+        ledger.release("nobody");
+        assert_eq!(ledger.children_of("nobody"), 0);
+
+        ledger.release("root");
+        assert_eq!(ledger.children_of("root"), 0);
+        // Extra release beyond zero saturates rather than underflowing.
+        ledger.release("root");
+        assert_eq!(ledger.children_of("root"), 0);
+
+        // global_spawned (the lifetime budget) is unaffected by release().
+        assert_eq!(ledger.global_spawned(), 1);
     }
 
     #[test]
@@ -2758,6 +2889,46 @@ deny_sandboxes = ["local"]
         let map: BTreeMap<_, _> = settled.into_iter().collect();
         assert_eq!(map["a"], TaskStatus::Done);
         assert_eq!(map["b"], TaskStatus::Failed);
+    }
+
+    #[test]
+    fn broker_full_wave_settles_then_a_fresh_full_wave_is_allowed() {
+        // #716 end-to-end: spawn a full max_fanout wave through the REAL broker
+        // (not the pure ledger), await all of them terminal via the actual
+        // await_subtasks wiring, and confirm a second full wave is then allowed —
+        // proving release_fanout is actually wired into the collect path, not
+        // just correct in isolation.
+        let results = MockResults::new(|_, _| Some(TaskStatus::Done));
+        let broker = fast_timing(
+            SpawnBroker::new(resident_policy(), "resident", MockLauncher::new())
+                .with_results(results),
+        );
+
+        let mut first_wave = Vec::new();
+        for _ in 0..16 {
+            first_wave.push(broker.spawn_subtask("resident", req()).unwrap());
+        }
+        assert_eq!(broker.children_of("resident"), 16);
+        match broker.spawn_subtask("resident", req()) {
+            Err(BrokerError::Denied(SpawnDenied::FanoutExceeded { max: 16, .. })) => {}
+            other => panic!("expected FanoutExceeded before the wave settles, got {other:?}"),
+        }
+
+        let AwaitOutcome::Ready(_) = broker.await_subtasks(&first_wave) else {
+            panic!("first wave should settle");
+        };
+        assert_eq!(broker.children_of("resident"), 0);
+
+        let mut second_wave = Vec::new();
+        for _ in 0..16 {
+            second_wave.push(
+                broker
+                    .spawn_subtask("resident", req())
+                    .expect("a fresh wave must be allowed once the prior wave has settled"),
+            );
+        }
+        assert_eq!(broker.children_of("resident"), 16);
+        assert_eq!(broker.global_spawned(), 32);
     }
 
     #[test]
