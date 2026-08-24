@@ -1327,13 +1327,14 @@ impl SandboxProvider for DockerProvider {
         } else {
             egress_pins = Vec::with_capacity(self.egress.len());
             for host in &self.egress {
+                let host = split_egress_host(host).0;
                 let ip = resolve_host(host).await.with_context(|| {
                     format!(
                         "failed to resolve egress-allow-listed host '{host}' for sandbox '{}'",
                         self.name
                     )
                 })?;
-                egress_pins.push((host.clone(), ip));
+                egress_pins.push((host.to_owned(), ip));
             }
         }
         // Give the container a dedicated HOME backed by a PER-SESSION DOCKER
@@ -1394,6 +1395,24 @@ fn egress_proxy_container(handle: &str) -> String {
     format!("varda-eproxy-{handle}")
 }
 
+/// Split an egress entry into its host and optional explicit port (`host[:port]`).
+///
+/// A bare `example.com` is HTTPS-shaped and needs nothing beyond the default CONNECT
+/// ports. An entry like `host.docker.internal:8765` additionally opens CONNECT to that
+/// port, which a plain-`http://` client still needs: undici's `ProxyAgent` (Node's
+/// fetch, hence every Node MCP client) CONNECT-tunnels through a forward proxy
+/// REGARDLESS of scheme, so an http service on a non-default port is unreachable
+/// until its port is allowed. The host half is what the filter matches — tinyproxy
+/// filters on host only, never host:port.
+fn split_egress_host(entry: &str) -> (&str, Option<&str>) {
+    match entry.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            (host, Some(port))
+        }
+        _ => (entry, None),
+    }
+}
+
 /// Build the tinyproxy config that default-denies and allow-lists exactly `hosts`.
 /// `FilterDefaultDeny Yes` + a per-host anchored regex means a non-allow-listed
 /// CONNECT/GET is refused at the proxy — real enforcement, not just DNS breakage.
@@ -1401,22 +1420,36 @@ fn egress_proxy_container(handle: &str) -> String {
 /// ONLY that host, never a subdomain (`evil.api.anthropic.com`) or a suffix-match
 /// impostor (`api.anthropic.com.evil.com`).
 fn tinyproxy_filter(hosts: &[String]) -> String {
+    let mut seen = std::collections::BTreeSet::new();
     hosts
         .iter()
+        .map(|h| split_egress_host(h).0)
+        .filter(|h| seen.insert(h.to_owned()))
         .map(|h| format!("^{}$", h.replace('.', "\\.")))
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
 }
 
-fn tinyproxy_conf() -> String {
+fn tinyproxy_conf(hosts: &[String]) -> String {
+    // 443/563 are the defaults every HTTPS client needs; anything else must be opted
+    // into per host via an explicit `host:port` egress entry.
+    let mut ports: std::collections::BTreeSet<&str> = ["443", "563"].into_iter().collect();
+    for host in hosts {
+        if let (_, Some(port)) = split_egress_host(host) {
+            ports.insert(port);
+        }
+    }
+    let connect_ports = ports
+        .iter()
+        .map(|p| format!("ConnectPort {p}\n"))
+        .collect::<String>();
     format!(
         "Port {EGRESS_PROXY_PORT}\n\
          Listen 0.0.0.0\n\
          Timeout 600\n\
          Allow 0.0.0.0/0\n\
-         ConnectPort 443\n\
-         ConnectPort 563\n\
+         {connect_ports}\
          FilterExtended On\n\
          FilterCaseSensitive Off\n\
          FilterDefaultDeny Yes\n\
@@ -1466,7 +1499,7 @@ async fn setup_egress_proxy(
     let cfg_dir = session_store.join("egress-proxy");
     std::fs::create_dir_all(&cfg_dir)
         .with_context(|| format!("failed to create proxy config dir {}", cfg_dir.display()))?;
-    std::fs::write(cfg_dir.join("tinyproxy.conf"), tinyproxy_conf())
+    std::fs::write(cfg_dir.join("tinyproxy.conf"), tinyproxy_conf(hosts))
         .with_context(|| "failed to write tinyproxy.conf".to_string())?;
     std::fs::write(cfg_dir.join("filter"), tinyproxy_filter(hosts))
         .with_context(|| "failed to write proxy filter".to_string())?;
@@ -4047,6 +4080,43 @@ mod tests {
 
     /// Docker now accepts a non-empty egress allow-list in EVERY mode: `strict`/
     /// `proxy` build the forward-proxy sidecar provider, `dns-pin` keeps the legacy
+    /// `host:port` egress entries open CONNECT to that port and still filter on the
+    /// bare host — tinyproxy never matches host:port — so a plain-http service on a
+    /// non-default port is reachable by a Node client (undici CONNECT-tunnels even
+    /// for http://) without widening the host allow-list.
+    #[test]
+    fn egress_host_port_opens_connect_port_and_filters_on_host() {
+        let hosts = vec![
+            "api.github.com".to_owned(),
+            "host.docker.internal:8765".to_owned(),
+        ];
+        let conf = tinyproxy_conf(&hosts);
+        assert!(conf.contains("ConnectPort 443\n"), "{conf}");
+        assert!(conf.contains("ConnectPort 563\n"), "{conf}");
+        assert!(conf.contains("ConnectPort 8765\n"), "{conf}");
+
+        let filter = tinyproxy_filter(&hosts);
+        assert!(filter.contains("^host\\.docker\\.internal$"), "{filter}");
+        assert!(!filter.contains("8765"), "filter must match host only: {filter}");
+
+        // A bare host list opens nothing beyond the defaults.
+        let bare = tinyproxy_conf(&["api.github.com".to_owned()]);
+        assert_eq!(bare.matches("ConnectPort").count(), 2, "{bare}");
+    }
+
+    /// A port suffix is stripped before DNS-pin resolution/pinning, so `dns-pin`
+    /// compatibility mode does not try to resolve "host:8765" as a hostname.
+    #[test]
+    fn split_egress_host_splits_only_numeric_ports() {
+        assert_eq!(split_egress_host("api.github.com"), ("api.github.com", None));
+        assert_eq!(
+            split_egress_host("host.docker.internal:8765"),
+            ("host.docker.internal", Some("8765"))
+        );
+        // Not a port: left intact rather than silently truncated.
+        assert_eq!(split_egress_host("host:abc"), ("host:abc", None));
+    }
+
     /// `--add-host` pins. None of them is refused at build time.
     #[test]
     fn docker_non_empty_egress_builds_in_all_modes() {
