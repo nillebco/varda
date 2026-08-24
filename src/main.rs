@@ -1317,6 +1317,69 @@ struct VardaSubtaskLauncher {
     worker_registry: orchestration::WorkerRegistry,
 }
 
+impl VardaSubtaskLauncher {
+    fn worker_sandbox_override(
+        &self,
+        mother: &Path,
+        requested: Option<&str>,
+        assignee: &str,
+        action: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let orch_policy = self.config.resolve_orchestration_for(mother);
+        let sandbox = orchestration::spawn_sandbox_override(requested, &orch_policy);
+
+        orchestration::check_effective_placement(&orch_policy, assignee, sandbox.as_deref())
+            .map_err(|denied| anyhow::anyhow!("cannot {action} subtask: {denied}"))?;
+
+        if let Some(sandbox) = &sandbox
+            && !self.config.sandboxes.contains_key(sandbox)
+        {
+            anyhow::bail!(
+                "cannot {action} subtask: worker sandbox '{sandbox}' is not defined as a central \
+                 [sandboxes.{sandbox}] (from the request, task, or \
+                 [routes.orchestration].default_worker_sandbox). Define it, or request a sandbox \
+                 that exists."
+            );
+        }
+
+        Ok(sandbox)
+    }
+
+    fn isolate_worker(
+        &self,
+        task_doc: &mut task::TaskDocument,
+        mother: &Path,
+        worktree_slug: &str,
+    ) -> Option<git::WorkerCheckout> {
+        match worker_worktree_path(worktree_slug) {
+            Ok(worktree_path) => {
+                match git::create_worker_worktree(mother, worktree_slug, &worktree_path) {
+                    Ok(checkout) => {
+                        task_doc.frontmatter.project = Some(checkout.path.display().to_string());
+                        task_doc.frontmatter.mother_project = Some(mother.display().to_string());
+                        Some(checkout)
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: worker isolation unavailable for '{}' \
+                             (falling back to the shared mount): {error:#}",
+                            mother.display()
+                        );
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: could not allocate a worker worktree path \
+                     (falling back to the shared mount): {error:#}"
+                );
+                None
+            }
+        }
+    }
+}
+
 impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
     fn launch(
         &mut self,
@@ -1359,34 +1422,8 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
         // in `resolve_sandbox_for`, so the worker lands in a box that can actually
         // build/reach its model API rather than the route's LLM-only resident box —
         // the failure that stranded #642/#649/#636.
-        let orch_policy = self.config.resolve_orchestration_for(&project);
         let spawn_sandbox =
-            orchestration::spawn_sandbox_override(req.sandbox.as_deref(), &orch_policy);
-
-        // `authorize_and_record` (in `gated_launch`) only re-checks `allow_agents`/
-        // `deny_agents`/`allow_sandboxes`/`deny_sandboxes` when the caller passed
-        // `req.agent`/`req.sandbox` explicitly. `assignee`/`spawn_sandbox` above may
-        // instead be a FALLBACK (`self.fallback_agent`, `default_worker_sandbox`)
-        // that policy never saw — re-run the same allow/deny check against the
-        // EFFECTIVE values so a fallback can never silently bypass `deny_sandboxes`
-        // (which defaults to denying `local`) or `deny_agents`.
-        orchestration::check_effective_placement(
-            &orch_policy,
-            assignee,
-            spawn_sandbox.as_deref(),
-        )
-        .map_err(|denied| anyhow::anyhow!("cannot spawn subtask: {denied}"))?;
-
-        if let Some(sandbox) = &spawn_sandbox
-            && !self.config.sandboxes.contains_key(sandbox)
-        {
-            anyhow::bail!(
-                "cannot spawn subtask: worker sandbox '{sandbox}' is not defined as a central \
-                 [sandboxes.{sandbox}] (from the spawn request or \
-                 [routes.orchestration].default_worker_sandbox). Define it, or request a sandbox \
-                 that exists."
-            );
-        }
+            self.worker_sandbox_override(&project, req.sandbox.as_deref(), assignee, "spawn")?;
 
         let short = uuid::Uuid::new_v4().to_string();
         let task_name = format!("spawned-subtask-{}", &short[..8]);
@@ -1423,33 +1460,7 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
         // `create_worker_worktree` fails outside a git repo, so a non-git mother
         // falls back to today's shared-mount behaviour (no worktree, no override).
         let worktree_slug = format!("{}-{}", task_name, &short[..8]);
-        let worker_checkout = match worker_worktree_path(&worktree_slug) {
-            Ok(worktree_path) => {
-                match git::create_worker_worktree(&project, &worktree_slug, &worktree_path) {
-                    Ok(checkout) => {
-                        task_doc.frontmatter.project = Some(checkout.path.display().to_string());
-                        task_doc.frontmatter.mother_project =
-                            Some(project.display().to_string());
-                        Some(checkout)
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "warning: worker isolation unavailable for '{}' \
-                             (falling back to the shared mount): {error:#}",
-                            project.display()
-                        );
-                        None
-                    }
-                }
-            }
-            Err(error) => {
-                eprintln!(
-                    "warning: could not allocate a worker worktree path \
-                     (falling back to the shared mount): {error:#}"
-                );
-                None
-            }
-        };
+        let worker_checkout = self.isolate_worker(&mut task_doc, &project, &worktree_slug);
 
         task_doc.set_status(task::TaskStatus::Ready);
         task::write_task(&task_doc)?;
@@ -1514,6 +1525,25 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
             )
         })?;
 
+        let mother = PathBuf::from(
+            task_doc
+                .frontmatter
+                .policy_project()
+                .cloned()
+                .unwrap_or_else(|| self.project_path.display().to_string()),
+        );
+        let assignee = task_doc
+            .frontmatter
+            .assignee
+            .as_deref()
+            .unwrap_or(&self.fallback_agent);
+        let run_sandbox = self.worker_sandbox_override(
+            &mother,
+            task_doc.frontmatter.sandbox.as_deref(),
+            assignee,
+            "run",
+        )?;
+
         let subtask_id = task_doc
             .frontmatter
             .id
@@ -1533,8 +1563,20 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
             );
         }
 
+        if let Some(sandbox) = run_sandbox {
+            task_doc.frontmatter.sandbox = Some(sandbox);
+        }
+
+        let short = uuid::Uuid::new_v4().to_string();
+        let worktree_slug = format!("task-{subtask_id}-{}", &short[..8]);
+        let worker_checkout = self.isolate_worker(&mut task_doc, &mother, &worktree_slug);
+
         task_doc.set_status(task::TaskStatus::Ready);
         task::write_task(&task_doc)?;
+
+        if let Some(checkout) = worker_checkout {
+            self.worker_registry.record(subtask_id.clone(), checkout);
+        }
 
         let lineage = SpawnLineage {
             root_id: subtask_id.clone(),
@@ -2289,9 +2331,8 @@ fn worker_worktree_path(slug: &str) -> Result<PathBuf> {
         .with_context(|| format!("failed to create worktree base {}", base.display()))?;
     let path = base.join(format!("wip-{slug}"));
     if path.exists() {
-        std::fs::remove_dir_all(&path).with_context(|| {
-            format!("failed to clear stale worktree path {}", path.display())
-        })?;
+        std::fs::remove_dir_all(&path)
+            .with_context(|| format!("failed to clear stale worktree path {}", path.display()))?;
     }
     Ok(path)
 }
@@ -2328,7 +2369,11 @@ async fn run_task_path_for_parallel(
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
-        task_document.frontmatter.mother_project.as_deref().map(Path::new),
+        task_document
+            .frontmatter
+            .mother_project
+            .as_deref()
+            .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
     )?;
     // POLICY reads (orchestration policy + sandbox-primitive/transport selection)
@@ -2407,7 +2452,11 @@ async fn run_spawned_subtask_settling(
     child_id: String,
     label: &'static str,
 ) {
-    let run = tokio::spawn(run_task_path_for_parallel(config, path.clone(), Some(lineage)));
+    let run = tokio::spawn(run_task_path_for_parallel(
+        config,
+        path.clone(),
+        Some(lineage),
+    ));
     let abort = run.abort_handle();
     let settled_ok = match tokio::time::timeout(SPAWNED_SUBTASK_HARD_CEILING, run).await {
         Ok(Ok(Ok(_report))) => true, // run_task wrote a terminal status on a clean finish
@@ -3854,7 +3903,11 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
-        task_document.frontmatter.mother_project.as_deref().map(Path::new),
+        task_document
+            .frontmatter
+            .mother_project
+            .as_deref()
+            .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
     )?;
     // Wire the nested-orchestration broker onto the interactive resident: when
@@ -4006,7 +4059,11 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
-        task_document.frontmatter.mother_project.as_deref().map(Path::new),
+        task_document
+            .frontmatter
+            .mother_project
+            .as_deref()
+            .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
     )?;
     let outcome = runner::plan_task(
@@ -4100,7 +4157,11 @@ async fn run_captured_resume_command(
         &route.route_mounts,
         &route.route_env,
         task_document.frontmatter.project.as_deref().map(Path::new),
-        task_document.frontmatter.mother_project.as_deref().map(Path::new),
+        task_document
+            .frontmatter
+            .mother_project
+            .as_deref()
+            .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
     )?;
     if config.git.auto_commit {
@@ -4599,7 +4660,10 @@ mod tests {
         let err = resolve_env_secrets(&mut env, &["EXFIL".to_owned()])
             .expect_err("untrusted fnox binding must error");
         let msg = err.to_string();
-        assert!(msg.contains("untrusted"), "error must name the untrusted origin: {msg}");
+        assert!(
+            msg.contains("untrusted"),
+            "error must name the untrusted origin: {msg}"
+        );
         assert!(msg.contains("EXFIL"), "error must name the key: {msg}");
         // The sentinel is left in place; no value was resolved.
         assert_eq!(env.get("EXFIL").unwrap(), "${fnox:aws-prod-key}");
@@ -4678,6 +4742,196 @@ planner_agent: codex
 "#;
 
         assert_eq!(plan_planner_agent(content).as_deref(), Some("codex"));
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn git_ok(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error:#}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn seed_git_repo(repo: &Path) {
+        fs::create_dir_all(repo).expect("repo dir should be created");
+        git_ok(repo, &["init"]);
+        git_ok(
+            repo,
+            &["config", "user.email", "varda-test@example.invalid"],
+        );
+        git_ok(repo, &["config", "user.name", "Varda Test"]);
+        fs::write(repo.join("README.md"), "seed\n").expect("seed file should write");
+        git_ok(repo, &["add", "README.md"]);
+        git_ok(repo, &["commit", "-m", "seed"]);
+        fs::create_dir_all(repo.join(".varda/tasks")).expect(".varda task store should exist");
+    }
+
+    fn launcher_test_config(root: &Path) -> config::Config {
+        config::Config {
+            defaults: config::Defaults {
+                operations_dir: root.join("operations").display().to_string(),
+                ..Default::default()
+            },
+            routes: Vec::new(),
+            agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
+            git: config::GitConfig { auto_commit: false },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: orchestration::OrchestrationPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn run_existing_worker_isolation_reruns_from_mother_not_prior_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-run-existing-isolate-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        let varda_home = root.join("home");
+        let _guard = EnvVarGuard::set(config::VARDA_HOME_ENV, &varda_home);
+        seed_git_repo(&mother);
+
+        let config = launcher_test_config(&root);
+        let task_path = task::create_task(
+            &config,
+            "Existing Worker",
+            &mother,
+            Some("claude"),
+            None,
+            None,
+        )
+        .expect("task should be created");
+        let mut task_doc = task::load_task(&task_path).expect("task should load");
+        let launcher = VardaSubtaskLauncher {
+            config,
+            project_path: mother.clone(),
+            fallback_agent: "claude".to_owned(),
+            spawn_state: orchestration::SharedSpawnState::new(),
+            worker_registry: orchestration::WorkerRegistry::new(),
+        };
+
+        let first = launcher
+            .isolate_worker(&mut task_doc, &mother, "existing-first")
+            .expect("first run should create an isolated worktree");
+        assert_eq!(
+            task_doc.frontmatter.mother_project.as_deref(),
+            Some(mother.to_str().unwrap())
+        );
+        assert_eq!(
+            task_doc.frontmatter.project.as_deref(),
+            Some(first.path.to_str().unwrap())
+        );
+
+        let second_mother = PathBuf::from(
+            task_doc
+                .frontmatter
+                .policy_project()
+                .expect("mother_project should survive the first isolation"),
+        );
+        let second = launcher
+            .isolate_worker(&mut task_doc, &second_mother, "existing-second")
+            .expect("second run should create a fresh isolated worktree");
+
+        assert_ne!(first.path, second.path);
+        assert_eq!(second_mother, mother);
+        assert!(
+            !second.path.starts_with(&first.path),
+            "second run must not nest a worktree inside the first run's worktree"
+        );
+        assert_eq!(
+            task_doc.frontmatter.mother_project.as_deref(),
+            Some(mother.to_str().unwrap())
+        );
+        assert_eq!(
+            task_doc.frontmatter.project.as_deref(),
+            Some(second.path.to_str().unwrap())
+        );
+
+        let _ = git::remove_worker_worktree(&mother, &first, true);
+        let _ = git::remove_worker_worktree(&mother, &second, true);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_sandbox_override_uses_default_worker_sandbox_and_enforces_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-worker-sandbox-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        fs::create_dir_all(&mother).expect("repo dir should be created");
+
+        let mut config = launcher_test_config(&root);
+        config.sandboxes.insert(
+            "worker".to_owned(),
+            config::SandboxConfig {
+                primitive: "docker".to_owned(),
+                ..Default::default()
+            },
+        );
+        config.orchestration = orchestration::OrchestrationPolicy {
+            enabled: true,
+            allow_agents: vec!["claude".to_owned()],
+            allow_sandboxes: vec!["worker".to_owned()],
+            default_worker_sandbox: Some("worker".to_owned()),
+            ..Default::default()
+        };
+        let launcher = VardaSubtaskLauncher {
+            config,
+            project_path: mother.clone(),
+            fallback_agent: "claude".to_owned(),
+            spawn_state: orchestration::SharedSpawnState::new(),
+            worker_registry: orchestration::WorkerRegistry::new(),
+        };
+
+        assert_eq!(
+            launcher
+                .worker_sandbox_override(&mother, None, "claude", "run")
+                .expect("default worker sandbox should be allowed")
+                .as_deref(),
+            Some("worker")
+        );
+        let err = launcher
+            .worker_sandbox_override(&mother, Some("local"), "claude", "run")
+            .expect_err("denied explicit sandbox must fail before launch");
+        assert!(err.to_string().contains("local"), "got {err:#}");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn resident_tmp(name: &str) -> PathBuf {

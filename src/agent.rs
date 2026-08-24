@@ -109,6 +109,8 @@ Do NOT run `git add`, `git commit`, or any other git history-modifying command. 
 
 This is a headless run: there is no human to approve commands interactively. If the permission layer blocks a command or tool you needed (for example a shell command that was not pre-authorized), do NOT guess around it. Add a markdown heading called `Blocked commands` and, below it, list each blocked command or tool — one per line, the exact command name or invocation (e.g. `msb` or `docker build`). Varda surfaces this list so the orchestrator can add those commands to the task's `allow_commands` allowlist and re-run automatically. If nothing was blocked, omit the heading (or write `(none)` under it).
 
+This is a one-turn headless run. Run required verification commands, such as `cargo check`, `cargo test`, linters, or build commands, in the foreground and wait for their exit status before ending your turn. Do not background verification or end with a promise to continue after a monitor, notification, or future result; there is no human-attached continuation for this turn unless Varda explicitly starts a new one.
+
 At the end of the recap, include exactly one bare machine-readable marker line whose content is either `requires_user: true` or `requires_user: false`.
 
 If you need user input, stop and use the true marker."#

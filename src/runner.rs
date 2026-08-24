@@ -265,6 +265,23 @@ fn combine_recaps(prior: &[String], last: &str) -> String {
     parts.join("\n\n---\n\n")
 }
 
+fn recap_reports_pending_verification(recap: &str) -> bool {
+    let lower = recap.to_ascii_lowercase();
+    let pending = [
+        "waiting on cargo check",
+        "waiting for cargo check",
+        "waiting on cargo test",
+        "waiting for cargo test",
+        "waiting on the build",
+        "waiting for the build",
+        "waiting on verification",
+        "waiting for verification",
+        "before running the test suite",
+        "i'll continue as soon as",
+    ];
+    pending.iter().any(|needle| lower.contains(needle))
+}
+
 /// M10 multi-hop auto-resume loop (headless runs only).
 ///
 /// Runs the first (already-built) watched session, then — while the agent hands
@@ -594,7 +611,9 @@ pub async fn run_task(
         eprintln!("captured resume command: {resume}");
     }
 
-    let requires_user = result.requires_user || recap_requires_user_interaction(&result.recap);
+    let requires_user = result.requires_user
+        || recap_requires_user_interaction(&result.recap)
+        || recap_reports_pending_verification(&result.recap);
     let files_touched = parse_files_touched(&result.recap);
     let blocked_commands = parse_blocked_commands(&result.recap);
     let recap_path = write_recap(config, task_path, &result.recap)?;
@@ -737,7 +756,9 @@ pub async fn resume_interactive_task(
         }
     };
 
-    let requires_user = result.requires_user || recap_requires_user_interaction(&result.recap);
+    let requires_user = result.requires_user
+        || recap_requires_user_interaction(&result.recap)
+        || recap_reports_pending_verification(&result.recap);
     let files_touched = parse_files_touched(&result.recap);
     let blocked_commands = parse_blocked_commands(&result.recap);
     let recap_path = write_recap(config, task_path, &result.recap)?;
@@ -1205,7 +1226,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // An external transcript varda can read (the interpreter could not).
         let transcript = dir.join("events.jsonl");
-        std::fs::write(&transcript, "{\"event\":\"edit\",\"file\":\"a.tf\"}\nOUTCOME-MARKER\n").unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"event\":\"edit\",\"file\":\"a.tf\"}\nOUTCOME-MARKER\n",
+        )
+        .unwrap();
         // A referenced transcript that does NOT exist -> noted, not dropped.
         let missing = dir.join("gone.jsonl");
         let log = dir.join("session.log");
@@ -1222,14 +1247,27 @@ mod tests {
         .unwrap();
 
         let out = super::read_external_transcripts(&log);
-        assert!(out.contains("OUTCOME-MARKER"), "transcript content must be inlined: {out}");
-        assert_eq!(out.matches("## External transcript").count(), 2, "dedup + note the missing one: {out}");
-        assert!(out.contains("could not read this transcript"), "missing ref noted: {out}");
+        assert!(
+            out.contains("OUTCOME-MARKER"),
+            "transcript content must be inlined: {out}"
+        );
+        assert_eq!(
+            out.matches("## External transcript").count(),
+            2,
+            "dedup + note the missing one: {out}"
+        );
+        assert!(
+            out.contains("could not read this transcript"),
+            "missing ref noted: {out}"
+        );
 
         // tail_excerpt keeps the END (outcome) when over budget.
         let big = format!("HEAD{}TAIL-OUTCOME", "x".repeat(200_000));
         let tail = super::tail_excerpt(&big, 64 * 1024);
-        assert!(tail.contains("TAIL-OUTCOME") && !tail.contains("HEAD"), "tail keeps the end");
+        assert!(
+            tail.contains("TAIL-OUTCOME") && !tail.contains("HEAD"),
+            "tail keeps the end"
+        );
         assert!(tail.starts_with("[truncated"), "notes truncation");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1501,6 +1539,50 @@ Do it.
 
         let updated = fs::read_to_string(&task_path).expect("task should be readable");
 
+        assert_eq!(outcome.status, TaskStatus::NeedsUser);
+        assert!(updated.contains("status: needs_user"));
+        assert!(updated.contains("requires_user: true"));
+    }
+
+    #[tokio::test]
+    async fn run_task_does_not_review_recap_with_pending_verification() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-run-pending-verification-{}",
+            std::process::id()
+        ));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: codex
+requires_user: false
+---
+
+# Task
+
+Do it.
+"#,
+        )
+        .expect("task should be written");
+
+        let config = test_config(operations_dir.display().to_string());
+        let client = FakeAgentClient::new(AgentRunResult {
+            recap: "I've made the core code changes and am waiting on cargo check --all-targets to confirm it compiles cleanly before running the test suite. I'll continue as soon as the monitor notifies me.".to_owned(),
+            requires_user: false,
+            suggested_agent: None,
+            resume_command: None,
+        });
+
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
+            .await
+            .expect("task should run");
+
+        let updated = fs::read_to_string(&task_path).expect("task should be readable");
         assert_eq!(outcome.status, TaskStatus::NeedsUser);
         assert!(updated.contains("status: needs_user"));
         assert!(updated.contains("requires_user: true"));
