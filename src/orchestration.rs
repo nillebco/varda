@@ -1241,10 +1241,14 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
     /// (after cross-review / at root-run completion), reusing
     /// [`git::remove_worker_worktree`] with `delete_branch = true` only once the
     /// branch is no longer needed for review. Root-run teardown deletes every
-    /// registered checkout after all spawned workers have joined (or have been
-    /// aborted). Worker branches live only in the independent clones, so deleting
-    /// each clone also deletes its `wip/` branch. The registry therefore keeps
-    /// each entry for the whole root run rather than draining it here.
+    /// registered checkout once all spawned workers have joined on a SUCCESSFUL
+    /// root run. On a failed root run, workers are aborted and checkouts are
+    /// deliberately left in place — un-integrated work is exactly what a human
+    /// needs to recover after an infra-level failure, so cleanup does not run on
+    /// that path. Worker branches live only in the independent clones, so
+    /// deleting each clone also deletes its `wip/` branch. The registry
+    /// therefore keeps each entry for the whole root run rather than draining
+    /// it here.
     fn integrate_subtasks(&self, ids: &[String]) -> anyhow::Result<Value> {
         let integration_worktree = self
             .integration_worktree
