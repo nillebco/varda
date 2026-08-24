@@ -1397,7 +1397,7 @@ fn build_prompt(request: &AgentRunRequest) -> String {
         .as_deref()
         .map(|socket| {
             format!(
-                "\n## Nested orchestration MCP\n\nA host-gated MCP broker is available at Unix socket `{socket}`. Speak newline-delimited JSON-RPC over that socket; `tools/list` advertises the available tools. The only spawn capability is `spawn_subtask`, and denials are hard errors. The broker also exposes task control-plane tools — `list_tasks`, `get_task`, and `set_task_status` — scoped to your own project; use `list_tasks` (or `.varda/tasks/*.md` in the workspace) to discover work, since there is no GitHub egress and no `varda` CLI inside this box, and call `set_task_status` on your OWN task id once you finish (running -> done/needs_user/failed only; review -> done is a human-only gate).\n"
+                "\n## Nested orchestration MCP\n\nA host-gated MCP broker is available at Unix socket `{socket}`. Speak newline-delimited JSON-RPC over that socket; `tools/list` advertises the available tools. The only spawn capability is `spawn_subtask`, and denials are hard errors. The broker also exposes task control-plane tools — `list_tasks`, `get_task`, and `set_task_status` — scoped to your own project; use `list_tasks` (or `.varda/tasks/*.md` in the workspace) to discover work, since there is no GitHub egress and no `varda` CLI inside this box, and call `set_task_status` on your OWN task id once you finish (running -> done/needs_user/failed only; review -> done is a human-only gate). If you are the root/orchestrator of this run, you may also call `set_task_status` on any task in your project, not just your own — an ordinary spawned worker stays self-only.\n"
             )
         })
         .unwrap_or_default();
