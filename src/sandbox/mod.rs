@@ -2285,8 +2285,11 @@ impl SandboxSession for DockerSession {
 /// Parse a docker `--memory` value (`<number>[b|k|kb|m|mb|g|gb]`, no suffix ⇒
 /// bytes) and convert it to whole megabytes for `msb run --memory`, which takes
 /// a plain MB integer rather than docker's suffixed grammar. Returns `None` for
-/// anything that does not parse as that grammar (dropped with a warning by the
-/// caller rather than failing the run).
+/// anything that does not parse as that grammar, including non-finite numbers
+/// like `NaN`/`inf` (dropped with a warning by the caller rather than failing
+/// the run). Rounds DOWN (floor, min 1 MB): the translated ceiling must never
+/// exceed the configured one — the whole point of a ceiling is to bound usage,
+/// so rounding up would silently grant more than was asked for.
 fn docker_memory_to_msb_mb(raw: &str) -> Option<u64> {
     let trimmed = raw.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
@@ -2297,7 +2300,7 @@ fn docker_memory_to_msb_mb(raw: &str) -> Option<u64> {
         .unwrap_or(trimmed.len());
     let (number, unit) = trimmed.split_at(split_at);
     let number: f64 = number.parse().ok()?;
-    if number <= 0.0 {
+    if !number.is_finite() || number <= 0.0 {
         return None;
     }
     let bytes_per_unit = match unit {
@@ -2307,20 +2310,24 @@ fn docker_memory_to_msb_mb(raw: &str) -> Option<u64> {
         "g" | "gb" => 1024.0 * 1024.0 * 1024.0,
         _ => return None,
     };
-    let mb = (number * bytes_per_unit / (1024.0 * 1024.0)).round() as u64;
+    let mb = (number * bytes_per_unit / (1024.0 * 1024.0)).floor() as u64;
     Some(mb.max(1))
 }
 
-/// Parse a docker `--cpus` value (a decimal core count, e.g. `"1.5"`) and round
-/// it to the nearest whole core for `msb run --cpus`, which takes an integer
-/// count rather than docker's fractional grammar. Returns `None` for anything
-/// that does not parse as a positive number.
+/// Parse a docker `--cpus` value (a decimal core count, e.g. `"1.5"`) for `msb
+/// run --cpus`, which takes an integer count rather than docker's fractional
+/// grammar. Returns `None` for anything that does not parse as a positive,
+/// finite number (rejects `NaN`/`inf`, which `f64::parse` would otherwise
+/// accept as valid floats). Rounds DOWN (floor, min 1 core): the translated
+/// ceiling must never exceed the configured one, so `"1.5"` maps to `1`, not
+/// `2` — rounding up would silently grant more cores than the ceiling asked
+/// for. A value below 1 core still maps to `1`, msb's minimum granularity.
 fn docker_cpus_to_msb_count(raw: &str) -> Option<u32> {
     let cores: f64 = raw.trim().parse().ok()?;
-    if cores <= 0.0 {
+    if !cores.is_finite() || cores <= 0.0 {
         return None;
     }
-    Some(cores.round().max(1.0) as u32)
+    Some(cores.floor().max(1.0) as u32)
 }
 
 /// microVM provider backed by the `msb` (microsandbox) CLI.
@@ -4680,14 +4687,48 @@ mod tests {
         assert_eq!(docker_memory_to_msb_mb("0g"), None);
     }
 
+    /// #706 review fix: a fractional-MB value must floor down, never up — the
+    /// translated ceiling must never exceed the configured one. `1000k` is
+    /// 0.9765625 MB, which floors to 0 and then clamps to the 1 MB minimum.
     #[test]
-    fn docker_cpus_to_msb_count_rounds_to_nearest_core() {
+    fn docker_memory_to_msb_mb_floors_fractional_mb_down() {
+        assert_eq!(docker_memory_to_msb_mb("1000k"), Some(1));
+    }
+
+    /// #706 review fix: a digit-only number large enough to overflow `f64`
+    /// parses to `inf`, which would otherwise silently pass the `<= 0.0` guard
+    /// (a non-finite comparison is never true) and coerce into a bogus 1 MB
+    /// limit instead of being rejected and warned about. (The number portion
+    /// of this grammar can only ever be digits/`.`, so `inf` — not `nan` — is
+    /// the realistic non-finite case here; `"nan"`/`"inf"` as literal text are
+    /// covered on the `--cpus` side below, which parses the whole string.)
+    #[test]
+    fn docker_memory_to_msb_mb_rejects_non_finite() {
+        let overflowing = format!("{}g", "1".to_owned() + &"0".repeat(309));
+        assert_eq!(docker_memory_to_msb_mb(&overflowing), None);
+    }
+
+    #[test]
+    fn docker_cpus_to_msb_count_floors_and_never_exceeds_the_ceiling() {
         assert_eq!(docker_cpus_to_msb_count("2"), Some(2));
-        assert_eq!(docker_cpus_to_msb_count("1.5"), Some(2));
+        // Floors, not rounds: 1.5 configured cores must never translate to 2 —
+        // that would silently grant more than the configured ceiling.
+        assert_eq!(docker_cpus_to_msb_count("1.5"), Some(1));
         assert_eq!(docker_cpus_to_msb_count("1.2"), Some(1));
+        // Below 1 core still clamps up to 1 — msb's minimum granularity, not a
+        // ceiling violation since there is no smaller unit to floor to.
         assert_eq!(docker_cpus_to_msb_count("0.1"), Some(1));
         assert_eq!(docker_cpus_to_msb_count("0"), None);
         assert_eq!(docker_cpus_to_msb_count("bogus"), None);
+    }
+
+    /// #706 review fix: reject non-finite `--cpus` values instead of silently
+    /// coercing `NaN`/`inf` into a bogus 1-core limit.
+    #[test]
+    fn docker_cpus_to_msb_count_rejects_non_finite() {
+        assert_eq!(docker_cpus_to_msb_count("NaN"), None);
+        assert_eq!(docker_cpus_to_msb_count("inf"), None);
+        assert_eq!(docker_cpus_to_msb_count("-inf"), None);
     }
 
     /// task-limits: `memory`/`cpus` translate from the shared docker grammar onto
@@ -4725,7 +4766,9 @@ mod tests {
             .iter()
             .position(|a| a == "--cpus")
             .expect("--cpus present");
-        assert_eq!(wrapped.args[idx + 1], "2");
+        // Floors, not rounds: 1.5 configured cores must translate to AT MOST 1.5
+        // cores, never more — 2 would silently exceed the configured ceiling.
+        assert_eq!(wrapped.args[idx + 1], "1");
     }
 
     /// Credential env values cross the microsandbox boundary in a private staged
