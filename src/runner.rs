@@ -385,10 +385,14 @@ async fn run_auto_resume_loop(
                 if more_work && hop < bounds.max_continuations {
                     // Continue: dispatch a FRESH continuation seeded with the
                     // captured resume command; preserve this hop's recap in order.
-                    let resume = result
+                    let resume_template = result
                         .resume_command
                         .clone()
                         .expect("more_work implies a resume command");
+                    let resume = consume_operator_inbox(
+                        &resume_template,
+                        task.frontmatter.project.as_deref(),
+                    )?;
                     prior_recaps.push(result.recap);
                     hop += 1;
                     sid = Uuid::new_v4().to_string();
@@ -398,10 +402,17 @@ async fn run_auto_resume_loop(
                         .agent_session_logs
                         .push(log_path.display().to_string());
                     write_task(task)?;
+                    let logged_resume = if resume_template.contains("{prompt}")
+                        && resume.contains("OPERATOR STEERING INPUT")
+                    {
+                        "<redacted: operator inbox consumed>"
+                    } else {
+                        resume.as_str()
+                    };
                     write_session_log(
                         &log_path,
                         &format!(
-                            "session_id={sid}\nagent={agent_name}\ntask={}\nresume_command={resume}\n[auto_resume hop={hop}/{}]\n",
+                            "session_id={sid}\nagent={agent_name}\ntask={}\nresume_command={logged_resume}\n[auto_resume hop={hop}/{}]\n",
                             task_path.display(),
                             bounds.max_continuations,
                         ),
@@ -480,6 +491,92 @@ async fn run_auto_resume_loop(
             }
         }
     }
+}
+
+/// Materialize the optional prompt slot in a resume command from the workspace inbox.
+///
+/// Inbox text is operator steering input, trusted at the same level as the task itself;
+/// it is deliberately labelled so a resumed agent cannot confuse it with a low-trust
+/// worker recap. The file is truncated after materialization to make delivery one-shot.
+fn consume_operator_inbox(resume_template: &str, project: Option<&str>) -> Result<String> {
+    if !resume_template.contains("{prompt}") {
+        return Ok(resume_template.to_owned());
+    }
+
+    let Some(project) = project else {
+        return Ok(remove_empty_prompt_slot(resume_template));
+    };
+    let inbox_dir = Path::new(project).join(".varda");
+    if let Ok(metadata) = fs::symlink_metadata(&inbox_dir)
+        && (!metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        bail!("operator inbox directory must be a real directory: {}", inbox_dir.display());
+    }
+    let inbox = inbox_dir.join("INBOX.md");
+    let content = match open_and_clear_operator_inbox(&inbox) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", inbox.display()));
+        }
+    };
+
+    if content.trim().is_empty() {
+        return Ok(remove_empty_prompt_slot(resume_template));
+    }
+
+    let prompt = format!(
+        "OPERATOR STEERING INPUT (trusted like the task definition; not a worker recap):\n\n{}",
+        content.trim_end()
+    );
+    let quoted = crate::capability::shell_single_quote(&prompt);
+    Ok(resume_template
+        .replace("\"{prompt}\"", &quoted)
+        .replace("{prompt}", &quoted))
+}
+
+fn open_and_clear_operator_inbox(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operator inbox is not a regular file",
+        ));
+    }
+    // A hard-linked INBOX.md passes the checks above but `set_len(0)` below would
+    // truncate every other name pointing at the same inode, not just the inbox.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "operator inbox has multiple hard links; refusing to truncate a shared file",
+            ));
+        }
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    file.set_len(0)?;
+    Ok(content)
+}
+
+fn remove_empty_prompt_slot(template: &str) -> String {
+    template
+        .replace("\"{prompt}\"", "")
+        .replace("{prompt}", "")
+        .trim_end()
+        .to_owned()
 }
 
 pub async fn run_task(
@@ -597,11 +694,12 @@ pub async fn run_task(
             // before running the interpreter pass so it survives even if the interpreter
             // pass fails or returns its own (None) resume_command.
             if let Some(resume) = session_result.resume_command.as_deref() {
+                let persisted_resume = remove_empty_prompt_slot(resume);
                 task.frontmatter
                     .agent_resume_commands
-                    .push(resume.to_owned());
+                    .push(persisted_resume.clone());
                 write_task(&task)?;
-                eprintln!("captured resume command: {resume}");
+                eprintln!("captured resume command: {persisted_resume}");
             }
             if agent_skips_recap(config, agent_name) {
                 skip_recap_result(&session_log_path)
@@ -647,10 +745,11 @@ pub async fn run_task(
     // session stores, or sandbox stores extracted after exit). Persist it so
     // `varda task resume` has the same direct resume surface as interactive runs.
     if !interactive && let Some(resume) = result.resume_command.as_deref() {
+        let persisted_resume = remove_empty_prompt_slot(resume);
         task.frontmatter
             .agent_resume_commands
-            .push(resume.to_owned());
-        eprintln!("captured resume command: {resume}");
+            .push(persisted_resume.clone());
+        eprintln!("captured resume command: {persisted_resume}");
     }
 
     let requires_user = result.requires_user
@@ -2307,6 +2406,141 @@ Help interactively.
             task.frontmatter.agent_session_ids.len(),
             2,
             "each hop records its own session id"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_inbox_is_delivered_once_to_the_next_continuation() {
+        let (task_path, mut config) = ready_task("run-autoresume-inbox");
+        config.defaults.max_continuations = 2;
+        let project = task_path
+            .parent()
+            .expect("task has parent")
+            .join("resident-workspace");
+        fs::create_dir_all(project.join(".varda")).expect("inbox directory created");
+        fs::write(
+            project.join(".varda/INBOX.md"),
+            "Re-check worker 'alpha' before merging. It's $HOME's `output`.\n",
+        )
+        .expect("inbox written");
+        let mut task = crate::task::load_task(&task_path).expect("task loads");
+        task.frontmatter.project = Some(project.display().to_string());
+        crate::task::write_task(&task).expect("project persisted");
+
+        let client = ScriptedResumeClient {
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::from(vec![
+                    AgentRunResult {
+                        recap: "hop one".to_owned(),
+                        requires_user: false,
+                        suggested_agent: None,
+                        resume_command: Some("claude --resume abc \"{prompt}\"".to_owned()),
+                    },
+                    AgentRunResult {
+                        recap: "hop two".to_owned(),
+                        requires_user: false,
+                        suggested_agent: None,
+                        resume_command: Some("claude --resume abc \"{prompt}\"".to_owned()),
+                    },
+                    AgentRunResult {
+                        recap: "done".to_owned(),
+                        requires_user: true,
+                        suggested_agent: None,
+                        resume_command: Some("claude --resume abc \"{prompt}\"".to_owned()),
+                    },
+                ]),
+            )),
+            fallback: AgentRunResult {
+                recap: "unexpected extra call".to_owned(),
+                requires_user: true,
+                suggested_agent: None,
+                resume_command: None,
+            },
+        };
+        let requests = client.requests.clone();
+
+        run_task(&config, "codex", None, &task_path, &client, false, false)
+            .await
+            .expect("auto-resume with inbox runs");
+
+        let recorded = requests.lock().unwrap();
+        let first_resume = recorded[1]
+            .resume_command
+            .as_deref()
+            .expect("first continuation has command");
+        assert!(first_resume.contains("OPERATOR STEERING INPUT"));
+        assert!(first_resume.contains("Re-check worker"));
+        assert!(
+            first_resume.contains("$HOME"),
+            "shell metacharacters stay data"
+        );
+        assert!(!first_resume.contains("{prompt}"));
+        assert_eq!(
+            recorded[2].resume_command.as_deref(),
+            Some("claude --resume abc"),
+            "cleared inbox must not replay or leave an empty prompt argument"
+        );
+        assert_eq!(
+            fs::read_to_string(project.join(".varda/INBOX.md")).expect("inbox readable"),
+            "",
+            "consumed inbox is cleared"
+        );
+    }
+
+    #[test]
+    fn missing_operator_inbox_is_a_noop_without_empty_argument() {
+        let project = std::env::temp_dir().join(format!("varda-missing-inbox-{}", Uuid::new_v4()));
+        fs::create_dir_all(&project).expect("project created");
+        let command = consume_operator_inbox(
+            "claude --resume abc \"{prompt}\"",
+            Some(project.to_str().expect("utf8 path")),
+        )
+        .expect("missing inbox is accepted");
+        assert_eq!(command, "claude --resume abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_inbox_refuses_symlinks_without_truncating_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let project = std::env::temp_dir().join(format!("varda-symlink-inbox-{}", Uuid::new_v4()));
+        fs::create_dir_all(project.join(".varda")).expect("inbox directory created");
+        let target = project.join("do-not-truncate");
+        fs::write(&target, "preserve me").expect("target written");
+        symlink(&target, project.join(".varda/INBOX.md")).expect("symlink created");
+
+        let error = consume_operator_inbox(
+            "claude --resume abc \"{prompt}\"",
+            Some(project.to_str().expect("utf8 path")),
+        )
+        .expect_err("symlink inbox must be refused");
+        assert!(error.to_string().contains("failed to read"));
+        assert_eq!(fs::read_to_string(target).expect("target readable"), "preserve me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_quoted_operator_input_stays_inert_when_actually_run_through_sh() {
+        // The prior test only inspected the constructed resume STRING for the
+        // presence of metacharacters; this proves they don't get expanded or
+        // executed when that string is handed to a real shell, by round-tripping
+        // it through `sh -c printf` and asserting the shell's output byte-for-byte
+        // matches the untouched operator input.
+        let hostile_input = "Re-check worker 'alpha'. It's $HOME's `whoami` and $(rm -rf /).";
+        let quoted = crate::capability::shell_single_quote(hostile_input);
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .expect("sh should run printf with the quoted operator input");
+        assert!(output.status.success(), "shell command failed: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("shell output is utf8"),
+            hostile_input,
+            "shell metacharacters in operator input must stay inert data, not be expanded/executed"
         );
     }
 

@@ -113,6 +113,13 @@ pub fn is_claude_backend(command: &str) -> bool {
     command == "claude" || command.ends_with("/claude")
 }
 
+/// Single-quote `value` so it survives as one literal argument when spliced into
+/// a string destined for `sh -c`, regardless of spaces or shell metacharacters it
+/// contains.
+pub fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +205,28 @@ mod tests {
         assert!(is_claude_backend("/usr/local/bin/claude"));
         assert!(!is_claude_backend("codex"));
         assert!(!is_claude_backend("sh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_single_quoted_path_with_spaces_stays_one_argument_when_run_through_sh() {
+        // Mirrors the operator-input round-trip test in runner.rs: prove the
+        // quoting is not just visually plausible but actually survives a real
+        // `sh -c` invocation as a single word, using `printf '<%s>'` to make word
+        // splitting visible if the quoting were ever to regress.
+        let path_with_space = "/Users/John Doe/.varda/runs/abc.settings.json";
+        let quoted = shell_single_quote(path_with_space);
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '<%s>' --settings {quoted}"))
+            .output()
+            .expect("sh should run printf with the quoted settings path");
+        assert!(output.status.success(), "shell command failed: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("shell output is utf8"),
+            format!("<--settings><{path_with_space}>"),
+            "the space-containing path must arrive as ONE argument, not be word-split"
+        );
     }
 }

@@ -215,7 +215,7 @@ The interactive prompt also drops the structured recap requirements (file lists,
 
 When the interpreter pass starts, Varda prints a notice on stderr so you don't mistake the wait for a hang. During the post-session storage phase, Ctrl-C is temporarily disabled so Varda can persist the resume command, run the interpreter pass, write the recap, and update the task metadata without leaving the task half-recorded. On Unix, the interpreter subprocess also runs outside Varda's terminal process group so terminal Ctrl-C does not interrupt recap generation.
 
-If the agent the route resolves to has a `resume_command_template` set in `config.toml`, Varda also captures the agent's own session id from its on-disk session storage (claude -> `~/.claude/projects/...`, codex -> `~/.codex/sessions/...`, copilot -> `~/.copilot/session-state/...`) and stores a ready-to-run resume command on the task in the `agent_resume_commands:` frontmatter list. A later `varda task resume` can offer to use that command instead of starting over. `opencode` is the exception: it keeps sessions in a SQLite database (`~/.local/share/opencode/opencode.db`) rather than per-session files, so Varda can't scan the filesystem for its session id — resume is unwired for opencode in this first pass (use `opencode run --continue` or `opencode session` to resume manually).
+If the agent the route resolves to has a `resume_command_template` set in `config.toml`, Varda also captures the agent's own session id from its on-disk session storage (claude -> `~/.claude/projects/...`, codex -> `~/.codex/sessions/...`, copilot -> `~/.copilot/session-state/...`) and stores a ready-to-run resume command on the task in the `agent_resume_commands:` frontmatter list. A later `varda task resume` can offer to use that command instead of starting over. For unattended continuation templates, an optional `"{prompt}"` slot receives one-shot trusted operator steering from `<project>/.varda/INBOX.md`; Varda clears the file after materializing the next hop and omits the argument when the inbox is empty or absent. `opencode` is the exception: it keeps sessions in a SQLite database (`~/.local/share/opencode/opencode.db`) rather than per-session files, so Varda can't scan the filesystem for its session id — resume is unwired for opencode in this first pass (use `opencode run --continue` or `opencode session` to resume manually).
 
 `make install` also installs four convenience wrappers next to the `varda` binary:
 
@@ -685,7 +685,7 @@ command = "claude"
 args = ["-p", "--permission-mode", "acceptEdits", "--add-dir", "{project}", "--add-dir", "{varda_project}", "--add-dir", "{varda_home}"]
 interactive_command = "sh"
 interactive_args = ["-c", "claude \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --permission-mode acceptEdits"]
-resume_command_template = "claude --resume {external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --permission-mode acceptEdits"
+resume_command_template = "claude --resume {external_session_id} --add-dir {project} --add-dir {varda_project} --add-dir {varda_home} --permission-mode acceptEdits \"{prompt}\""
 
 [agents.copilot]
 kind = "acp"
