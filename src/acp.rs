@@ -226,14 +226,28 @@ impl AcpSubprocessClient {
     async fn execute(
         &self,
         prompt: String,
-        mut args: Vec<String>,
+        args: Vec<String>,
         request: &AgentRunRequest,
     ) -> Result<AgentRunResult> {
         if request.interactive {
             return self.execute_interactive(prompt, args, request).await;
         }
         let started_at = SystemTime::now();
-        let command = expand_request_value(&self.command, request);
+        let fresh_command = expand_request_value(&self.command, request);
+        // The M12 capability check below must reflect the ORIGINAL agent command,
+        // not the "sh" wrapper a resume hop rebinds `command` to just below —
+        // otherwise a resumed hop silently loses its `allow_commands` posture.
+        let is_claude_backend = crate::capability::is_claude_backend(&fresh_command);
+        let is_resume = request.resume_command.is_some();
+        let (command, mut args) = if let Some(resume) = request.resume_command.as_deref() {
+            // Headless continuations must execute the captured resume command. Running
+            // it through the guest shell keeps the invocation inside the selected
+            // sandbox; treating it as a fresh agent command silently starts a new
+            // session and makes auto-resume illusory.
+            ("sh".to_owned(), vec!["-c".to_owned(), resume.to_owned()])
+        } else {
+            (fresh_command, args)
+        };
 
         // M12 per-task capability allowlist: for the Claude Code backend, a
         // headless (`-p`) run has no interactive approver, so any command not
@@ -241,17 +255,35 @@ impl AcpSubprocessClient {
         // `allow_commands` into a run-scoped settings file carrying
         // `permissions.allow` and inject it via `--settings` — deterministic,
         // scoped to exactly those commands, never a blanket bypass.
-        if crate::capability::is_claude_backend(&command)
-            && !request.frontmatter.allow_commands.is_empty()
-        {
+        if is_claude_backend && !request.frontmatter.allow_commands.is_empty() {
             if let Some(log_path) = request.session_log_path.as_deref() {
                 match crate::capability::write_claude_run_settings(
                     Path::new(log_path),
                     &request.frontmatter.allow_commands,
                 ) {
                     Ok(Some(settings_path)) => {
-                        args.push("--settings".to_owned());
-                        args.push(settings_path.display().to_string());
+                        if is_resume {
+                            // args is exactly ["-c", "<resume string>"]: `--settings`
+                            // must be injected into the opaque resume string itself
+                            // (appended as trailing words on the `claude --resume ...`
+                            // command line) since pushing a separate argv entry would
+                            // hand it to `sh`, not to the wrapped `claude` invocation.
+                            if let Some(resume_arg) = args.get_mut(1) {
+                                resume_arg.push_str(" --settings ");
+                                resume_arg.push_str(&crate::capability::shell_single_quote(
+                                    &settings_path.display().to_string(),
+                                ));
+                            } else {
+                                eprintln!(
+                                    "warning: allow_commands declared but the resume \
+                                     command had no argument to inject --settings into; \
+                                     the capability allowlist was not injected"
+                                );
+                            }
+                        } else {
+                            args.push("--settings".to_owned());
+                            args.push(settings_path.display().to_string());
+                        }
                         let _ = append_session_log(
                             log_path,
                             &format!(
@@ -281,15 +313,25 @@ impl AcpSubprocessClient {
             .map(|dir| expand_request_value(dir, request));
         let env = env_for_request(&self.env, &self.static_env, request);
         if let Some(log_path) = request.session_log_path.as_deref() {
+            // A resume hop's `args` is the captured resume command, which may embed
+            // trusted-but-sensitive operator steering text pulled from the workspace
+            // inbox (see runner.rs's `consume_operator_inbox`). Logging it verbatim
+            // here would defeat that redaction by writing the same session log via a
+            // second, independent path.
+            let logged_args = if is_resume {
+                "<redacted: resume command containing operator input>".to_owned()
+            } else {
+                format!("{args:?}")
+            };
             let _ = append_session_log(
                 log_path,
                 &format!(
-                    "session_id={}\nagent={}\ntask={}\ncommand={} args={:?}\nworking_dir={:?}\n",
+                    "session_id={}\nagent={}\ntask={}\ncommand={} args={}\nworking_dir={:?}\n",
                     request.session_id,
                     self.agent_name,
                     request.task_path,
                     command,
-                    args,
+                    logged_args,
                     working_dir
                 ),
             );
@@ -346,7 +388,7 @@ impl AcpSubprocessClient {
         // wait, warn "no stdin data received", and exit 1. For those, stage the
         // prompt as a guest FILE (via `--copy-file`) and let `wrap` redirect it
         // into the agent's stdin IN-GUEST; the host-side stdin pipe goes unused.
-        let batch_prompt_via_file = session.prompt_via_file();
+        let batch_prompt_via_file = session.prompt_via_file() && request.resume_command.is_none();
         if batch_prompt_via_file {
             let guest_prompt = session
                 .stage_file(&prompt, GUEST_PROMPT_FILE)
@@ -394,10 +436,10 @@ impl AcpSubprocessClient {
             )
         })?;
 
-        if batch_prompt_via_file {
+        if batch_prompt_via_file || request.resume_command.is_some() {
             // Prompt reaches the agent via the staged guest file + in-guest stdin
-            // redirect (see `prompt_via_file`); the host-side stdin pipe is unused
-            // because msb does not forward it. Close it so nothing waits on it.
+            // redirect (see `prompt_via_file`), or positionally in a resume command.
+            // In either case the host-side fresh-task prompt must not also reach stdin.
             drop(child.stdin.take());
         } else {
             let mut stdin = child.stdin.take().context("failed to open agent stdin")?;
@@ -1017,7 +1059,12 @@ impl AcpSubprocessClient {
     }
 
     /// Build a resume command from the configured template by substituting the
-    /// agent's external session id and the task's project path. Returns None when
+    /// agent's external session id and the task's project path. The project path is
+    /// shell-single-quoted since this command is now auto-executed via `sh -c` on
+    /// the headless auto-resume path, with no human review to catch word-splitting
+    /// from an unquoted space (e.g. a macOS home directory). A `{prompt}` slot is
+    /// intentionally preserved for the runner to fill from the operator inbox just
+    /// before each continuation hop. Returns None when
     /// no template is configured or no session id was discovered.
     fn build_resume_command(
         &self,
@@ -1025,12 +1072,14 @@ impl AcpSubprocessClient {
         external_session_id: Option<&str>,
     ) -> Option<String> {
         let template = self.resume_command_template.as_deref()?;
-        let session_id = external_session_id?;
-        let project = request.frontmatter.project.as_deref().unwrap_or("");
+        let session_id = crate::capability::shell_single_quote(external_session_id?);
+        let project = crate::capability::shell_single_quote(
+            request.frontmatter.project.as_deref().unwrap_or(""),
+        );
         Some(
             template
-                .replace("{external_session_id}", session_id)
-                .replace("{project}", project),
+                .replace("{external_session_id}", &session_id)
+                .replace("{project}", &project),
         )
     }
 }
@@ -1657,6 +1706,7 @@ fn terminal_title(agent_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::time::Duration;
 
     use crate::task::{TaskFrontmatter, TaskStatus};
@@ -1796,6 +1846,206 @@ mod tests {
         assert!(result.recap.contains("You have at most 10 minutes"));
         assert!(result.recap.contains("Do it."));
         assert!(!result.requires_user);
+    }
+
+    #[tokio::test]
+    async fn headless_continuation_executes_resume_command_not_fresh_agent() {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "false".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("resume-test", &config);
+        let mut request = docker_request("/tmp", "resume-session");
+        request.resume_command = Some(
+            "printf '# Resumed\\n\\nresume command ran\\n\\nrequires_user: false\\n'".to_owned(),
+        );
+
+        let result = client
+            .run_task(request)
+            .await
+            .expect("resume command should run instead of configured false command");
+        assert!(result.recap.contains("resume command ran"));
+    }
+
+    #[tokio::test]
+    async fn resume_hop_still_injects_allow_commands_settings() {
+        // `command` is "claude" purely so the M12 `is_claude_backend` check fires;
+        // the actual subprocess spawned is always "sh" on the resume path, so no
+        // real `claude` binary is required for this test to run.
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("resume-settings-test", &config);
+        let log_dir = std::env::temp_dir().join(format!(
+            "varda-resume-settings-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&log_dir).expect("log dir created");
+        let log_path = log_dir.join("session.log");
+
+        let mut request = docker_request("/tmp", "resume-settings-session");
+        request.session_log_path = Some(log_path.display().to_string());
+        request.frontmatter.allow_commands = vec!["msb".to_owned()];
+        // `echo` prints every word on its command line, including any trailing
+        // `--settings <path>` this test expects M12 to append to the resume string.
+        request.resume_command = Some("echo requires_user: false".to_owned());
+
+        let result = client
+            .run_task(request)
+            .await
+            .expect("resume hop with allow_commands should still run");
+
+        assert!(
+            result.recap.contains("--settings"),
+            "the resumed invocation must still receive the injected --settings flag: {}",
+            result.recap
+        );
+
+        let log_contents = fs::read_to_string(&log_path).expect("session log readable");
+        assert!(
+            log_contents.contains("run_settings="),
+            "settings injection must still be logged on a resume hop: {log_contents}"
+        );
+        let _ = fs::remove_dir_all(&log_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_hop_settings_path_containing_a_space_stays_one_argument() {
+        // The run-scoped settings file is derived from `session_log_path`, which is
+        // ultimately rooted under VARDA_HOME or the project path — both of which can
+        // legitimately contain spaces (e.g. a macOS home directory like
+        // "/Users/John Doe/..."). If that path is spliced unquoted into the resume
+        // string handed to `sh -c`, it gets word-split instead of reaching `claude`
+        // as a single `--settings` argument.
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("resume-settings-space-test", &config);
+        let log_dir = std::env::temp_dir().join(format!(
+            "varda-resume-settings-space test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&log_dir).expect("log dir created");
+        let log_path = log_dir.join("session.log");
+
+        let mut request = docker_request("/tmp", "resume-settings-space-session");
+        request.session_log_path = Some(log_path.display().to_string());
+        request.frontmatter.allow_commands = vec!["msb".to_owned()];
+        // `printf '[%s]'` echoes each word it receives wrapped in brackets, so a
+        // settings path that got word-split (the bug) shows up as multiple bracketed
+        // segments instead of one.
+        request.resume_command = Some("printf '[%s]' requires_user: false".to_owned());
+
+        let result = client
+            .run_task(request)
+            .await
+            .expect("resume hop with a space-containing settings path should still run");
+
+        let settings_path = crate::capability::run_settings_path(&log_path);
+        let expected = format!("[{}]", settings_path.display());
+        assert!(
+            result.recap.contains(&expected),
+            "the space-containing settings path must arrive as ONE argument: {}",
+            result.recap
+        );
+        let _ = fs::remove_dir_all(&log_dir);
+    }
+
+    #[tokio::test]
+    async fn resume_hop_session_log_redacts_the_raw_resume_command() {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "false".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("resume-redact-test", &config);
+        let log_dir = std::env::temp_dir().join(format!(
+            "varda-resume-redact-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&log_dir).expect("log dir created");
+        let log_path = log_dir.join("session.log");
+
+        let mut request = docker_request("/tmp", "resume-redact-session");
+        request.session_log_path = Some(log_path.display().to_string());
+        request.resume_command = Some(
+            "printf 'requires_user: false\\n' # OPERATOR STEERING INPUT: secret inbox text"
+                .to_owned(),
+        );
+
+        let _ = client
+            .run_task(request)
+            .await
+            .expect("resume command should run");
+
+        let log_contents = fs::read_to_string(&log_path).expect("session log readable");
+        assert!(
+            !log_contents.contains("OPERATOR STEERING INPUT"),
+            "raw resume command (with operator inbox content) must not leak into the \
+             session log: {log_contents}"
+        );
+        assert!(
+            log_contents.contains("<redacted: resume command containing operator input>"),
+            "session log should record that the resume args were redacted: {log_contents}"
+        );
+        let _ = fs::remove_dir_all(&log_dir);
     }
 
     fn docker_request(project: &str, session_id: &str) -> AgentRunRequest {
@@ -2728,7 +2978,7 @@ mod tests {
             credentials: Vec::new(),
             streams_output: None,
             resume_command_template: Some(
-                "claude --resume {external_session_id} --add-dir {project}".to_owned(),
+                "claude --resume {external_session_id} --add-dir {project} \"{prompt}\"".to_owned(),
             ),
             interpreter_agent: None,
             skip_recap: false,
@@ -2739,10 +2989,115 @@ mod tests {
         let resume = client.build_resume_command(&request, Some("abc-123"));
         assert_eq!(
             resume.as_deref(),
-            Some("claude --resume abc-123 --add-dir /work/project")
+            Some("claude --resume 'abc-123' --add-dir '/work/project' \"{prompt}\"")
         );
 
         assert!(client.build_resume_command(&request, None).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_resume_command_quotes_a_project_path_containing_a_space_so_sh_sees_one_argument() {
+        // Legitimate on macOS: "/Users/John Doe/project". Unquoted, `sh -c` would
+        // word-split this into two `--add-dir` arguments, silently corrupting the
+        // headless auto-resume invocation this command now feeds directly into `sh`.
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: Some(
+                "claude --resume {external_session_id} --add-dir {project}".to_owned(),
+            ),
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("claude", &config);
+        let request = sample_request("claude", "/Users/John Doe/project");
+
+        let resume = client
+            .build_resume_command(&request, Some("abc-123"))
+            .expect("template and session id present");
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '[%s]' {resume}"))
+            .output()
+            .expect("sh should run printf with the resume command");
+        assert!(output.status.success(), "shell command failed: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("shell output is utf8"),
+            "[claude][--resume][abc-123][--add-dir][/Users/John Doe/project]",
+            "the space-containing project path must arrive as ONE argument, not be word-split"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_resume_command_quotes_a_hostile_session_id_so_sh_cannot_execute_it() {
+        // `external_session_id` is derived from on-disk session storage this process
+        // doesn't fully control the naming of (a Claude transcript filename stem, the
+        // trailing 36 chars of a Codex session filename, or the first token of Copilot
+        // process log content) and is auto-executed via `sh -c` on the headless
+        // auto-resume path. Prove a hostile value can't break out of its argument.
+        let sentinel = std::env::temp_dir().join(format!(
+            "varda-resume-session-id-injection-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_file(&sentinel);
+        let hostile_session_id = format!("abc; touch {}", sentinel.display());
+
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: Some(
+                "claude --resume {external_session_id} --add-dir {project}".to_owned(),
+            ),
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("claude", &config);
+        let request = sample_request("claude", "/work/project");
+
+        let resume = client
+            .build_resume_command(&request, Some(&hostile_session_id))
+            .expect("template and session id present");
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '[%s]' {resume}"))
+            .output()
+            .expect("sh should run printf with the resume command");
+        assert!(output.status.success(), "shell command failed: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("shell output is utf8"),
+            format!("[claude][--resume][{hostile_session_id}][--add-dir][/work/project]"),
+            "the hostile session id must arrive as ONE inert argument, not be word-split or executed"
+        );
+        assert!(
+            !sentinel.exists(),
+            "session id metacharacters must not be executed by sh: sentinel file was created"
+        );
+        let _ = fs::remove_file(&sentinel);
     }
 
     #[test]
