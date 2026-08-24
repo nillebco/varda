@@ -138,9 +138,11 @@ enum TaskCommand {
         #[arg(long)]
         ready: bool,
         /// Resume-or-create: if a task with this name already exists for the project,
-        /// resume it (fresh session) instead of erroring. Only acts with `--exec`;
-        /// intended for the interactive shell aliases (vadc/vtgg/…) so repeated
-        /// launches reuse one task per (project, name) rather than colliding.
+        /// resume it instead of erroring. Continues the previously captured agent
+        /// session when one is available (falling back to fresh, with a message, if
+        /// not); a task already marked `done` always starts fresh. Only acts with
+        /// `--exec`; intended for the interactive shell aliases (vadc/vtgg/…) so
+        /// repeated launches reuse one task per (project, name) rather than colliding.
         #[arg(long)]
         reuse: bool,
     },
@@ -422,18 +424,36 @@ async fn run_cli() -> Result<()> {
                 let config = config::load_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
                 // --reuse (with --exec): if this (project, name) task already exists,
-                // resume it with a fresh interactive session instead of erroring on the
-                // collision. Lets the shell aliases be launched repeatedly without a
-                // stuck fixed-name task blocking the next run. Skips creation entirely;
-                // the existing task keeps its stored assignee/sandbox.
+                // resume it instead of erroring on the collision. Lets the shell aliases
+                // (vadbdev, vadbinfra, ...) be launched repeatedly without a stuck
+                // fixed-name task blocking the next run. Skips creation entirely; the
+                // existing task keeps its stored assignee/sandbox.
+                //
+                // The whole point of these daily-driver aliases is conversation
+                // continuity, so reuse continues the captured agent session (via
+                // resume_task_command's captured_resume_command path) rather than
+                // forcing a fresh one. The one exception is a task already marked
+                // `done`: that conversation is closed, so continuing it is odd —
+                // start fresh instead. Either way `resume_task_command` still falls
+                // back to fresh (and says so) when there is nothing to resume or the
+                // resume attempt fails.
                 if reuse && exec {
                     let existing = task::task_file_path(&config, &project_path, &taskname)?;
                     if existing.exists() {
-                        println!(
-                            "task {} already exists — resuming (fresh, interactive)",
-                            existing.display()
-                        );
-                        return resume_task_command(&existing, true, interactive).await;
+                        let existing_task = task::load_task(&existing)?;
+                        let fresh = existing_task.frontmatter.status == task::TaskStatus::Done;
+                        if fresh {
+                            println!(
+                                "task {} already exists and is done — starting a fresh session",
+                                existing.display()
+                            );
+                        } else {
+                            println!(
+                                "task {} already exists — continuing the previous session",
+                                existing.display()
+                            );
+                        }
+                        return resume_task_command(&existing, fresh, interactive).await;
                     }
                 }
                 // Validate the pinned sandbox up front so `--sandbox typo` fails at
@@ -4269,15 +4289,22 @@ async fn resume_task_command(task_path: &Path, fresh: bool, interactive: bool) -
         println!("Captured agent resume command found:");
         println!("  {resume_command}");
         if prompt_yes_no("Resume the previous agent session?", true)? {
-            return run_captured_resume_command(
-                &config,
-                &task_path,
-                &task_document,
-                resume_command,
-            )
-            .await;
+            match run_captured_resume_command(&config, &task_path, &task_document, resume_command)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    println!(
+                        "Resuming the previous session failed ({error:#}); \
+                         falling back to a fresh session."
+                    );
+                }
+            }
+        } else {
+            println!("Starting a fresh agent session.");
         }
-        println!("Starting a fresh agent session.");
+    } else if !fresh {
+        println!("No captured resume command found for this task — starting a fresh session.");
     }
 
     run_task_command(&task_path, interactive, false).await
