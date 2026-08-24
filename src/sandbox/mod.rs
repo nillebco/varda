@@ -2370,6 +2370,8 @@ pub struct MicrosandboxSession {
 }
 
 impl MicrosandboxSession {
+    const CREDENTIAL_ENV_FILE: &'static str = "/tmp/.varda-credential-env";
+
     /// Write `content` to a host temp (read-only when `read_only`) and record it so
     /// [`wrap`](Self::wrap) can emit a pre-boot `--copy-file host:guest` flag (msb
     /// copies it in before the guest boots). Returns the guest path.
@@ -2380,6 +2382,28 @@ impl MicrosandboxSession {
             .expect("staged_files mutex poisoned")
             .push((tmp, guest_path.to_owned()));
         Ok(guest_path.to_owned())
+    }
+
+    /// Render credential-target env vars as a shell fragment copied into the VM.
+    /// Single-quote escaping keeps arbitrary secret bytes (including whitespace,
+    /// `$`, and newlines) literal when the guest shell sources the file.
+    fn credential_env_script(&self) -> Result<String> {
+        let mut script = String::new();
+        for (key, value) in &self.identity.auth_env {
+            let mut chars = key.chars();
+            let valid = chars
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+            if !valid {
+                bail!(
+                    "microsandbox credential env target '{key}' is not a portable shell variable name"
+                );
+            }
+            let quoted = value.replace('\'', "'\\''");
+            script.push_str(&format!("export {key}='{quoted}'\n"));
+        }
+        Ok(script)
     }
 }
 
@@ -2407,6 +2431,17 @@ impl SandboxSession for MicrosandboxSession {
         if matches!(mode, LaunchMode::Interactive) {
             args.push("-t".to_owned());
         }
+        // msb 0.6.x has no env-file input. Keep credential values off its argv by
+        // staging a private shell fragment and sourcing it inside the guest. Only
+        // the non-secret guest path appears in the process list.
+        if !self.identity.auth_env.is_empty() {
+            self.record_staged(
+                &self.credential_env_script()?,
+                Self::CREDENTIAL_ENV_FILE,
+                true,
+            )?;
+        }
+
         // Pre-boot copy every staged file (`msb` copies it in before the guest
         // boots). The prompt is only staged in Interactive, but a `file`-target
         // credential is staged in EITHER mode — so emitting `--copy-file` here for
@@ -2543,6 +2578,11 @@ impl SandboxSession for MicrosandboxSession {
         // `guest_env()`. Sorted for a deterministic argv.
         let mut env = spec.env;
         env.extend(self.identity.guest_env());
+        // Credential targets are loaded from CREDENTIAL_ENV_FILE in-guest below.
+        // Remove them after the merge so a colliding spec env cannot leak either.
+        for key in self.identity.auth_env.keys() {
+            env.remove(key);
+        }
         env.insert("HOME".to_owned(), self.home.clone());
         for (key, value) in &env {
             args.push("--env".to_owned());
@@ -2561,7 +2601,20 @@ impl SandboxSession for MicrosandboxSession {
         // program + args verbatim (no re-quoting) and `exec` keeps the agent as
         // the process msb waits on. Interactive mode already reads the file via
         // its own `sh -c '<agent> "$(cat $VARDA_PROMPT_FILE)"'`, so it is untouched.
-        if matches!(mode, LaunchMode::Batch) && env.contains_key("VARDA_PROMPT_FILE") {
+        if !self.identity.auth_env.is_empty() {
+            args.push("sh".to_owned());
+            args.push("-c".to_owned());
+            let redirect =
+                if matches!(mode, LaunchMode::Batch) && env.contains_key("VARDA_PROMPT_FILE") {
+                    " < \"$VARDA_PROMPT_FILE\""
+                } else {
+                    ""
+                };
+            args.push(format!(
+                ". {} && exec \"$0\" \"$@\"{redirect}",
+                Self::CREDENTIAL_ENV_FILE
+            ));
+        } else if matches!(mode, LaunchMode::Batch) && env.contains_key("VARDA_PROMPT_FILE") {
             args.push("sh".to_owned());
             args.push("-c".to_owned());
             args.push(r#"exec "$0" "$@" < "$VARDA_PROMPT_FILE""#.to_owned());
@@ -4366,6 +4419,110 @@ mod tests {
             session.session_store_root(),
             Some(PathBuf::from("/host/store/agent"))
         );
+    }
+
+    /// Credential env values cross the microsandbox boundary in a private staged
+    /// file, never in the ps-visible `msb run` argv. Ordinary env stays on argv.
+    #[test]
+    fn microsandbox_credential_env_is_not_exposed_on_argv() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let secret = "token with '$HOME'\nand a newline";
+        let mut auth_env = BTreeMap::new();
+        auth_env.insert("ANTHROPIC_API_KEY".to_owned(), secret.to_owned());
+        let session = MicrosandboxSession {
+            image: "busybox".to_owned(),
+            project_root: PathBuf::from("/proj"),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-secret-test".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity {
+                auth_env,
+                ..Default::default()
+            },
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut env = BTreeMap::new();
+        env.insert("PLAIN_SETTING".to_owned(), "visible".to_owned());
+        let wrapped = session
+            .wrap(
+                CommandSpec {
+                    program: "claude".to_owned(),
+                    args: vec!["--print".to_owned()],
+                    env,
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+
+        assert!(
+            wrapped
+                .args
+                .iter()
+                .any(|arg| arg == "PLAIN_SETTING=visible")
+        );
+        assert!(!wrapped.args.iter().any(|arg| arg.contains(secret)));
+        assert!(
+            !wrapped
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("ANTHROPIC_API_KEY="))
+        );
+        assert!(wrapped.args.iter().any(|arg| {
+            arg.contains(". /tmp/.varda-credential-env") && arg.contains("exec \"$0\" \"$@\"")
+        }));
+
+        let staged = session.staged_files.lock().unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].1, MicrosandboxSession::CREDENTIAL_ENV_FILE);
+        let host_temp = staged[0].0.clone();
+        let contents = std::fs::read_to_string(&host_temp).unwrap();
+        assert_eq!(
+            contents,
+            "export ANTHROPIC_API_KEY='token with '\\''$HOME'\\''\nand a newline'\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&host_temp).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        drop(staged);
+        std::fs::remove_file(host_temp).unwrap();
+    }
+
+    #[test]
+    fn microsandbox_rejects_credential_env_shell_syntax() {
+        let mut auth_env = BTreeMap::new();
+        auth_env.insert("SAFE; touch /tmp/pwned #".to_owned(), "secret".to_owned());
+        let session = MicrosandboxSession {
+            image: "busybox".to_owned(),
+            project_root: PathBuf::from("/proj"),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-invalid-env".to_owned(),
+            home: "/home/agent".to_owned(),
+            identity: SandboxIdentity {
+                auth_env,
+                ..Default::default()
+            },
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let error = session
+            .wrap(
+                CommandSpec {
+                    program: "claude".to_owned(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("portable shell variable name"));
+        assert!(session.staged_files.lock().unwrap().is_empty());
     }
 
     /// #535 regression: the sandboxed-resident/orchestrate shape — an explicit
