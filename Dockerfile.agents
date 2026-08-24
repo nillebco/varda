@@ -75,6 +75,10 @@ ENV PATH="/home/agent/.cargo/bin:${PATH}"
 # only the manifests to keep this layer reusable when application sources change.
 WORKDIR /tmp/varda-deps
 COPY --chown=agent:agent Cargo.toml Cargo.lock ./
+# `cargo fetch` parses the manifest, and a manifest with no target is an error
+# ("no targets specified in the manifest"). Stub the bin target so resolution
+# succeeds — only the dependency graph matters here, never this source file.
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs
 RUN cargo fetch --locked
 # Deliberately NOT setting CARGO_NET_OFFLINE=true here. The warmed cache above is
 # what makes a worker build survive flaky egress; pinning the whole image offline
