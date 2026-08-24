@@ -609,9 +609,12 @@ work and, under a sandbox, leaking containers/volumes. Varda is moving to a
   enable this for agents that emit a resume command on every successful completion
   unless they have a separate completion signal.
 - **Operation budget** (`max_seconds`) — soft ceiling tracked across the whole
-  task. `max_seconds` accepts an integer or `"none"`. On exceed, the run **stops
-  and marks the task `needs_user`** with the accumulated recap — a graceful
-  checkpoint, never a kill.
+  task. `max_seconds` accepts an integer or `"none"`. A completed agent result is
+  authoritative even when sandbox cleanup is still running: Varda settles the task
+  first and preserves its `requires_user` marker and `Files touched`.
+  If the ceiling arrives before any complete recap, the run **stops and marks the
+  task `needs_user`** with a synthesized budget recap — a graceful checkpoint,
+  never a kill.
 - **Reserved tool-call budget** (`max_tool_calls`) — parsed from config/frontmatter
   for forward compatibility, but not enforced yet because the current agent stream
   does not expose a reliable per-run tool-call count. Non-zero values print a
@@ -623,9 +626,9 @@ supplies the soft ceiling, so existing configs behave unchanged.
 The idle watchdog observes the session log's growth as its activity signal: the acp
 streaming path appends every stdout/stderr chunk to the log, so a growing log is a
 direct proxy for a productive run and a stalled log is a wedged child. Reaching the
-soft `max_seconds` ceiling stops the run gracefully as `needs_user`; a silent stall
-past `idle_timeout_seconds` cancels the wedged session and suggests a long-running
-runner follow-up.
+soft `max_seconds` ceiling without a complete recap stops the run gracefully as
+`needs_user`; a silent stall past `idle_timeout_seconds` cancels the wedged session
+and suggests a long-running runner follow-up.
 
 **Per-task overrides.** Any of the four bounds can be overridden per task via its
 frontmatter — the keys `idle_timeout`, `max_seconds`, `max_continuations`, and

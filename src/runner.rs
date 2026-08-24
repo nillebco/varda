@@ -115,6 +115,7 @@ where
 
     loop {
         tokio::select! {
+            biased;
             output = &mut fut => return Ok(output),
             _ = ticker.tick() => {
                 let now = Instant::now();
@@ -1353,6 +1354,66 @@ mod tests {
             matches!(exceeded, Err(SessionKill::Budget { .. })),
             "the cumulative budget must still stop buffered sessions, got {exceeded:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_agent_result_wins_at_budget_boundary_with_metadata() {
+        let dir = std::env::temp_dir().join(format!("varda-finished-recap-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let log_path = dir.join("session.log");
+        fs::write(&log_path, "header\n").expect("seed log");
+
+        let outcome = run_session_watched(
+            Duration::from_secs(60),
+            Some(0),
+            &log_path,
+            true,
+            std::future::ready(Ok(AgentRunResult {
+                recap: "# Complete\n\n## Files touched\n/abs/src.rs\n\nrequires_user: false"
+                    .to_owned(),
+                requires_user: false,
+                suggested_agent: Some("reviewer".to_owned()),
+                resume_command: Some("agent resume session".to_owned()),
+            })),
+        )
+        .await;
+
+        let Ok(Ok(result)) = outcome else {
+            panic!("the completed recap should settle the session: {outcome:?}");
+        };
+        assert_eq!(
+            result.recap,
+            "# Complete\n\n## Files touched\n/abs/src.rs\n\nrequires_user: false"
+        );
+        assert!(!result.requires_user);
+        assert_eq!(result.suggested_agent.as_deref(), Some("reviewer"));
+        assert_eq!(
+            result.resume_command.as_deref(),
+            Some("agent resume session")
+        );
+        assert_eq!(
+            parse_files_touched(&result.recap),
+            vec![PathBuf::from("/abs/src.rs")]
+        );
+    }
+
+    #[test]
+    fn empty_output_at_budget_uses_synthesized_verdict() {
+        let dir = std::env::temp_dir().join(format!("varda-budget-race-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let task_path = dir.join("task.md");
+        let log_path = dir.join("session.log");
+        fs::write(&log_path, "header\n").expect("empty log");
+        let synthesized = single_session_outcome(
+            Err(SessionKill::Budget { max_secs: 1 }),
+            "session",
+            &log_path,
+            &task_path,
+        )
+        .expect("outcome should normalize")
+        .expect_err("empty output should retain the budget verdict");
+        assert!(synthesized.requires_user);
+        assert!(synthesized.recap.starts_with("# Operation Budget Reached"));
     }
 
     #[tokio::test]

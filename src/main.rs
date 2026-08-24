@@ -329,6 +329,12 @@ enum SkillCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let result = run_cli().await;
+    acp::drain_session_teardowns().await;
+    result
+}
+
+async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {

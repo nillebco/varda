@@ -69,10 +69,10 @@ fn stage_identity_files(session: &dyn SandboxSession, sandbox_name: &str) -> Res
 /// drops the in-flight `run_task` future before it reaches the inline teardown.
 ///
 /// Rust has no async `Drop`, so the two paths differ:
-/// - **Normal exit** — the caller invokes [`Self::teardown`], which takes the
-///   session and awaits its teardown inline (a leak here would fail the run).
+/// - **Normal exit** — once result/status/session metadata is captured, the caller
+///   invokes [`Self::detach_teardown`] so cleanup cannot delay task settlement.
 /// - **Cancel** — the future is dropped with the session still held, so [`Drop`]
-///   detaches the teardown onto the current Tokio runtime. Sandbox teardown is
+///   performs the same detach onto the current Tokio runtime. Sandbox teardown is
 ///   idempotent `docker rm -f` / `volume rm -f`, so fire-and-forget is enough to
 ///   stop `varda-sbx-*` containers/volumes from leaking on an idle/budget kill.
 struct SessionTeardownGuard {
@@ -94,13 +94,52 @@ impl SessionTeardownGuard {
             .expect("session is present until teardown() or Drop consumes it")
     }
 
-    /// Normal-exit teardown: take the session and await its cleanup inline,
-    /// disarming [`Drop`] so it does not double-tear-down.
-    async fn teardown(mut self) -> Result<()> {
-        match self.session.take() {
-            Some(session) => session.teardown().await,
-            None => Ok(()),
+    /// Result-producing work is complete. Reclaim the sandbox asynchronously so
+    /// a slow provider teardown cannot hold a finished task open until its budget.
+    fn detach_teardown(mut self) {
+        if let Some(session) = self.session.take() {
+            spawn_session_teardown(session);
         }
+    }
+}
+
+fn spawn_session_teardown(session: Box<dyn SandboxSession>) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let task = handle.spawn(async move {
+                if let Err(error) = session.teardown().await {
+                    eprintln!("warning: failed to tear down sandbox session: {error:#}");
+                }
+            });
+            pending_session_teardowns()
+                .lock()
+                .expect("session teardown queue poisoned")
+                .push(task);
+        }
+        Err(_) => {
+            eprintln!("warning: sandbox session dropped outside a Tokio runtime; teardown skipped");
+        }
+    }
+}
+
+fn pending_session_teardowns() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Await cleanup only after command results have settled. This keeps teardown
+/// out of the task's completion critical path without letting a one-shot CLI
+/// runtime abort outstanding sandbox cleanup on exit.
+pub(crate) async fn drain_session_teardowns() {
+    let tasks = {
+        let mut pending = pending_session_teardowns()
+            .lock()
+            .expect("session teardown queue poisoned");
+        std::mem::take(&mut *pending)
+    };
+    for task in tasks {
+        let _ = task.await;
     }
 }
 
@@ -113,22 +152,7 @@ impl Drop for SessionTeardownGuard {
         // Detach teardown onto the runtime so the container/volume are still
         // reclaimed. Best-effort — nothing awaits it, but sandbox removal is
         // idempotent, so a fire-and-forget task is enough to prevent the leak.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    if let Err(error) = session.teardown().await {
-                        eprintln!(
-                            "warning: failed to tear down sandbox session on cancel: {error:#}"
-                        );
-                    }
-                });
-            }
-            Err(_) => {
-                eprintln!(
-                    "warning: sandbox session dropped outside a Tokio runtime; teardown skipped"
-                );
-            }
-        }
+        spawn_session_teardown(session);
     }
 }
 
@@ -300,8 +324,8 @@ impl AcpSubprocessClient {
         // Own the session in a guard so `teardown()` runs on EVERY exit path —
         // including a watchdog/budget cancel that drops this future mid-run
         // (otherwise the `varda-sbx-*` container/volume leak). All `&self` uses
-        // below go through `guard.session()`; the final `guard.teardown()` awaits
-        // cleanup inline on the normal path.
+        // below go through `guard.session()`; after result metadata is captured,
+        // cleanup is detached so provider teardown cannot delay settlement.
         let guard = SessionTeardownGuard::new(session);
         let session = guard.session();
         let session_store_root = session.session_store_root();
@@ -443,10 +467,6 @@ impl AcpSubprocessClient {
             }
         }
 
-        if let Err(error) = guard.teardown().await {
-            eprintln!("warning: failed to tear down sandbox session: {error:#}");
-        }
-
         // The external session id (hence resume command) comes from the discovery
         // task: for a live store it polled during the run; for an extracted store it
         // ran against the copied-out store above.
@@ -481,12 +501,14 @@ impl AcpSubprocessClient {
             bail!("agent '{}' produced an empty recap", self.agent_name);
         }
 
-        Ok(AgentRunResult {
+        let result = AgentRunResult {
             requires_user: recap_requires_user_interaction(&recap),
             suggested_agent: None,
             recap,
             resume_command,
-        })
+        };
+        guard.detach_teardown();
+        Ok(result)
     }
 
     async fn execute_interactive(
@@ -916,10 +938,6 @@ impl AcpSubprocessClient {
             }
         }
 
-        if let Err(error) = guard.teardown().await {
-            eprintln!("warning: failed to tear down sandbox session: {error:#}");
-        }
-
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
         }
@@ -933,12 +951,14 @@ impl AcpSubprocessClient {
         };
         let resume_command = self.build_resume_command(request, external_session_id.as_deref());
 
-        Ok(AgentRunResult {
+        let result = AgentRunResult {
             recap: "Interactive sandboxed session completed.\n\nrequires_user: false".to_owned(),
             requires_user: false,
             suggested_agent: None,
             resume_command,
-        })
+        };
+        guard.detach_teardown();
+        Ok(result)
     }
 
     fn uses_copilot(&self) -> bool {
@@ -1656,17 +1676,18 @@ mod tests {
         }
     }
 
-    /// The guard's normal-exit path awaits teardown inline exactly once.
+    /// A completed run detaches teardown instead of waiting for provider cleanup.
     #[tokio::test]
-    async fn teardown_guard_runs_teardown_on_normal_exit() {
+    async fn teardown_guard_detaches_teardown_on_normal_exit() {
         let torn_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let guard = SessionTeardownGuard::new(Box::new(RecordingSession {
             torn_down: torn_down.clone(),
         }));
-        guard.teardown().await.expect("teardown should succeed");
+        guard.detach_teardown();
+        drain_session_teardowns().await;
         assert!(
             torn_down.load(std::sync::atomic::Ordering::SeqCst),
-            "normal exit must tear the sandbox session down"
+            "normal exit must schedule sandbox teardown"
         );
     }
 
@@ -1696,13 +1717,9 @@ mod tests {
             _ = time::sleep(Duration::from_millis(20)) => {}
         }
 
-        // Drop detaches teardown onto the runtime; yield so it gets polled.
-        for _ in 0..10 {
-            if torn_down.load(std::sync::atomic::Ordering::SeqCst) {
-                break;
-            }
-            time::sleep(Duration::from_millis(10)).await;
-        }
+        // The command-level drain guarantees a one-shot runtime cannot abort the
+        // detached cleanup while exiting.
+        drain_session_teardowns().await;
         assert!(
             torn_down.load(std::sync::atomic::Ordering::SeqCst),
             "a cancelled sandboxed run must still tear the session down (no varda-sbx-* leak)"
