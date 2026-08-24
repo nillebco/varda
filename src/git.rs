@@ -369,6 +369,12 @@ pub fn create_worker_worktree(
     worktree_path: &Path,
 ) -> Result<WorkerCheckout> {
     let repo = repo_root_for_path(mother_repo)?;
+    // Successful workers are independent clones, but older/crashed versions may
+    // have left linked-worktree administration behind in the mother. Prune it
+    // before allocating a new checkout so stale `.git/worktrees` entries do not
+    // accumulate or block reuse of a path removed out-of-band.
+    run_git_in(&repo, ["worktree", "prune"])
+        .context("failed to prune stale worker worktree metadata")?;
     let branch = format!("wip/{slug}");
     let output = Command::new("git")
         .args(["clone", "--no-hardlinks"])
