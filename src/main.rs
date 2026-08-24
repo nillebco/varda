@@ -1885,6 +1885,32 @@ impl orchestration::TaskControlPlane for VardaTaskControlPlane {
         doc.set_status(status);
         task::write_task(&doc).map_err(|error| error.to_string())
     }
+
+    fn create_task(
+        &self,
+        project_path: &Path,
+        title: &str,
+        body: Option<&str>,
+        assignee: Option<&str>,
+        sandbox: Option<&str>,
+        status: task::TaskStatus,
+    ) -> Result<orchestration::CreatedTask, String> {
+        let task_path = task::create_task(&self.config, title, project_path, assignee, body, sandbox)
+            .map_err(|error| error.to_string())?;
+        let mut doc = task::load_task(&task_path).map_err(|error| error.to_string())?;
+        if status != task::TaskStatus::Backlog {
+            doc.set_status(status);
+            task::write_task(&doc).map_err(|error| error.to_string())?;
+        }
+        let id = doc
+            .frontmatter
+            .id
+            .ok_or_else(|| "created task has no id".to_owned())?;
+        Ok(orchestration::CreatedTask {
+            id,
+            slug: task_slug(&task_path),
+        })
+    }
 }
 
 struct OrchestratedAgentClient<C: AgentClient = acp::AcpSubprocessClient> {
