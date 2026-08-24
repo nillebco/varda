@@ -1351,9 +1351,9 @@ impl VardaSubtaskLauncher {
         mother: &Path,
         worktree_slug: &str,
     ) -> Option<git::WorkerCheckout> {
-        match worker_worktree_path(worktree_slug) {
-            Ok(worktree_path) => {
-                match git::create_worker_worktree(mother, worktree_slug, &worktree_path) {
+        match worker_checkout_path(worktree_slug) {
+            Ok(checkout_path) => {
+                match git::create_worker_worktree(mother, worktree_slug, &checkout_path) {
                     Ok(checkout) => {
                         task_doc.frontmatter.project = Some(checkout.path.display().to_string());
                         task_doc.frontmatter.mother_project = Some(mother.display().to_string());
@@ -1371,7 +1371,7 @@ impl VardaSubtaskLauncher {
             }
             Err(error) => {
                 eprintln!(
-                    "warning: could not allocate a worker worktree path \
+                    "warning: could not allocate a worker checkout path \
                      (falling back to the shared mount): {error:#}"
                 );
                 None
@@ -2319,13 +2319,13 @@ fn routing_root_for(project_path: &Path) -> PathBuf {
     git::repo_root_for_path(project_path).unwrap_or_else(|_| project_path.to_path_buf())
 }
 
-/// Distinct out-of-tree host path for a per-worker isolated worktree, under
+/// Distinct out-of-tree host path for a per-worker isolated clone, under
 /// `<varda_home>/worktrees/wip-<slug>/`. Kept out of the mother tree so the
-/// worktree never shadows or collides with the project checkout. The path must
+/// clone never shadows or collides with the project checkout. The path must
 /// NOT already exist (`create_worker_worktree` requires a fresh path); the `slug`
 /// carries a per-spawn uuid suffix, so collisions are not expected, but a
 /// lingering directory from a crashed prior run is removed first.
-fn worker_worktree_path(slug: &str) -> Result<PathBuf> {
+fn worker_checkout_path(slug: &str) -> Result<PathBuf> {
     let base = config::varda_home()?.join("worktrees");
     std::fs::create_dir_all(&base)
         .with_context(|| format!("failed to create worktree base {}", base.display()))?;

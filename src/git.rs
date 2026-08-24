@@ -317,7 +317,7 @@ fn tracked_paths(repo: &Path, rel_paths: &[String]) -> Result<Vec<String>> {
     Ok(tracked)
 }
 
-/// An isolated per-worker checkout: a dedicated git worktree with its own
+/// An isolated per-worker checkout: a self-contained git clone with its own
 /// `wip/<slug>` branch, checked out at [`WorkerCheckout::path`]. This is the
 /// isolation primitive behind the orchestrate resident's fan-out (task #578):
 /// each spawned worker edits files in its OWN worktree/branch rather than a
@@ -325,9 +325,9 @@ fn tracked_paths(repo: &Path, rel_paths: &[String]) -> Result<Vec<String>> {
 /// branches that surface a merge conflict at integration time instead of a
 /// silent last-writer-wins clobber.
 ///
-/// The worker itself never runs git in-box (agents are forbidden from
-/// committing per `AGENTS.md`); it only edits files. The trusted host side
-/// commits the worker's `files_touched` onto its branch with
+/// The clone has its own `.git` directory, so ordinary read-only git commands
+/// work inside the worker sandbox. The trusted host side commits the worker's
+/// `files_touched` onto its branch with
 /// [`commit_worker_changes`] and later integrates it with
 /// [`merge_worker_branch`].
 // NOTE (task #578): these worker-isolation primitives are the tested foundation
@@ -339,9 +339,9 @@ fn tracked_paths(repo: &Path, rel_paths: &[String]) -> Result<Vec<String>> {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct WorkerCheckout {
-    /// Host path of the worktree (mount this rw into the worker's sandbox).
+    /// Host path of the clone (mount this rw into the worker's sandbox).
     pub path: PathBuf,
-    /// The `wip/<slug>` branch the worktree has checked out.
+    /// The `wip/<slug>` branch the clone has checked out.
     pub branch: String,
 }
 
@@ -356,13 +356,12 @@ pub struct MergeOutcome {
     pub conflicted_files: Vec<String>,
 }
 
-/// Create an isolated worktree + `wip/<slug>` branch off `mother_repo`'s current
-/// HEAD, materialized at `worktree_path`. The branch is unique per worker so
-/// concurrent workers never share a ref. `worktree_path` must not already exist.
+/// Create an isolated clone + `wip/<slug>` branch off `mother_repo`'s current
+/// HEAD, materialized at `worktree_path`. `--no-hardlinks` keeps its object
+/// database independent from the mother. `worktree_path` must not already exist.
 ///
 /// Returns the [`WorkerCheckout`] the resident mounts into the worker's box and
-/// later harvests. The common gitdir stays with the mother repo, so all git
-/// operations happen host-side where the whole repo is visible.
+/// later harvests. Its real `.git` directory is available inside the sandbox.
 #[allow(dead_code)]
 pub fn create_worker_worktree(
     mother_repo: &Path,
@@ -371,16 +370,24 @@ pub fn create_worker_worktree(
 ) -> Result<WorkerCheckout> {
     let repo = repo_root_for_path(mother_repo)?;
     let branch = format!("wip/{slug}");
-    let path_str = worktree_path
-        .to_str()
-        .with_context(|| format!("worktree path {} is not valid UTF-8", worktree_path.display()))?;
-    run_git_in(
-        &repo,
-        ["worktree", "add", "-b", branch.as_str(), path_str, "HEAD"],
-    )
-    .with_context(|| {
+    let output = Command::new("git")
+        .args(["clone", "--no-hardlinks"])
+        .arg(&repo)
+        .arg(worktree_path)
+        .output()
+        .context("failed to start worker clone")?;
+    if !output.status.success() {
+        bail!(
+            "git clone failed for {} at {}; stderr: {}",
+            repo.display(),
+            worktree_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    copy_git_identity(&repo, worktree_path)?;
+    run_git_in(worktree_path, ["checkout", "-b", branch.as_str()]).with_context(|| {
         format!(
-            "failed to create worker worktree for branch {branch} at {}",
+            "failed to create worker branch {branch} in clone at {}",
             worktree_path.display()
         )
     })?;
@@ -388,6 +395,31 @@ pub fn create_worker_worktree(
         path: worktree_path.to_path_buf(),
         branch,
     })
+}
+
+fn copy_git_identity(source_repo: &Path, clone: &Path) -> Result<()> {
+    for (key, fallback) in [
+        ("user.name", "Varda Worker"),
+        ("user.email", "varda-worker@localhost"),
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(source_repo)
+            .args(["config", "--get", key])
+            .output()
+            .with_context(|| format!("failed to read {key} from mother repository"))?;
+        let value = if output.status.success() {
+            String::from_utf8(output.stdout)
+                .with_context(|| format!("mother repository {key} was not valid UTF-8"))?
+                .trim()
+                .to_owned()
+        } else {
+            fallback.to_owned()
+        };
+        run_git_in(clone, ["config", key, value.as_str()])
+            .with_context(|| format!("failed to configure {key} in worker clone"))?;
+    }
+    Ok(())
 }
 
 /// Commit the worker's edited files onto its branch, host-side. `files` are the
@@ -444,8 +476,7 @@ pub fn commit_worker_changes(
         return Ok(false);
     }
 
-    run_git_in(worktree, ["commit", "-m", message])
-        .context("failed to commit worker changes")?;
+    run_git_in(worktree, ["commit", "-m", message]).context("failed to commit worker changes")?;
     Ok(true)
 }
 
@@ -465,12 +496,28 @@ pub fn commit_worker_changes(
 #[allow(dead_code)]
 pub fn merge_worker_branch(
     integration_worktree: &Path,
-    worker_branch: &str,
+    worker: &WorkerCheckout,
 ) -> Result<MergeOutcome> {
+    let worker_branch = &worker.branch;
+    let fetch = Command::new("git")
+        .arg("-C")
+        .arg(integration_worktree)
+        .arg("fetch")
+        .arg(&worker.path)
+        .arg(worker_branch)
+        .output()
+        .context("failed to fetch worker branch")?;
+    if !fetch.status.success() {
+        bail!(
+            "git fetch of {worker_branch} from {} failed; stderr: {}",
+            worker.path.display(),
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        );
+    }
     let output = Command::new("git")
         .arg("-C")
         .arg(integration_worktree)
-        .args(["merge", "--no-ff", "--no-edit", worker_branch])
+        .args(["merge", "--no-ff", "--no-edit", "FETCH_HEAD"])
         .output()
         .context("failed to start git merge")?;
     if output.status.success() {
@@ -542,39 +589,19 @@ pub fn merge_worker_branch(
     })
 }
 
-/// Remove a worker worktree once its branch has been integrated (or abandoned).
-/// Uses `--force` because the worktree may hold uncommitted scratch.
-///
-/// When `delete_branch` is `true`, the `wip/<slug>` branch is also deleted
-/// (`git branch -D`) after the worktree is removed — use this once the branch
-/// has been merged (or abandoned) and no longer needs post-hoc review. When
-/// `false`, the branch ref is left intact so it can be inspected or pruned
-/// later. The branch can only be deleted after its worktree is gone, since git
-/// refuses to delete a branch that is still checked out somewhere.
+/// Remove a worker clone once its branch has been integrated (or abandoned).
+/// The branch is contained in the clone and is removed with it. `delete_branch`
+/// is retained for caller compatibility; worker branches are never created in
+/// the mother's ref namespace.
 #[allow(dead_code)]
 pub fn remove_worker_worktree(
     mother_repo: &Path,
     checkout: &WorkerCheckout,
-    delete_branch: bool,
+    _delete_branch: bool,
 ) -> Result<()> {
-    let repo = repo_root_for_path(mother_repo)?;
-    let path_str = checkout
-        .path
-        .to_str()
-        .with_context(|| format!("worktree path {} is not valid UTF-8", checkout.path.display()))?;
-    run_git_in(&repo, ["worktree", "remove", "--force", path_str])
-        .with_context(|| format!("failed to remove worker worktree {}", checkout.path.display()))?;
-
-    if delete_branch {
-        run_git_in(&repo, ["branch", "-D", &checkout.branch]).with_context(|| {
-            format!(
-                "failed to delete worker branch {} after removing its worktree",
-                checkout.branch
-            )
-        })?;
-    }
-
-    Ok(())
+    repo_root_for_path(mother_repo)?;
+    std::fs::remove_dir_all(&checkout.path)
+        .with_context(|| format!("failed to remove worker clone {}", checkout.path.display()))
 }
 
 /// Dependency-manifest files among `files`, for the G5 gate: manifest and
@@ -669,7 +696,7 @@ pub fn integrate_worker_branches(
             &format!("{commit_message_prefix} {branch}"),
         )?;
         let merge = if committed {
-            Some(merge_worker_branch(integration_worktree, &branch)?)
+            Some(merge_worker_branch(integration_worktree, &worker.checkout)?)
         } else {
             None
         };
@@ -962,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_worktrees_isolate_branches_and_surface_conflicts() {
+    fn worker_clones_have_real_gitdirs_isolate_branches_and_surface_conflicts() {
         let repo = init_test_repo("worker-isolation");
         seed_commit(&repo, "shared.txt", "base\n");
 
@@ -987,6 +1014,14 @@ mod tests {
         let b = create_worker_worktree(&repo, "task-b", &b_path).expect("worktree b");
         assert_eq!(a.branch, "wip/task-a");
         assert_eq!(b.branch, "wip/task-b");
+        assert!(
+            a.path.join(".git").is_dir(),
+            "worker clone needs a real .git directory"
+        );
+        assert!(
+            b.path.join(".git").is_dir(),
+            "worker clone needs a real .git directory"
+        );
 
         // Both workers edit the SAME file in their own worktrees.
         std::fs::write(a.path.join("shared.txt"), "from-a\n").expect("write a");
@@ -1011,9 +1046,9 @@ mod tests {
             create_worker_worktree(&repo, "integration", &int_path).expect("integration worktree");
 
         // First worker merges cleanly; the second conflicts on the same file.
-        let first = merge_worker_branch(&integration.path, &a.branch).expect("merge a");
+        let first = merge_worker_branch(&integration.path, &a).expect("merge a");
         assert!(first.clean, "first merge should be clean: {first:?}");
-        let second = merge_worker_branch(&integration.path, &b.branch).expect("merge b");
+        let second = merge_worker_branch(&integration.path, &b).expect("merge b");
         assert!(!second.clean, "second merge should conflict");
         assert_eq!(second.conflicted_files, vec!["shared.txt".to_owned()]);
 
@@ -1046,30 +1081,30 @@ mod tests {
     }
 
     #[test]
-    fn remove_worker_worktree_optionally_deletes_branch() {
+    fn remove_worker_worktree_removes_clone_without_creating_mother_refs() {
         let repo = init_test_repo("worktree-branch-delete");
         seed_commit(&repo, "file.txt", "base\n");
 
-        // delete_branch = false: worktree gone, branch preserved.
+        // Worker branches belong only to their clones, never to the mother.
         let kept_path = unique_worktree_path(&repo, "keep");
         let kept = create_worker_worktree(&repo, "keep", &kept_path).expect("worktree keep");
-        assert!(branch_exists(&repo, &kept.branch));
+        assert!(!branch_exists(&repo, &kept.branch));
         remove_worker_worktree(&repo, &kept, false).expect("remove keep");
-        assert!(!kept.path.exists(), "worktree dir should be gone");
+        assert!(!kept.path.exists(), "clone dir should be gone");
         assert!(
-            branch_exists(&repo, &kept.branch),
-            "branch should survive delete_branch = false"
+            !branch_exists(&repo, &kept.branch),
+            "worker branch must not leak into mother refs"
         );
 
         // delete_branch = true: worktree and branch both gone.
         let gone_path = unique_worktree_path(&repo, "gone");
         let gone = create_worker_worktree(&repo, "gone", &gone_path).expect("worktree gone");
-        assert!(branch_exists(&repo, &gone.branch));
+        assert!(!branch_exists(&repo, &gone.branch));
         remove_worker_worktree(&repo, &gone, true).expect("remove gone");
-        assert!(!gone.path.exists(), "worktree dir should be gone");
+        assert!(!gone.path.exists(), "clone dir should be gone");
         assert!(
             !branch_exists(&repo, &gone.branch),
-            "branch should be deleted with delete_branch = true"
+            "worker branch must remain absent from mother refs"
         );
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -1087,13 +1122,12 @@ mod tests {
         assert!(commit_worker_changes(&worker, &[worker.path.join("other.txt")], "worker")
             .expect("commit worker"));
 
-        // Integration worktree whose git dir carries a pre-merge-commit hook that
+        // Integration clone whose git dir carries a pre-merge-commit hook that
         // rejects the merge. The trees merge cleanly (no unmerged paths) but the
         // merge still fails — this must be surfaced as an error, not a conflict.
         let int_path = unique_worktree_path(&repo, "int");
         let integration = create_worker_worktree(&repo, "integration", &int_path).expect("int wt");
-        // Hooks live in the common git dir shared by all worktrees, not the
-        // per-worktree gitdir, so install pre-merge-commit there.
+        // Install pre-merge-commit in this clone's independent git directory.
         let common_dir = String::from_utf8(
             Command::new("git")
                 .arg("-C")
@@ -1115,7 +1149,7 @@ mod tests {
                 .expect("chmod hook");
         }
 
-        let err = merge_worker_branch(&integration.path, &worker.branch)
+        let err = merge_worker_branch(&integration.path, &worker)
             .expect_err("merge should error when it fails without unmerged paths");
         assert!(
             err.to_string().contains("without unmerged paths"),
