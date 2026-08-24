@@ -570,6 +570,12 @@ pub const AWAIT_SUBTASKS_TOOL: &str = "await_subtasks";
 pub const LIST_TASKS_TOOL: &str = "list_tasks";
 pub const GET_TASK_TOOL: &str = "get_task";
 pub const SET_TASK_STATUS_TOOL: &str = "set_task_status";
+/// Mint a NEW task on the caller's own board WITHOUT launching it (task
+/// #717) — the missing "file this for later" primitive. Unlike
+/// [`SPAWN_SUBTASK_TOOL`]/[`RUN_SUBTASK_TOOL`], nothing is launched, so this
+/// consumes no fan-out and no child budget: recording a finding must be cheap
+/// enough that an agent never weighs it against doing its actual work.
+pub const CREATE_TASK_TOOL: &str = "create_task";
 
 /// Tool error returned by `await_subtask*`/`subtask_result` when no collect
 /// channel is wired ([`NoSubtaskResults`]): the pre-collect stub semantics,
@@ -716,6 +722,15 @@ pub struct TaskDetail {
     pub body: String,
 }
 
+/// Result of `create_task`: the minted task's id and slug — nothing else,
+/// since this is a fire-and-forget "file it" primitive (task #717) and the
+/// caller can always follow up with `get_task` if it needs more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CreatedTask {
+    pub id: u64,
+    pub slug: String,
+}
+
 /// Host-side seam the task control-plane tools read/write through. The
 /// broker never touches `~/.varda` itself — it calls this trait, and the run
 /// path injects a concrete impl (`main::VardaTaskControlPlane`) that wraps
@@ -734,6 +749,20 @@ pub trait TaskControlPlane: Send + Sync {
     /// [`validate_self_status_transition`]) — this is the low-level write,
     /// not a gate. `Err` carries a human-readable reason (e.g. unknown id).
     fn set_task_status(&self, project_path: &Path, id: u64, status: TaskStatus) -> Result<(), String>;
+    /// Mint a NEW task in `project_path`, WITHOUT launching it (task #717).
+    /// `status` is the initial status to write — callers MUST have already
+    /// validated it is `Backlog` or `Ready` (see [`SpawnBroker::create_task`]);
+    /// this is the low-level write, not a gate. `Err` carries a
+    /// human-readable reason.
+    fn create_task(
+        &self,
+        project_path: &Path,
+        title: &str,
+        body: Option<&str>,
+        assignee: Option<&str>,
+        sandbox: Option<&str>,
+        status: TaskStatus,
+    ) -> Result<CreatedTask, String>;
 }
 
 /// Default control-plane seam: no host wiring. Used until the run path
@@ -749,6 +778,17 @@ impl TaskControlPlane for NoTaskControlPlane {
         None
     }
     fn set_task_status(&self, _project_path: &Path, _id: u64, _status: TaskStatus) -> Result<(), String> {
+        Err(RESULTS_UNAVAILABLE.to_owned())
+    }
+    fn create_task(
+        &self,
+        _project_path: &Path,
+        _title: &str,
+        _body: Option<&str>,
+        _assignee: Option<&str>,
+        _sandbox: Option<&str>,
+        _status: TaskStatus,
+    ) -> Result<CreatedTask, String> {
         Err(RESULTS_UNAVAILABLE.to_owned())
     }
 }
@@ -1446,6 +1486,42 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
         self.task_control_plane.set_task_status(project, id, status)
     }
 
+    /// `create_task`: mint a NEW task on the caller's OWN project board
+    /// WITHOUT launching it (task #717) — the missing "file this for later"
+    /// primitive. Unlike `spawn_subtask`/`run_subtask`, nothing is launched
+    /// here, so it consumes no fan-out and no child budget. Two gates, both
+    /// structural:
+    ///
+    /// 1. Always scoped to `task_control_plane_project` — the CALLER'S OWN
+    ///    project, resolved host-side and never attacker-supplied. There is
+    ///    no `project` argument on the tool surface at all, so a guest
+    ///    cannot even ASK to file into another project.
+    /// 2. `status` must be `Backlog` or `Ready` — never a terminal status
+    ///    and never `Running`, so a guest can never fabricate a task that
+    ///    LOOKS already finished, blocked, or in flight.
+    fn create_task(
+        &self,
+        title: &str,
+        body: Option<&str>,
+        assignee: Option<&str>,
+        sandbox: Option<&str>,
+        status: TaskStatus,
+    ) -> Result<CreatedTask, String> {
+        let project = self
+            .task_control_plane_project
+            .as_ref()
+            .ok_or_else(|| RESULTS_UNAVAILABLE.to_owned())?;
+        if !matches!(status, TaskStatus::Backlog | TaskStatus::Ready) {
+            return Err(format!(
+                "create_task denied: status must be 'backlog' or 'ready' (not '{}') — a guest \
+                 may not file a task that already looks finished or in flight",
+                status.as_str()
+            ));
+        }
+        self.task_control_plane
+            .create_task(project, title, body, assignee, sandbox, status)
+    }
+
     /// Whether `caller_id` may settle `target_id`'s status: either the same
     /// id (self-close), or `caller_id` is the ROOT/orchestrator of this
     /// broker's spawn tree — registered at depth 0 in
@@ -1503,7 +1579,8 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                 {"name": INTEGRATE_SUBTASKS_TOOL, "description": "Merge a wave of finished sub-tasks' isolated worktree branches onto the integration workspace. Commits each worker's files_touched onto its wip/ branch host-side and 3-way merges it, returning per-worker {branch, committed, clean, conflicted_files, dependency_manifests}. A non-clean merge lists the conflicted files for a resolver; dependency_manifests flags Cargo.toml/package.json/lockfile changes (G5). Never pushes (G2/G3). Call after await_subtasks.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}},
                 {"name": LIST_TASKS_TOOL, "description": "List YOUR OWN project's tasks: [{id, slug, status, title, assignee}]. Host-mediated; never crosses into another project. Use this (or `.varda/tasks/*.md` in the workspace) to discover work — there is no GitHub egress and no `varda` CLI inside the box.", "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "description": "Optional status filter: backlog, ready, running, review, needs_user, failed, or done."}}}},
                 {"name": GET_TASK_TOOL, "description": "Read one of your project's tasks by id: {id, slug, status, title, assignee, body}. Returns not-found for any id outside your own project (cross-project ids are never distinguishable from unknown ones).", "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "integer", "description": "Numeric task id."}}}},
-                {"name": SET_TASK_STATUS_TOOL, "description": "Close out a task once it is finished: set its status to done, needs_user, or failed. Allowed for the caller's own task id; if the caller is the root/orchestrator of this run, also allowed for any task in its project — an ordinary spawned worker stays self-only. Only from 'running' — a task in 'review' is a human-only gate and cannot be self-marked done, even by the root.", "inputSchema": {"type": "object", "required": ["id", "status"], "properties": {"id": {"type": "integer", "description": "The caller's own task id, or (if the caller is the root/orchestrator) any task id in its project."}, "status": {"type": "string", "enum": ["done", "needs_user", "failed"]}}}}
+                {"name": SET_TASK_STATUS_TOOL, "description": "Close out a task once it is finished: set its status to done, needs_user, or failed. Allowed for the caller's own task id; if the caller is the root/orchestrator of this run, also allowed for any task in its project — an ordinary spawned worker stays self-only. Only from 'running' — a task in 'review' is a human-only gate and cannot be self-marked done, even by the root.", "inputSchema": {"type": "object", "required": ["id", "status"], "properties": {"id": {"type": "integer", "description": "The caller's own task id, or (if the caller is the root/orchestrator) any task id in its project."}, "status": {"type": "string", "enum": ["done", "needs_user", "failed"]}}}},
+                {"name": CREATE_TASK_TOOL, "description": "File a NEW task on YOUR OWN project's board WITHOUT launching it. Use this to record a finding, defect, or follow-up discovered mid-run — instead of spawning a worker for it right now, burying it in a recap, or handing it to a human in prose. Consumes no fan-out and no child budget. Always lands in your own project (there is no project argument); status is always backlog (default) or ready, never running or a terminal status. Returns {id, slug}.", "inputSchema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string", "description": "Short task title/name."}, "body": {"type": "string", "description": "Full task body/description — the finding, in full."}, "assignee": {"type": "string", "description": "Optional suggested assignee."}, "sandbox": {"type": "string", "description": "Optional suggested sandbox name."}, "status": {"type": "string", "enum": ["backlog", "ready"], "description": "Initial status; defaults to backlog."}}}}
             ]
         })
     }
@@ -1760,6 +1837,30 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                             false,
                         ),
                     ),
+                    Err(error) => rpc_result(id, tool_text(&error, true)),
+                }
+            }
+            CREATE_TASK_TOOL => {
+                let Some(title) = args
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return rpc_error(id, -32602, "create_task requires a `title`");
+                };
+                let status = match str_arg(&args, "status").map(|s| s.parse::<TaskStatus>()) {
+                    None => TaskStatus::Backlog,
+                    Some(Ok(status)) => status,
+                    Some(Err(error)) => return rpc_result(id, tool_text(&error.to_string(), true)),
+                };
+                match self.create_task(
+                    title,
+                    str_arg(&args, "body").as_deref(),
+                    str_arg(&args, "assignee").as_deref(),
+                    str_arg(&args, "sandbox").as_deref(),
+                    status,
+                ) {
+                    Ok(created) => rpc_result(id, tool_text(&json!(created).to_string(), false)),
                     Err(error) => rpc_result(id, tool_text(&error, true)),
                 }
             }
@@ -2490,7 +2591,8 @@ deny_sandboxes = ["local"]
                 INTEGRATE_SUBTASKS_TOOL,
                 LIST_TASKS_TOOL,
                 GET_TASK_TOOL,
-                SET_TASK_STATUS_TOOL
+                SET_TASK_STATUS_TOOL,
+                CREATE_TASK_TOOL
             ]
         );
     }
@@ -3182,12 +3284,17 @@ deny_sandboxes = ["local"]
     /// assert cross-project scoping without touching the filesystem.
     struct StubControlPlane {
         tasks: BTreeMap<(String, u64), TaskDetail>,
+        /// `create_task` calls recorded as `(project, title, status)`, so
+        /// tests can assert what actually reached the control plane without
+        /// touching the filesystem.
+        created: Mutex<Vec<(String, String, String)>>,
     }
 
     impl StubControlPlane {
         fn new() -> Self {
             Self {
                 tasks: BTreeMap::new(),
+                created: Mutex::new(Vec::new()),
             }
         }
 
@@ -3233,6 +3340,25 @@ deny_sandboxes = ["local"]
             } else {
                 Err(format!("task '{id}' not found"))
             }
+        }
+
+        fn create_task(
+            &self,
+            project_path: &Path,
+            title: &str,
+            _body: Option<&str>,
+            _assignee: Option<&str>,
+            _sandbox: Option<&str>,
+            status: TaskStatus,
+        ) -> Result<CreatedTask, String> {
+            let project = project_path.display().to_string();
+            let mut created = self.created.lock().expect("stub mutex poisoned");
+            let id = 1000 + created.len() as u64;
+            created.push((project, title.to_owned(), status.as_str().to_owned()));
+            Ok(CreatedTask {
+                id,
+                slug: title.to_owned(),
+            })
         }
     }
 
@@ -3416,5 +3542,109 @@ deny_sandboxes = ["local"]
         assert_eq!(resp["result"]["isError"], json!(true));
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("review"), "got {text}");
+    }
+
+    // -----------------------------------------------------------------
+    // `create_task` (task #717): file a task without launching it.
+    // -----------------------------------------------------------------
+
+    /// `create_task` reaches the control plane scoped to the CALLER'S OWN
+    /// project — there is no `project` argument on the broker method at all,
+    /// so a guest cannot even ask to file elsewhere.
+    #[test]
+    fn create_task_lands_in_the_callers_own_project() {
+        let plane = StubControlPlane::new();
+        let broker = SpawnBroker::new(base_policy(), "1", MockLauncher::new())
+            .with_task_control_plane(plane, PathBuf::from("/proj/a"));
+
+        let created = broker
+            .create_task(
+                "fix the thing",
+                Some("details"),
+                None,
+                None,
+                TaskStatus::Backlog,
+            )
+            .expect("create_task should succeed once wired");
+        assert_eq!(created.slug, "fix the thing");
+    }
+
+    /// A guest may only file `backlog` or `ready` — never a terminal status
+    /// and never `running`, so it can never fabricate a task that looks
+    /// already finished or in flight.
+    #[test]
+    fn create_task_refuses_non_backlog_ready_status() {
+        let plane = StubControlPlane::new();
+        let broker = SpawnBroker::new(base_policy(), "1", MockLauncher::new())
+            .with_task_control_plane(plane, PathBuf::from("/proj/a"));
+
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Review,
+            TaskStatus::NeedsUser,
+            TaskStatus::Failed,
+            TaskStatus::Done,
+        ] {
+            let err = broker
+                .create_task("title", None, None, None, status)
+                .expect_err("non-backlog/ready status must be refused");
+            assert!(err.contains("backlog"), "got {err}");
+        }
+
+        assert!(
+            broker
+                .create_task("title", None, None, None, TaskStatus::Ready)
+                .is_ok(),
+            "ready must be allowed"
+        );
+    }
+
+    /// `create_task` reports unavailable (never panics or silently
+    /// succeeds) when no control plane is wired — mirrors
+    /// `list_tasks`/`get_task`/`set_task_status`'s unwired behaviour.
+    #[test]
+    fn create_task_is_unavailable_when_unwired() {
+        let broker = SpawnBroker::new(base_policy(), "1", MockLauncher::new());
+        let err = broker
+            .create_task("title", None, None, None, TaskStatus::Backlog)
+            .expect_err("unwired control plane must refuse, not silently succeed");
+        assert!(err.contains("not available"), "got {err}");
+    }
+
+    /// The RPC surface: a `create_task` tool call returns `{id, slug}` and
+    /// consumes no fan-out or child budget — nothing is launched.
+    #[test]
+    fn rpc_create_task_returns_id_and_slug_and_spends_no_budget() {
+        let mut policy = base_policy();
+        policy.max_fanout = 0;
+        let plane = StubControlPlane::new();
+        let broker = SpawnBroker::new(policy, "1", MockLauncher::new())
+            .with_task_control_plane(plane, PathBuf::from("/proj/a"));
+
+        let resp = broker.handle_rpc(
+            "1",
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": CREATE_TASK_TOOL, "arguments": {"title": "found a bug"}}}),
+        );
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let created: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(created["slug"], json!("found a bug"));
+        assert!(created["id"].as_u64().is_some());
+    }
+
+    /// A missing `title` is a param error, not a silent no-op.
+    #[test]
+    fn rpc_create_task_without_title_is_a_param_error() {
+        let plane = StubControlPlane::new();
+        let broker = SpawnBroker::new(base_policy(), "1", MockLauncher::new())
+            .with_task_control_plane(plane, PathBuf::from("/proj/a"));
+
+        let resp = broker.handle_rpc(
+            "1",
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": CREATE_TASK_TOOL, "arguments": {}}}),
+        );
+        assert_eq!(resp["error"]["code"], json!(-32602));
     }
 }
