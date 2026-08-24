@@ -503,8 +503,10 @@ pub async fn run_task(
     };
 
     // M10 cooperative model: an interactive run stays fully user-driven (no
-    // watchdog); a headless run is guarded by the idle watchdog + soft ceiling
-    // and may stitch multiple auto-resume continuations into one task.
+    // watchdog) and structurally bypasses `run_auto_resume_loop`; unattended
+    // residents must therefore use the headless path. A headless run is guarded
+    // by the idle watchdog + soft ceiling and may stitch multiple auto-resume
+    // continuations into one task.
     let bounds = OperationBounds::resolve(config, &task.frontmatter);
     if bounds.max_tool_calls > 0 {
         // Surfaced loudly rather than silently ignored: enforcement needs a per-run
@@ -2336,6 +2338,92 @@ Help interactively.
         );
         let recap = fs::read_to_string(&outcome.recap_path).expect("recap readable");
         assert!(recap.contains("Auto-Resume Limit Reached"));
+    }
+
+    /// An explicit per-task continuation bound enables unattended hops without
+    /// changing the global default (`0`) used by ordinary headless workers.
+    #[tokio::test]
+    async fn per_task_max_continuations_drives_headless_resume_loop() {
+        let (task_path, config) = ready_task("run-task-autoresume");
+        assert_eq!(config.defaults.max_continuations, 0);
+
+        let mut task = crate::task::load_task(&task_path).expect("task loads");
+        task.frontmatter.bounds.max_continuations = Some(1);
+        crate::task::write_task(&task).expect("task bound should be persisted");
+
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = ScriptedResumeClient {
+            requests: requests.clone(),
+            responses: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::from(vec![
+                    AgentRunResult {
+                        recap: "# Resident hop one".to_owned(),
+                        requires_user: false,
+                        suggested_agent: None,
+                        resume_command: Some("codex resume resident".to_owned()),
+                    },
+                    AgentRunResult {
+                        recap: "# Resident drained backlog".to_owned(),
+                        requires_user: true,
+                        suggested_agent: None,
+                        resume_command: Some("codex resume resident-again".to_owned()),
+                    },
+                ]),
+            )),
+            fallback: AgentRunResult {
+                recap: "unexpected extra call".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+        };
+
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
+            .await
+            .expect("per-task auto-resume should run");
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "one task-scoped continuation hop");
+        assert_eq!(
+            recorded[1].resume_command.as_deref(),
+            Some("codex resume resident")
+        );
+        assert_eq!(outcome.status, TaskStatus::NeedsUser);
+    }
+
+    /// `requires_user` is the resident's explicit drained-backlog stop signal:
+    /// even with a resume command and spare continuation capacity, it must stop.
+    #[tokio::test]
+    async fn requires_user_stops_auto_resume_on_first_hop() {
+        let (task_path, mut config) = ready_task("run-autoresume-needs-user");
+        config.defaults.max_continuations = 8;
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = ScriptedResumeClient {
+            requests: requests.clone(),
+            responses: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::from(vec![AgentRunResult {
+                    recap: "# Push boundary\n\nOperator review is required.".to_owned(),
+                    requires_user: true,
+                    suggested_agent: None,
+                    resume_command: Some("codex resume should-not-run".to_owned()),
+                }]),
+            )),
+            fallback: AgentRunResult {
+                recap: "unexpected continuation".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+        };
+
+        let outcome = run_task(&config, "codex", None, &task_path, &client, false, false)
+            .await
+            .expect("requires-user stop should run");
+
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(outcome.status, TaskStatus::NeedsUser);
+        let task = crate::task::load_task(&task_path).expect("task loads");
+        assert_eq!(task.frontmatter.agent_session_ids.len(), 1);
     }
 
     /// M10 per-task overrides: a task frontmatter bound wins over the config default.
