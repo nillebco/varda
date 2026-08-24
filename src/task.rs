@@ -506,6 +506,7 @@ pub fn create_task(
     // Always write the home-store STATE file: it is the run-time authority and
     // keeps status/recaps/logs OUT of the code repository.
     write_task(&task)?;
+    insert_task_index_entry(config, id, &path);
 
     // When the repo opts in with a `.varda/` directory, also drop the durable
     // DEFINITION (frontmatter spec + brief) into `<repo>/.varda/tasks/`, so the
@@ -870,20 +871,163 @@ fn split_trailing_comment(s: &str) -> (&str, &str) {
     (s, "")
 }
 
+/// Resolve a numeric task id to its file path. Consults the persistent
+/// id→path index first (O(1): one index-file read plus one task-file read to
+/// verify the cached entry still carries `id`) so a hot path like
+/// `await_subtask`'s poll loop never pays for a full-tree rescan (#653). On a
+/// cache miss or a stale/invalidated entry, falls back to a full recursive
+/// scan of `task_dir` — which also rebuilds the index from what it finds, so
+/// a missing or corrupt index file self-heals on the next lookup instead of
+/// staying slow forever.
 pub fn find_task_by_id(config: &Config, id: u64) -> Result<Option<PathBuf>> {
     let task_dir = Path::new(&config.defaults.operations_dir).join("tasks");
     if !task_dir.exists() {
         return Ok(None);
     }
 
-    let mut matches = Vec::new();
-    collect_task_id_matches(&task_dir, id, &mut matches)?;
-
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(matches.pop()),
-        _ => bail!("multiple tasks found with id {id}"),
+    if let Some(path) = read_task_index(config).get(&id).cloned()
+        && path.exists()
+        && let Ok(task) = load_task(&path)
+        && task.frontmatter.id == Some(id)
+    {
+        return Ok(Some(path));
     }
+
+    let index = rebuild_task_index(&task_dir)?;
+    write_task_index(config, &index);
+
+    match index.get(&id) {
+        Some(TaskIndexEntry::Unique(path)) => Ok(Some(path.clone())),
+        Some(TaskIndexEntry::Duplicate) => bail!("multiple tasks found with id {id}"),
+        None => Ok(None),
+    }
+}
+
+/// One id's resolution as discovered by a full-tree scan: either it maps to
+/// exactly one file, or two-or-more files claim it (a genuine duplicate,
+/// which must surface as a visible error rather than silently picking one).
+#[derive(Debug, Clone)]
+enum TaskIndexEntry {
+    Unique(PathBuf),
+    Duplicate,
+}
+
+fn task_index_path(config: &Config) -> PathBuf {
+    Path::new(&config.defaults.operations_dir).join("tasks").join(".task_index.json")
+}
+
+/// Best-effort read of the persistent id→path index. Any failure (missing
+/// file, corrupt JSON, unreadable) is treated as an empty index rather than
+/// an error — the caller always has the full-tree scan as a correctness
+/// fallback, so a broken index degrades to "slow" (like before this fix),
+/// never to a wrong answer.
+fn read_task_index(config: &Config) -> std::collections::HashMap<u64, PathBuf> {
+    let Ok(raw) = fs::read_to_string(task_index_path(config)) else {
+        return std::collections::HashMap::new();
+    };
+    serde_json::from_str::<std::collections::HashMap<String, PathBuf>>(&raw)
+        .map(|map| {
+            map.into_iter()
+                .filter_map(|(id, path)| id.parse::<u64>().ok().map(|id| (id, path)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Best-effort persist of the id→path index. Failure to write (e.g.
+/// read-only filesystem) is logged and otherwise ignored: the index is a
+/// cache, not the source of truth, so a write failure must never fail the
+/// caller's lookup.
+fn write_task_index(config: &Config, index: &std::collections::HashMap<u64, TaskIndexEntry>) {
+    let unique: std::collections::HashMap<String, &PathBuf> = index
+        .iter()
+        .filter_map(|(id, entry)| match entry {
+            TaskIndexEntry::Unique(path) => Some((id.to_string(), path)),
+            TaskIndexEntry::Duplicate => None,
+        })
+        .collect();
+    let path = task_index_path(config);
+    match serde_json::to_string(&unique) {
+        Ok(json) => {
+            if let Err(error) = fs::write(&path, json) {
+                eprintln!(
+                    "warning: failed to write task index {}: {error:#}",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => eprintln!("warning: failed to serialize task index: {error:#}"),
+    }
+}
+
+/// Incrementally add one freshly-created task's id to the persistent index,
+/// so a just-spawned subtask resolves in O(1) without waiting for the next
+/// full-tree rescan. Best-effort: falls back to the scan-and-heal path in
+/// [`find_task_by_id`] on any failure.
+fn insert_task_index_entry(config: &Config, id: u64, path: &Path) {
+    let mut index = read_task_index(config)
+        .into_iter()
+        .map(|(id, path)| (id, TaskIndexEntry::Unique(path)))
+        .collect::<std::collections::HashMap<_, _>>();
+    index.insert(id, TaskIndexEntry::Unique(path.to_path_buf()));
+    write_task_index(config, &index);
+}
+
+fn rebuild_task_index(task_dir: &Path) -> Result<std::collections::HashMap<u64, TaskIndexEntry>> {
+    let mut matches: std::collections::HashMap<u64, Vec<PathBuf>> = std::collections::HashMap::new();
+    collect_all_task_ids(task_dir, &mut matches)?;
+    Ok(matches
+        .into_iter()
+        .map(|(id, mut paths)| {
+            if paths.len() == 1 {
+                (id, TaskIndexEntry::Unique(paths.pop().unwrap()))
+            } else {
+                (id, TaskIndexEntry::Duplicate)
+            }
+        })
+        .collect())
+}
+
+fn collect_all_task_ids(
+    path: &Path,
+    matches: &mut std::collections::HashMap<u64, Vec<PathBuf>>,
+) -> Result<()> {
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("failed to read task directory {}", path.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read task directory {}", path.display()))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry_path.display()))?;
+
+        if file_type.is_dir() {
+            collect_all_task_ids(&entry_path, matches)?;
+            continue;
+        }
+
+        if entry_path
+            .extension()
+            .is_none_or(|extension| extension != "md")
+        {
+            continue;
+        }
+
+        let task = match load_task(&entry_path) {
+            Ok(task) => task,
+            Err(error) => {
+                eprintln!("warning: skipped {}: {error:#}", entry_path.display());
+                continue;
+            }
+        };
+
+        if let Some(id) = task.frontmatter.id {
+            matches.entry(id).or_default().push(entry_path);
+        }
+    }
+
+    Ok(())
 }
 
 fn collect_task_id_matches(path: &Path, id: u64, matches: &mut Vec<PathBuf>) -> Result<()> {
@@ -2025,6 +2169,60 @@ requires_user: false
             resolve_task_reference(&config, Path::new("42")).expect("task id should resolve");
 
         assert_eq!(resolved, task_path);
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn find_task_by_id_errors_visibly_on_a_genuine_duplicate_instead_of_none() {
+        let root = std::env::temp_dir().join(format!("varda-task-dup-id-{}", std::process::id()));
+        let task_dir = root.join("operations/tasks");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        for name in ["one.md", "two.md"] {
+            fs::write(
+                task_dir.join(name),
+                "---\nid: 7\nstatus: ready\nrequires_user: false\n---\n\n# Dup\n",
+            )
+            .expect("task should be written");
+        }
+
+        let config = test_config(&root.join("operations"));
+
+        let error = find_task_by_id(&config, 7)
+            .expect_err("a duplicate id must surface as an error, not None");
+        assert!(error.to_string().contains("multiple tasks found with id 7"));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn find_task_by_id_resolves_through_a_stale_index_by_healing_it() {
+        let root = std::env::temp_dir().join(format!("varda-task-index-heal-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("mine.md");
+        fs::write(
+            &task_path,
+            "---\nid: 9\nstatus: ready\nrequires_user: false\n---\n\n# Mine\n",
+        )
+        .expect("task should be written");
+
+        let config = test_config(&operations_dir);
+
+        // A corrupt/garbage index file must not break resolution: the scan
+        // fallback finds the task and heals the index in place.
+        fs::write(task_dir.join(".task_index.json"), "not json").expect("index should write");
+
+        let resolved = find_task_by_id(&config, 9)
+            .expect("lookup should not error on a corrupt index")
+            .expect("task should resolve via the scan fallback");
+        assert_eq!(resolved, task_path);
+
+        // The corrupt index was overwritten with a real, healed entry.
+        let index_raw =
+            fs::read_to_string(task_dir.join(".task_index.json")).expect("index should exist");
+        assert!(index_raw.contains("\"9\""));
+
         fs::remove_dir_all(root).expect("test directory should be removable");
     }
 }

@@ -1622,8 +1622,26 @@ impl VardaSubtaskResults {
 }
 
 impl orchestration::SubtaskResults for VardaSubtaskResults {
-    fn status(&self, id: &str) -> Option<task::TaskStatus> {
-        self.state(id).map(|(status, _)| status)
+    /// Resolves `id` and distinguishes "found" from a genuine resolution
+    /// failure (unknown id, non-numeric id, ambiguous duplicate, or a failed
+    /// state load) instead of collapsing all of those into `None` the way the
+    /// old `Option`-returning signature did — that conflation is what let
+    /// `await_subtask` poll an unresolvable id to its 30-minute ceiling (#653).
+    fn status(&self, id: &str) -> orchestration::SubtaskStatus {
+        let Ok(num) = id.parse::<u64>() else {
+            return orchestration::SubtaskStatus::Unresolved(format!(
+                "subtask id '{id}' is not a resolvable numeric task id"
+            ));
+        };
+        match task::lookup_task_state(&self.config, num) {
+            Ok(Some((status, _))) => orchestration::SubtaskStatus::Found(status),
+            Ok(None) => {
+                orchestration::SubtaskStatus::Unresolved(format!("no task found with id {num}"))
+            }
+            Err(error) => orchestration::SubtaskStatus::Unresolved(format!(
+                "failed to resolve task {num}: {error:#}"
+            )),
+        }
     }
 
     fn recap(&self, id: &str) -> Option<String> {

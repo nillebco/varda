@@ -571,8 +571,14 @@ fn is_terminal(status: TaskStatus) -> bool {
 /// the `task::` helpers. Kept read-only and object-safe so one impl can serve both
 /// the sandboxed broker and the resident host.
 pub trait SubtaskResults: Send + Sync {
-    /// Current status of `id`, or `None` if no task carries that id.
-    fn status(&self, id: &str) -> Option<TaskStatus>;
+    /// Current status of `id`: [`SubtaskStatus::Found`] if resolved (terminal or
+    /// not — caller checks [`is_terminal`]), or [`SubtaskStatus::Unresolved`] if
+    /// the id could not be resolved to a task (unknown id, an ambiguous
+    /// duplicate, or a failed state load). The two must never collapse into the
+    /// same `None` the way they used to (#653): an unresolved id is a genuine
+    /// failure and `await_subtask*` must surface it as a tool error at once,
+    /// never silently retry it as "still running" until `max_wait`.
+    fn status(&self, id: &str) -> SubtaskStatus;
     /// Most recent recap TEXT for `id`, or `None` if the task is unknown or has
     /// not yet produced a recap.
     fn recap(&self, id: &str) -> Option<String>;
@@ -604,8 +610,8 @@ pub trait SubtaskResults: Send + Sync {
 struct NoSubtaskResults;
 
 impl SubtaskResults for NoSubtaskResults {
-    fn status(&self, _id: &str) -> Option<TaskStatus> {
-        None
+    fn status(&self, _id: &str) -> SubtaskStatus {
+        SubtaskStatus::Unresolved(RESULTS_UNAVAILABLE.to_owned())
     }
     fn recap(&self, _id: &str) -> Option<String> {
         None
@@ -613,6 +619,28 @@ impl SubtaskResults for NoSubtaskResults {
     fn is_available(&self) -> bool {
         false
     }
+}
+
+/// Outcome of resolving a subtask id's current status through [`SubtaskResults`].
+/// See [`SubtaskResults::status`] for why the two variants must stay distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubtaskStatus {
+    Found(TaskStatus),
+    Unresolved(String),
+}
+
+/// Outcome of blocking on one or more subtasks via `await_subtask*`. Distinguishes
+/// three cases that previously collapsed into a single `None` (#653): a healthy
+/// settle (`Ready`), the `max_wait` ceiling elapsing on a still-in-flight child
+/// (`TimedOut`), and a RESOLUTION failure — unknown id, ambiguous duplicate id,
+/// or a failed state load (`Unresolved`) — which must reach the master as a
+/// prompt tool error, never be silently retried as if the child were merely
+/// still working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AwaitOutcome<T> {
+    Ready(T),
+    TimedOut,
+    Unresolved(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,47 +1129,56 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
     /// child) or no collect channel is wired. Never blocks past the cap. An
     /// unwired provider short-circuits at once (no polling) — callers translate
     /// that `None` into the [`RESULTS_UNAVAILABLE`] error via `is_available`.
-    fn await_subtask(&self, id: &str) -> Option<TaskStatus> {
+    fn await_subtask(&self, id: &str) -> AwaitOutcome<TaskStatus> {
         if !self.results.is_available() {
-            return None;
+            return AwaitOutcome::Unresolved(RESULTS_UNAVAILABLE.to_owned());
         }
         let start = Instant::now();
         loop {
-            if let Some(status) = self.results.status(id)
-                && is_terminal(status)
-            {
-                return Some(status);
+            match self.results.status(id) {
+                SubtaskStatus::Found(status) if is_terminal(status) => {
+                    return AwaitOutcome::Ready(status);
+                }
+                SubtaskStatus::Found(_) => {}
+                // A resolution failure is never "still running" — surface it at
+                // once rather than polling a dead id to `max_wait` (#653).
+                SubtaskStatus::Unresolved(reason) => return AwaitOutcome::Unresolved(reason),
             }
             if start.elapsed() >= self.max_wait {
-                return None;
+                return AwaitOutcome::TimedOut;
             }
             std::thread::sleep(self.poll_interval);
         }
     }
 
     /// Block until EVERY id reaches a terminal status; return `(id, status)` for
-    /// each once all are settled. `None` if the ceiling elapses before every id is
-    /// terminal, or no collect channel is wired. This is the wave primitive.
-    fn await_subtasks(&self, ids: &[String]) -> Option<Vec<(String, TaskStatus)>> {
+    /// each once all are settled. This is the wave primitive. Mirrors
+    /// [`Self::await_subtask`]'s three-way outcome: a single unresolved id fails
+    /// the whole wave immediately rather than polling every other id to the
+    /// ceiling behind it.
+    fn await_subtasks(&self, ids: &[String]) -> AwaitOutcome<Vec<(String, TaskStatus)>> {
         if !self.results.is_available() {
-            return None;
+            return AwaitOutcome::Unresolved(RESULTS_UNAVAILABLE.to_owned());
         }
         let start = Instant::now();
         loop {
-            let settled: Vec<(String, TaskStatus)> = ids
-                .iter()
-                .filter_map(|id| {
-                    self.results
-                        .status(id)
-                        .filter(|s| is_terminal(*s))
-                        .map(|s| (id.clone(), s))
-                })
-                .collect();
+            let mut settled = Vec::with_capacity(ids.len());
+            for id in ids {
+                match self.results.status(id) {
+                    SubtaskStatus::Found(status) if is_terminal(status) => {
+                        settled.push((id.clone(), status));
+                    }
+                    SubtaskStatus::Found(_) => {}
+                    SubtaskStatus::Unresolved(reason) => {
+                        return AwaitOutcome::Unresolved(format!("subtask '{id}': {reason}"));
+                    }
+                }
+            }
             if settled.len() == ids.len() {
-                return Some(settled);
+                return AwaitOutcome::Ready(settled);
             }
             if start.elapsed() >= self.max_wait {
-                return None;
+                return AwaitOutcome::TimedOut;
             }
             std::thread::sleep(self.poll_interval);
         }
@@ -1158,7 +1195,10 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
             .map(|p| p.display().to_string())
             .collect();
         let blocked_commands = parse_blocked_commands(&recap);
-        let status = self.results.status(id).map(TaskStatus::as_str);
+        let status = match self.results.status(id) {
+            SubtaskStatus::Found(status) => Some(status.as_str()),
+            SubtaskStatus::Unresolved(_) => None,
+        };
         Some(json!({
             "subtask_id": id,
             "status": status,
@@ -1425,20 +1465,27 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                     return rpc_result(id, tool_text(RESULTS_UNAVAILABLE, true));
                 }
                 match self.await_subtask(sid) {
-                    Some(status) => rpc_result(
+                    AwaitOutcome::Ready(status) => rpc_result(
                         id,
                         tool_text(
                             &json!({"subtask_id": sid, "status": status.as_str()}).to_string(),
                             false,
                         ),
                     ),
-                    None => rpc_result(
+                    AwaitOutcome::TimedOut => rpc_result(
                         id,
                         tool_text(
                             &format!(
                                 "await_subtask timed out after {}s waiting for subtask '{sid}' to finish",
                                 self.max_wait.as_secs()
                             ),
+                            true,
+                        ),
+                    ),
+                    AwaitOutcome::Unresolved(reason) => rpc_result(
+                        id,
+                        tool_text(
+                            &format!("await_subtask could not resolve subtask '{sid}': {reason}"),
                             true,
                         ),
                     ),
@@ -1466,14 +1513,14 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                     return rpc_result(id, tool_text(RESULTS_UNAVAILABLE, true));
                 }
                 match self.await_subtasks(&ids) {
-                    Some(settled) => {
+                    AwaitOutcome::Ready(settled) => {
                         let payload: Vec<Value> = settled
                             .into_iter()
                             .map(|(sid, status)| json!({"subtask_id": sid, "status": status.as_str()}))
                             .collect();
                         rpc_result(id, tool_text(&json!(payload).to_string(), false))
                     }
-                    None => rpc_result(
+                    AwaitOutcome::TimedOut => rpc_result(
                         id,
                         tool_text(
                             &format!(
@@ -1482,6 +1529,10 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                             ),
                             true,
                         ),
+                    ),
+                    AwaitOutcome::Unresolved(reason) => rpc_result(
+                        id,
+                        tool_text(&format!("await_subtasks could not resolve a subtask: {reason}"), true),
                     ),
                 }
             }
@@ -2456,14 +2507,17 @@ deny_sandboxes = ["local"]
     }
 
     impl SubtaskResults for MockResults {
-        fn status(&self, id: &str) -> Option<TaskStatus> {
+        fn status(&self, id: &str) -> SubtaskStatus {
             let n = {
                 let mut c = self.counts.lock().unwrap();
                 let e = c.entry(id.to_owned()).or_insert(0);
                 *e += 1;
                 *e
             };
-            (self.status_fn)(id, n)
+            match (self.status_fn)(id, n) {
+                Some(status) => SubtaskStatus::Found(status),
+                None => SubtaskStatus::Unresolved(format!("mock: no status for '{id}'")),
+            }
         }
         fn recap(&self, id: &str) -> Option<String> {
             self.recaps.get(id).cloned()
@@ -2490,7 +2544,7 @@ deny_sandboxes = ["local"]
         let broker = fast_timing(
             SpawnBroker::new(base_policy(), "root", MockLauncher::new()).with_results(results),
         );
-        assert_eq!(broker.await_subtask("child"), Some(TaskStatus::Done));
+        assert_eq!(broker.await_subtask("child"), AwaitOutcome::Ready(TaskStatus::Done));
         // It could only return on a terminal poll, so it must have polled ≥ 3×.
         assert!(
             polls.load(Ordering::SeqCst) >= 3,
@@ -2505,7 +2559,75 @@ deny_sandboxes = ["local"]
         let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new())
             .with_results(results)
             .with_poll_timing(Duration::from_millis(1), Duration::from_millis(30));
-        assert_eq!(broker.await_subtask("child"), None);
+        assert_eq!(broker.await_subtask("child"), AwaitOutcome::TimedOut);
+    }
+
+    #[test]
+    fn await_subtask_errors_promptly_on_unresolved_id_instead_of_wedging() {
+        // A resolution failure (unknown id / ambiguous duplicate / failed state
+        // load) must surface as an error AT ONCE — never be treated as "still
+        // running" and polled to `max_wait` (#653's root cause).
+        let results = MockResults::new(|_, _| None);
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new())
+            .with_results(results)
+            .with_poll_timing(Duration::from_millis(1), Duration::from_secs(3600));
+        let t = Instant::now();
+        assert!(matches!(
+            broker.await_subtask("ghost"),
+            AwaitOutcome::Unresolved(_)
+        ));
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "unresolved id polled toward the ceiling instead of erroring promptly ({:?})",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn rpc_await_subtask_unresolved_id_is_a_tool_error_not_a_timeout() {
+        let results = MockResults::new(|_, _| None);
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new())
+            .with_results(results)
+            .with_poll_timing(Duration::from_millis(1), Duration::from_secs(3600));
+        let t = Instant::now();
+        let resp = broker.handle_rpc(
+            "root",
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": AWAIT_SUBTASK_TOOL, "arguments": {"subtask_id": "ghost"}}}),
+        );
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "unresolved id polled toward the ceiling instead of erroring promptly ({:?})",
+            t.elapsed()
+        );
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("timed out"), "got {text}");
+        assert!(text.contains("could not resolve"), "got {text}");
+    }
+
+    #[test]
+    fn await_subtasks_fails_fast_on_one_unresolved_id_instead_of_wedging() {
+        // `a` is healthy (never terminal); `b` is unresolvable. The wave must not
+        // poll `a` to the ceiling behind `b` — it must error the instant `b`'s
+        // resolution fails.
+        let results = MockResults::new(|id, _| match id {
+            "a" => Some(TaskStatus::Running),
+            _ => None,
+        });
+        let broker = SpawnBroker::new(base_policy(), "root", MockLauncher::new())
+            .with_results(results)
+            .with_poll_timing(Duration::from_millis(1), Duration::from_secs(3600));
+        let t = Instant::now();
+        assert!(matches!(
+            broker.await_subtasks(&["a".to_owned(), "b".to_owned()]),
+            AwaitOutcome::Unresolved(_)
+        ));
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "unresolved id in a wave polled toward the ceiling instead of erroring promptly ({:?})",
+            t.elapsed()
+        );
     }
 
     #[test]
@@ -2577,9 +2699,11 @@ deny_sandboxes = ["local"]
         let broker = fast_timing(
             SpawnBroker::new(base_policy(), "root", MockLauncher::new()).with_results(results),
         );
-        let settled = broker
-            .await_subtasks(&["a".to_owned(), "b".to_owned()])
-            .expect("both settle before the cap");
+        let AwaitOutcome::Ready(settled) =
+            broker.await_subtasks(&["a".to_owned(), "b".to_owned()])
+        else {
+            panic!("both should settle before the cap");
+        };
         assert!(
             bpolls.load(Ordering::SeqCst) >= 4,
             "await_subtasks returned before `b` was terminal"
@@ -2599,11 +2723,14 @@ deny_sandboxes = ["local"]
             .with_poll_timing(Duration::from_secs(1), Duration::from_secs(3600));
 
         let t = Instant::now();
-        assert_eq!(broker.await_subtask("child"), None);
-        assert_eq!(
+        assert!(matches!(
+            broker.await_subtask("child"),
+            AwaitOutcome::Unresolved(_)
+        ));
+        assert!(matches!(
             broker.await_subtasks(&["a".to_owned(), "b".to_owned()]),
-            None
-        );
+            AwaitOutcome::Unresolved(_)
+        ));
         assert!(
             t.elapsed() < Duration::from_secs(1),
             "unwired await polled instead of short-circuiting ({:?})",
