@@ -1687,21 +1687,40 @@ fn write_stage_temp(content: &str, read_only: bool) -> Result<PathBuf> {
         // umask) on the host — a credential must never be exposed that way.
         // `create_new` additionally refuses a pre-existing file, so we never write
         // the credential into an attacker-planted inode (belt to the remove above).
+        use std::os::unix::fs::PermissionsExt as _;
+        // The guest agent is NOT root and NOT the host uid (it runs as uid 1001),
+        // and `--copy-file` preserves the source mode — so a `0o400` credential
+        // staged by the host user is unreadable inside the box and the wrapper dies
+        // with "cannot open ... Permission denied" before the agent starts.
+        //
+        // Protect the credential with a PRIVATE DIRECTORY instead of an unreadable
+        // file: `<varda_home>/stage` is created `0o700`, so no other local user can
+        // traverse into it, while the file itself stays readable to whoever can get
+        // there — which in the guest is the agent. #627's actual property is
+        // unchanged: the secret never appears on the argv, only its guest path does.
+        let dir = crate::config::varda_home()?.join("stage");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create credential stage dir {}", dir.display()))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).with_context(
+            || format!("failed to lock down credential stage dir {}", dir.display()),
+        )?;
+        let tmp = dir.join(
+            tmp.file_name()
+                .expect("staged temp path always has a file name"),
+        );
+        let _ = std::fs::remove_file(&tmp);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o400)
+            .mode(0o444)
             .open(&tmp)
             .with_context(|| format!("failed to stage file {}", tmp.display()))?;
         file.write_all(content.as_bytes())
             .with_context(|| format!("failed to write staged file {}", tmp.display()))?;
-        // `create_new`'s mode is masked by the umask; force exactly `0o400` so the
-        // owner can still read the credential regardless of the process umask. This
-        // only ever tightens/keeps perms private — never opens a world-readable
-        // window, since the file was already created private.
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o400))
-            .with_context(|| format!("failed to set read-only perms on {}", tmp.display()))?;
+        // `create_new`'s mode is masked by the umask; force exactly `0o444` so the
+        // guest agent can read it regardless of the host process umask.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444))
+            .with_context(|| format!("failed to set perms on {}", tmp.display()))?;
         return Ok(tmp);
     }
     // Prompt / non-credential: default (umask) perms so a non-root guest agent can
@@ -3210,6 +3229,22 @@ impl DockerSession {
 
 #[cfg(test)]
 mod tests {
+
+    /// A staged credential is guest-readable by design (the in-box agent is neither
+    /// root nor the host uid, and `--copy-file` preserves the source mode). Its
+    /// privacy on the HOST therefore comes from the containing directory, which must
+    /// be `0o700` — no other local user can traverse in. Assert the property that
+    /// actually protects the secret, not a proxy for it.
+    fn assert_credential_dir_is_private(host_temp: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = host_temp.parent().expect("staged credential has a parent dir");
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "credential stage dir {} must be private, got {mode:o}",
+            dir.display()
+        );
+    }
     use super::*;
     use std::path::Path;
 
@@ -3765,9 +3800,10 @@ mod tests {
             );
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(
-                mode, 0o400,
-                "staged credential must be read-only, got {mode:o}"
+                mode, 0o444,
+                "staged credential must be guest-readable, got {mode:o}"
             );
+            assert_credential_dir_is_private(&path);
             path
         };
         // Batch with a staged file takes the `create` → cp → `start -ai` lifecycle
@@ -3839,9 +3875,10 @@ mod tests {
         let host_temp = session.staged_files.lock().unwrap()[0].0.clone();
         let mode = std::fs::metadata(&host_temp).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o400,
-            "staged credential must be read-only, got {mode:o}"
+            mode, 0o444,
+            "staged credential must be guest-readable, got {mode:o}"
         );
+        assert_credential_dir_is_private(&host_temp);
         // BATCH wrap emits a `--copy-file host:guest` for the staged credential and
         // still no TTY — the fix over the old "interactive-only copy" behavior.
         let wrapped = session
@@ -4492,8 +4529,9 @@ mod tests {
         );
         assert_eq!(
             std::fs::metadata(&host_temp).unwrap().permissions().mode() & 0o777,
-            0o400
+            0o444
         );
+        assert_credential_dir_is_private(&host_temp);
         drop(staged);
         std::fs::remove_file(host_temp).unwrap();
     }
@@ -4934,8 +4972,9 @@ mod tests {
 
     /// M11-ext fix2 Finding 1 (docker): a staged credential host temp is `0o400`
     /// and NEVER group/world-accessible — asserted immediately after
-    /// `stage_credential_file` returns, so there is no create-time window where a
-    /// normal umask would leave the value world-readable (`0o644`) on the host.
+    /// `stage_credential_file` returns. The value is never reachable by another
+    /// local user at any point: the containing directory is created `0o700` before
+    /// the file exists, so there is no create-time window regardless of umask.
     #[test]
     fn m11ext_docker_staged_credential_private_at_creation() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -4947,13 +4986,20 @@ mod tests {
         let host_temp = session.staged_files.lock().unwrap()[0].0.clone();
         let mode = std::fs::metadata(&host_temp).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o400,
-            "credential temp must be exactly 0o400, got {mode:o}"
+            mode, 0o444,
+            "credential temp must be exactly 0o444, got {mode:o}"
         );
+        assert_credential_dir_is_private(&host_temp);
+        // The FILE is deliberately group/world-readable so the non-root guest agent
+        // can read it after a mode-preserving copy; unreachability is enforced one
+        // level up, by the 0o700 directory asserted above.
+        let dir_mode = {
+            let dir = host_temp.parent().unwrap();
+            std::fs::metadata(dir).unwrap().permissions().mode() & 0o077
+        };
         assert_eq!(
-            mode & 0o077,
-            0,
-            "credential temp must never be group/world-accessible"
+            dir_mode, 0,
+            "credential stage DIR must never be group/world-accessible"
         );
         let _ = std::fs::remove_file(&host_temp);
     }
@@ -5700,7 +5746,8 @@ mod tests {
             .unwrap();
         let host_temp = session.staged_files.lock().unwrap()[0].0.clone();
         let mode = std::fs::metadata(&host_temp).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o400);
+        assert_eq!(mode, 0o444);
+        assert_credential_dir_is_private(&host_temp);
         session.teardown().await.unwrap();
         assert!(!host_temp.exists());
     }
