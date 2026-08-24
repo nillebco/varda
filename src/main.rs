@@ -11,6 +11,7 @@ mod routing;
 mod runner;
 mod sandbox;
 mod task;
+mod verify;
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -1248,7 +1249,7 @@ async fn run_task_paths_in_parallel(
     let mut failures = 0usize;
     while let Some(joined) = runs.join_next().await {
         match joined.context("task runner join failed")? {
-            Ok(report) => {
+            Ok(mut report) => {
                 println!(
                     "processed task={} agent={} glob={} status={:?} recap={}",
                     report.task_path.display(),
@@ -1257,6 +1258,15 @@ async fn run_task_paths_in_parallel(
                     report.outcome.status,
                     report.outcome.recap_path.display()
                 );
+                let mut may_commit_files = true;
+                if config.git.auto_commit && let Some(project) = report.project.clone() {
+                    may_commit_files = apply_verification_gate(
+                        &report.task_path,
+                        &project,
+                        &report.verify,
+                        &mut report.outcome,
+                    )?;
+                }
                 let notification = if report.outcome.status == task::TaskStatus::NeedsUser {
                     let notification = notify::notify_user_interaction(
                         &config,
@@ -1273,7 +1283,7 @@ async fn run_task_paths_in_parallel(
                     None
                 };
                 if config.git.auto_commit {
-                    if let Some(project) = report.project.as_deref() {
+                    if may_commit_files && let Some(project) = report.project.as_deref() {
                         commit_agent_files_for_task(
                             &report.task_path,
                             project,
@@ -1310,6 +1320,7 @@ struct ParallelRunReport {
     glob: String,
     outcome: runner::RunOutcome,
     project: Option<String>,
+    verify: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -2481,6 +2492,7 @@ async fn run_task_path_for_parallel(
         glob: route.glob,
         outcome,
         project: task_document.frontmatter.project.clone(),
+        verify: route.verify,
     })
 }
 
@@ -4003,7 +4015,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         println!("committed task snapshot");
     }
     let stream = !quiet && !interactive;
-    let outcome = runner::run_task(
+    let mut outcome = runner::run_task(
         &config,
         &display_name,
         route.role_instructions.as_deref(),
@@ -4024,6 +4036,20 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         outcome.recap_path.display()
     );
 
+    if !outcome.blocked_commands.is_empty() {
+        println!();
+        println!("blocked_commands: {}", outcome.blocked_commands.join(", "));
+        println!(
+            "hint: add these to the task's `allow_commands` frontmatter and re-run to authorize them headlessly"
+        );
+    }
+
+    let mut may_commit_files = true;
+    if config.git.auto_commit && let Some(project) = task_document.frontmatter.project.clone() {
+        may_commit_files =
+            apply_verification_gate(&task_path, &project, &route.verify, &mut outcome)?;
+    }
+
     let recap_content = fs::read_to_string(&outcome.recap_path)
         .with_context(|| format!("failed to read recap at {}", outcome.recap_path.display()))?;
     println!();
@@ -4032,14 +4058,6 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     print!("{recap_content}");
     if !recap_content.ends_with('\n') {
         println!();
-    }
-
-    if !outcome.blocked_commands.is_empty() {
-        println!();
-        println!("blocked_commands: {}", outcome.blocked_commands.join(", "));
-        println!(
-            "hint: add these to the task's `allow_commands` frontmatter and re-run to authorize them headlessly"
-        );
     }
 
     let notification = if outcome.status == task::TaskStatus::NeedsUser {
@@ -4054,7 +4072,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         None
     };
     if config.git.auto_commit {
-        if let Some(project) = task_document.frontmatter.project.as_deref() {
+        if may_commit_files && let Some(project) = task_document.frontmatter.project.as_deref() {
             commit_agent_files_for_task(&task_path, project, &outcome.files_touched);
         }
         git::commit_task_update(
@@ -4091,6 +4109,92 @@ fn commit_agent_files_for_task(task_path: &Path, project: &str, files_touched: &
             project_path.display()
         );
     }
+}
+
+/// Host-side verification gate (#674). Runs the matched route's `verify`
+/// commands against `project` BEFORE `files_touched` is committed: the box
+/// that produced the change is not a trustworthy witness (a warmed cache lets
+/// it build there while the host disagrees; in-box network/FS restrictions
+/// can also produce false self-reported failures). Appends a structured
+/// `## Verification` section to the recap on disk so a parent can tell
+/// "verified green" from "not verified" from "verified red" without
+/// re-running anything.
+///
+/// On failure, downgrades `outcome.status` to `Failed` (and rewrites the task
+/// file to match) and returns `false`: the caller must skip
+/// `commit_agent_files_for_task` so the change stays uncommitted on the
+/// worker's own `wip/` branch/worktree rather than landing broken. Returns
+/// `true` when the caller may proceed with the commit as before (verification
+/// passed, or no `verify` command is configured for the route).
+fn apply_verification_gate(
+    task_path: &Path,
+    project: &str,
+    verify_commands: &[String],
+    outcome: &mut runner::RunOutcome,
+) -> Result<bool> {
+    let project_path = Path::new(project);
+    let result = verify::run_verification(project_path, verify_commands).with_context(|| {
+        format!(
+            "failed to run host verification for task {} in {}",
+            task_path.display(),
+            project_path.display()
+        )
+    })?;
+
+    let label = result.label();
+    let note = match &result {
+        verify::VerificationOutcome::Skipped => format!(
+            "\n\n## Verification\n\nverification: {label} (no `verify` command configured for this route)\n"
+        ),
+        verify::VerificationOutcome::Passed { commands } => format!(
+            "\n\n## Verification\n\nverification: {label}\ncommands:\n{}\n",
+            commands
+                .iter()
+                .map(|c| format!("- `{c}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        verify::VerificationOutcome::Failed { command, output } => format!(
+            "\n\n## Verification\n\nverification: {label}\ncommand: `{command}`\n\n```\n{}\n```\n",
+            output.trim()
+        ),
+    };
+
+    let mut recap_content = fs::read_to_string(&outcome.recap_path).with_context(|| {
+        format!(
+            "failed to read recap at {} to append verification result",
+            outcome.recap_path.display()
+        )
+    })?;
+    recap_content.push_str(&note);
+    fs::write(&outcome.recap_path, &recap_content).with_context(|| {
+        format!(
+            "failed to append verification result to recap at {}",
+            outcome.recap_path.display()
+        )
+    })?;
+
+    if !matches!(result, verify::VerificationOutcome::Failed { .. }) {
+        return Ok(true);
+    }
+
+    if outcome.status == task::TaskStatus::NeedsUser {
+        eprintln!(
+            "verification failed for task {}; not committing files_touched, task already needs user input so status is preserved",
+            task_path.display()
+        );
+        return Ok(false);
+    }
+
+    let mut task = task::load_task(task_path)?;
+    task.set_status(task::TaskStatus::Failed);
+    task::write_task(&task)?;
+    outcome.status = task::TaskStatus::Failed;
+    eprintln!(
+        "verification failed for task {}; not committing files_touched, task settled to failed",
+        task_path.display()
+    );
+    Ok(false)
 }
 
 async fn plan_task_command(task_path: &Path) -> Result<()> {
@@ -4864,6 +4968,77 @@ planner_agent: codex
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: orchestration::OrchestrationPolicy::default(),
         }
+    }
+
+    /// Seeds a bare task markdown file and recap file for
+    /// `apply_verification_gate` tests, under a fresh temp dir. Returns
+    /// `(task_path, recap_path)`.
+    fn seed_gate_test_task(root: &Path, status: task::TaskStatus) -> (PathBuf, PathBuf) {
+        fs::create_dir_all(root).expect("root dir should be created");
+        let task_path = root.join("task.md");
+        fs::write(
+            &task_path,
+            format!(
+                "---\nstatus: {}\n---\n\nGate test task.\n",
+                status.as_str()
+            ),
+        )
+        .expect("task file should write");
+        let recap_path = root.join("recap.md");
+        fs::write(&recap_path, "# Recap\n\nOriginal recap body.\n")
+            .expect("recap file should write");
+        (task_path, recap_path)
+    }
+
+    #[test]
+    fn apply_verification_gate_preserves_needs_user_status_on_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-verify-gate-needs-user-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let (task_path, recap_path) = seed_gate_test_task(&root, task::TaskStatus::NeedsUser);
+        let mut outcome = runner::RunOutcome {
+            status: task::TaskStatus::NeedsUser,
+            recap_path: recap_path.clone(),
+            session_log_path: root.join("session.log"),
+            files_touched: Vec::new(),
+            blocked_commands: Vec::new(),
+        };
+
+        let may_commit = apply_verification_gate(
+            &task_path,
+            &root.display().to_string(),
+            &["exit 1".to_owned()],
+            &mut outcome,
+        )
+        .expect("gate should run without error");
+
+        assert!(!may_commit, "a failing verify command must block the commit");
+        assert_eq!(
+            outcome.status,
+            task::TaskStatus::NeedsUser,
+            "a pre-existing NeedsUser status must survive a verification failure"
+        );
+
+        let reloaded = task::load_task(&task_path).expect("task should reload");
+        assert_eq!(
+            reloaded.frontmatter.status,
+            task::TaskStatus::NeedsUser,
+            "the on-disk task status must also still be NeedsUser"
+        );
+
+        let recap_content = fs::read_to_string(&recap_path).expect("recap should read");
+        assert!(
+            recap_content.contains("## Verification"),
+            "recap should still get the verification section appended: {recap_content}"
+        );
+        assert!(
+            recap_content.contains("verification: failed"),
+            "recap should report the failure: {recap_content}"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub struct RouteMatch {
     pub route_mounts: Vec<String>,
     /// Trusted static env declared on the matched route.
     pub route_env: std::collections::BTreeMap<String, String>,
+    /// Host-side verification commands (#674) declared on the matched route.
+    /// Empty ⇒ no gate configured for this project.
+    pub verify: Vec<String>,
 }
 
 impl RouteMatch {
@@ -67,6 +70,7 @@ pub fn match_route(
         sandbox: config.effective_sandbox(route).to_owned(),
         route_mounts: route.mounts.clone(),
         route_env: route.env.clone(),
+        verify: route.verify.clone(),
     })
 }
 
@@ -105,6 +109,7 @@ pub fn match_route_for_task(
         sandbox: config.effective_sandbox(route).to_owned(),
         route_mounts: route.mounts.clone(),
         route_env: route.env.clone(),
+        verify: route.verify.clone(),
     })
 }
 
@@ -368,6 +373,7 @@ mod tests {
                     mounts: Vec::new(),
                     env: BTreeMap::new(),
                     orchestration: None,
+                    verify: Vec::new(),
                 },
                 Route {
                     glob: "**".to_owned(),
@@ -376,6 +382,7 @@ mod tests {
                     mounts: Vec::new(),
                     env: BTreeMap::new(),
                     orchestration: None,
+                    verify: Vec::new(),
                 },
             ],
             agents: BTreeMap::from([
@@ -449,6 +456,7 @@ mod tests {
                     mounts: Vec::new(),
                     orchestration: None,
                     env: BTreeMap::new(),
+                    verify: Vec::new(),
                 },
                 Route {
                     glob: "**".to_owned(),
@@ -457,6 +465,7 @@ mod tests {
                     mounts: Vec::new(),
                     orchestration: None,
                     env: BTreeMap::new(),
+                    verify: Vec::new(),
                 },
             ],
             agents: BTreeMap::from([
@@ -556,6 +565,7 @@ mod tests {
                 mounts: Vec::new(),
                 orchestration: None,
                 env: BTreeMap::new(),
+                verify: Vec::new(),
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),
@@ -605,6 +615,7 @@ mod tests {
                 mounts: Vec::new(),
                 orchestration: None,
                 env: BTreeMap::new(),
+                verify: Vec::new(),
             }],
             agents: BTreeMap::from([
                 (
@@ -700,6 +711,7 @@ mod tests {
                 mounts: Vec::new(),
                 orchestration: None,
                 env: BTreeMap::new(),
+                verify: Vec::new(),
             }],
             agents: BTreeMap::from([
                 (

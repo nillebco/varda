@@ -1552,6 +1552,7 @@ Body.
                 mounts: Vec::new(),
                 orchestration: None,
                 env: std::collections::BTreeMap::new(),
+                verify: Vec::new(),
             }],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
