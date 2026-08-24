@@ -1340,22 +1340,32 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
     /// Two structural gates run BEFORE the control-plane write, both hard
     /// errors (never a silent no-op):
     ///
-    /// 1. Self-only — `parent_id` (the id of the task that owns this broker
-    ///    channel; host-known, never attacker-supplied — see
-    ///    [`SpawnBroker::gated_launch`] for the same lineage-guard pattern)
-    ///    must equal `id`. A guest may close out only its OWN task, never a
-    ///    sibling's or an arbitrary id — even one in the same project.
+    /// 1. Role-scoped (task #687) — `parent_id` (the id of the task that owns
+    ///    this broker channel; host-known, never attacker-supplied) must
+    ///    either equal `id` (self-close, always allowed), or `parent_id` must
+    ///    be the ROOT/orchestrator of this broker's spawn tree — registered
+    ///    at depth 0 in [`SpawnTreeState::depths`] (see
+    ///    [`SpawnBroker::with_shared_state`]) — in which case it may settle
+    ///    ANY task id within the single project this broker is scoped to
+    ///    (`task_control_plane_project` already scopes the whole
+    ///    list_tasks/get_task/set_task_status surface to one project, so no
+    ///    additional project check is needed here). An ordinary spawned
+    ///    worker (depth >= 1) stays self-only — it may not settle a
+    ///    sibling's or unrelated task's status even if it has spawned
+    ///    subtasks of its own; role, not lineage, gates the broad grant. See
+    ///    [`Self::caller_may_settle`].
     /// 2. [`validate_self_status_transition`] — target must be a terminal
     ///    self-report status and the task must currently be `running`.
+    ///    `review -> done` stays refused for everyone, including the root.
     fn set_task_status(&self, parent_id: &str, id: u64, status: TaskStatus) -> Result<(), String> {
         let project = self
             .task_control_plane_project
             .as_ref()
             .ok_or_else(|| RESULTS_UNAVAILABLE.to_owned())?;
-        if parent_id.parse::<u64>().ok() != Some(id) {
+        if !self.caller_may_settle(parent_id, id) {
             return Err(format!(
                 "set_task_status denied: caller '{parent_id}' may only set the status of its own \
-                 task, not '{id}'"
+                 task, or (if it is the root/orchestrator) any task in its project, not '{id}'"
             ));
         }
         let current = self
@@ -1370,6 +1380,26 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
         })?;
         validate_self_status_transition(current_status, status)?;
         self.task_control_plane.set_task_status(project, id, status)
+    }
+
+    /// Whether `caller_id` may settle `target_id`'s status: either the same
+    /// id (self-close), or `caller_id` is the ROOT/orchestrator of this
+    /// broker's spawn tree — registered at depth 0 in
+    /// [`SpawnTreeState::depths`] — which may settle any task id within the
+    /// single project this broker is scoped to (task #687, role-scoped: the
+    /// resident is by construction the only depth-0/unspawned caller for a
+    /// given project's broker).
+    fn caller_may_settle(&self, caller_id: &str, target_id: u64) -> bool {
+        if caller_id.parse::<u64>().ok() == Some(target_id) {
+            return true;
+        }
+        self.state
+            .0
+            .lock()
+            .expect("spawn state mutex poisoned")
+            .depths
+            .get(caller_id)
+            .is_some_and(|depth| *depth == 0)
     }
 
     /// The MCP `tools/list` manifest: exactly the narrow spawn tool plus the
@@ -1409,7 +1439,7 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
                 {"name": INTEGRATE_SUBTASKS_TOOL, "description": "Merge a wave of finished sub-tasks' isolated worktree branches onto the integration workspace. Commits each worker's files_touched onto its wip/ branch host-side and 3-way merges it, returning per-worker {branch, committed, clean, conflicted_files, dependency_manifests}. A non-clean merge lists the conflicted files for a resolver; dependency_manifests flags Cargo.toml/package.json/lockfile changes (G5). Never pushes (G2/G3). Call after await_subtasks.", "inputSchema": {"type": "object", "required": ["subtask_ids"], "properties": {"subtask_ids": {"type": "array", "items": {"type": "string"}}}}},
                 {"name": LIST_TASKS_TOOL, "description": "List YOUR OWN project's tasks: [{id, slug, status, title, assignee}]. Host-mediated; never crosses into another project. Use this (or `.varda/tasks/*.md` in the workspace) to discover work — there is no GitHub egress and no `varda` CLI inside the box.", "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "description": "Optional status filter: backlog, ready, running, review, needs_user, failed, or done."}}}},
                 {"name": GET_TASK_TOOL, "description": "Read one of your project's tasks by id: {id, slug, status, title, assignee, body}. Returns not-found for any id outside your own project (cross-project ids are never distinguishable from unknown ones).", "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "integer", "description": "Numeric task id."}}}},
-                {"name": SET_TASK_STATUS_TOOL, "description": "Close out YOUR OWN task once you are finished: set its status to done, needs_user, or failed. Only allowed for the caller's own task id, and only from 'running' — a task in 'review' is a human-only gate and cannot be self-marked done.", "inputSchema": {"type": "object", "required": ["id", "status"], "properties": {"id": {"type": "integer", "description": "Must be the caller's own task id."}, "status": {"type": "string", "enum": ["done", "needs_user", "failed"]}}}}
+                {"name": SET_TASK_STATUS_TOOL, "description": "Close out a task once it is finished: set its status to done, needs_user, or failed. Allowed for the caller's own task id; if the caller is the root/orchestrator of this run, also allowed for any task in its project — an ordinary spawned worker stays self-only. Only from 'running' — a task in 'review' is a human-only gate and cannot be self-marked done, even by the root.", "inputSchema": {"type": "object", "required": ["id", "status"], "properties": {"id": {"type": "integer", "description": "The caller's own task id, or (if the caller is the root/orchestrator) any task id in its project."}, "status": {"type": "string", "enum": ["done", "needs_user", "failed"]}}}}
             ]
         })
     }
@@ -3093,8 +3123,8 @@ deny_sandboxes = ["local"]
     }
 
     /// (b) Forbidden status transitions are refused: guests may not move a
-    /// task out of `review` (the human gate), and may not self-target a
-    /// task that is not their own.
+    /// task out of `review` (the human gate), and a non-root guest may not
+    /// self-target a task that is not their own.
     #[test]
     fn set_task_status_refuses_forbidden_transitions() {
         let plane = StubControlPlane::new()
@@ -3120,10 +3150,21 @@ deny_sandboxes = ["local"]
             .expect_err("review -> done must be refused");
         assert!(err.contains("review"), "got {err}");
 
-        // A caller may never set another task's (even its own project's) status.
-        let err = broker
-            .set_task_status("1", 2, TaskStatus::Done)
-            .expect_err("setting a non-self task must be refused");
+        // A non-root caller may never set another task's (even its own
+        // project's) status — only the root/orchestrator gets that grant
+        // (task #687, role-scoped — see
+        // `set_task_status_allows_root_to_settle_any_task_in_its_project`).
+        let plane_nonroot = StubControlPlane::new()
+            .with_task("/proj/a", task_detail(3, TaskStatus::Running))
+            .with_task("/proj/a", task_detail(4, TaskStatus::Running));
+        let broker_nonroot = SpawnBroker::new(base_policy(), "3", MockLauncher::new())
+            .with_task_control_plane(plane_nonroot, PathBuf::from("/proj/a"));
+        let child = broker_nonroot
+            .spawn_subtask("3", req())
+            .expect("spawn should succeed");
+        let err = broker_nonroot
+            .set_task_status(&child, 4, TaskStatus::Done)
+            .expect_err("a non-root caller must never set a non-self task's status");
         assert!(err.contains("own"), "got {err}");
 
         // Guests may never target a non-terminal status.
@@ -3136,6 +3177,58 @@ deny_sandboxes = ["local"]
             .set_task_status("3", 3, TaskStatus::Running)
             .expect_err("non-terminal target status must be refused");
         assert!(err.contains("guests may only set"), "got {err}");
+    }
+
+    /// Task #687, role-scoped: the ROOT/orchestrator of a broker's spawn tree
+    /// (registered at depth 0) may settle any task within its own project —
+    /// including one it never spawned, directly or transitively — while an
+    /// ordinary spawned worker (depth >= 1) stays self-only, even for a
+    /// sibling task.
+    #[test]
+    fn set_task_status_allows_root_to_settle_any_task_in_its_project() {
+        let plane = StubControlPlane::new()
+            .with_task("/proj/a", task_detail(1, TaskStatus::Running))
+            .with_task("/proj/a", task_detail(2, TaskStatus::Running))
+            .with_task("/proj/a", task_detail(9, TaskStatus::Running));
+
+        let broker = SpawnBroker::new(base_policy(), "1", MockLauncher::new())
+            .with_task_control_plane(plane, PathBuf::from("/proj/a"));
+
+        // The root may settle a task it never spawned at all.
+        assert!(broker.set_task_status("1", 2, TaskStatus::Done).is_ok());
+        assert!(broker.set_task_status("1", 9, TaskStatus::Done).is_ok());
+
+        // A non-root spawned worker still cannot settle a sibling's status,
+        // even though under lineage-scoping it might have been allowed to
+        // reach its own descendants.
+        let plane_worker = StubControlPlane::new()
+            .with_task("/proj/a", task_detail(1, TaskStatus::Running))
+            .with_task("/proj/a", task_detail(9, TaskStatus::Running));
+        let broker_worker = SpawnBroker::new(base_policy(), "1", MockLauncher::new())
+            .with_task_control_plane(plane_worker, PathBuf::from("/proj/a"));
+        let child = broker_worker
+            .spawn_subtask("1", req())
+            .expect("spawn should succeed");
+        let err = broker_worker
+            .set_task_status(&child, 9, TaskStatus::Done)
+            .expect_err("a non-root spawned worker must still be refused");
+        assert!(err.contains("own"), "got {err}");
+    }
+
+    /// `review -> done` stays a human-only gate even for the root/orchestrator.
+    #[test]
+    fn set_task_status_keeps_review_to_done_human_only_even_for_the_root() {
+        let plane = StubControlPlane::new()
+            .with_task("/proj/a", task_detail(1, TaskStatus::Running))
+            .with_task("/proj/a", task_detail(2, TaskStatus::Review));
+
+        let broker = SpawnBroker::new(base_policy(), "1", MockLauncher::new())
+            .with_task_control_plane(plane, PathBuf::from("/proj/a"));
+
+        let err = broker
+            .set_task_status("1", 2, TaskStatus::Done)
+            .expect_err("review -> done must stay refused even for the root");
+        assert!(err.contains("review"), "got {err}");
     }
 
     #[test]
