@@ -1427,9 +1427,17 @@ fn tinyproxy_conf() -> String {
 /// Stand up the allow-listing forward-proxy sidecar for `hosts`:
 /// 1. an `--internal` docker network (no route to the internet) the sandbox joins;
 /// 2. the proxy container on that network (alias [`EGRESS_PROXY_ALIAS`]) with the
-///    generated tinyproxy config mounted read-only;
+///    generated tinyproxy config COPIED IN (`docker cp`, not bind-mounted);
 /// 3. the proxy ALSO connected to the default `bridge` so IT — and only it — can
 ///    reach the allow-listed hosts on the sandbox's behalf.
+///
+/// The config is `docker cp`-ed rather than bind-mounted for the same reason the
+/// agent HOME is a named volume: it lives under `~/.varda`, which a VM-backed daemon
+/// (e.g. a Colima profile sharing only `~/dev`) does NOT share. A host bind of it
+/// silently mounts an EMPTY in-VM stub, tinyproxy exits with "Could not open config
+/// file", and the sandbox — whose only route out is that proxy — loses ALL egress
+/// while looking like a network fault. `docker cp` streams over the daemon API and
+/// is independent of what the VM shares.
 ///
 /// Idempotent by name: re-running `network create`/`run` for an existing resource
 /// is tolerated. Best-effort mirror in [`DockerSession::teardown`].
@@ -1462,11 +1470,10 @@ async fn setup_egress_proxy(
         .with_context(|| "failed to write tinyproxy.conf".to_string())?;
     std::fs::write(cfg_dir.join("filter"), tinyproxy_filter(hosts))
         .with_context(|| "failed to write proxy filter".to_string())?;
-    let mount = format!("{}:/etc/varda-proxy:ro", cfg_dir.display());
+    // 2a. CREATE (not run) the proxy so the config can be copied in before it starts.
     let out = tokio::process::Command::new("docker")
         .args([
-            "run",
-            "-d",
+            "create",
             "--rm",
             "--name",
             &container,
@@ -1474,8 +1481,6 @@ async fn setup_egress_proxy(
             &network,
             "--network-alias",
             EGRESS_PROXY_ALIAS,
-            "-v",
-            &mount,
             image,
             "tinyproxy",
             "-d",
@@ -1487,7 +1492,21 @@ async fn setup_egress_proxy(
         .with_context(|| format!("failed to spawn proxy container `{container}`"))?;
     if !out.status.success() {
         bail!(
-            "`docker run` for egress proxy '{container}' (image '{image}') failed; stderr: {}",
+            "`docker create` for egress proxy '{container}' (image '{image}') failed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // 2b. Copy the config+filter INTO the created container (daemon API stream — works
+    //     on a VM-backed daemon that does not share `~/.varda`; a bind mount does not).
+    let cp_dest = format!("{container}:/etc/varda-proxy");
+    let out = tokio::process::Command::new("docker")
+        .args(["cp", &cfg_dir.display().to_string(), &cp_dest])
+        .output()
+        .await
+        .with_context(|| format!("failed to copy proxy config into `{container}`"))?;
+    if !out.status.success() {
+        bail!(
+            "`docker cp` of the egress-proxy config into '{container}' failed; stderr: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -1501,6 +1520,44 @@ async fn setup_egress_proxy(
         bail!(
             "`docker network connect bridge {container}` failed; stderr: {}",
             String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // 4. Start it now that the config is in place and both networks are attached.
+    let out = tokio::process::Command::new("docker")
+        .args(["start", &container])
+        .output()
+        .await
+        .with_context(|| format!("failed to start proxy container `{container}`"))?;
+    if !out.status.success() {
+        bail!(
+            "`docker start` for egress proxy '{container}' failed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // The sandbox's ONLY route out is this proxy, so a proxy that exits immediately
+    // (bad config, missing filter) would surface as an opaque "network fetch failed"
+    // inside the box. Assert it is actually running before handing the box its route.
+    let out = tokio::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", &container])
+        .output()
+        .await
+        .with_context(|| format!("failed to inspect proxy container `{container}`"))?;
+    if String::from_utf8_lossy(&out.stdout).trim() != "true" {
+        let logs = tokio::process::Command::new("docker")
+            .args(["logs", "--tail", "20", &container])
+            .output()
+            .await
+            .map(|o| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_default();
+        bail!(
+            "egress proxy '{container}' exited immediately after start; the sandbox would have              NO working egress. Proxy logs: {}",
+            logs.trim()
         );
     }
     Ok(())
