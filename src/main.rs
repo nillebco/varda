@@ -2207,7 +2207,7 @@ fn resolve_agent_credentials(
     for cred in agent_config.effective_credentials() {
         let source = cred.source()?;
         let target = cred.target()?;
-        let Some(value) = resolve_credential_value(&source)? else {
+        let Some(value) = resolve_credential_value(&source, cred.optional)? else {
             continue;
         };
         match target {
@@ -2227,7 +2227,15 @@ fn resolve_agent_credentials(
 /// still boots, matching the legacy `auth_token_env` behavior). `command` and
 /// secret-store failures fail loudly — the minting identity never reaches the box,
 /// so a broken mint must not silently degrade to an unauthenticated run.
-fn resolve_credential_value(source: &config::CredentialSource<'_>) -> Result<Option<String>> {
+///
+/// `optional` relaxes exactly one case: a SUCCESSFUL mint that produced an EMPTY
+/// value is skipped instead of failing, for credentials that are deliberately
+/// conditional (a `command` gated on a wrapper env var, or one whose upstream is
+/// not running). A non-zero exit still fails loudly even when `optional`.
+fn resolve_credential_value(
+    source: &config::CredentialSource<'_>,
+    optional: bool,
+) -> Result<Option<String>> {
     match source {
         config::CredentialSource::Env(name) => match std::env::var(name) {
             Ok(value) if !value.is_empty() => Ok(Some(value)),
@@ -2244,6 +2252,12 @@ fn resolve_credential_value(source: &config::CredentialSource<'_>) -> Result<Opt
                 format!("failed to resolve secret '{name}' from the host secret store (`fnox get {name}`)")
             })?;
             if value.is_empty() {
+                if optional {
+                    eprintln!(
+                        "sandbox: optional credential secret '{name}' resolved to an empty value                          on the host; skipping this injection"
+                    );
+                    return Ok(None);
+                }
                 anyhow::bail!("secret '{name}' resolved to an empty value on the host");
             }
             Ok(Some(value))
@@ -2252,6 +2266,12 @@ fn resolve_credential_value(source: &config::CredentialSource<'_>) -> Result<Opt
             let value = run_host_credential_command("sh", &["-c", cmd])
                 .with_context(|| format!("credential command failed on the host: {cmd}"))?;
             if value.is_empty() {
+                if optional {
+                    eprintln!(
+                        "sandbox: optional credential command produced no value on the host;                          skipping this injection: {cmd}"
+                    );
+                    return Ok(None);
+                }
                 anyhow::bail!("credential command produced empty output on the host: {cmd}");
             }
             Ok(Some(value))
@@ -5833,6 +5853,49 @@ deny_sandboxes = ["local"]
         assert!(
             resolve_agent_credentials(&failing).is_err(),
             "failed command must fail"
+        );
+    }
+
+    /// `optional = true` relaxes ONLY the empty-output case: a deliberately conditional
+    /// credential (gated on a wrapper env var) is skipped instead of failing the run,
+    /// while a mint that actually FAILS still fails loudly.
+    #[test]
+    fn optional_credential_skips_empty_output_but_still_fails_on_error() {
+        let empty = agent_for_credentials(vec![config::CredentialConfig {
+            command: Some("true".to_owned()),
+            env: Some("TF_TOKEN_app_terraform_io".to_owned()),
+            optional: true,
+            ..Default::default()
+        }]);
+        let (auth_env, auth_files) = resolve_agent_credentials(&empty).unwrap();
+        assert!(
+            auth_env.is_empty() && auth_files.is_empty(),
+            "optional empty mint must be skipped: {auth_env:?} {auth_files:?}"
+        );
+
+        // Still injects when the gate is on.
+        let gated = agent_for_credentials(vec![config::CredentialConfig {
+            command: Some("printf tfc-token".to_owned()),
+            env: Some("TF_TOKEN_app_terraform_io".to_owned()),
+            optional: true,
+            ..Default::default()
+        }]);
+        let (auth_env, _) = resolve_agent_credentials(&gated).unwrap();
+        assert_eq!(
+            auth_env.get("TF_TOKEN_app_terraform_io").map(String::as_str),
+            Some("tfc-token")
+        );
+
+        // A broken mint is NOT excused by `optional`.
+        let failing = agent_for_credentials(vec![config::CredentialConfig {
+            command: Some("exit 3".to_owned()),
+            env: Some("X".to_owned()),
+            optional: true,
+            ..Default::default()
+        }]);
+        assert!(
+            resolve_agent_credentials(&failing).is_err(),
+            "optional must not excuse a failed mint"
         );
     }
 

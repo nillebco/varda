@@ -1087,6 +1087,14 @@ pub struct CredentialConfig {
     /// follow-up — today the value is minted ONCE at `prepare`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_seconds: Option<u64>,
+    /// Allow this credential to resolve to NOTHING: an EMPTY (but successful) mint is
+    /// skipped instead of failing the run. For deliberately conditional credentials —
+    /// a `command` that gates on a wrapper env var, or one that emits nothing when the
+    /// upstream it reads is not running. A command that FAILS (non-zero exit) still
+    /// fails loudly: a broken mint must never silently degrade to an unauthenticated
+    /// run. Has no effect on `from_env`, which is always skipped when unset/empty.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
 }
 
 /// The validated SOURCE of a [`CredentialConfig`] (exactly one is set).
