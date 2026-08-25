@@ -251,11 +251,166 @@ impl TaskDocument {
     }
 }
 
+/// Load a task document, overlaying the BODY from the repo-local DEFINITION
+/// (`.varda/tasks/<id>-<slug>.md`) live when one still exists — see
+/// [`overlay_repo_definition_body`]. This is the universal read path (`get_task`,
+/// `run_subtask`, `varda task run`, CLI display, `list_tasks`), so an edit to a
+/// committed definition is visible on the very next read instead of only at the
+/// one-shot materialization that seeds the home STATE file (#710: the two used to
+/// silently diverge after creation, with every reader stuck on the stale
+/// snapshot).
+///
+/// If the repo definition store exists but the overlay lookup itself fails —
+/// the store can't be read, a candidate definition fails to parse, or more
+/// than one definition file claims the same id — this returns an `Err` rather
+/// than silently falling back to the (possibly stale) body already on disk.
+/// A silent fallback here would reproduce the exact class of divergence #710
+/// exists to eliminate.
 pub fn load_task(path: impl AsRef<Path>) -> Result<TaskDocument> {
-    let path = path.as_ref();
+    let mut task = parse_task_raw(path.as_ref())?;
+    overlay_repo_definition_body(&mut task)?;
+    Ok(task)
+}
+
+/// Read and parse a task file with NO repo-definition overlay. Used internally
+/// wherever overlaying could recurse into the same lookup (scanning a repo
+/// DEFINITION store) or is simply irrelevant (id-only scans).
+fn parse_task_raw(path: &Path) -> Result<TaskDocument> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read task at {}", path.display()))?;
     parse_task(path, &content)
+}
+
+/// If `task` is a home STATE file (i.e. NOT itself sitting inside a repo-local
+/// DEFINITION store) whose project carries a `.varda/tasks/<id>-*.md` DEFINITION
+/// with a matching id, replace `task.body` with that definition's CURRENT body.
+/// This is what makes a post-creation edit to the repo file visible without a
+/// re-sync step: the home copy written at materialization time is treated as a
+/// one-shot seed, never the read authority for content, once a live definition
+/// exists.
+///
+/// Uses `policy_project()` (mother project first) so a spawned worker running in
+/// an isolated worktree resolves against the ORCHESTRATOR's checkout — the place
+/// an operator's edit actually lands — not its own possibly-stale git clone.
+///
+/// No-ops (leaves `task.body` untouched) when: there is no id, no project, the
+/// project has no `.varda/` directory, no definition store yet, no definition
+/// with a matching id, or `task.path` is already inside the definition store
+/// (the doc being loaded IS the definition, so its body is already live).
+///
+/// Returns `Err` if the store exists but can't be enumerated, a candidate
+/// definition file can't be parsed, or multiple definition files claim the
+/// same id (see [`find_definition_body`]) — never silently swallowed.
+fn overlay_repo_definition_body(task: &mut TaskDocument) -> Result<()> {
+    let Some(id) = task.frontmatter.id else {
+        return Ok(());
+    };
+    let Some(project) = task.frontmatter.policy_project().cloned() else {
+        return Ok(());
+    };
+    let Some(store) = repo_task_store(Path::new(&project)) else {
+        return Ok(());
+    };
+    if !store.exists() || path_is_within(&task.path, &store) {
+        return Ok(());
+    }
+
+    if let Some(body) = find_definition_body(&store, id)? {
+        task.body = body;
+    }
+    Ok(())
+}
+
+/// Whether `path` lives inside `ancestor`, comparing canonicalized paths when
+/// possible (falling back to the raw paths if either cannot be canonicalized,
+/// e.g. because `path` does not exist).
+fn path_is_within(path: &Path, ancestor: &Path) -> bool {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let ancestor = ancestor.canonicalize().unwrap_or_else(|_| ancestor.to_path_buf());
+    path.starts_with(&ancestor)
+}
+
+/// Find the single DEFINITION under `store` (recursively) whose id is `id` and
+/// return its body. Filenames follow `<id>-<slug>.md` (see
+/// [`materialize_from_repo_definition`]), so candidates are first narrowed by
+/// filename prefix before the expensive parse — this keeps the common case to
+/// "parse the one matching file" rather than "parse every file in the store".
+/// The store is still walked and every id-prefixed candidate is still parsed
+/// on every call (no cache/index), so this remains O(matching files) per
+/// `load_task` call and the containing store is O(store size) to enumerate;
+/// callers on hot paths (`list_tasks`, `find_task_by_id`) pay that cost per
+/// task. Full elimination would need a cache or index and is out of scope
+/// here.
+///
+/// Returns `Ok(None)` when no candidate matches. Returns `Err` if the
+/// directory walk fails, a candidate fails to parse, or more than one
+/// candidate claims `id` — mirrors the duplicate rejection
+/// `materialize_from_repo_definition` already applies at materialization
+/// time, so a duplicate is never resolved by nondeterministic filesystem
+/// iteration order.
+fn find_definition_body(store: &Path, id: u64) -> Result<Option<String>> {
+    let mut candidates = Vec::new();
+    collect_definition_candidates(store, id, &mut candidates)?;
+
+    match candidates.len() {
+        0 => Ok(None),
+        1 => {
+            let path = candidates.remove(0);
+            let doc = parse_task_raw(&path).with_context(|| {
+                format!("failed to parse task definition {}", path.display())
+            })?;
+            Ok(Some(doc.body))
+        }
+        _ => bail!(
+            "multiple task definitions found with id {id} in {}",
+            store.display()
+        ),
+    }
+}
+
+/// Recursively collect paths under `path` whose filename plausibly names
+/// definition `id` (`<id>-<slug>.md`, or the bare `<id>.md`), without parsing
+/// them. Narrows the set of files [`find_definition_body`] has to parse.
+fn collect_definition_candidates(
+    path: &Path,
+    id: u64,
+    candidates: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let prefix = format!("{id}-");
+    let exact = format!("{id}.md");
+
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("failed to read task directory {}", path.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read task directory {}", path.display()))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry_path.display()))?;
+
+        if file_type.is_dir() {
+            collect_definition_candidates(&entry_path, id, candidates)?;
+            continue;
+        }
+
+        if entry_path
+            .extension()
+            .is_none_or(|extension| extension != "md")
+        {
+            continue;
+        }
+
+        let file_name = entry_path.file_name().map(|name| name.to_string_lossy().into_owned());
+        let Some(file_name) = file_name else {
+            continue;
+        };
+        if file_name == exact || file_name.starts_with(&prefix) {
+            candidates.push(entry_path);
+        }
+    }
+
+    Ok(())
 }
 
 pub fn write_task(task: &TaskDocument) -> Result<()> {
@@ -2291,6 +2446,184 @@ requires_user: false
         let index_raw =
             fs::read_to_string(task_dir.join(".task_index.json")).expect("index should exist");
         assert!(index_raw.contains("\"9\""));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn editing_repo_definition_after_materialization_is_visible_without_resync() {
+        // #710: materialization used to seed the home STATE body once, and every
+        // later read stayed on that frozen snapshot even after the committed
+        // definition changed. `load_task` must overlay the LIVE definition body
+        // on every read instead.
+        let root =
+            std::env::temp_dir().join(format!("varda-repo-body-overlay-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        fs::write(
+            store.join("21-policy.md"),
+            "---\nid: 21\nassignee: claude\n---\n\n# Policy Task\n\nOriginal brief.\n",
+        )
+        .expect("definition should write");
+
+        let config = test_config(&operations_dir);
+        let resolved = materialize_from_repo_definition(&config, 21, &project)
+            .expect("materialization should not fail")
+            .expect("id should resolve via repo definition");
+
+        let seeded = load_task(&resolved).expect("materialized state should load");
+        assert!(seeded.body.contains("Original brief."));
+
+        // An operator edits the committed definition AFTER materialization —
+        // e.g. recording a policy decision before spawning a worker.
+        fs::write(
+            store.join("21-policy.md"),
+            "---\nid: 21\nassignee: claude\n---\n\n# Policy Task\n\nUpdated brief with the new policy.\n",
+        )
+        .expect("definition should update");
+
+        // The home STATE file on disk still carries the stale, seeded body...
+        let raw_state = fs::read_to_string(&resolved).expect("state file should be readable");
+        assert!(raw_state.contains("Original brief."));
+
+        // ...but every read through `load_task` sees the live definition body,
+        // with no explicit re-sync step.
+        let reloaded = load_task(&resolved).expect("state should reload");
+        assert!(reloaded.body.contains("Updated brief with the new policy."));
+        assert!(!reloaded.body.contains("Original brief."));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn load_task_errors_on_duplicate_definition_ids_instead_of_picking_one() {
+        // Reviewer finding #2: two definitions claiming the same id must not be
+        // resolved by nondeterministic filesystem iteration order — the overlay
+        // must bail out explicitly, mirroring what `materialize_from_repo_definition`
+        // already does at materialization time.
+        let root = std::env::temp_dir().join(format!("varda-repo-dup-def-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        fs::write(
+            store.join("30-first.md"),
+            "---\nid: 30\nassignee: claude\n---\n\n# First\n",
+        )
+        .expect("definition should write");
+        fs::write(
+            store.join("30-second.md"),
+            "---\nid: 30\nassignee: codex\n---\n\n# Second\n",
+        )
+        .expect("definition should write");
+
+        let task_dir = operations_dir
+            .join("tasks")
+            .join(project_task_folder(&project).expect("project should slugify"));
+        fs::create_dir_all(&task_dir).expect("home task dir should be created");
+        let state_path = task_dir.join("30-first.md");
+        fs::write(
+            &state_path,
+            format!(
+                "---\nid: 30\nstatus: ready\nproject: {}\nassignee: claude\n---\n\n# First\n",
+                project.display()
+            ),
+        )
+        .expect("state should write");
+
+        let error = load_task(&state_path).expect_err(
+            "duplicate definitions must surface as an error, not a silently-chosen body",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("multiple task definitions found with id 30")
+        );
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn load_task_errors_on_unparseable_definition_matching_the_target_id() {
+        // Reviewer finding #1: a definition candidate that fails to parse must
+        // surface as an error, not be silently skipped in favor of the stale
+        // home body.
+        let root =
+            std::env::temp_dir().join(format!("varda-repo-malformed-def-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        // Filename prefix matches id 40 but the content is not a parseable task.
+        fs::write(store.join("40-broken.md"), "not a task file at all")
+            .expect("definition should write");
+
+        let task_dir = operations_dir
+            .join("tasks")
+            .join(project_task_folder(&project).expect("project should slugify"));
+        fs::create_dir_all(&task_dir).expect("home task dir should be created");
+        let state_path = task_dir.join("40-broken.md");
+        fs::write(
+            &state_path,
+            format!(
+                "---\nid: 40\nstatus: ready\nproject: {}\nassignee: claude\n---\n\n# Broken\n",
+                project.display()
+            ),
+        )
+        .expect("state should write");
+
+        let error = load_task(&state_path)
+            .expect_err("a malformed definition matching the target id must surface as an error");
+        assert!(error.to_string().contains("failed to parse task definition"));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn overlay_resolves_definition_via_mother_project_not_worker_checkout() {
+        // Reviewer finding #4 (test coverage): a task loaded from a spawned
+        // worker's isolated worktree must resolve the definition via
+        // `policy_project()` (the MOTHER project) rather than its own,
+        // possibly `.varda/`-less, checkout.
+        let root = std::env::temp_dir()
+            .join(format!("varda-repo-mother-overlay-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let mother = root.join("mother-repo");
+        let worker_checkout = root.join("worker-checkout");
+        let store = mother.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("mother repo store should be created");
+        fs::create_dir_all(&worker_checkout).expect("worker checkout should be created");
+        fs::write(
+            store.join("50-cross-worktree.md"),
+            "---\nid: 50\nassignee: claude\n---\n\n# Cross Worktree\n\nLive mother body.\n",
+        )
+        .expect("mother definition should write");
+
+        let task_dir = operations_dir
+            .join("tasks")
+            .join(project_task_folder(&worker_checkout).expect("worker checkout should slugify"));
+        fs::create_dir_all(&task_dir).expect("home task dir should be created");
+        let state_path = task_dir.join("50-cross-worktree.md");
+        fs::write(
+            &state_path,
+            format!(
+                "---\nid: 50\nstatus: ready\nproject: {}\nmother_project: {}\nassignee: claude\n---\n\n# Cross Worktree\n\nStale worker-local body.\n",
+                worker_checkout.display(),
+                mother.display()
+            ),
+        )
+        .expect("state should write");
+
+        // The worker's own checkout carries no `.varda/` store at all, so if the
+        // overlay resolved against `project` instead of `policy_project()` this
+        // would no-op and the stale body would survive.
+        assert!(repo_task_store(&worker_checkout).is_none());
+
+        let loaded = load_task(&state_path).expect("state should load");
+        assert!(loaded.body.contains("Live mother body."));
+        assert!(!loaded.body.contains("Stale worker-local body."));
 
         fs::remove_dir_all(root).expect("test directory should be removable");
     }
