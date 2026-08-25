@@ -431,6 +431,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let route = match_route(&config, Path::new("/work/special/project"), None)
@@ -534,6 +537,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let adb_route = match_route(
@@ -591,6 +597,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let error = match_route(&config, Path::new("/work/project"), Some("claude"))
@@ -663,6 +672,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),
@@ -759,6 +771,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),

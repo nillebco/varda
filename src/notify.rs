@@ -132,6 +132,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let notification = notify_user_interaction(

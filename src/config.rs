@@ -284,6 +284,60 @@ pub struct Config {
         skip_serializing_if = "crate::orchestration::OrchestrationPolicy::is_default"
     )]
     pub orchestration: crate::orchestration::OrchestrationPolicy,
+    /// Shareable config bundles: other TOML fragment files whose `[[routes]]` /
+    /// `[sandboxes.*]` / `[agents.*]` get merged into this config at load time.
+    /// See [`resolve_includes`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<IncludeEntry>,
+    /// Host commands this config (plus everything it includes) requires to be
+    /// present on `$PATH`. Validated at config-load time by [`validate_requirements`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_commands: Vec<String>,
+    /// Secret names this config (plus everything it includes) requires to be
+    /// resolvable via `fnox get NAME`. Validated at config-load time by
+    /// [`validate_requirements`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_secrets: Vec<String>,
+}
+
+/// One entry in `Config::include`: either a bare path string, or a
+/// `{path, sha256}` table. The `sha256` is stored for a FUTURE verification
+/// pass and is not checked yet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum IncludeEntry {
+    Path(String),
+    Detailed {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+    },
+}
+
+impl IncludeEntry {
+    /// The include path exactly AS WRITTEN in config (never the
+    /// expanded/resolved value) — safe to embed in error messages.
+    pub fn path(&self) -> &str {
+        match self {
+            IncludeEntry::Path(path) => path,
+            IncludeEntry::Detailed { path, .. } => path,
+        }
+    }
+}
+
+/// The subset of [`Config`] an included TOML fragment file may declare.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConfigFragment {
+    #[serde(default)]
+    pub routes: Vec<Route>,
+    #[serde(default)]
+    pub sandboxes: BTreeMap<String, SandboxConfig>,
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentConfig>,
+    #[serde(default)]
+    pub requires_commands: Vec<String>,
+    #[serde(default)]
+    pub requires_secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1747,6 +1801,294 @@ pub fn config_file() -> Result<PathBuf> {
     Ok(varda_home()?.join(CONFIG_FILENAME))
 }
 
+/// Merge every `config.include` entry's fragment into `config`.
+///
+/// Precedence: on a `sandboxes`/`agents` name collision, the CENTRAL config
+/// always wins (an included name already defined centrally is silently
+/// skipped). Among includes themselves, a LATER include wins over an earlier
+/// one. Routes have no name: central routes stay first, included routes are
+/// appended in include order.
+///
+/// `requires_commands`/`requires_secrets` declared by a fragment are unioned
+/// into `config.requires_commands`/`config.requires_secrets` (deduped).
+///
+/// CENTRAL `config.routes`/`config.sandboxes` are never touched/expanded by
+/// this function — only content coming from an included fragment goes
+/// through mount expansion.
+fn resolve_includes(config_dir: &Path, config: &mut Config) -> Result<()> {
+    let central_sandbox_names: std::collections::HashSet<String> =
+        config.sandboxes.keys().cloned().collect();
+    let central_agent_names: std::collections::HashSet<String> =
+        config.agents.keys().cloned().collect();
+
+    for entry in &config.include {
+        let expanded_path = expand_env_and_home(entry.path())
+            .with_context(|| format!("failed to resolve include path {}", entry.path()))?;
+        let include_path = PathBuf::from(resolve_bundle_relative(&expanded_path, config_dir));
+        let bundle_dir = include_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| config_dir.to_path_buf());
+
+        let content = fs::read_to_string(&include_path)
+            .with_context(|| format!("failed to read included config fragment {}", entry.path()))?;
+        let mut fragment: ConfigFragment = toml::from_str(&content).with_context(|| {
+            format!("failed to parse included config fragment {}", entry.path())
+        })?;
+
+        for route in &mut fragment.routes {
+            expand_route_mounts(route, Some(&bundle_dir))?;
+        }
+        for sandbox in fragment.sandboxes.values_mut() {
+            expand_sandbox_mounts(sandbox, Some(&bundle_dir))?;
+        }
+        for agent in fragment.agents.values_mut() {
+            agent.command = resolve_bundle_relative_command(&agent.command, &bundle_dir);
+            if let Some(working_dir) = &agent.working_dir {
+                agent.working_dir = Some(resolve_bundle_relative_command(working_dir, &bundle_dir));
+            }
+        }
+
+        config.routes.append(&mut fragment.routes);
+        for (name, sandbox) in fragment.sandboxes {
+            if !central_sandbox_names.contains(&name) {
+                config.sandboxes.insert(name, sandbox);
+            }
+        }
+        for (name, agent) in fragment.agents {
+            if !central_agent_names.contains(&name) {
+                config.agents.insert(name, agent);
+            }
+        }
+        for command in fragment.requires_commands {
+            if !config.requires_commands.contains(&command) {
+                config.requires_commands.push(command);
+            }
+        }
+        for secret in fragment.requires_secrets {
+            if !config.requires_secrets.contains(&secret) {
+                config.requires_secrets.push(secret);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Expand `${env:NAME}` references and a leading `~` in a plain (non-mount)
+/// string, e.g. an include path. `${env:NAME}` errors if `NAME` is unset.
+fn expand_env_and_home(value: &str) -> Result<String> {
+    let mut result = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${env:") {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + "${env:".len()..];
+        let end = after
+            .find('}')
+            .context("malformed ${env:NAME} reference: missing closing '}'")?;
+        let name = &after[..end];
+        let resolved = std::env::var(name).with_context(|| {
+            format!("environment variable '{name}' referenced by ${{env:{name}}} is not set")
+        })?;
+        result.push_str(&resolved);
+        rest = &after[end + 1..];
+    }
+    result.push_str(rest);
+
+    if let Some(stripped) = result.strip_prefix('~')
+        && (stripped.is_empty() || stripped.starts_with('/'))
+    {
+        let home = std::env::var("HOME").context("HOME is not set, cannot expand '~'")?;
+        result = format!("{home}{stripped}");
+    }
+
+    Ok(result)
+}
+
+/// Resolve a bundle-relative path/value against `base_dir` (the directory the
+/// value's OWN config fragment lives in). Values already absolute pass
+/// through unchanged. Values containing the literal substring `{project}`
+/// ALSO pass through unchanged: `{project}` is a symbolic placeholder
+/// resolved later, at sandbox-launch time, by `crate::sandbox::expand_mount_path`
+/// against the matched project root — resolving it here as a literal relative
+/// path would corrupt it (e.g. "{project}/vendor" would become
+/// "<bundle_dir>/{project}/vendor").
+fn resolve_bundle_relative(value: &str, base_dir: &Path) -> String {
+    if value.contains("{project}") {
+        return value.to_owned();
+    }
+    let candidate = Path::new(value);
+    if candidate.is_absolute() {
+        value.to_owned()
+    } else {
+        base_dir.join(candidate).to_string_lossy().into_owned()
+    }
+}
+
+fn resolve_bundle_relative_command(value: &str, base_dir: &Path) -> String {
+    resolve_bundle_relative(value, base_dir)
+}
+
+/// Split a `source[:target][:mode]` mount spec on `:`, keeping any
+/// `${env:NAME}` reference atomic (a `:` inside `${env:...}` is part of the
+/// reference syntax, never a segment delimiter).
+fn split_mount_segments(spec: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    while i < spec.len() {
+        if spec[i..].starts_with("${env:") {
+            match spec[i..].find('}') {
+                Some(rel_end) => {
+                    i += rel_end + 1;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        if spec.as_bytes()[i] == b':' {
+            segments.push(spec[seg_start..i].to_owned());
+            seg_start = i + 1;
+        }
+        i += 1;
+    }
+    segments.push(spec[seg_start..].to_owned());
+    segments
+}
+
+/// Expand `${env:NAME}` (and, for the `source` segment, a leading `~`) within
+/// one mount segment. If a resolved `${env:NAME}` value itself contains `:`,
+/// error WITHOUT embedding the resolved value in the message (it may be
+/// credential-bearing) — name only the mount, segment role, and env var NAME.
+fn expand_mount_segment(segment: &str, mount_desc: &str, segment_role: &str) -> Result<String> {
+    let mut result = String::new();
+    let mut rest = segment;
+    while let Some(start) = rest.find("${env:") {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + "${env:".len()..];
+        let end = after.find('}').with_context(|| {
+            format!("mount '{mount_desc}' ({segment_role} segment): malformed ${{env:NAME}} reference, missing closing '}}'")
+        })?;
+        let name = &after[..end];
+        let value = std::env::var(name).with_context(|| {
+            format!("mount '{mount_desc}' ({segment_role} segment): environment variable '{name}' referenced by ${{env:{name}}} is not set")
+        })?;
+        if value.contains(':') {
+            bail!(
+                "mount '{mount_desc}' ({segment_role} segment): value resolved from ${{env:{name}}} contains ':', which is not allowed in a mount segment"
+            );
+        }
+        result.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    result.push_str(rest);
+
+    if segment_role == "source"
+        && let Some(stripped) = result.strip_prefix('~')
+        && (stripped.is_empty() || stripped.starts_with('/'))
+    {
+        let home = std::env::var("HOME").with_context(|| {
+            format!(
+                "mount '{mount_desc}' ({segment_role} segment): HOME is not set, cannot expand '~'"
+            )
+        })?;
+        result = format!("{home}{stripped}");
+    }
+
+    Ok(result)
+}
+
+fn expand_relocatable_mount(spec: &str, bundle_dir: Option<&Path>) -> Result<String> {
+    let segments = split_mount_segments(spec);
+    let mut expanded = Vec::with_capacity(segments.len());
+    for (idx, segment) in segments.iter().enumerate() {
+        let role = match idx {
+            0 => "source",
+            1 => "target",
+            _ => "mode",
+        };
+        let mut value = expand_mount_segment(segment, spec, role)?;
+        if idx == 0
+            && let Some(base) = bundle_dir
+        {
+            value = resolve_bundle_relative(&value, base);
+        }
+        expanded.push(value);
+    }
+    Ok(expanded.join(":"))
+}
+
+fn expand_route_mounts(route: &mut Route, bundle_dir: Option<&Path>) -> Result<()> {
+    for mount in &mut route.mounts {
+        *mount = expand_relocatable_mount(mount, bundle_dir)?;
+    }
+    Ok(())
+}
+
+fn expand_sandbox_mounts(sandbox: &mut SandboxConfig, bundle_dir: Option<&Path>) -> Result<()> {
+    for mount in &mut sandbox.mounts {
+        *mount = expand_relocatable_mount(mount, bundle_dir)?;
+    }
+    Ok(())
+}
+
+/// Whether `command` resolves to an executable file somewhere on `$PATH`.
+fn command_on_path(command: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| dir.join(command).is_file())
+}
+
+/// Whether stdout captured from `fnox get NAME` counts as a resolved secret.
+/// A bare newline (fnox exits 0 but the secret is unset/empty) must NOT count
+/// as resolved — only non-whitespace content does.
+fn fnox_output_is_resolved(output: &str) -> bool {
+    !output.trim().is_empty()
+}
+
+/// Whether `fnox get name` resolves to a non-empty value on this host. Never
+/// surfaces the resolved value anywhere — only success/emptiness is reported.
+fn secret_is_resolvable(name: &str) -> bool {
+    std::process::Command::new("fnox")
+        .arg("get")
+        .arg(name)
+        .output()
+        .map(|output| {
+            output.status.success()
+                && fnox_output_is_resolved(&String::from_utf8_lossy(&output.stdout))
+        })
+        .unwrap_or(false)
+}
+
+/// Fail loudly, at config-load time, when a declared `requires_commands` or
+/// `requires_secrets` dependency is not satisfied on this host — listing
+/// EVERY missing item in ONE error, not stopping at the first.
+fn validate_requirements(config: &Config) -> Result<()> {
+    let mut missing = Vec::new();
+
+    for command in &config.requires_commands {
+        if !command_on_path(command) {
+            missing.push(format!("command '{command}' not found on $PATH"));
+        }
+    }
+    for secret in &config.requires_secrets {
+        if !secret_is_resolvable(secret) {
+            missing.push(format!(
+                "secret '{secret}' not resolvable via `fnox get {secret}`"
+            ));
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "config declares requirements not satisfied on this host:\n  - {}",
+        missing.join("\n  - ")
+    );
+}
+
 pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
     let path = path.as_ref();
     let content = fs::read_to_string(path)
@@ -1754,8 +2096,13 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
     let mut config: Config = toml::from_str(&content)
         .with_context(|| format!("failed to parse config at {}", path.display()))?;
     resolve_config_paths(path, &mut config)?;
+    let config_dir = path
+        .parent()
+        .with_context(|| format!("config path {} has no parent", path.display()))?;
+    resolve_includes(config_dir, &mut config)?;
     remove_legacy_codex_exec_args(&mut config);
     add_varda_project_dir_to_default_agents(&mut config);
+    validate_requirements(&config)?;
 
     Ok(config)
 }
@@ -3814,5 +4161,298 @@ mod resident_tests {
             &resident_policy(),
         )
         .expect("a workspace with a clean, credential-free remote must pass");
+    }
+}
+
+#[cfg(test)]
+mod bundle_include_tests {
+    use super::*;
+
+    fn minimal_config_toml() -> String {
+        r#"[defaults]
+timeout_seconds = 600
+operations_dir = "operations"
+
+[[routes]]
+glob = "**"
+agents = ["codex"]
+
+[agents.codex]
+kind = "acp"
+command = "codex"
+"#
+        .to_owned()
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "varda-bundle-{tag}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        dir
+    }
+
+    #[test]
+    fn resolve_includes_central_wins_and_later_include_wins_among_fragments() {
+        let root = temp_dir("precedence");
+
+        fs::write(
+            root.join("frag1.toml"),
+            "[sandboxes.shared]\nimage = \"frag1-image\"\n\n[sandboxes.dup]\nimage = \"frag1-dup\"\n",
+        )
+        .expect("frag1 should be written");
+        fs::write(
+            root.join("frag2.toml"),
+            "[sandboxes.shared]\nimage = \"frag2-image\"\n\n[sandboxes.dup]\nimage = \"frag2-dup\"\n",
+        )
+        .expect("frag2 should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.sandboxes.insert(
+            "shared".to_owned(),
+            SandboxConfig {
+                image: Some("central-image".to_owned()),
+                ..Default::default()
+            },
+        );
+        config.include = vec![
+            IncludeEntry::Path("frag1.toml".to_owned()),
+            IncludeEntry::Path("frag2.toml".to_owned()),
+        ];
+
+        resolve_includes(&root, &mut config).expect("includes should resolve");
+
+        assert_eq!(
+            config.sandboxes["shared"].image.as_deref(),
+            Some("central-image"),
+            "a name already defined centrally must never be overwritten by an include"
+        );
+        assert_eq!(
+            config.sandboxes["dup"].image.as_deref(),
+            Some("frag2-dup"),
+            "among includes themselves, a later include must win over an earlier one"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn project_placeholder_mount_passes_through_include_expansion_untouched() {
+        let root = temp_dir("project-placeholder");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[sandboxes.from_frag]\nmounts = [\"{project}/vendor:/vendor:ro\"]\n",
+        )
+        .expect("frag should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+
+        resolve_includes(&root, &mut config).expect("includes should resolve");
+
+        assert_eq!(
+            config.sandboxes["from_frag"].mounts,
+            vec!["{project}/vendor:/vendor:ro".to_owned()],
+            "a {{project}} placeholder must stay literal, not be resolved against the bundle dir"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn central_sandboxes_and_routes_are_never_touched_when_there_are_no_includes() {
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.sandboxes.insert(
+            "central".to_owned(),
+            SandboxConfig {
+                mounts: vec!["./relative-central:/x:ro".to_owned()],
+                ..Default::default()
+            },
+        );
+        config.routes[0].mounts = vec!["./relative-route:/y:ro".to_owned()];
+
+        let root = temp_dir("no-includes");
+        resolve_includes(&root, &mut config).expect("includes should resolve");
+
+        assert_eq!(
+            config.sandboxes["central"].mounts,
+            vec!["./relative-central:/x:ro".to_owned()],
+            "central sandbox mounts must never be expanded by resolve_includes"
+        );
+        assert_eq!(
+            config.routes[0].mounts,
+            vec!["./relative-route:/y:ro".to_owned()],
+            "central route mounts must never be expanded by resolve_includes"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn include_read_error_references_as_written_path_not_resolved_value() {
+        let root = temp_dir("error-leak");
+        // SAFETY: test-only env var, unique name, no concurrent access to it.
+        unsafe {
+            std::env::set_var("VARDA_TEST_BUNDLE_SECRET_DIR", "super-secret-directory-name");
+        }
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path(
+            "${env:VARDA_TEST_BUNDLE_SECRET_DIR}/missing-fragment.toml".to_owned(),
+        )];
+
+        let err = resolve_includes(&root, &mut config)
+            .expect_err("a nonexistent include file must fail to resolve");
+        let message = format!("{err:#}");
+
+        unsafe {
+            std::env::remove_var("VARDA_TEST_BUNDLE_SECRET_DIR");
+        }
+
+        assert!(
+            message.contains("${env:VARDA_TEST_BUNDLE_SECRET_DIR}/missing-fragment.toml"),
+            "error must reference the include path as written: {message}"
+        );
+        assert!(
+            !message.contains("super-secret-directory-name"),
+            "error must never embed the resolved/expanded path value: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn colon_in_resolved_env_value_errors_without_leaking_the_value() {
+        // SAFETY: test-only env var, unique name, no concurrent access to it.
+        unsafe {
+            std::env::set_var("VARDA_TEST_MOUNT_COLON_VALUE", "abc:def-super-secret");
+        }
+
+        let result =
+            expand_relocatable_mount("${env:VARDA_TEST_MOUNT_COLON_VALUE}:/target:ro", None);
+
+        unsafe {
+            std::env::remove_var("VARDA_TEST_MOUNT_COLON_VALUE");
+        }
+
+        let err = result.expect_err("a resolved value containing ':' must be rejected");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("VARDA_TEST_MOUNT_COLON_VALUE"),
+            "error must name the offending env var: {message}"
+        );
+        assert!(
+            !message.contains("abc:def-super-secret"),
+            "error must never embed the resolved value itself: {message}"
+        );
+    }
+
+    #[test]
+    fn requires_commands_naming_missing_command_fails_load_with_its_name() {
+        let root = temp_dir("requires-commands-missing");
+        let path = root.join("config.toml");
+        let content = format!(
+            "requires_commands = [\"definitely-not-a-real-command-xyz123\"]\n{}",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        let err = load_config(&path).expect_err("missing required command must fail load");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("definitely-not-a-real-command-xyz123"),
+            "error must name the missing command: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn requires_secrets_naming_unresolvable_secret_fails_load_with_its_name() {
+        let root = temp_dir("requires-secrets-missing");
+        let path = root.join("config.toml");
+        let content = format!(
+            "requires_secrets = [\"definitely-not-a-real-secret-xyz123\"]\n{}",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        let err = load_config(&path).expect_err("unresolvable required secret must fail load");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("definitely-not-a-real-secret-xyz123"),
+            "error must name the missing secret: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn requires_commands_and_requires_secrets_both_missing_report_one_error_with_both_names() {
+        let root = temp_dir("requires-both-missing");
+        let path = root.join("config.toml");
+        let content = format!(
+            "requires_commands = [\"definitely-not-a-real-command-abc123\"]\nrequires_secrets = [\"definitely-not-a-real-secret-abc123\"]\n{}",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        let err = load_config(&path).expect_err("both missing requirements must fail load");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("definitely-not-a-real-command-abc123"),
+            "single error must contain the missing command name: {message}"
+        );
+        assert!(
+            message.contains("definitely-not-a-real-secret-abc123"),
+            "single error must contain the missing secret name: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fnox_output_is_resolved_treats_blank_output_as_unresolved() {
+        assert!(!fnox_output_is_resolved("\n"));
+        assert!(!fnox_output_is_resolved(""));
+        assert!(fnox_output_is_resolved("secret-value\n"));
+    }
+
+    #[test]
+    fn included_fragment_requires_commands_are_unioned_and_validated_on_load() {
+        let root = temp_dir("requires-from-fragment");
+        fs::write(
+            root.join("frag.toml"),
+            "requires_commands = [\"definitely-not-a-real-command-from-fragment\"]\n",
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        let content = format!(
+            "include = [\"frag.toml\"]\n{}",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        let err =
+            load_config(&path).expect_err("a fragment's unresolved requirement must fail load");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("definitely-not-a-real-command-from-fragment"),
+            "error must name the command required by the included fragment: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 }
