@@ -2266,13 +2266,41 @@ fn validate_requirements(config: &Config) -> Result<()> {
     );
 }
 
-pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
-    let path = path.as_ref();
+fn parse_central_config(path: &Path) -> Result<Config> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
     let mut config: Config = toml::from_str(&content)
         .with_context(|| format!("failed to parse config at {}", path.display()))?;
     resolve_config_paths(path, &mut config)?;
+
+    Ok(config)
+}
+
+/// Tier 1: parses only the central `config.toml` file itself. Does NOT resolve
+/// `include`d bundle fragments and does NOT validate `requires_commands`/`requires_secrets`.
+/// `config.include` is populated from parsing but left unprocessed — `sandboxes`/`agents`/
+/// `routes` reflect only the central file's own content. Cheap and side-effect free (no
+/// fragment file reads, no `fnox` shell-outs). Use this for call sites that don't need
+/// bundle-sourced routes/agents/sandboxes to be correct.
+pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
+    let path = path.as_ref();
+    let mut config = parse_central_config(path)?;
+    remove_legacy_codex_exec_args(&mut config);
+    add_varda_project_dir_to_default_agents(&mut config);
+
+    Ok(config)
+}
+
+/// Tier 2: central-config parsing, then `resolve_includes` (merges bundle fragments'
+/// `[[routes]]`/`[sandboxes.*]`/`[agents.*]`), then the same agent-normalization steps as
+/// `load_config` (now applied to the merged agent set, matching the pre-split behavior),
+/// then `validate_requirements` (enforces `requires_commands`/`requires_secrets`).
+/// Functionally identical to the pre-split `load_config`. Use this for call sites whose
+/// correctness depends on bundle-sourced routes/agents/sandboxes (routing/dispatch
+/// decisions, sandbox resolution).
+pub fn resolve_config(path: impl AsRef<Path>) -> Result<Config> {
+    let path = path.as_ref();
+    let mut config = parse_central_config(path)?;
     let config_dir = path
         .parent()
         .with_context(|| format!("config path {} has no parent", path.display()))?;
@@ -4541,7 +4569,7 @@ command = "codex"
         );
         fs::write(&path, content).expect("config should be written");
 
-        let err = load_config(&path).expect_err("missing required command must fail load");
+        let err = resolve_config(&path).expect_err("missing required command must fail load");
         let message = format!("{err:#}");
 
         assert!(
@@ -4562,7 +4590,7 @@ command = "codex"
         );
         fs::write(&path, content).expect("config should be written");
 
-        let err = load_config(&path).expect_err("unresolvable required secret must fail load");
+        let err = resolve_config(&path).expect_err("unresolvable required secret must fail load");
         let message = format!("{err:#}");
 
         assert!(
@@ -4583,7 +4611,7 @@ command = "codex"
         );
         fs::write(&path, content).expect("config should be written");
 
-        let err = load_config(&path).expect_err("both missing requirements must fail load");
+        let err = resolve_config(&path).expect_err("both missing requirements must fail load");
         let message = format!("{err:#}");
 
         assert!(
@@ -4622,7 +4650,7 @@ command = "codex"
         fs::write(&path, content).expect("config should be written");
 
         let err =
-            load_config(&path).expect_err("a fragment's unresolved requirement must fail load");
+            resolve_config(&path).expect_err("a fragment's unresolved requirement must fail load");
         let message = format!("{err:#}");
 
         assert!(
@@ -4683,7 +4711,7 @@ command = "codex"
         )
         .expect("config should be written");
 
-        let err = load_config(&path).expect_err("unrecognized top-level fragment key must fail");
+        let err = resolve_config(&path).expect_err("unrecognized top-level fragment key must fail");
         let message = format!("{err:#}");
 
         assert!(
@@ -4710,7 +4738,7 @@ command = "codex"
         )
         .expect("config should be written");
 
-        let err = load_config(&path)
+        let err = resolve_config(&path)
             .expect_err("unrecognized key inside a fragment's [sandboxes.X] must fail");
         let message = format!("{err:#}");
 
@@ -4742,7 +4770,7 @@ command = "codex"
         )
         .expect("config should be written");
 
-        let err = load_config(&path)
+        let err = resolve_config(&path)
             .expect_err("unrecognized key inside a fragment credential entry must fail");
         let message = format!("{err:#}");
 
@@ -4788,7 +4816,7 @@ agents = ["frag_agent"]
         )
         .expect("config should be written");
 
-        let config = load_config(&path)
+        let config = resolve_config(&path)
             .expect("a fragment using only recognized keys must load successfully");
 
         assert!(config.sandboxes.contains_key("frag"));
@@ -4814,6 +4842,59 @@ agents = ["frag_agent"]
         assert_eq!(
             config.sandboxes["central"].image.as_deref(),
             Some("central-image")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tier1_load_config_skips_requirement_validation_that_tier2_resolve_config_enforces() {
+        let root = temp_dir("tier1-skips-requirements");
+        let path = root.join("config.toml");
+        let content = format!(
+            "requires_commands = [\"definitely-not-a-real-command-tier1\"]\n{}",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        load_config(&path).expect("Tier 1 load_config must not run validate_requirements at all");
+        let err = resolve_config(&path)
+            .expect_err("Tier 2 resolve_config must still enforce requires_commands");
+        assert!(
+            format!("{err:#}").contains("definitely-not-a-real-command-tier1"),
+            "resolve_config error must name the missing command"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bundle_sourced_route_is_visible_via_resolve_config_but_not_via_load_config() {
+        let root = temp_dir("tier-route-visibility");
+        fs::write(
+            root.join("frag.toml"),
+            "[[routes]]\nglob = \"bundle/**\"\nagents = [\"codex\"]\n",
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .expect("config should be written");
+
+        let tier1 =
+            load_config(&path).expect("Tier 1 load_config should still parse the central file");
+        assert!(
+            !tier1.routes.iter().any(|route| route.glob == "bundle/**"),
+            "Tier 1 load_config must not merge include-sourced routes"
+        );
+
+        let tier2 = resolve_config(&path).expect("Tier 2 resolve_config should resolve includes");
+        assert!(
+            tier2.routes.iter().any(|route| route.glob == "bundle/**"),
+            "Tier 2 resolve_config must merge include-sourced routes"
         );
 
         fs::remove_dir_all(&root).ok();

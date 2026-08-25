@@ -181,7 +181,7 @@ fn persisted_boot_probe(log: &str) -> Option<Probe> {
 }
 
 pub fn doctor_task_command(task_ref: &Path) -> Result<()> {
-    let config = config::load_config(&config::config_file()?)?;
+    let config = config::resolve_config(&config::config_file()?)?;
     let task_path = task::resolve_task_reference(&config, task_ref)?;
     let document = task::load_task(&task_path)?;
     let Some(session_id) = document.frontmatter.agent_session_ids.last() else {

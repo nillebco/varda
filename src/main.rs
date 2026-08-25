@@ -377,7 +377,7 @@ async fn run_cli() -> Result<()> {
             ConfigCommand::Show { resolved } => {
                 let config_path = config::config_file()?;
                 if resolved {
-                    let config = config::load_config(&config_path)?;
+                    let config = config::resolve_config(&config_path)?;
                     let content =
                         toml::to_string_pretty(&config).context("failed to serialize config")?;
                     println!("{content}");
@@ -444,7 +444,7 @@ async fn run_cli() -> Result<()> {
                     (name, desc)
                 };
                 let config_path = config::config_file()?;
-                let config = config::load_config(&config_path)?;
+                let config = config::resolve_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
                 // --reuse (with --exec): if this (project, name) task already exists,
                 // resume it instead of erroring on the collision. Lets the shell aliases
@@ -706,7 +706,7 @@ async fn run_cli() -> Result<()> {
 
 fn plan_command() -> Result<()> {
     let config_path = config::config_file()?;
-    let config = config::load_config(&config_path)?;
+    let config = config::resolve_config(&config_path)?;
     let project_path = task::resolve_project_path(None)?;
     let project_tasks = task::list_tasks(&config, &project_path)?;
     let (scope, considered_tasks, selection_reason) = if project_tasks.is_empty() {
@@ -1094,7 +1094,7 @@ fn looks_like_task(config: &config::Config, path: &Path) -> bool {
 
 async fn run_plan_command(plan_path: &Path, yes: bool) -> Result<()> {
     let config_path = config::config_file()?;
-    let config = config::load_config(&config_path)?;
+    let config = config::resolve_config(&config_path)?;
     let plan_path = if plan_path.exists() {
         plan_path.to_path_buf()
     } else {
@@ -1234,7 +1234,7 @@ fn load_json_execution_plan(path: &Path) -> Result<JsonExecutionPlan> {
 
 async fn run_ready_tasks_command(yes: bool) -> Result<()> {
     let config_path = config::config_file()?;
-    let config = config::load_config(&config_path)?;
+    let config = config::resolve_config(&config_path)?;
     let ready_summaries: Vec<task::TaskSummary> = task::list_all_tasks(&config)?
         .into_iter()
         .filter(|summary| summary.status == task::TaskStatus::Ready)
@@ -2670,7 +2670,7 @@ fn render_show_task_output(task_path: &Path, task_document: &task::TaskDocument)
 
 fn inspect_task_command(task_path: &Path) -> Result<()> {
     let config_path = config::config_file()?;
-    let config = config::load_config(&config_path)?;
+    let config = config::resolve_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
     let task = task::load_task(&task_path)?;
     let fm = &task.frontmatter;
@@ -3953,7 +3953,7 @@ fn resolve_or_scaffold_resident_task(
 
 async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Result<()> {
     let config_path = config::config_file()?;
-    let config = config::load_config(&config_path)?;
+    let config = config::resolve_config(&config_path)?;
 
     // Default to a dedicated workspace under the Varda home — never $HOME/~/dev.
     let workspace = match workspace {
@@ -4011,7 +4011,7 @@ async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Res
 
 async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> Result<()> {
     let config_path = config::config_file()?;
-    let config = config::load_config(&config_path)?;
+    let config = config::resolve_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
     let task_document = task::load_task(&task_path)?;
     let id_str = task_document
@@ -4272,7 +4272,7 @@ fn apply_verification_gate(
 
 async fn plan_task_command(task_path: &Path) -> Result<()> {
     let config_path = config::config_file()?;
-    let config = config::load_config(&config_path)?;
+    let config = config::resolve_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
     let task_document = task::load_task(&task_path)?;
     let route = routing::match_route_for_task(&config, &task_document, true)?;
@@ -4320,7 +4320,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
 
 async fn resume_task_command(task_path: &Path, fresh: bool, interactive: bool) -> Result<()> {
     let config_path = config::config_file()?;
-    let config = config::load_config(&config_path)?;
+    let config = config::resolve_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
     let mut task_document = task::load_task(&task_path)?;
     let was_needs_user = task_document.frontmatter.status == task::TaskStatus::NeedsUser;
