@@ -413,11 +413,21 @@ fn collect_definition_candidates(
     Ok(())
 }
 
-pub fn write_task(task: &TaskDocument) -> Result<()> {
+/// Render a task document (frontmatter + body) into the on-disk markdown
+/// format, without writing it anywhere. Shared by [`write_task`] and by CLI
+/// display (`varda task show`), so both surfaces render the SAME frontmatter
+/// serialization — and, critically, display callers pass the `load_task`
+/// (overlaid) document rather than a raw file read, so an edited repo-local
+/// definition body shows up here too (#710).
+pub fn render_task_document(task: &TaskDocument) -> Result<String> {
     let frontmatter =
         serde_yaml::to_string(&task.frontmatter).context("failed to serialize task frontmatter")?;
     let frontmatter = frontmatter.trim_start_matches("---\n").trim_end();
-    let content = format!("---\n{frontmatter}\n---\n\n{}", task.body.trim_start());
+    Ok(format!("---\n{frontmatter}\n---\n\n{}", task.body.trim_start()))
+}
+
+pub fn write_task(task: &TaskDocument) -> Result<()> {
+    let content = render_task_document(task)?;
 
     fs::write(&task.path, content)
         .with_context(|| format!("failed to write task at {}", task.path.display()))?;
@@ -2493,6 +2503,48 @@ requires_user: false
         let reloaded = load_task(&resolved).expect("state should reload");
         assert!(reloaded.body.contains("Updated brief with the new policy."));
         assert!(!reloaded.body.contains("Original brief."));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn render_task_document_reflects_the_overlaid_body_not_the_raw_home_file() {
+        // #710 follow-up: `varda task show` computed the overlaid document via
+        // `load_task` but printed a separate raw `fs::read_to_string` of the home
+        // file instead, so CLI display stayed on the stale snapshot even though
+        // every other read path (get_task, run_subtask, list_tasks) was already
+        // fixed. `render_task_document` is what CLI display now renders from —
+        // assert it carries the live definition body, not the raw file's.
+        let root =
+            std::env::temp_dir().join(format!("varda-render-overlay-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        fs::write(
+            store.join("22-policy.md"),
+            "---\nid: 22\nassignee: claude\n---\n\n# Policy Task\n\nOriginal brief.\n",
+        )
+        .expect("definition should write");
+
+        let config = test_config(&operations_dir);
+        let resolved = materialize_from_repo_definition(&config, 22, &project)
+            .expect("materialization should not fail")
+            .expect("id should resolve via repo definition");
+
+        fs::write(
+            store.join("22-policy.md"),
+            "---\nid: 22\nassignee: claude\n---\n\n# Policy Task\n\nUpdated brief with the new policy.\n",
+        )
+        .expect("definition should update");
+
+        let raw_state = fs::read_to_string(&resolved).expect("state file should be readable");
+        assert!(raw_state.contains("Original brief."));
+
+        let reloaded = load_task(&resolved).expect("state should reload");
+        let rendered = render_task_document(&reloaded).expect("document should render");
+        assert!(rendered.contains("Updated brief with the new policy."));
+        assert!(!rendered.contains("Original brief."));
 
         fs::remove_dir_all(root).expect("test directory should be removable");
     }

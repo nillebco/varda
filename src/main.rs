@@ -2599,45 +2599,50 @@ async fn run_spawned_subtask_settling(
 
 fn show_task_command(task_path: &Path) -> Result<()> {
     let task_path = resolve_task_for_show(task_path)?;
-    let task_content = fs::read_to_string(&task_path)
-        .with_context(|| format!("failed to read task at {}", task_path.display()))?;
     let task_document = task::load_task(&task_path)?;
+    let output = render_show_task_output(&task_path, &task_document)?;
+    print!("{output}");
+    Ok(())
+}
 
-    println!("# Task {}", task_path.display());
-    println!();
-    print!("{task_content}");
+/// Build the full text `varda task show` prints, as a `String` (rather than
+/// printing directly) so it is unit-testable. Renders `task_document` — the
+/// `load_task`-overlaid document — via `task::render_task_document`, NOT a
+/// separate raw read of `task_path`; a prior version read the overlaid
+/// document but printed a raw `fs::read_to_string` of the home file instead,
+/// so this surface stayed on the stale body even after every other read path
+/// (get_task, run_subtask, list_tasks) picked up a post-materialization edit
+/// to the repo-local definition (#710).
+fn render_show_task_output(task_path: &Path, task_document: &task::TaskDocument) -> Result<String> {
+    let task_content = task::render_task_document(task_document)?;
+
+    let mut out = String::new();
+    out.push_str(&format!("# Task {}\n\n", task_path.display()));
+    out.push_str(&task_content);
     if !task_content.ends_with('\n') {
-        println!();
+        out.push('\n');
     }
-
-    println!();
-    println!("---");
-    println!();
+    out.push_str("\n---\n\n");
 
     if task_document.frontmatter.recaps.is_empty() {
-        println!("# Recap");
-        println!();
-        println!("No recap is associated with this task.");
-        return Ok(());
+        out.push_str("# Recap\n\nNo recap is associated with this task.\n");
+        return Ok(out);
     }
 
     for recap_path_str in &task_document.frontmatter.recaps {
-        let recap_path = resolve_recap_path(recap_path_str, &task_path);
+        let recap_path = resolve_recap_path(recap_path_str, task_path);
         let recap_content = fs::read_to_string(&recap_path)
             .with_context(|| format!("failed to read recap at {}", recap_path.display()))?;
 
-        println!("# Recap {}", recap_path.display());
-        println!();
-        print!("{recap_content}");
+        out.push_str(&format!("# Recap {}\n\n", recap_path.display()));
+        out.push_str(&recap_content);
         if !recap_content.ends_with('\n') {
-            println!();
+            out.push('\n');
         }
-        println!();
-        println!("---");
-        println!();
+        out.push_str("\n---\n\n");
     }
 
-    Ok(())
+    Ok(out)
 }
 
 fn inspect_task_command(task_path: &Path) -> Result<()> {
@@ -3069,8 +3074,7 @@ fn load_dashboard_task_detail(
 ) -> Result<DashboardTaskDetail> {
     let task_path = task::resolve_task_reference(config, task_path)?;
     let document = task::load_task(&task_path)?;
-    let markdown = fs::read_to_string(&task_path)
-        .with_context(|| format!("failed to read task at {}", task_path.display()))?;
+    let markdown = task::render_task_document(&document)?;
     let recaps = document
         .frontmatter
         .recaps
@@ -4877,6 +4881,90 @@ mod tests {
         assert!(msg.contains("EXFIL"), "error must name the key: {msg}");
         // The sentinel is left in place; no value was resolved.
         assert_eq!(env.get("EXFIL").unwrap(), "${fnox:aws-prod-key}");
+    }
+
+    #[test]
+    fn render_show_task_output_uses_the_overlaid_body_not_the_raw_home_file() {
+        // #710 follow-up: `varda task show` computed the overlaid document via
+        // `task::load_task` but printed a separate raw read of the home file
+        // instead, so it displayed the stale body even after a post-materialization
+        // edit to the repo-local definition — the one read path (get_task,
+        // run_subtask, list_tasks, CLI display) #710 named that the fix missed.
+        // This drives `render_show_task_output` with a home file/definition pair
+        // whose bodies genuinely diverge, so it fails if the CLI path regresses
+        // back to reading the raw file.
+        let root =
+            std::env::temp_dir().join(format!("varda-show-task-overlay-{}", std::process::id()));
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        std::fs::create_dir_all(&store).expect("repo store should be created");
+        std::fs::write(
+            store.join("40-policy.md"),
+            "---\nid: 40\nassignee: claude\n---\n\n# Policy Task\n\nNew body from the repo definition.\n",
+        )
+        .expect("definition should write");
+
+        let home_dir = root.join("operations");
+        std::fs::create_dir_all(&home_dir).expect("home dir should be created");
+        let home_path = home_dir.join("40-policy.md");
+        std::fs::write(
+            &home_path,
+            format!(
+                "---\nid: 40\nstatus: review\nproject: {}\nassignee: claude\n---\n\n# Policy Task\n\nOld body frozen at materialization.\n",
+                project.display()
+            ),
+        )
+        .expect("home state file should write");
+
+        let task_document = task::load_task(&home_path).expect("home state should load overlaid");
+        let output = render_show_task_output(&home_path, &task_document)
+            .expect("show output should render");
+
+        assert!(output.contains("New body from the repo definition."));
+        assert!(!output.contains("Old body frozen at materialization."));
+
+        std::fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn load_dashboard_task_detail_uses_the_overlaid_body_not_the_raw_home_file() {
+        // #710 follow-up (codex review of the CLI fix, #736): the web dashboard's
+        // task-detail view had the identical defect as `varda task show` — it
+        // loaded the overlaid `task::load_task` document (for `recaps` only) but
+        // built `markdown` from a separate raw `fs::read_to_string(&task_path)`,
+        // so the dashboard alone would still show a stale body after a
+        // post-materialization edit to the repo-local definition.
+        let root = std::env::temp_dir()
+            .join(format!("varda-dashboard-detail-overlay-{}", std::process::id()));
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        fs::write(
+            store.join("41-policy.md"),
+            "---\nid: 41\nassignee: claude\n---\n\n# Policy Task\n\nNew body from the repo definition.\n",
+        )
+        .expect("definition should write");
+
+        let home_dir = root.join("operations");
+        fs::create_dir_all(&home_dir).expect("home dir should be created");
+        let home_path = home_dir.join("41-policy.md");
+        fs::write(
+            &home_path,
+            format!(
+                "---\nid: 41\nstatus: review\nproject: {}\nassignee: claude\n---\n\n# Policy Task\n\nOld body frozen at materialization.\n",
+                project.display()
+            ),
+        )
+        .expect("home state file should write");
+
+        let config = launcher_test_config(&root);
+        let detail = load_dashboard_task_detail(&config, &home_path)
+            .expect("dashboard detail should load");
+
+        assert!(detail.markdown.contains("New body from the repo definition."));
+        assert!(!detail.markdown.contains("Old body frozen at materialization."));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
     }
 
     #[derive(Debug, Deserialize)]
