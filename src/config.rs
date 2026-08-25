@@ -338,6 +338,11 @@ pub struct ConfigFragment {
     pub requires_commands: Vec<String>,
     #[serde(default)]
     pub requires_secrets: Vec<String>,
+    /// A fragment may NOT itself declare further includes — see the nested-include
+    /// rejection in [`resolve_includes`]. Captured here (rather than left to be
+    /// silently dropped as an unknown field) purely so that rejection can fire.
+    #[serde(default)]
+    pub include: Vec<IncludeEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1832,9 +1837,17 @@ fn resolve_includes(config_dir: &Path, config: &mut Config) -> Result<()> {
 
         let content = fs::read_to_string(&include_path)
             .with_context(|| format!("failed to read included config fragment {}", entry.path()))?;
+        reject_unknown_fragment_keys(&content, entry.path())?;
         let mut fragment: ConfigFragment = toml::from_str(&content).with_context(|| {
             format!("failed to parse included config fragment {}", entry.path())
         })?;
+        if !fragment.include.is_empty() {
+            bail!(
+                "included config fragment {} declares its own `include`; \
+                 nested includes are not supported",
+                entry.path()
+            );
+        }
 
         for route in &mut fragment.routes {
             expand_route_mounts(route, Some(&bundle_dir))?;
@@ -1868,6 +1881,170 @@ fn resolve_includes(config_dir: &Path, config: &mut Config) -> Result<()> {
         for secret in fragment.requires_secrets {
             if !config.requires_secrets.contains(&secret) {
                 config.requires_secrets.push(secret);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Field names recognized by [`ConfigFragment`] / [`SandboxConfig`] / [`AgentConfig`]
+/// / [`Route`] / [`CredentialConfig`], used by [`reject_unknown_fragment_keys`] to
+/// catch a key an included fragment sets that this varda version does not
+/// understand (a typo, or version skew between the varda that authored a shared
+/// bundle and the one loading it).
+///
+/// MAINTENANCE: there is no compile-time reflection available here, so each list
+/// must be updated BY HAND whenever a field is added to (or renamed on) the
+/// corresponding struct — this is a known trade-off, not an oversight. If a struct
+/// gains a `#[serde(rename = "...")]` field, list it under the RENAMED name (the
+/// name as it appears in TOML), matching what serde itself accepts.
+const FRAGMENT_TOP_LEVEL_FIELDS: &[&str] = &[
+    "routes",
+    "sandboxes",
+    "agents",
+    "requires_commands",
+    "requires_secrets",
+    "include",
+];
+const SANDBOX_CONFIG_FIELDS: &[&str] = &[
+    "image",
+    "build",
+    "image_from",
+    "primitive",
+    "mounts",
+    "env",
+    "egress",
+    "egress_mode",
+    "egress_proxy_image",
+    "memory",
+    "cpus",
+];
+const AGENT_CONFIG_FIELDS: &[&str] = &[
+    "kind",
+    "command",
+    "args",
+    "max_prompt_tokens",
+    "working_dir",
+    "env",
+    "streams_output",
+    "auth_token_env",
+    "auth_token_target",
+    "credentials",
+    "interactive_command",
+    "interactive_args",
+    "resume_command_template",
+    "interpreter_agent",
+    "skip_recap",
+];
+const CREDENTIAL_CONFIG_FIELDS: &[&str] = &[
+    "from_env",
+    "from_secret",
+    "from_fnox",
+    "command",
+    "env",
+    "file",
+    "refresh_seconds",
+    "optional",
+];
+const ROUTE_FIELDS: &[&str] = &["glob", "agents", "sandbox", "mounts", "env", "orchestration", "verify"];
+
+/// Reject a key in `table` that isn't in `known` — named by `fragment_path` (the
+/// include path as written) and `location` (e.g. `"sandboxes.mydev"`) so the error
+/// pinpoints exactly where the unrecognized key lives.
+fn check_table_keys(
+    table: &toml::value::Table,
+    known: &[&str],
+    fragment_path: &str,
+    location: &str,
+) -> Result<()> {
+    for key in table.keys() {
+        if !known.contains(&key.as_str()) {
+            bail!(
+                "included config fragment {fragment_path} has an unrecognized key '{key}' in \
+                 {location}; this varda version does not recognize it (possible typo or version \
+                 skew) and refuses to silently ignore it"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Parse a fragment's raw TOML text a SECOND time as a generic [`toml::Value`] and
+/// reject any key the corresponding typed struct doesn't recognize.
+///
+/// The lenient, typed `toml::from_str::<ConfigFragment>` parse used elsewhere in
+/// [`resolve_includes`] silently drops unknown fields (serde's default behavior for
+/// a struct without `deny_unknown_fields`). That is fine — even desirable — for the
+/// CENTRAL `config.toml`, which is edited by the same operator who runs it. But a
+/// fragment/bundle may be authored on a different varda version and shared across
+/// hosts: a security-relevant key this version doesn't recognize yet would silently
+/// vanish, with the sandbox coming up on defaults for whatever it was meant to set.
+///
+/// `SandboxConfig`/`AgentConfig`/`Route`/`ConfigFragment` deliberately do NOT get
+/// `#[serde(deny_unknown_fields)]` directly — those types are shared verbatim by the
+/// central config's own (deliberately permissive) parsing, and making them strict
+/// would also make central-config parsing strict. This check applies strictness
+/// ONLY to fragment-sourced content, by re-parsing the same text out-of-band.
+fn reject_unknown_fragment_keys(raw: &str, fragment_path: &str) -> Result<()> {
+    let value: toml::Value = toml::from_str(raw).with_context(|| {
+        format!("failed to parse included config fragment {fragment_path}")
+    })?;
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+
+    check_table_keys(table, FRAGMENT_TOP_LEVEL_FIELDS, fragment_path, "top level")?;
+
+    if let Some(sandboxes) = table.get("sandboxes").and_then(toml::Value::as_table) {
+        for (name, sandbox) in sandboxes {
+            if let Some(sandbox_table) = sandbox.as_table() {
+                check_table_keys(
+                    sandbox_table,
+                    SANDBOX_CONFIG_FIELDS,
+                    fragment_path,
+                    &format!("sandboxes.{name}"),
+                )?;
+            }
+        }
+    }
+
+    if let Some(agents) = table.get("agents").and_then(toml::Value::as_table) {
+        for (name, agent) in agents {
+            let Some(agent_table) = agent.as_table() else {
+                continue;
+            };
+            check_table_keys(
+                agent_table,
+                AGENT_CONFIG_FIELDS,
+                fragment_path,
+                &format!("agents.{name}"),
+            )?;
+            if let Some(credentials) = agent_table.get("credentials").and_then(toml::Value::as_array)
+            {
+                for (idx, cred) in credentials.iter().enumerate() {
+                    if let Some(cred_table) = cred.as_table() {
+                        check_table_keys(
+                            cred_table,
+                            CREDENTIAL_CONFIG_FIELDS,
+                            fragment_path,
+                            &format!("agents.{name}.credentials[{idx}]"),
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(routes) = table.get("routes").and_then(toml::Value::as_array) {
+        for (idx, route) in routes.iter().enumerate() {
+            if let Some(route_table) = route.as_table() {
+                check_table_keys(
+                    route_table,
+                    ROUTE_FIELDS,
+                    fragment_path,
+                    &format!("routes[{idx}]"),
+                )?;
             }
         }
     }
@@ -4451,6 +4628,192 @@ command = "codex"
         assert!(
             message.contains("definitely-not-a-real-command-from-fragment"),
             "error must name the command required by the included fragment: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn nested_include_in_a_fragment_fails_with_fragment_path_and_clear_message() {
+        let root = temp_dir("nested-include");
+        fs::write(
+            root.join("inner.toml"),
+            "[sandboxes.inner]\nimage = \"inner-image\"\n",
+        )
+        .expect("inner fragment should be written");
+        fs::write(
+            root.join("outer.toml"),
+            "include = [\"inner.toml\"]\n[sandboxes.outer]\nimage = \"outer-image\"\n",
+        )
+        .expect("outer fragment should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("outer.toml".to_owned())];
+
+        let err = resolve_includes(&root, &mut config)
+            .expect_err("a fragment declaring its own `include` must be rejected");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("outer.toml"),
+            "error must name the fragment that declared the nested include: {message}"
+        );
+        assert!(
+            message.to_lowercase().contains("nested include"),
+            "error must clearly state nested includes are unsupported: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fragment_with_unrecognized_top_level_key_fails_to_load() {
+        let root = temp_dir("unknown-top-level");
+        fs::write(
+            root.join("frag.toml"),
+            "totally_unknown_field = true\n[sandboxes.frag]\nimage = \"frag-image\"\n",
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .expect("config should be written");
+
+        let err = load_config(&path).expect_err("unrecognized top-level fragment key must fail");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("totally_unknown_field"),
+            "error must name the unrecognized key: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fragment_with_unrecognized_key_inside_sandbox_table_fails_to_load() {
+        let root = temp_dir("unknown-sandbox-key");
+        fs::write(
+            root.join("frag.toml"),
+            "[sandboxes.mydev]\nimage = \"frag-image\"\ntotally_unknown_sandbox_key = 1\n",
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .expect("config should be written");
+
+        let err = load_config(&path)
+            .expect_err("unrecognized key inside a fragment's [sandboxes.X] must fail");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("sandboxes.mydev"),
+            "error must name the table the unrecognized key was found in: {message}"
+        );
+        assert!(
+            message.contains("totally_unknown_sandbox_key"),
+            "error must name the unrecognized key: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fragment_with_unrecognized_key_inside_agent_credentials_fails_to_load() {
+        let root = temp_dir("unknown-credential-key");
+        fs::write(
+            root.join("frag.toml"),
+            "[agents.frag_agent]\nkind = \"acp\"\ncommand = \"codex\"\n\n[[agents.frag_agent.credentials]]\nfrom_env = \"MY_TOKEN\"\nenv = \"TOKEN\"\ntotally_unknown_credential_key = 1\n",
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .expect("config should be written");
+
+        let err = load_config(&path)
+            .expect_err("unrecognized key inside a fragment credential entry must fail");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("totally_unknown_credential_key"),
+            "error must name the unrecognized key: {message}"
+        );
+        assert!(
+            message.contains("agents.frag_agent.credentials"),
+            "error must name the credentials entry it was found in: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fragment_using_only_recognized_and_absent_optional_keys_loads_successfully() {
+        let root = temp_dir("recognized-only");
+        fs::write(
+            root.join("frag.toml"),
+            r#"[sandboxes.frag]
+image = "frag-image"
+
+[agents.frag_agent]
+kind = "acp"
+command = "codex"
+
+[[agents.frag_agent.credentials]]
+from_env = "MY_TOKEN"
+env = "TOKEN"
+
+[[routes]]
+glob = "frag/**"
+agents = ["frag_agent"]
+"#,
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .expect("config should be written");
+
+        let config = load_config(&path)
+            .expect("a fragment using only recognized keys must load successfully");
+
+        assert!(config.sandboxes.contains_key("frag"));
+        assert!(config.agents.contains_key("frag_agent"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn central_config_with_stray_unknown_key_still_loads_unaffected() {
+        let root = temp_dir("central-stray-key");
+        let path = root.join("config.toml");
+        let content = format!(
+            "{}\n[sandboxes.central]\nimage = \"central-image\"\ntotally_unknown_central_key = 1\n",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        let config = load_config(&path).expect(
+            "a stray unknown key in the CENTRAL config must be tolerated exactly as before this change",
+        );
+
+        assert_eq!(
+            config.sandboxes["central"].image.as_deref(),
+            Some("central-image")
         );
 
         fs::remove_dir_all(&root).ok();
