@@ -5108,6 +5108,9 @@ planner_agent: codex
             git: config::GitConfig { auto_commit: false },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         }
     }
 
@@ -5821,6 +5824,9 @@ deny_sandboxes = ["local"]
             git: config::GitConfig { auto_commit: false },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         }
     }
 
@@ -6376,6 +6382,9 @@ deny_sandboxes = ["local"]
             git: config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let sessions = task_sessions(&config, &task_path).expect("sessions should be found");
@@ -6425,6 +6434,9 @@ Do it.
             git: config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         record_background_launch_failure(&config, &task_path, "agent binary was not found")

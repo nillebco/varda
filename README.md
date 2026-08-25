@@ -753,6 +753,8 @@ These are the main config knobs that shape execution. The shipped default config
 | Orchestration defaults | `[orchestration] enabled = true; max_depth = 2; max_fanout = 4; global_child_budget = 16; deny_sandboxes = ["local"]` gates sandboxed subtask spawning. |
 | Route orchestration override | `[routes.orchestration] enabled = false` disables spawning for that matched route. |
 | Repo-local tasks and config | `.varda/tasks/<id>-<slug>.md` stores committed task definitions; `.varda/config.toml` can carry repo workflow rules while runtime state remains in `$VARDA_HOME`. |
+| Shareable config bundles | `include = ["team-bundle.toml"]` (or `include = [{ path = "team-bundle.toml", sha256 = "..." }]`) merges another TOML fragment's `[[routes]]`/`[sandboxes.*]`/`[agents.*]` into the central config; a central name always wins over an included one, and among includes a later one wins. |
+| Host requirement validation | `requires_commands = ["fnox"]` and `requires_secrets = ["tfc-token"]` (also settable inside an included fragment) fail `varda`'s config load loudly, listing every unmet requirement, when a command is missing from `$PATH` or a secret does not resolve via `fnox get NAME`. |
 
 Credential entries must name exactly one source (`from_env`, `from_secret`, `from_fnox`, or `command`) and one target (`env` or `file`). Store secret names, not resolved secret values, in config.
 
