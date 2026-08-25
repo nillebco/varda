@@ -1,0 +1,5 @@
+#!/bin/sh
+# Interactive shell inside a docker sandbox over the current directory.
+# Forces the `dockershell` sandbox regardless of route, and the `shell` agent.
+# NOTE: $CWD must be under a Colima-shared path (~/dev) for the mount to work.
+exec varda task add "docker shell" --agent shell --sandbox dockershell --exec --interactive "$@"

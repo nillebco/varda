@@ -1,23 +1,31 @@
 mod acp;
 mod agent;
+mod capability;
 mod config;
+mod doctor;
 mod git;
+mod mcp_transport;
 mod notify;
+mod orchestration;
 mod routing;
 mod runner;
+mod sandbox;
 mod task;
+mod verify;
 
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
 use crate::agent::AgentClient;
 
@@ -71,6 +79,22 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    /// Launch the self-hosting orchestrator: run the RESIDENT as a sandboxed
+    /// interactive agent with the spawn broker wired, so Varda can drive its own
+    /// dev loop. The loop logic lives in the workspace's `.varda/WORKFLOW.md`; this
+    /// command only routes the resident into an isolating, net-denied sandbox with a
+    /// dedicated rw workspace mount and NO push credential (all asserted before launch).
+    Orchestrate {
+        /// Attach a TTY and put the operator in the conversation (M13b interactive
+        /// path). Without this flag the resident runs headless until it terminates
+        /// or signals `needs_user`.
+        #[arg(long)]
+        interactive: bool,
+        /// Dedicated workspace directory mounted rw into the resident sandbox.
+        /// Defaults to `<varda_home>/orchestrate/workspace`. Never `$HOME`/`~/dev`.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -90,6 +114,11 @@ enum TaskCommand {
         /// Agent to assign the task to. Skips the interactive assignee prompt.
         #[arg(long)]
         agent: Option<String>,
+        /// Pin this task to a named central sandbox (`[sandboxes.<NAME>]`),
+        /// overriding route/`.varda`/defaults resolution at run time. Use `local`
+        /// for the identity provider. Composes with `--exec --interactive`.
+        #[arg(long, value_name = "NAME")]
+        sandbox: Option<String>,
         /// Treat the task name as a complete one-line task and run it immediately.
         #[arg(long)]
         exec: bool,
@@ -108,12 +137,23 @@ enum TaskCommand {
         /// Set the task status to ready after creation (skips backlog).
         #[arg(long)]
         ready: bool,
+        /// Resume-or-create: if a task with this name already exists for the project,
+        /// resume it instead of erroring. Continues the previously captured agent
+        /// session when one is available (falling back to fresh, with a message, if
+        /// not); a task already marked `done` always starts fresh. Only acts with
+        /// `--exec`; intended for the interactive shell aliases (vadc/vtgg/…) so
+        /// repeated launches reuse one task per (project, name) rather than colliding.
+        #[arg(long)]
+        reuse: bool,
     },
     /// List markdown tasks for a project.
     List {
         /// Project path to list tasks for. Defaults to the current directory.
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Include backlog and done tasks.
+        #[arg(long)]
+        all: bool,
     },
     /// Run a markdown task through the configured agent.
     Run {
@@ -187,9 +227,14 @@ enum TaskCommand {
         /// Markdown task file or task id to inspect.
         task: PathBuf,
     },
+    /// Probe the latest run using sandbox and session-log authorities.
+    Doctor {
+        /// Markdown task file or task id to diagnose.
+        task: PathBuf,
+    },
     /// Set the status of a task directly.
     SetStatus {
-        /// New status (backlog, ready, running, pending, needs_user, failed, done).
+        /// New status (backlog, ready, running, review, needs_user, failed, done). Legacy `pending` is accepted as an alias for `review`.
         status: String,
         /// Markdown task file or task id to update.
         task: PathBuf,
@@ -199,11 +244,22 @@ enum TaskCommand {
         /// Markdown task file or task id to resolve.
         task: PathBuf,
     },
+    /// Delete a task's runtime state file (and its recaps) from the home store.
+    Delete {
+        /// Markdown task file or task id to delete.
+        task: PathBuf,
+        /// Delete without prompting for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Keep the task's recap files instead of removing them alongside the task.
+        #[arg(long)]
+        keep_recaps: bool,
+    },
     /// Update task properties for a single task or in bulk.
     Update {
         /// Task file or task id to update. Omit to use filter flags for bulk selection.
         task: Option<PathBuf>,
-        /// Set the task status (backlog, ready, running, pending, needs_user, failed, done).
+        /// Set the task status (backlog, ready, running, review, needs_user, failed, done). Legacy `pending` is accepted as an alias for `review`.
         #[arg(long, value_name = "STATUS")]
         set_status: Option<String>,
         /// Set the task assignee.
@@ -225,6 +281,13 @@ enum TaskCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Rewrite legacy `status: pending` task state files to `status: review`.
+    ///
+    /// Operates on the configured Varda operations task directory, preserves all
+    /// other frontmatter and task body, is idempotent, and reports how many files
+    /// were changed. Legacy `pending` parsing stays supported afterwards, so task
+    /// files from another machine or branch still load.
+    MigrateStatus,
 }
 
 #[derive(Debug, Subcommand)]
@@ -243,6 +306,22 @@ enum ProjectCommand {
         #[arg(long, value_delimiter = ',', required = true)]
         agents: Vec<String>,
     },
+    /// Fold a finished workspace's tasks into a mother project (post-merge cleanup).
+    ///
+    /// Re-keys every task whose `project` is WORKSPACE to the mother and relocates
+    /// the records into the mother's store, so a merged worktree stops being a
+    /// separate dashboard project. WORKSPACE is matched as a path string — the
+    /// worktree may already be removed.
+    Fold {
+        /// The workspace/worktree project path whose tasks to fold.
+        workspace: String,
+        /// The mother project to fold into (must exist).
+        #[arg(long)]
+        into: PathBuf,
+        /// Preview what would move without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -259,6 +338,12 @@ enum SkillCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let result = run_cli().await;
+    acp::drain_session_teardowns().await;
+    result
+}
+
+async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -288,12 +373,14 @@ async fn main() -> Result<()> {
                 file,
                 project,
                 agent,
+                sandbox,
                 exec,
                 edit,
                 background,
                 interactive,
                 quiet,
                 ready,
+                reuse,
             } => {
                 use std::io::IsTerminal as _;
                 let (taskname, description) = if let Some(file_path) = file {
@@ -336,6 +423,51 @@ async fn main() -> Result<()> {
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
+                // --reuse (with --exec): if this (project, name) task already exists,
+                // resume it instead of erroring on the collision. Lets the shell aliases
+                // (vadbdev, vadbinfra, ...) be launched repeatedly without a stuck
+                // fixed-name task blocking the next run. Skips creation entirely; the
+                // existing task keeps its stored assignee/sandbox.
+                //
+                // The whole point of these daily-driver aliases is conversation
+                // continuity, so reuse continues the captured agent session (via
+                // resume_task_command's captured_resume_command path) rather than
+                // forcing a fresh one. The one exception is a task already marked
+                // `done`: that conversation is closed, so continuing it is odd —
+                // start fresh instead. Either way `resume_task_command` still falls
+                // back to fresh (and says so) when there is nothing to resume or the
+                // resume attempt fails.
+                if reuse && exec {
+                    let existing = task::task_file_path(&config, &project_path, &taskname)?;
+                    if existing.exists() {
+                        let existing_task = task::load_task(&existing)?;
+                        let fresh = existing_task.frontmatter.status == task::TaskStatus::Done;
+                        if fresh {
+                            println!(
+                                "task {} already exists and is done — starting a fresh session",
+                                existing.display()
+                            );
+                        } else {
+                            println!(
+                                "task {} already exists — continuing the previous session",
+                                existing.display()
+                            );
+                        }
+                        return resume_task_command(&existing, fresh, interactive).await;
+                    }
+                }
+                // Validate the pinned sandbox up front so `--sandbox typo` fails at
+                // creation time rather than only at run time. `local` is always valid.
+                if let Some(name) = sandbox.as_deref() {
+                    let known = name == config::DEFAULT_SANDBOX_PROVIDER
+                        || config.sandboxes.contains_key(name);
+                    if !known {
+                        anyhow::bail!(
+                            "sandbox '{name}' is not configured; \
+                             add a `[sandboxes.{name}]` entry or use `local`"
+                        );
+                    }
+                }
                 let assignee = if let Some(ref agent_name) = agent {
                     routing::match_route(&config, &project_path, Some(agent_name))?;
                     Some(agent_name.clone())
@@ -354,6 +486,7 @@ async fn main() -> Result<()> {
                     &project_path,
                     assignee.as_deref(),
                     description.as_deref(),
+                    sandbox.as_deref(),
                 )?;
                 let mut task_doc = task::load_task(&task_path)?;
                 if ready || exec {
@@ -378,11 +511,14 @@ async fn main() -> Result<()> {
                     open_editor(&task_path)?;
                 }
             }
-            TaskCommand::List { project } => {
+            TaskCommand::List { project, all } => {
                 let config_path = config::config_file()?;
                 let config = config::load_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
-                let tasks = task::list_tasks(&config, &project_path)?;
+                let mut tasks = task::list_tasks(&config, &project_path)?;
+                if !all {
+                    tasks.retain(|task| is_active_task_status(task.status));
+                }
                 print_task_list(&project_path, &tasks);
             }
             TaskCommand::Run {
@@ -400,7 +536,11 @@ async fn main() -> Result<()> {
             TaskCommand::Plan { task } => {
                 plan_task_command(&task).await?;
             }
-            TaskCommand::Resume { task, fresh, interactive } => {
+            TaskCommand::Resume {
+                task,
+                fresh,
+                interactive,
+            } => {
                 resume_task_command(&task, fresh, interactive).await?;
             }
             TaskCommand::ResumeSession { task } => {
@@ -435,6 +575,9 @@ async fn main() -> Result<()> {
             TaskCommand::Inspect { task } => {
                 inspect_task_command(&task)?;
             }
+            TaskCommand::Doctor { task } => {
+                doctor::doctor_task_command(&task)?;
+            }
             TaskCommand::SetStatus { status, task } => {
                 update_tasks_command(
                     Some(&task),
@@ -452,6 +595,13 @@ async fn main() -> Result<()> {
                 let config = config::load_config(&config_path)?;
                 let resolved = task::resolve_task_reference(&config, &task)?;
                 println!("{}", resolved.display());
+            }
+            TaskCommand::Delete {
+                task,
+                yes,
+                keep_recaps,
+            } => {
+                delete_task_command(&task, yes, keep_recaps)?;
             }
             TaskCommand::Update {
                 task,
@@ -474,6 +624,11 @@ async fn main() -> Result<()> {
                     yes,
                 )?;
             }
+            TaskCommand::MigrateStatus => {
+                let config = config::load_config(&config::config_file()?)?;
+                let changed = task::migrate_pending_status(&config)?;
+                println!("migrated {changed} task file(s) from `pending` to `review`");
+            }
         },
         Command::Project { command } => match command {
             ProjectCommand::Add { glob, agents } => {
@@ -485,12 +640,42 @@ async fn main() -> Result<()> {
                     agents.join(",")
                 );
             }
+            ProjectCommand::Fold {
+                workspace,
+                into,
+                dry_run,
+            } => {
+                let config = config::load_config(&config::config_file()?)?;
+                let report = task::fold_project(&config, &workspace, &into, dry_run)?;
+                let verb = if dry_run { "would fold" } else { "folded" };
+                println!(
+                    "{verb} {} task(s) from {} into {}",
+                    report.moved.len(),
+                    workspace,
+                    into.display()
+                );
+                if !report.collisions.is_empty() {
+                    println!(
+                        "  left in place (name already in mother store): {}",
+                        report.collisions.join(", ")
+                    );
+                }
+                for dir in &report.removed_dirs {
+                    println!("  removed empty store folder {dir}");
+                }
+            }
         },
         Command::Skill { command } => match command {
             SkillCommand::Install { source, link } => {
                 skill_install_command(source.as_deref(), link)?;
             }
         },
+        Command::Orchestrate {
+            interactive,
+            workspace,
+        } => {
+            orchestrate_command(interactive, workspace.as_deref()).await?;
+        }
     }
 
     Ok(())
@@ -922,16 +1107,29 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         .agents
         .get(&planner_agent)
         .with_context(|| format!("plan transformer agent '{planner_agent}' is not configured"))?;
-    let client = acp::AcpSubprocessClient::new(&planner_agent, agent_config);
+    let client = build_client(
+        config,
+        &planner_agent,
+        agent_config,
+        config::DEFAULT_SANDBOX_PROVIDER,
+        &[],
+        &std::collections::BTreeMap::new(),
+        None,
+        None,
+        None,
+    )?;
     let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
     let request = agent::AgentRunRequest {
         agent_name: planner_agent.clone(),
         role_instructions: None,
         task_path: plan_path.display().to_string(),
         frontmatter: task::TaskFrontmatter {
+            bounds: crate::task::TaskBounds::default(),
             id: None,
+            sandbox: None,
             status: task::TaskStatus::Ready,
             project: None,
+            mother_project: None,
             assignee: Some(planner_agent),
             recap: None,
             recaps: vec![],
@@ -941,6 +1139,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
             agent_session_ids: vec![],
             agent_session_logs: vec![],
             agent_resume_commands: vec![],
+            allow_commands: vec![],
             requires_user: false,
         },
         body: format!(
@@ -955,6 +1154,8 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         interpret: false,
         stream: false,
         resume_command: None,
+        orchestration_socket_path: None,
+        orchestration_addr: None,
     };
     let result = client.run_task(request).await?;
     let json = extract_json_object(&result.recap)?;
@@ -1062,13 +1263,13 @@ async fn run_task_paths_in_parallel(
     let mut runs = JoinSet::new();
     for task_path in task_paths {
         let config = config.clone();
-        runs.spawn(async move { run_task_path_for_parallel(config, task_path).await });
+        runs.spawn(async move { run_task_path_for_parallel(config, task_path, None).await });
     }
 
     let mut failures = 0usize;
     while let Some(joined) = runs.join_next().await {
         match joined.context("task runner join failed")? {
-            Ok(report) => {
+            Ok(mut report) => {
                 println!(
                     "processed task={} agent={} glob={} status={:?} recap={}",
                     report.task_path.display(),
@@ -1077,6 +1278,15 @@ async fn run_task_paths_in_parallel(
                     report.outcome.status,
                     report.outcome.recap_path.display()
                 );
+                let mut may_commit_files = true;
+                if config.git.auto_commit && let Some(project) = report.project.clone() {
+                    may_commit_files = apply_verification_gate(
+                        &report.task_path,
+                        &project,
+                        &report.verify,
+                        &mut report.outcome,
+                    )?;
+                }
                 let notification = if report.outcome.status == task::TaskStatus::NeedsUser {
                     let notification = notify::notify_user_interaction(
                         &config,
@@ -1093,7 +1303,7 @@ async fn run_task_paths_in_parallel(
                     None
                 };
                 if config.git.auto_commit {
-                    if let Some(project) = report.project.as_deref() {
+                    if may_commit_files && let Some(project) = report.project.as_deref() {
                         commit_agent_files_for_task(
                             &report.task_path,
                             project,
@@ -1130,11 +1340,1117 @@ struct ParallelRunReport {
     glob: String,
     outcome: runner::RunOutcome,
     project: Option<String>,
+    verify: Vec<String>,
+}
+
+#[derive(Clone)]
+struct VardaSubtaskLauncher {
+    config: config::Config,
+    project_path: PathBuf,
+    fallback_agent: String,
+    spawn_state: orchestration::SharedSpawnState,
+    /// Registry of isolated per-worker checkouts (subtask id → worktree/branch),
+    /// shared with the broker's `integrate_subtasks` tool. The launcher records
+    /// each worktree it creates here; the resident harvests them back at merge
+    /// time. A subtask absent from the map ran on the shared mount (non-git
+    /// mother → degrade).
+    worker_registry: orchestration::WorkerRegistry,
+}
+
+impl VardaSubtaskLauncher {
+    fn worker_sandbox_override(
+        &self,
+        mother: &Path,
+        requested: Option<&str>,
+        assignee: &str,
+        action: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let orch_policy = self.config.resolve_orchestration_for(mother);
+        let sandbox = orchestration::spawn_sandbox_override(requested, &orch_policy);
+
+        orchestration::check_effective_placement(&orch_policy, assignee, sandbox.as_deref())
+            .map_err(|denied| anyhow::anyhow!("cannot {action} subtask: {denied}"))?;
+
+        if let Some(sandbox) = &sandbox
+            && !self.config.sandboxes.contains_key(sandbox)
+        {
+            anyhow::bail!(
+                "cannot {action} subtask: worker sandbox '{sandbox}' is not defined as a central \
+                 [sandboxes.{sandbox}] (from the request, task, or \
+                 [routes.orchestration].default_worker_sandbox). Define it, or request a sandbox \
+                 that exists."
+            );
+        }
+
+        Ok(sandbox)
+    }
+
+    fn isolate_worker(
+        &self,
+        task_doc: &mut task::TaskDocument,
+        mother: &Path,
+        worktree_slug: &str,
+    ) -> Option<git::WorkerCheckout> {
+        match worker_checkout_path(worktree_slug) {
+            Ok(checkout_path) => {
+                match git::create_worker_worktree(mother, worktree_slug, &checkout_path) {
+                    Ok(checkout) => {
+                        task_doc.frontmatter.project = Some(checkout.path.display().to_string());
+                        task_doc.frontmatter.mother_project = Some(mother.display().to_string());
+                        Some(checkout)
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: worker isolation unavailable for '{}' \
+                             (falling back to the shared mount): {error:#}",
+                            mother.display()
+                        );
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: could not allocate a worker checkout path \
+                     (falling back to the shared mount): {error:#}"
+                );
+                None
+            }
+        }
+    }
+}
+
+impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
+    fn launch(
+        &mut self,
+        req: &orchestration::SpawnRequest,
+        grant: &orchestration::SpawnGrant,
+    ) -> anyhow::Result<orchestration::SubtaskId> {
+        let handle = tokio::runtime::Handle::try_current()
+            .context("spawn_subtask launch requires a Tokio runtime")?;
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+            anyhow::bail!("detached spawn_subtask launch requires Tokio's multi-thread runtime");
+        }
+        let project = req
+            .route
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.project_path.clone());
+        let assignee = req.agent.as_deref().unwrap_or(&self.fallback_agent);
+
+        // Preflight route resolution BEFORE creating/spawning the subtask. A
+        // spawned worker is run through normal route resolution, which enforces
+        // the route's `agents` allowlist and sandbox. If the requested agent
+        // isn't runnable at the target path, fail the spawn LOUDLY here so the
+        // master's `spawn_subtask` call returns an error it can react to —
+        // otherwise the subtask sits at `ready` forever and an `await_subtasks`
+        // on it deadlocks (the resident route listing only `claude-resident`
+        // while the broker spawns `claude` workers did exactly this).
+        routing::match_route(&self.config, &project, Some(assignee)).with_context(|| {
+            format!(
+                "cannot spawn subtask: agent '{assignee}' is not runnable at '{}'. \
+                 Add it to that route's `agents`, or request a permitted agent.",
+                project.display()
+            )
+        })?;
+
+        // Resolve + preflight the worker sandbox BEFORE creating anything, so a
+        // misconfigured sandbox fails the spawn LOUDLY (like the agent check above)
+        // instead of stranding a task/worktree. An explicit `sandbox=` request wins;
+        // else the route's `default_worker_sandbox`; else `None` (route resolution).
+        // Pinning it onto the subtask's frontmatter (below) takes highest precedence
+        // in `resolve_sandbox_for`, so the worker lands in a box that can actually
+        // build/reach its model API rather than the route's LLM-only resident box —
+        // the failure that stranded #642/#649/#636.
+        let spawn_sandbox =
+            self.worker_sandbox_override(&project, req.sandbox.as_deref(), assignee, "spawn")?;
+
+        let short = uuid::Uuid::new_v4().to_string();
+        let task_name = format!("spawned-subtask-{}", &short[..8]);
+        // `create_task` is ALWAYS called with the MOTHER path (`project`): it uses
+        // this both for the home-store folder and to locate the repo DEFINITION
+        // store. If it were called with the worktree, every subtask would write
+        // its definition INTO the worktree, where it would be committed onto that
+        // worker's own `wip/` branch and self-replicate through merge-back. So we
+        // create against the mother, then (below) point the LOADED doc's `project`
+        // at the isolated worktree while recording the mother in `mother_project`.
+        let task_path = task::create_task(
+            &self.config,
+            &task_name,
+            &project,
+            Some(assignee),
+            Some(&req.brief),
+            None,
+        )
+        .context("failed to create spawned subtask")?;
+        let mut task_doc = task::load_task(&task_path)?;
+
+        // Pin the resolved sandbox onto the subtask (highest precedence in
+        // `resolve_sandbox_for`) so it overrides the route's sandbox. Preflighted
+        // above, so this name is known to resolve. See #636.
+        if let Some(sandbox) = spawn_sandbox {
+            task_doc.frontmatter.sandbox = Some(sandbox);
+        }
+
+        // §2 — per-worker isolation. Create a `git worktree add -b wip/<slug>` off
+        // the mother's HEAD at a distinct out-of-tree host path, mount THAT into
+        // the worker (via its `project`), and record the mother in `mother_project`
+        // so POLICY (route/sandbox/orchestration) still keys on the mother while
+        // the worker edits files in its own worktree/branch. DEGRADE gracefully:
+        // `create_worker_worktree` fails outside a git repo, so a non-git mother
+        // falls back to today's shared-mount behaviour (no worktree, no override).
+        let worktree_slug = format!("{}-{}", task_name, &short[..8]);
+        let worker_checkout = self.isolate_worker(&mut task_doc, &project, &worktree_slug);
+
+        task_doc.set_status(task::TaskStatus::Ready);
+        task::write_task(&task_doc)?;
+        let subtask_id = task_doc
+            .frontmatter
+            .id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| task_path.display().to_string());
+
+        // Record the isolated checkout so the resident's `integrate_subtasks` tool
+        // can harvest and merge this worker's branch back later. Keyed by the same
+        // subtask id the broker returns and the master `await`s on.
+        if let Some(checkout) = worker_checkout {
+            self.worker_registry.record(subtask_id.clone(), checkout);
+        }
+
+        let lineage = SpawnLineage {
+            root_id: subtask_id.clone(),
+            root_depth: grant.child_depth,
+            state: self.spawn_state.clone(),
+        };
+        let config = self.config.clone();
+        let path = task_path.clone();
+        let child_id = subtask_id.clone();
+        let child_handle = tokio::spawn(run_spawned_subtask_settling(
+            config, path, lineage, child_id, "spawned",
+        ));
+        self.spawn_state
+            .insert_handle(subtask_id.clone(), child_handle);
+
+        Ok(subtask_id)
+    }
+
+    fn run_existing(
+        &mut self,
+        task_id: &str,
+        grant: &orchestration::SpawnGrant,
+    ) -> anyhow::Result<orchestration::SubtaskId> {
+        let handle = tokio::runtime::Handle::try_current()
+            .context("run_subtask launch requires a Tokio runtime")?;
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+            anyhow::bail!("detached run_subtask launch requires Tokio's multi-thread runtime");
+        }
+
+        // Resolve the caller-supplied id to an EXISTING task's STATE file. A numeric
+        // id maps through the home store; anything that resolves to no task is a
+        // spoofed / out-of-scope id and fails LOUDLY here (never trusted).
+        let task_path = task::resolve_task_reference(&self.config, Path::new(task_id))
+            .with_context(|| format!("cannot run subtask: no task resolves to id '{task_id}'"))?;
+        let mut task_doc = task::load_task(&task_path)?;
+
+        // Preflight route resolution BEFORE running, exactly like `launch`: this
+        // re-validates the EXISTING task's own agent/sandbox against the route's
+        // `agents` allowlist and isolating-sandbox requirement, so an unrunnable
+        // placement surfaces as an error the master can react to instead of a
+        // subtask wedged at `ready`. The id is caller-supplied — its stored
+        // frontmatter is never trusted without this re-validation.
+        routing::match_route_for_task(&self.config, &task_doc, false).with_context(|| {
+            format!(
+                "cannot run subtask '{task_id}': its agent/sandbox is not runnable. \
+                 Fix the task's route/agent, or run a permitted task."
+            )
+        })?;
+
+        let mother = PathBuf::from(
+            task_doc
+                .frontmatter
+                .policy_project()
+                .cloned()
+                .unwrap_or_else(|| self.project_path.display().to_string()),
+        );
+        let assignee = task_doc
+            .frontmatter
+            .assignee
+            .as_deref()
+            .unwrap_or(&self.fallback_agent);
+        let run_sandbox = self.worker_sandbox_override(
+            &mother,
+            task_doc.frontmatter.sandbox.as_deref(),
+            assignee,
+            "run",
+        )?;
+
+        let subtask_id = task_doc
+            .frontmatter
+            .id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| task_path.display().to_string());
+
+        // Runtime collision guard: refuse to re-run a task that is CURRENTLY
+        // executing in this process — a second run would clobber its `JoinHandle`
+        // and orphan the live child. A finished/leftover handle (or a task merely
+        // marked `running` in frontmatter by a crashed prior run) is NOT live and
+        // may be re-run. Frontmatter status is otherwise irrelevant: it is
+        // normalized to `Ready` below, so the caller never needs a separate
+        // "prepare the task" tool — any state is runnable.
+        if self.spawn_state.has_live_handle(&subtask_id) {
+            anyhow::bail!(
+                "task '{subtask_id}' is already running in this session; refusing to double-run it"
+            );
+        }
+
+        if let Some(sandbox) = run_sandbox {
+            task_doc.frontmatter.sandbox = Some(sandbox);
+        }
+
+        let short = uuid::Uuid::new_v4().to_string();
+        let worktree_slug = format!("task-{subtask_id}-{}", &short[..8]);
+        let worker_checkout = self.isolate_worker(&mut task_doc, &mother, &worktree_slug);
+
+        task_doc.set_status(task::TaskStatus::Ready);
+        task::write_task(&task_doc)?;
+
+        if let Some(checkout) = worker_checkout {
+            self.worker_registry.record(subtask_id.clone(), checkout);
+        }
+
+        let lineage = SpawnLineage {
+            root_id: subtask_id.clone(),
+            root_depth: grant.child_depth,
+            state: self.spawn_state.clone(),
+        };
+        let config = self.config.clone();
+        let path = task_path.clone();
+        let child_id = subtask_id.clone();
+        let child_handle = tokio::spawn(run_spawned_subtask_settling(
+            config, path, lineage, child_id, "run",
+        ));
+        self.spawn_state
+            .insert_handle(subtask_id.clone(), child_handle);
+
+        Ok(subtask_id)
+    }
+}
+
+async fn join_spawned_subtasks(spawn_state: &orchestration::SharedSpawnState) {
+    loop {
+        let handles = spawn_state.drain_handles();
+        if handles.is_empty() {
+            break;
+        }
+        for (subtask_id, handle) in handles {
+            match handle.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {
+                    eprintln!("warning: spawned subtask {subtask_id} was cancelled");
+                }
+                Err(error) => {
+                    eprintln!("warning: spawned subtask {subtask_id} join failed: {error:#}");
+                }
+            }
+        }
+    }
+}
+
+async fn abort_spawned_subtasks(spawn_state: &orchestration::SharedSpawnState) {
+    for (subtask_id, handle) in spawn_state.drain_handles() {
+        handle.abort();
+        if let Err(error) = handle.await {
+            if !error.is_cancelled() {
+                eprintln!(
+                    "warning: spawned subtask {subtask_id} join failed after abort: {error:#}"
+                );
+            }
+        }
+    }
+}
+
+async fn finish_spawned_subtasks(
+    spawn_state: &orchestration::SharedSpawnState,
+    worker_registry: &orchestration::WorkerRegistry,
+    mother: &Path,
+    is_root_run: bool,
+    run_succeeded: bool,
+) {
+    if !is_root_run {
+        return;
+    }
+
+    if run_succeeded {
+        join_spawned_subtasks(spawn_state).await;
+
+        // All worker processes are now joined, so none can still be using its
+        // checkout. Keep clones through integration/cross-review, then remove the
+        // complete root run's reviewable units here. `drain` scopes deletion to
+        // paths this launcher registered and makes repeated teardown harmless.
+        // Only reclaimed on a SUCCESSFUL root run — on failure the checkouts are
+        // left in place for a human to inspect/recover un-integrated work.
+        for checkout in worker_registry.drain() {
+            if let Err(error) = git::remove_worker_worktree(mother, &checkout, true) {
+                eprintln!(
+                    "warning: failed to remove worker checkout '{}' after root run: {error:#}",
+                    checkout.path.display()
+                );
+            }
+        }
+    } else {
+        abort_spawned_subtasks(spawn_state).await;
+    }
+}
+
+/// Host-side collect channel: resolves a spawned subtask id to its STATE
+/// (status + recap text) from the `~/.varda` home store. Injected into the
+/// [`orchestration::SpawnBroker`] so a sandboxed master's `await_subtask*` /
+/// `subtask_result` calls can harvest a child's result without any host
+/// capability crossing the boundary. The resident (un-sandboxed) host reuses
+/// this SAME impl directly, so it is public and holds only the config it needs.
+#[derive(Clone)]
+pub struct VardaSubtaskResults {
+    config: config::Config,
+}
+
+impl VardaSubtaskResults {
+    pub fn new(config: config::Config) -> Self {
+        Self { config }
+    }
+
+    /// Shared id→STATE resolution: a subtask id is the numeric task id the
+    /// launcher assigned. A non-numeric id (fallback path form) never matches.
+    fn state(&self, id: &str) -> Option<(task::TaskStatus, Option<String>)> {
+        let num = id.parse::<u64>().ok()?;
+        task::lookup_task_state(&self.config, num).ok().flatten()
+    }
+}
+
+impl orchestration::SubtaskResults for VardaSubtaskResults {
+    /// Resolves `id` and distinguishes "found" from a genuine resolution
+    /// failure (unknown id, non-numeric id, ambiguous duplicate, or a failed
+    /// state load) instead of collapsing all of those into `None` the way the
+    /// old `Option`-returning signature did — that conflation is what let
+    /// `await_subtask` poll an unresolvable id to its 30-minute ceiling (#653).
+    fn status(&self, id: &str) -> orchestration::SubtaskStatus {
+        let Ok(num) = id.parse::<u64>() else {
+            return orchestration::SubtaskStatus::Unresolved(format!(
+                "subtask id '{id}' is not a resolvable numeric task id"
+            ));
+        };
+        match task::lookup_task_state(&self.config, num) {
+            Ok(Some((status, _))) => orchestration::SubtaskStatus::Found(status),
+            Ok(None) => {
+                orchestration::SubtaskStatus::Unresolved(format!("no task found with id {num}"))
+            }
+            Err(error) => orchestration::SubtaskStatus::Unresolved(format!(
+                "failed to resolve task {num}: {error:#}"
+            )),
+        }
+    }
+
+    fn recap(&self, id: &str) -> Option<String> {
+        let (_, recap_path) = self.state(id)?;
+        std::fs::read_to_string(recap_path?).ok()
+    }
+
+    /// Unified diff of the subtask's worktree (its uncommitted output). Resolves the
+    /// subtask's `project` (its isolated worktree) and diffs it HOST-side, where git
+    /// and the worktree are local — so a reviewer never needs git or a mount of the
+    /// reviewed worker's box.
+    fn diff(&self, id: &str) -> Option<String> {
+        let num = id.parse::<u64>().ok()?;
+        let path = task::find_task_by_id(&self.config, num).ok().flatten()?;
+        let fm = task::load_task(&path).ok()?.frontmatter;
+        subtask_worktree_diff(fm.project.as_deref()?, fm.mother_project.as_deref())
+    }
+}
+
+/// Compute the unified diff of a worker's full contribution — everything its
+/// worktree differs from the mother branch-point — INCLUDING new files. Diffs
+/// against `merge-base(worktree HEAD, mother HEAD)` so it captures the changes
+/// whether they are still uncommitted OR already committed onto the wip/ branch
+/// (integrate commits `files_touched` there); falls back to `HEAD` (uncommitted
+/// only) when the mother/merge-base can't be resolved. `add -N` renders untracked
+/// files; `reset` restores the index so nothing is left mutated for integration.
+fn subtask_worktree_diff(project: &str, mother: Option<&str>) -> Option<String> {
+    let git_out = |dir: &str, args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let base = mother
+        .and_then(|m| git_out(m, &["rev-parse", "HEAD"]))
+        .and_then(|head| git_out(project, &["merge-base", "HEAD", &head]))
+        .unwrap_or_else(|| "HEAD".to_owned());
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "git add -A -N >/dev/null 2>&1; git diff {base}; git reset -q >/dev/null 2>&1"
+        ))
+        .current_dir(project)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Host-side task control-plane seam (task #640): resolves `list_tasks` /
+/// `get_task` / `set_task_status` against the `~/.varda` home store through
+/// the `task::` helpers. The broker calls this ONLY with the caller's own
+/// `project_path` (never attacker-supplied — see
+/// `orchestration::SpawnBroker::with_task_control_plane`), so scoping is
+/// enforced by construction: every method reuses `task::list_tasks`, which
+/// already filters by project.
+#[derive(Clone)]
+pub struct VardaTaskControlPlane {
+    config: config::Config,
+}
+
+impl VardaTaskControlPlane {
+    pub fn new(config: config::Config) -> Self {
+        Self { config }
+    }
+
+    fn find(&self, project_path: &Path, id: u64) -> Option<task::TaskSummary> {
+        task::list_tasks(&self.config, project_path)
+            .ok()?
+            .into_iter()
+            .find(|t| t.id == Some(id))
+    }
+}
+
+/// The task-file basename minus its extension, used as the caller-facing
+/// `slug` for a task (the home store names STATE files `<slug>.md`, with no
+/// id prefix — unlike the repo-local `<id>-<slug>.md` DEFINITION naming).
+fn task_slug(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+impl orchestration::TaskControlPlane for VardaTaskControlPlane {
+    fn list_tasks(
+        &self,
+        project_path: &Path,
+        status: Option<task::TaskStatus>,
+    ) -> Vec<orchestration::TaskListEntry> {
+        let Ok(summaries) = task::list_tasks(&self.config, project_path) else {
+            return Vec::new();
+        };
+        summaries
+            .into_iter()
+            .filter(|t| t.id.is_some())
+            .filter(|t| status.is_none_or(|status| t.status == status))
+            .map(|t| orchestration::TaskListEntry {
+                id: t.id.expect("filtered to Some above"),
+                slug: task_slug(&t.path),
+                status: t.status.as_str().to_owned(),
+                title: t.title,
+                assignee: t.assignee,
+            })
+            .collect()
+    }
+
+    fn get_task(&self, project_path: &Path, id: u64) -> Option<orchestration::TaskDetail> {
+        let summary = self.find(project_path, id)?;
+        let doc = task::load_task(&summary.path).ok()?;
+        Some(orchestration::TaskDetail {
+            id,
+            slug: task_slug(&summary.path),
+            status: doc.frontmatter.status.as_str().to_owned(),
+            title: doc.title(),
+            assignee: doc.frontmatter.assignee.clone(),
+            body: doc.body.clone(),
+        })
+    }
+
+    fn set_task_status(
+        &self,
+        project_path: &Path,
+        id: u64,
+        status: task::TaskStatus,
+    ) -> Result<(), String> {
+        let summary = self
+            .find(project_path, id)
+            .ok_or_else(|| format!("task '{id}' not found in this project"))?;
+        let mut doc = task::load_task(&summary.path).map_err(|error| error.to_string())?;
+        doc.set_status(status);
+        task::write_task(&doc).map_err(|error| error.to_string())
+    }
+
+    fn create_task(
+        &self,
+        project_path: &Path,
+        title: &str,
+        body: Option<&str>,
+        assignee: Option<&str>,
+        sandbox: Option<&str>,
+        status: task::TaskStatus,
+    ) -> Result<orchestration::CreatedTask, String> {
+        let task_path = task::create_task(&self.config, title, project_path, assignee, body, sandbox)
+            .map_err(|error| error.to_string())?;
+        let mut doc = task::load_task(&task_path).map_err(|error| error.to_string())?;
+        if status != task::TaskStatus::Backlog {
+            doc.set_status(status);
+            task::write_task(&doc).map_err(|error| error.to_string())?;
+        }
+        let id = doc
+            .frontmatter
+            .id
+            .ok_or_else(|| "created task has no id".to_owned())?;
+        Ok(orchestration::CreatedTask {
+            id,
+            slug: task_slug(&task_path),
+        })
+    }
+}
+
+struct OrchestratedAgentClient<C: AgentClient = acp::AcpSubprocessClient> {
+    inner: C,
+    config: config::Config,
+    policy: orchestration::OrchestrationPolicy,
+    project_path: PathBuf,
+    fallback_agent: String,
+    lineage: Option<SpawnLineage>,
+    /// Resolved sandbox primitive for this run (`local`/`docker`/`microsandbox`/
+    /// `clawk`). Selects the broker transport: own-kernel microVMs cannot reach a
+    /// bind-mounted Unix socket, so they get the TCP transport
+    /// ([`config::primitive_needs_tcp_broker`]); everything else keeps the socket.
+    sandbox_primitive: String,
+}
+
+/// Host IP the broker TCP listener binds to for a microVM guest. Loopback by
+/// default (host-only, never a public interface); override with
+/// `VARDA_BROKER_BIND_IP` to the per-sandbox gateway the guest actually reaches
+/// (e.g. an msb bridge gateway `172.16.0.x`). Kept as a host-only bind per the
+/// orchestration isolation invariants — the broker is capability-gated, so the
+/// port grants no capability, but it is still never exposed on `0.0.0.0`.
+fn broker_bind_ip() -> std::net::IpAddr {
+    let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    std::env::var("VARDA_BROKER_BIND_IP")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<std::net::IpAddr>().ok())
+        // REJECT wildcard/unspecified addresses (`0.0.0.0`, `::`): binding there
+        // would expose the capability-gated broker on ALL interfaces (public/LAN),
+        // violating the host-only invariant. A misconfigured env var must not widen
+        // exposure — fall back to loopback.
+        .filter(|ip| {
+            if ip.is_unspecified() {
+                eprintln!(
+                    "warning: VARDA_BROKER_BIND_IP={ip} is a wildcard address; refusing to bind the broker on all interfaces — falling back to loopback. Set it to the per-sandbox gateway IP instead."
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .unwrap_or(loopback)
+}
+
+/// Resolve the effective sandbox primitive for the run at `project_path`, used to
+/// select the broker transport. Falls back to `local` (the Unix-socket transport)
+/// if resolution fails — a safe default that never mis-serves a microVM guest over
+/// an unreachable socket without at least the broker being harmless on loopback.
+fn resolve_sandbox_primitive(
+    config: &config::Config,
+    project_path: &Path,
+    pinned: Option<&str>,
+) -> String {
+    let routing_root = routing_root_for(project_path);
+    config
+        .resolve_sandbox_for(project_path, &routing_root, pinned)
+        .map(|resolved| resolved.config.primitive)
+        .unwrap_or_else(|_| "local".to_owned())
+}
+
+#[derive(Clone)]
+struct SpawnLineage {
+    root_id: orchestration::SubtaskId,
+    root_depth: u32,
+    state: orchestration::SharedSpawnState,
+}
+
+#[async_trait]
+impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
+    async fn run_task(&self, mut request: agent::AgentRunRequest) -> Result<agent::AgentRunResult> {
+        // An interactive orchestrated run (the long-lived resident) DOES get a broker:
+        // the socket is served for the whole session and torn down root-only after
+        // outstanding children join (see the teardown below). Only `interpret` (a
+        // read-only recap pass) and a policy-disabled run short-circuit with no broker.
+        if !self.policy.enabled || request.interpret {
+            return self.inner.run_task(request).await;
+        }
+
+        let socket_dir = self.project_path.join(".varda-mcp");
+        let socket_path = socket_dir.join(format!("{}.sock", request.session_id));
+        let default_root_id = request
+            .frontmatter
+            .id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| request.session_id.clone());
+        let (root_id, root_depth, spawn_state) = self.lineage.as_ref().map_or_else(
+            || (default_root_id, 0, orchestration::SharedSpawnState::new()),
+            |lineage| {
+                (
+                    lineage.root_id.clone(),
+                    lineage.root_depth,
+                    lineage.state.clone(),
+                )
+            },
+        );
+        // Shared worker registry: the launcher records each isolated worktree it
+        // creates, and the broker's `integrate_subtasks` tool harvests them back
+        // for the host-side merge. One instance threaded through both halves so
+        // they observe the same map.
+        let worker_registry = orchestration::WorkerRegistry::new();
+        let launcher = VardaSubtaskLauncher {
+            config: self.config.clone(),
+            project_path: self.project_path.clone(),
+            fallback_agent: self.fallback_agent.clone(),
+            spawn_state: spawn_state.clone(),
+            worker_registry: worker_registry.clone(),
+        };
+        let broker = std::sync::Arc::new(
+            orchestration::SpawnBroker::with_shared_state(
+                self.policy.clone(),
+                root_id.clone(),
+                root_depth,
+                spawn_state.clone(),
+                launcher,
+            )
+            .with_results(VardaSubtaskResults::new(self.config.clone()))
+            // The resident's own mounted workspace is the integration worktree each
+            // worker branch is merged onto (WORKFLOW.md step 5). Merge-back is
+            // local-only: the resident has no push credentials (G2/G3).
+            .with_integration(worker_registry.clone(), self.project_path.clone())
+            // Task control-plane tools (task #640): scoped to this run's OWN
+            // project, exactly like the integration worktree above.
+            .with_task_control_plane(
+                VardaTaskControlPlane::new(self.config.clone()),
+                self.project_path.clone(),
+            ),
+        );
+        // Transport selection by primitive. Own-kernel microVMs (microsandbox/clawk)
+        // share the project tree over virtio-fs, which exposes the socket FILE but
+        // not its AF_UNIX endpoint, so an in-guest connect() is refused; those guests
+        // reach the host over TCP instead. `local`/`docker` see the real socket
+        // through the bind mount and keep the Unix transport.
+        let use_tcp = config::primitive_needs_tcp_broker(&self.sandbox_primitive);
+        let server = if use_tcp {
+            let (addr, listener) = match mcp_transport::bind_tcp(broker_bind_ip()).await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    eprintln!("warning: MCP broker TCP bind failed: {error:#}");
+                    return self.inner.run_task(request).await;
+                }
+            };
+            request.orchestration_addr = Some(addr.to_string());
+            tokio::spawn(async move {
+                if let Err(error) = mcp_transport::serve_tcp(listener, root_id, broker).await {
+                    eprintln!("warning: MCP broker transport exited: {error:#}");
+                }
+            })
+        } else {
+            let server_path = socket_path.clone();
+            request.orchestration_socket_path = Some(socket_path.display().to_string());
+            tokio::spawn(async move {
+                if let Err(error) =
+                    mcp_transport::serve_unix_socket(&server_path, root_id, broker).await
+                {
+                    eprintln!("warning: MCP broker transport exited: {error:#}");
+                }
+            })
+        };
+
+        let is_root_run = self.lineage.is_none();
+        let result = self.inner.run_task(request).await;
+        finish_spawned_subtasks(
+            &spawn_state,
+            &worker_registry,
+            &self.project_path,
+            is_root_run,
+            result.is_ok(),
+        )
+        .await;
+        server.abort();
+        if !use_tcp {
+            let _ = std::fs::remove_file(&socket_path);
+            let _ = std::fs::remove_dir(&socket_dir);
+        }
+        result
+    }
+}
+
+/// Build an ACP client for `display_name`, injecting the resolved sandbox
+/// provider.
+///
+/// When `project_path` is `Some`, the sandbox is resolved through the live
+/// `.varda` path ([`config::Config::resolve_sandbox_for`]): the nearest `.varda`
+/// (walked up to the routing root) wins over the central route, the untrusted
+/// `.varda` origin is clamped by the hardening floor, and the three mount origins
+/// (`Sandbox`/`Route`/`Varda`) are merged into the provider. When `project_path`
+/// is `None` (no project context, e.g. plan transformation) the trusted-only
+/// by-name path is used with `sandbox_name`/`route_mounts`. `local` yields the
+/// identity provider; any other name must have a matching `[sandboxes.<name>]`.
+#[allow(clippy::too_many_arguments)]
+fn build_client(
+    config: &config::Config,
+    display_name: &str,
+    agent_config: &config::AgentConfig,
+    sandbox_name: &str,
+    route_mounts: &[String],
+    route_env: &std::collections::BTreeMap<String, String>,
+    project_path: Option<&Path>,
+    policy_path: Option<&Path>,
+    pinned_sandbox: Option<&str>,
+) -> Result<acp::AcpSubprocessClient> {
+    // M11 — resolve the three identity/auth channels (curated identity files,
+    // SSH-agent + git identity, scoped auth token) once and inject them into
+    // whichever provider is selected. `local` ignores them (no boundary to cross).
+    let identity = resolve_sandbox_identity(config, agent_config)?;
+    let mut static_env = std::collections::BTreeMap::new();
+    // Keys from the UNTRUSTED `.varda` origin, retained so `resolve_env_secrets`
+    // refuses a fnox binding from repo-committed config (see its doc).
+    let mut untrusted_env_keys: Vec<String> = Vec::new();
+    let provider = match project_path {
+        Some(project_path) => {
+            // POLICY vs MOUNT split (task #598): the sandbox/route/`.varda` policy
+            // is resolved against `policy_path` — the MOTHER repo root for an
+            // isolated worker whose `project_path` is an out-of-tree worktree —
+            // while the returned mounts are later `{project}`-expanded against the
+            // worktree (`project_path`). When there is no separate mother
+            // (`policy_path` is `None`), policy resolution keys on `project_path`,
+            // so a non-orchestrated run behaves exactly as before. The mother must
+            // be threaded explicitly: deriving it from the worktree via
+            // `routing_root_for` would return the WORKTREE root, not the mother.
+            let policy_path = policy_path.unwrap_or(project_path);
+            let routing_root = routing_root_for(policy_path);
+            let resolved =
+                config.resolve_sandbox_for(policy_path, &routing_root, pinned_sandbox)?;
+            enforce_varda_env_credential_floor(agent_config, &resolved)?;
+            if let Some(varda_file) = &resolved.varda_file {
+                eprintln!(
+                    "sandbox: '{}' selected via {}",
+                    resolved.name,
+                    varda_file.display()
+                );
+            }
+            let mounts = sandbox::merge_mount_origins(
+                &resolved.config.mounts,
+                &resolved.route_mounts,
+                &resolved.varda_mounts,
+            );
+            untrusted_env_keys = resolved.varda_env_keys.clone();
+            static_env = resolved.env;
+            sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &identity)?
+        }
+        None => {
+            if let Some(sandbox_config) = config.sandboxes.get(sandbox_name) {
+                static_env.extend(sandbox_config.env.clone());
+            }
+            static_env.extend(route_env.clone());
+            sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?
+        }
+    };
+    // Resolve `${fnox:NAME}` bindings on the HOST at prepare time, injecting only the
+    // resolved value. Static env carries the (possibly untrusted `.varda`) sandbox/route
+    // origins; agent env is always a trusted central origin, so no key is untrusted.
+    resolve_env_secrets(&mut static_env, &untrusted_env_keys)?;
+    let mut agent_config = agent_config.clone();
+    resolve_env_secrets(&mut agent_config.env, &[])?;
+    Ok(acp::AcpSubprocessClient::with_sandbox_env(
+        display_name,
+        &agent_config,
+        provider,
+        static_env,
+    ))
+}
+
+fn enforce_varda_env_credential_floor(
+    agent_config: &config::AgentConfig,
+    resolved: &config::ResolvedSandbox,
+) -> Result<()> {
+    // Every credential ENV target (the legacy pair folds into this list) is a
+    // credential-injection sink; a `.varda` may not shadow one. File targets are
+    // guest paths, not env keys, so they cannot collide with `varda_env_keys`.
+    for cred in agent_config.effective_credentials() {
+        let Ok(config::CredentialTarget::Env(target)) = cred.target() else {
+            continue;
+        };
+        if resolved.varda_env_keys.iter().any(|key| key == target) {
+            let origin = resolved
+                .varda_file
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| ".varda".to_owned());
+            anyhow::bail!(
+                "`.varda` at {origin} declares env key '{target}', which would override credential injection"
+            );
+        }
+    }
+    for key in &resolved.varda_env_keys {
+        if agent_config.env.contains_key(key) {
+            let origin = resolved
+                .varda_file
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| ".varda".to_owned());
+            anyhow::bail!(
+                "`.varda` at {origin} declares env key '{key}', which would override trusted agent env"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// M11 — assemble the sandbox identity/auth bundle from central config + the host
+/// environment. Three separable, opt-in channels; nothing is forwarded by default.
+///
+/// - **Auth token** (`[agents.X].auth_token_env`): the NAME of a host env var
+///   holding a dedicated, scoped, rotatable sandbox token. Its value is read from
+///   the environment (never a repo secret) and re-exported into the box as
+///   `auth_token_target` (defaulting to the same name). Missing/empty ⇒ skipped
+///   with a warning, so the sandbox still boots (it just won't be authenticated).
+/// - **SSH-agent + git identity** (`defaults.forward_ssh_agent`,
+///   `defaults.git_user_name`/`git_user_email`): forward `$SSH_AUTH_SOCK` (only
+///   when a live socket exists) and the read-only git identity.
+/// - **Curated identity files** (`defaults.identity_context`): passed through
+///   verbatim; validated read-only + credential-denylisted at wrap time.
+fn resolve_sandbox_identity(
+    config: &config::Config,
+    agent_config: &config::AgentConfig,
+) -> Result<sandbox::SandboxIdentity> {
+    let defaults = &config.defaults;
+    // M11-ext — resolve the effective credential list (explicit `credentials`
+    // entries plus the legacy `auth_token_env`/`auth_token_target` sugar) into the
+    // two injection channels: scoped in-box env vars and read-only staged files.
+    // Everything is minted HOST-side; only the scoped value crosses the boundary.
+    let (auth_env, auth_files) = resolve_agent_credentials(agent_config)?;
+
+    // Forward the SSH agent socket only when forwarding is enabled AND a live
+    // socket exists on the host; otherwise the mount source would be missing.
+    let ssh_auth_sock = if defaults.forward_ssh_agent {
+        match std::env::var("SSH_AUTH_SOCK") {
+            Ok(sock) if !sock.is_empty() && Path::new(&sock).exists() => Some(sock),
+            _ => {
+                eprintln!(
+                    "sandbox: forward_ssh_agent is set but no live $SSH_AUTH_SOCK on the host; \
+                     git push over SSH will not work in the box"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let identity = sandbox::SandboxIdentity {
+        identity_context: defaults.identity_context.clone(),
+        ssh_auth_sock,
+        git_name: defaults.git_user_name.clone(),
+        git_email: defaults.git_user_email.clone(),
+        auth_env,
+        auth_files,
+    };
+    if !identity.is_empty() {
+        eprintln!(
+            "sandbox: identity channels active — cred_env:{} cred_files:{} ssh_agent:{} git_identity:{} identity_files:{}",
+            identity.auth_env.len(),
+            identity.auth_files.len(),
+            identity.ssh_auth_sock.is_some(),
+            identity.git_name.is_some() || identity.git_email.is_some(),
+            identity.identity_context.len(),
+        );
+    }
+    Ok(identity)
+}
+
+/// M11-ext — resolve an agent's effective credential list into the two injection
+/// channels: `(auth_env, auth_files)` where `auth_env` maps in-box env var names to
+/// scoped values and `auth_files` maps absolute guest paths to scoped values. Each
+/// entry is validated (exactly one source, exactly one target) and minted HOST-side.
+fn resolve_agent_credentials(
+    agent_config: &config::AgentConfig,
+) -> Result<(
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+)> {
+    let mut auth_env = std::collections::BTreeMap::new();
+    let mut auth_files = std::collections::BTreeMap::new();
+    for cred in agent_config.effective_credentials() {
+        let source = cred.source()?;
+        let target = cred.target()?;
+        let Some(value) = resolve_credential_value(&source, cred.optional)? else {
+            continue;
+        };
+        match target {
+            config::CredentialTarget::Env(name) => {
+                auth_env.insert(name.to_owned(), value);
+            }
+            config::CredentialTarget::File(path) => {
+                auth_files.insert(path.to_owned(), value);
+            }
+        }
+    }
+    Ok((auth_env, auth_files))
+}
+
+/// Mint a single credential value on the HOST. Returns `Ok(None)` when a
+/// `from_env`/`from_secret` source is unset/empty (skip the injection so the box
+/// still boots, matching the legacy `auth_token_env` behavior). `command` and
+/// secret-store failures fail loudly — the minting identity never reaches the box,
+/// so a broken mint must not silently degrade to an unauthenticated run.
+///
+/// `optional` relaxes exactly one case: a SUCCESSFUL mint that produced an EMPTY
+/// value is skipped instead of failing, for credentials that are deliberately
+/// conditional (a `command` gated on a wrapper env var, or one whose upstream is
+/// not running). A non-zero exit still fails loudly even when `optional`.
+fn resolve_credential_value(
+    source: &config::CredentialSource<'_>,
+    optional: bool,
+) -> Result<Option<String>> {
+    match source {
+        config::CredentialSource::Env(name) => match std::env::var(name) {
+            Ok(value) if !value.is_empty() => Ok(Some(value)),
+            _ => {
+                eprintln!(
+                    "sandbox: credential source env '{name}' is unset/empty on the host; skipping \
+                     this injection (set a dedicated, scoped sandbox token)"
+                );
+                Ok(None)
+            }
+        },
+        config::CredentialSource::Secret(name) => {
+            let value = run_host_credential_command("fnox", &["get", name]).with_context(|| {
+                format!("failed to resolve secret '{name}' from the host secret store (`fnox get {name}`)")
+            })?;
+            if value.is_empty() {
+                if optional {
+                    eprintln!(
+                        "sandbox: optional credential secret '{name}' resolved to an empty value                          on the host; skipping this injection"
+                    );
+                    return Ok(None);
+                }
+                anyhow::bail!("secret '{name}' resolved to an empty value on the host");
+            }
+            Ok(Some(value))
+        }
+        config::CredentialSource::Command(cmd) => {
+            let value = run_host_credential_command("sh", &["-c", cmd])
+                .with_context(|| format!("credential command failed on the host: {cmd}"))?;
+            if value.is_empty() {
+                if optional {
+                    eprintln!(
+                        "sandbox: optional credential command produced no value on the host;                          skipping this injection: {cmd}"
+                    );
+                    return Ok(None);
+                }
+                anyhow::bail!("credential command produced empty output on the host: {cmd}");
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
+/// Resolve `${fnox:NAME}` bindings in a static env map on the HOST at prepare time,
+/// replacing each sentinel value in place with the value `fnox get NAME` returns. Only
+/// the resolved VALUE crosses the boundary; the agent/sandbox never contacts fnox and
+/// never sees the sentinel. Non-sentinel values are left untouched.
+///
+/// `untrusted_keys` names env keys that originate from the repo-committed (UNTRUSTED)
+/// `.varda` origin. A fnox binding on one of those is REFUSED: untrusted config must not
+/// be able to bind an arbitrary host secret and exfiltrate it through the agent's env.
+/// Trusted origins (central `[sandboxes.X].env`/`[[routes]].env`, `[agents.X].env`) may
+/// bind freely. Missing/failed/empty fnox resolution fails the run loudly (redacted:
+/// only the key and secret NAME are surfaced, never the value).
+fn resolve_env_secrets(
+    env: &mut std::collections::BTreeMap<String, String>,
+    untrusted_keys: &[String],
+) -> Result<()> {
+    for (key, value) in env.iter_mut() {
+        let Some(secret) = config::fnox_env_ref(value) else {
+            continue;
+        };
+        let secret = secret.to_owned();
+        if untrusted_keys.iter().any(|k| k == key) {
+            anyhow::bail!(
+                "env key '{key}' from an untrusted `.varda` binds fnox secret '{secret}'; \
+                 fnox env bindings are only allowed from trusted central config"
+            );
+        }
+        let resolved =
+            run_host_credential_command("fnox", &["get", &secret]).with_context(|| {
+                format!(
+                    "failed to resolve env '{key}' from the host secret store (`fnox get {secret}`)"
+                )
+            })?;
+        if resolved.is_empty() {
+            anyhow::bail!(
+                "env '{key}' fnox secret '{secret}' resolved to an empty value on the host"
+            );
+        }
+        *value = resolved;
+    }
+    Ok(())
+}
+
+/// Run a host-side credential minting command and return its stdout with the
+/// trailing newline trimmed. Never logs stdout (it is a secret); errors surface
+/// only the command and its stderr.
+fn run_host_credential_command(program: &str, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to spawn host credential command `{program}`"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`{program} {}` exited with {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(['\n', '\r'])
+        .to_owned())
+}
+
+/// Bound for the upward `.varda` walk: the git repository root of `project_path`,
+/// falling back to the project path itself when it is not inside a git repo.
+pub(crate) fn routing_root_for(project_path: &Path) -> PathBuf {
+    git::repo_root_for_path(project_path).unwrap_or_else(|_| project_path.to_path_buf())
+}
+
+/// Distinct out-of-tree host path for a per-worker isolated clone, under
+/// `<varda_home>/worktrees/wip-<slug>/`. Kept out of the mother tree so the
+/// clone never shadows or collides with the project checkout. The path must
+/// NOT already exist (`create_worker_worktree` requires a fresh path); the `slug`
+/// carries a per-spawn uuid suffix, so collisions are not expected, but a
+/// lingering directory from a crashed prior run is removed first.
+fn worker_checkout_path(slug: &str) -> Result<PathBuf> {
+    let base = config::varda_home()?.join("worktrees");
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("failed to create worktree base {}", base.display()))?;
+    let path = base.join(format!("wip-{slug}"));
+    if path.exists() {
+        std::fs::remove_dir_all(&path)
+            .with_context(|| format!("failed to clear stale worktree path {}", path.display()))?;
+    }
+    Ok(path)
 }
 
 async fn run_task_path_for_parallel(
     config: config::Config,
     task_path: PathBuf,
+    lineage: Option<SpawnLineage>,
 ) -> Result<ParallelRunReport> {
     let task_path = task::resolve_task_reference(&config, &task_path)?;
     let task_document = task::load_task(&task_path)?;
@@ -1155,13 +2471,62 @@ async fn run_task_path_for_parallel(
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    let client = build_client(
+        &config,
+        &display_name,
+        agent_config,
+        &route.sandbox,
+        &route.route_mounts,
+        &route.route_env,
+        task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document
+            .frontmatter
+            .mother_project
+            .as_deref()
+            .map(Path::new),
+        task_document.frontmatter.sandbox.as_deref(),
+    )?;
+    // POLICY reads (orchestration policy + sandbox-primitive/transport selection)
+    // key on the MOTHER repo root via `policy_project`; MOUNT/cwd (the socket dir,
+    // the launcher's project root) keeps `project`. For a non-orchestrated task
+    // `policy_project` == `project`, so this is backward-compatible.
+    let policy = task_document
+        .frontmatter
+        .policy_project()
+        .map(|p| Path::new(p.as_str()))
+        .map(|path| config.resolve_orchestration_for(path))
+        .unwrap_or_else(|| config.orchestration.clone());
+    let policy_path = task_document
+        .frontmatter
+        .policy_project()
+        .map(|p| PathBuf::from(p.as_str()));
+    let orchestrated_client = task_document
+        .frontmatter
+        .project
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|_| policy.enabled)
+        .map(|project_path| OrchestratedAgentClient {
+            inner: client.clone(),
+            config: config.clone(),
+            policy,
+            sandbox_primitive: resolve_sandbox_primitive(
+                &config,
+                policy_path.as_deref().unwrap_or(&project_path),
+                task_document.frontmatter.sandbox.as_deref(),
+            ),
+            project_path,
+            fallback_agent: route.agent.clone(),
+            lineage,
+        });
     let outcome = runner::run_task(
         &config,
         &display_name,
         route.role_instructions.as_deref(),
         &task_path,
-        &client,
+        orchestrated_client
+            .as_ref()
+            .map_or(&client as &dyn AgentClient, |c| c as &dyn AgentClient),
         false,
         false,
     )
@@ -1173,50 +2538,111 @@ async fn run_task_path_for_parallel(
         glob: route.glob,
         outcome,
         project: task_document.frontmatter.project.clone(),
+        verify: route.verify,
     })
+}
+
+/// Hard ceiling for a broker-spawned subtask's ENTIRE run (agent + interpreter +
+/// teardown). A backstop far above the agent's own budget/idle-watchdog, so a wedged
+/// box or a teardown that never returns cannot strand the subtask — and the master's
+/// `await_subtask` — forever.
+const SPAWNED_SUBTASK_HARD_CEILING: Duration = Duration::from_secs(60 * 60);
+
+/// Run a broker-spawned subtask to completion and GUARANTEE it settles on a terminal
+/// status, so an awaiting master never hangs. `runner::run_task` writes a terminal
+/// status on a clean finish; this backstops every path that never reaches that write:
+/// an uncaught `Err`, a PANIC (which unwinds past a plain `if let Err`), an abort, or a
+/// wedged run/teardown that returns nothing. On any non-success it forces `Failed` when
+/// the status is still non-terminal (never clobbering a real Done/Review/NeedsUser).
+/// Observed live: spawned reviews/checks whose agent had already exited (box `stopped`)
+/// yet stayed `running`, wedging the resident's `await_subtask` until hand-reconciled.
+async fn run_spawned_subtask_settling(
+    config: config::Config,
+    path: PathBuf,
+    lineage: SpawnLineage,
+    child_id: String,
+    label: &'static str,
+) {
+    let run = tokio::spawn(run_task_path_for_parallel(
+        config,
+        path.clone(),
+        Some(lineage),
+    ));
+    let abort = run.abort_handle();
+    let settled_ok = match tokio::time::timeout(SPAWNED_SUBTASK_HARD_CEILING, run).await {
+        Ok(Ok(Ok(_report))) => true, // run_task wrote a terminal status on a clean finish
+        Ok(Ok(Err(error))) => {
+            eprintln!("warning: {label} subtask {child_id} failed: {error:#}");
+            false
+        }
+        Ok(Err(join)) => {
+            eprintln!("warning: {label} subtask {child_id} panicked/aborted: {join}");
+            false
+        }
+        Err(_elapsed) => {
+            abort.abort(); // stop the wedged run so it can't leak in the background
+            eprintln!(
+                "warning: {label} subtask {child_id} exceeded the {}s hard ceiling; forcing terminal",
+                SPAWNED_SUBTASK_HARD_CEILING.as_secs()
+            );
+            false
+        }
+    };
+    if !settled_ok
+        && let Ok(mut doc) = task::load_task(&path)
+        && !doc.frontmatter.status.is_terminal()
+    {
+        doc.set_status(task::TaskStatus::Failed);
+        let _ = task::write_task(&doc);
+    }
 }
 
 fn show_task_command(task_path: &Path) -> Result<()> {
     let task_path = resolve_task_for_show(task_path)?;
-    let task_content = fs::read_to_string(&task_path)
-        .with_context(|| format!("failed to read task at {}", task_path.display()))?;
     let task_document = task::load_task(&task_path)?;
+    let output = render_show_task_output(&task_path, &task_document)?;
+    print!("{output}");
+    Ok(())
+}
 
-    println!("# Task {}", task_path.display());
-    println!();
-    print!("{task_content}");
+/// Build the full text `varda task show` prints, as a `String` (rather than
+/// printing directly) so it is unit-testable. Renders `task_document` — the
+/// `load_task`-overlaid document — via `task::render_task_document`, NOT a
+/// separate raw read of `task_path`; a prior version read the overlaid
+/// document but printed a raw `fs::read_to_string` of the home file instead,
+/// so this surface stayed on the stale body even after every other read path
+/// (get_task, run_subtask, list_tasks) picked up a post-materialization edit
+/// to the repo-local definition (#710).
+fn render_show_task_output(task_path: &Path, task_document: &task::TaskDocument) -> Result<String> {
+    let task_content = task::render_task_document(task_document)?;
+
+    let mut out = String::new();
+    out.push_str(&format!("# Task {}\n\n", task_path.display()));
+    out.push_str(&task_content);
     if !task_content.ends_with('\n') {
-        println!();
+        out.push('\n');
     }
-
-    println!();
-    println!("---");
-    println!();
+    out.push_str("\n---\n\n");
 
     if task_document.frontmatter.recaps.is_empty() {
-        println!("# Recap");
-        println!();
-        println!("No recap is associated with this task.");
-        return Ok(());
+        out.push_str("# Recap\n\nNo recap is associated with this task.\n");
+        return Ok(out);
     }
 
     for recap_path_str in &task_document.frontmatter.recaps {
-        let recap_path = resolve_recap_path(recap_path_str, &task_path);
+        let recap_path = resolve_recap_path(recap_path_str, task_path);
         let recap_content = fs::read_to_string(&recap_path)
             .with_context(|| format!("failed to read recap at {}", recap_path.display()))?;
 
-        println!("# Recap {}", recap_path.display());
-        println!();
-        print!("{recap_content}");
+        out.push_str(&format!("# Recap {}\n\n", recap_path.display()));
+        out.push_str(&recap_content);
         if !recap_content.ends_with('\n') {
-            println!();
+            out.push('\n');
         }
-        println!();
-        println!("---");
-        println!();
+        out.push_str("\n---\n\n");
     }
 
-    Ok(())
+    Ok(out)
 }
 
 fn inspect_task_command(task_path: &Path) -> Result<()> {
@@ -1376,6 +2802,9 @@ struct DashboardPayload {
     scope: String,
     generated_at: u64,
     default_project: Option<String>,
+    /// Host `$HOME`, so the UI can abbreviate it to `~` in displayed paths while
+    /// keeping absolute paths as the data/API keys.
+    home: Option<String>,
     tasks: Vec<DashboardTask>,
     projects: Vec<String>,
     statuses: Vec<&'static str>,
@@ -1389,10 +2818,15 @@ struct DashboardTask {
     assignee: Option<String>,
     title: String,
     path: String,
-    markdown: String,
-    recaps: Vec<DashboardRecap>,
     #[serde(skip_serializing_if = "Option::is_none")]
     completed_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardTaskDetail {
+    path: String,
+    markdown: String,
+    recaps: Vec<DashboardRecap>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1503,6 +2937,14 @@ fn handle_dashboard_connection(
                 serde_json::to_string(&payload).context("failed to encode dashboard JSON")?;
             write_http_response(stream, "200 OK", "application/json", &json)
         }
+        ("GET", "/api/tasks/detail") => {
+            let path =
+                query_param(target, "path").context("missing required query parameter 'path'")?;
+            let detail = load_dashboard_task_detail(config, Path::new(&path))?;
+            let json = serde_json::to_string(&detail)
+                .context("failed to encode dashboard task detail JSON")?;
+            write_http_response(stream, "200 OK", "application/json", &json)
+        }
         ("POST", "/api/tasks/status") => {
             let update: DashboardStatusUpdate =
                 serde_json::from_str(body).context("failed to decode dashboard status update")?;
@@ -1587,33 +3029,13 @@ fn load_dashboard_payload(
     let mut projects = Vec::new();
     let mut tasks = Vec::new();
     for summary in summaries {
-        if let Some(project) = summary.project.as_ref() {
-            if !projects.contains(project) {
-                projects.push(project.clone());
-            }
+        if let Some(project) = summary.project.as_ref()
+            && !projects.contains(project)
+        {
+            projects.push(project.clone());
         }
 
-        let document = task::load_task(&summary.path)?;
-        let markdown = fs::read_to_string(&summary.path)
-            .with_context(|| format!("failed to read task at {}", summary.path.display()))?;
-        let mut completed_at = file_mtime_seconds(&summary.path);
-        let mut recaps = Vec::new();
-        for recap_path in &document.frontmatter.recaps {
-            let resolved = resolve_recap_path(recap_path, &summary.path);
-            if let Some(mtime) = file_mtime_seconds(&resolved) {
-                completed_at = Some(completed_at.map_or(mtime, |current| current.max(mtime)));
-            }
-            let markdown = fs::read_to_string(&resolved).unwrap_or_else(|error| {
-                format!(
-                    "# Recap Unavailable\n\nFailed to read {}: {error}",
-                    resolved.display()
-                )
-            });
-            recaps.push(DashboardRecap {
-                path: resolved.display().to_string(),
-                markdown,
-            });
-        }
+        let completed_at = file_mtime_seconds(&summary.path);
 
         tasks.push(DashboardTask {
             id: summary.id,
@@ -1622,8 +3044,6 @@ fn load_dashboard_payload(
             assignee: summary.assignee,
             title: summary.title,
             path: summary.path.display().to_string(),
-            markdown,
-            recaps,
             completed_at,
         });
     }
@@ -1633,6 +3053,7 @@ fn load_dashboard_payload(
         scope,
         generated_at: unix_timestamp()?,
         default_project: Some(default_project),
+        home: std::env::var("HOME").ok(),
         tasks,
         projects,
         statuses: vec![
@@ -1641,10 +3062,83 @@ fn load_dashboard_payload(
             "running",
             "needs_user",
             "failed",
-            "pending",
+            "review",
             "done",
         ],
     })
+}
+
+fn load_dashboard_task_detail(
+    config: &config::Config,
+    task_path: &Path,
+) -> Result<DashboardTaskDetail> {
+    let task_path = task::resolve_task_reference(config, task_path)?;
+    let document = task::load_task(&task_path)?;
+    let markdown = task::render_task_document(&document)?;
+    let recaps = document
+        .frontmatter
+        .recaps
+        .iter()
+        .map(|recap_path| {
+            let resolved = resolve_recap_path(recap_path, &task_path);
+            let markdown = fs::read_to_string(&resolved).unwrap_or_else(|error| {
+                format!(
+                    "# Recap Unavailable\n\nFailed to read {}: {error}",
+                    resolved.display()
+                )
+            });
+            DashboardRecap {
+                path: resolved.display().to_string(),
+                markdown,
+            }
+        })
+        .collect();
+
+    Ok(DashboardTaskDetail {
+        path: task_path.display().to_string(),
+        markdown,
+        recaps,
+    })
+}
+
+fn query_param(target: &str, name: &str) -> Option<String> {
+    let query = target.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == name {
+            Some(percent_decode(value.replace('+', " ").as_bytes()))
+        } else {
+            None
+        }
+    })
+}
+
+fn percent_decode(input: &[u8]) -> String {
+    let mut output = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%'
+            && i + 2 < input.len()
+            && let (Some(high), Some(low)) = (hex_value(input[i + 1]), hex_value(input[i + 2]))
+        {
+            output.push((high << 4) | low);
+            i += 3;
+            continue;
+        }
+        output.push(input[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 const DASHBOARD_HTML: &str = r##"<!doctype html>
@@ -1700,7 +3194,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <div id="updated" class="meta"></div>
   </header>
   <section class="filters">
-    <label>Project <select id="projectFilter"><option value="">All projects</option></select></label>
+    <label>Project <input id="projectFilter" list="projectOptions" placeholder="All projects — type to search" autocomplete="off" /><datalist id="projectOptions"></datalist></label>
     <label>Status <select id="statusFilter"><option value="">All statuses</option></select></label>
   </section>
   <main>
@@ -1708,13 +3202,27 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <aside id="details" class="empty"></aside>
   </main>
   <script>
-    const statuses = ["backlog", "ready", "running", "needs_user", "failed", "pending", "done"];
+    const statuses = ["backlog", "ready", "running", "needs_user", "failed", "review", "done"];
     let payload = { tasks: [], projects: [], statuses };
     let selectedPath = "";
+    let selectedDetail = null;
+    let detailLoadingPath = "";
     let initializedFilters = false;
 
     function label(value) {
       return value.replaceAll("_", " ");
+    }
+
+    function homePrefix() {
+      const h = payload.home || "";
+      return h.endsWith("/") ? h.slice(0, -1) : h;
+    }
+    // Display paths under $HOME as ~/… ; keep absolute paths as the data/API keys.
+    function abbreviate(p) {
+      if (!p) return p;
+      const h = homePrefix();
+      if (h && (p === h || p.startsWith(h + "/"))) return "~" + p.slice(h.length);
+      return p;
     }
 
     function projectHue(name) {
@@ -1740,13 +3248,18 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function taskMatches(task) {
-      const project = document.getElementById("projectFilter").value;
+      // Case-insensitive SUBSTRING search over the ~-abbreviated project path, so
+      // "461", "sandbox", or a full "~/dev/…" path all filter as expected.
+      const query = document.getElementById("projectFilter").value.trim().toLowerCase();
       const status = document.getElementById("statusFilter").value;
-      return (!project || task.project === project) && (!status || task.status === status);
+      const projectOk = !query || (task.project && abbreviate(task.project).toLowerCase().includes(query));
+      return projectOk && (!status || task.status === status);
     }
 
     function closeDetails() {
       selectedPath = "";
+      selectedDetail = null;
+      detailLoadingPath = "";
       document.querySelector("main").classList.remove("details-open");
       document.getElementById("details").className = "empty";
       document.getElementById("details").innerHTML = "";
@@ -1754,12 +3267,20 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function renderBoard() {
-      optionList(document.getElementById("projectFilter"), payload.projects, "All projects");
+      // Project filter is a searchable input backed by a datalist of ~-abbreviated
+      // paths; status stays a plain select.
+      const projectOptions = document.getElementById("projectOptions");
+      projectOptions.innerHTML = "";
+      for (const project of payload.projects) {
+        const option = document.createElement("option");
+        option.value = abbreviate(project);
+        projectOptions.appendChild(option);
+      }
       optionList(document.getElementById("statusFilter"), payload.statuses || statuses, "All statuses");
       if (!initializedFilters) {
         const defaultProject = payload.default_project || "";
         if (payload.projects.includes(defaultProject)) {
-          document.getElementById("projectFilter").value = defaultProject;
+          document.getElementById("projectFilter").value = abbreviate(defaultProject);
         }
         initializedFilters = true;
       }
@@ -1811,7 +3332,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
             button.classList.add("dragging");
           };
           button.ondragend = () => button.classList.remove("dragging");
-          button.onclick = () => { selectedPath = task.path; renderBoard(); renderDetails(task); };
+          button.onclick = () => { selectedPath = task.path; selectedDetail = null; detailLoadingPath = ""; renderBoard(); renderDetails(task); };
           const id = task.id === null || task.id === undefined ? "unversioned" : `#${task.id}`;
           const projectChip = (payload.scope === "all projects" && task.project)
             ? task.project.replace(/\\/g, "/").split("/").filter(Boolean).pop() || task.project
@@ -1884,19 +3405,34 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       const taskHeading = document.createElement("h3");
       taskHeading.textContent = "Task";
       details.appendChild(taskHeading);
+      if (!selectedDetail || selectedDetail.path !== task.path) {
+        const loading = document.createElement("p");
+        loading.className = "meta";
+        loading.textContent = "Loading task details...";
+        details.appendChild(loading);
+        if (detailLoadingPath !== task.path) {
+          detailLoadingPath = task.path;
+          fetchTaskDetail(task.path).catch(error => {
+            if (selectedPath === task.path) {
+              details.textContent = `Failed to load task details: ${error}`;
+            }
+          });
+        }
+        return;
+      }
       const taskPre = document.createElement("pre");
-      taskPre.textContent = task.markdown;
+      taskPre.textContent = selectedDetail.markdown;
       details.appendChild(taskPre);
       const recapHeading = document.createElement("h3");
       recapHeading.textContent = "Recaps";
       details.appendChild(recapHeading);
-      if (!task.recaps.length) {
+      if (!selectedDetail.recaps.length) {
         const empty = document.createElement("p");
         empty.className = "meta";
         empty.textContent = "No recaps are associated with this task.";
         details.appendChild(empty);
       }
-      for (const recap of task.recaps) {
+      for (const recap of selectedDetail.recaps) {
         const recapPath = document.createElement("div");
         recapPath.className = "path";
         recapPath.textContent = recap.path;
@@ -1904,6 +3440,20 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
         const recapPre = document.createElement("pre");
         recapPre.textContent = recap.markdown;
         details.appendChild(recapPre);
+      }
+    }
+
+    async function fetchTaskDetail(path) {
+      const response = await fetch(`/api/tasks/detail?path=${encodeURIComponent(path)}`, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const detail = await response.json();
+      if (selectedPath === path) {
+        detailLoadingPath = "";
+        selectedDetail = detail;
+        const task = payload.tasks.find(task => task.path === path);
+        if (task) renderDetails(task);
       }
     }
 
@@ -1926,6 +3476,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     document.getElementById("projectFilter").addEventListener("change", renderBoard);
+    document.getElementById("projectFilter").addEventListener("input", renderBoard);
     document.getElementById("statusFilter").addEventListener("change", renderBoard);
     refresh().catch(error => {
       document.getElementById("details").textContent = `Failed to load dashboard: ${error}`;
@@ -1959,7 +3510,7 @@ fn print_task_dashboard(scope: &str, tasks: &[task::TaskSummary]) {
         task::TaskStatus::Running,
         task::TaskStatus::NeedsUser,
         task::TaskStatus::Failed,
-        task::TaskStatus::Pending,
+        task::TaskStatus::Review,
         task::TaskStatus::Done,
     ] {
         println!("## {}", status.as_str());
@@ -2055,6 +3606,10 @@ fn print_task_list(project_path: &Path, tasks: &[task::TaskSummary]) {
     }
 }
 
+fn is_active_task_status(status: task::TaskStatus) -> bool {
+    !matches!(status, task::TaskStatus::Backlog | task::TaskStatus::Done)
+}
+
 fn truncate_for_table(value: &str, width: usize) -> String {
     if value.chars().count() <= width {
         return value.to_owned();
@@ -2069,8 +3624,17 @@ fn spawn_task_in_background(task_path: &Path) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
     let resolved = task::resolve_task_reference(&config, task_path)?;
+    let initial_task = task::load_task(&resolved)?;
+    if initial_task.frontmatter.status != task::TaskStatus::Ready {
+        anyhow::bail!(
+            "task {} is not ready; current status is {:?}",
+            resolved.display(),
+            initial_task.frontmatter.status
+        );
+    }
+    let initial_session_count = initial_task.frontmatter.agent_session_ids.len();
     let exe = std::env::current_exe().context("failed to locate the varda executable")?;
-    let child = ProcessCommand::new(&exe)
+    let mut child = ProcessCommand::new(&exe)
         .args(["task", "run"])
         .arg(&resolved)
         .stdin(std::process::Stdio::null())
@@ -2083,12 +3647,343 @@ fn spawn_task_in_background(task_path: &Path) -> Result<()> {
                 resolved.display()
             )
         })?;
+    wait_for_background_launch(&config, &resolved, initial_session_count, &mut child)?;
     println!(
         "task running in background: {} (pid: {})",
         resolved.display(),
         child.id()
     );
     Ok(())
+}
+
+fn wait_for_background_launch(
+    config: &config::Config,
+    task_path: &Path,
+    initial_session_count: usize,
+    child: &mut std::process::Child,
+) -> Result<()> {
+    const BACKGROUND_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+    const BACKGROUND_LAUNCH_POLL: Duration = Duration::from_millis(100);
+
+    let started = Instant::now();
+    loop {
+        let task = task::load_task(task_path)?;
+        let recorded_launch = task.frontmatter.agent_session_ids.len() > initial_session_count
+            && task.frontmatter.agent_session_logs.len() > initial_session_count
+            && Path::new(&task.frontmatter.agent_session_logs[initial_session_count]).exists();
+        if recorded_launch && task.frontmatter.status != task::TaskStatus::Ready {
+            return Ok(());
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect background agent process")?
+        {
+            if recorded_launch {
+                return Ok(());
+            }
+            record_background_launch_failure(
+                config,
+                task_path,
+                &format!(
+                    "background child pid {} exited before recording a session (status: {status})",
+                    child.id()
+                ),
+            )?;
+            anyhow::bail!(
+                "background agent for {} exited before recording a session (status: {status})",
+                task_path.display()
+            );
+        }
+
+        if started.elapsed() >= BACKGROUND_LAUNCH_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            record_background_launch_failure(
+                config,
+                task_path,
+                &format!(
+                    "background child pid {} did not record a running session within {} seconds",
+                    child.id(),
+                    BACKGROUND_LAUNCH_TIMEOUT.as_secs()
+                ),
+            )?;
+            anyhow::bail!(
+                "background agent for {} did not record a session within {} seconds",
+                task_path.display(),
+                BACKGROUND_LAUNCH_TIMEOUT.as_secs()
+            );
+        }
+
+        std::thread::sleep(BACKGROUND_LAUNCH_POLL);
+    }
+}
+
+fn record_background_launch_failure(
+    config: &config::Config,
+    task_path: &Path,
+    reason: &str,
+) -> Result<()> {
+    let mut task = task::load_task(task_path)?;
+    if !matches!(
+        task.frontmatter.status,
+        task::TaskStatus::Ready | task::TaskStatus::Running
+    ) {
+        return Ok(());
+    }
+
+    let session_id = Uuid::new_v4().to_string();
+    let session_log_path = Path::new(&config.defaults.operations_dir)
+        .join(config::RUNS_DIRNAME)
+        .join(format!("{session_id}.log"));
+    if let Some(parent) = session_log_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create session log directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(
+        &session_log_path,
+        format!(
+            "session_id={session_id}\nagent=background-launcher\ntask={}\nlaunch_failure={reason}\n",
+            task_path.display()
+        ),
+    )
+    .with_context(|| format!("failed to write session log at {}", session_log_path.display()))?;
+
+    let recap_dir = Path::new(&config.defaults.operations_dir).join(config::RECAPS_DIRNAME);
+    fs::create_dir_all(&recap_dir)
+        .with_context(|| format!("failed to create recap directory {}", recap_dir.display()))?;
+    let recap_path = recap_dir.join(format!("{}.md", Uuid::new_v4()));
+    let recap = format!(
+        "---\ntask: {}\n---\n\n# Agent Run Failed\n\nThe background launch failed before Varda could record a running agent session.\n\nReason: {reason}\n\nSession ID: `{session_id}`\n\nSession log: [{}]({})\n",
+        task_path.display(),
+        session_log_path.display(),
+        session_log_path.display()
+    );
+    fs::write(&recap_path, recap)
+        .with_context(|| format!("failed to write recap at {}", recap_path.display()))?;
+
+    task.frontmatter.agent_session_ids.push(session_id);
+    task.frontmatter
+        .agent_session_logs
+        .push(session_log_path.display().to_string());
+    task.set_recap(recap_path.display().to_string());
+    task.frontmatter.requires_user = false;
+    task.set_status(task::TaskStatus::Failed);
+    task::write_task(&task)?;
+
+    Ok(())
+}
+
+/// The validated placement of the sandboxed RESIDENT: which agent drives it, the
+/// isolating sandbox it lands in, the dedicated rw workspace, and whether the
+/// spawn broker is wired. Produced by [`resolve_resident_launch`] only AFTER every
+/// security gate ([`config::enforce_resident_launch`]) has passed, so holding one
+/// is proof the launch is safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResidentLaunch {
+    /// Agent (or role) that drives the resident.
+    agent: String,
+    /// Effective isolating sandbox name (never `local`).
+    sandbox: String,
+    /// Dedicated host workspace mounted rw into the box.
+    workspace: PathBuf,
+    /// True when the nested-orchestration spawn broker is wired for this route
+    /// (461d interactive path) — always true after enforcement, since a disabled
+    /// policy is rejected.
+    broker_wired: bool,
+}
+
+/// Resolve the resident's placement for `workspace` and assert every load-bearing
+/// gate before returning. Errors (loudly) when the route would launch the resident
+/// un-sandboxed, with network, with a push credential, or with an unsafe workspace
+/// mount. Pure over `config` + the host `$HOME`/filesystem, so it is exercised
+/// directly by the deterministic tests.
+fn resolve_resident_launch(config: &config::Config, workspace: &Path) -> Result<ResidentLaunch> {
+    let route = routing::match_route(config, workspace, None).with_context(|| {
+        format!(
+            "no route matches the orchestration workspace {}; add a `[[routes]]` whose glob covers it \
+             (see the sandboxed-resident example in the default config)",
+            workspace.display()
+        )
+    })?;
+    let agent_config = config
+        .agents
+        .get(&route.agent)
+        .expect("routing ensures the selected agent exists");
+    let routing_root = routing_root_for(workspace);
+    // Orchestrate/resident launch has no task frontmatter → no task-pinned
+    // override. Route/`.varda`/defaults precedence is unchanged, keeping
+    // `enforce_resident_launch` intact.
+    let resolved = config.resolve_sandbox_for(workspace, &routing_root, None)?;
+    let mounts: Vec<String> = sandbox::merge_mount_origins(
+        &resolved.config.mounts,
+        &resolved.route_mounts,
+        &resolved.varda_mounts,
+    )
+    .into_iter()
+    .map(|(_origin, spec)| spec)
+    .collect();
+    let credentials = agent_config.effective_credentials();
+    let orchestration = config.resolve_orchestration_for(workspace);
+
+    // The resident's EFFECTIVE env, merged with the same precedence as the real
+    // launch (`build_client` → `env_for_request`): agent env is the base, the
+    // resolved sandbox+route+`.varda` static env overrides on collision. Presence of
+    // a push-enabling key — from ANY origin — is what `enforce_resident_launch`
+    // rejects, so this union is the full env-channel surface to scan.
+    let mut effective_env = agent_config.env.clone();
+    effective_env.extend(resolved.env.clone());
+
+    config::enforce_resident_launch(
+        &route.agent,
+        &resolved.name,
+        &resolved.config,
+        &mounts,
+        workspace,
+        &credentials,
+        &effective_env,
+        config.defaults.forward_ssh_agent,
+        &orchestration,
+    )?;
+
+    Ok(ResidentLaunch {
+        agent: route.display_name().to_owned(),
+        sandbox: resolved.name,
+        workspace: workspace.to_path_buf(),
+        broker_wired: orchestration.enabled,
+    })
+}
+
+/// Body of a scaffolded resident task. It points the agent at the workspace's
+/// `.varda/WORKFLOW.md` as the contract — the loop intelligence is authored there
+/// (a separate task), not here.
+const RESIDENT_TASK_BODY: &str = "\
+# Resident orchestrator
+
+You are the Varda self-hosting RESIDENT. You run inside an isolating sandbox whose \
+egress is restricted to your LLM provider API ONLY (no `github.com`, no general hosts) \
+with this workspace mounted read-write. Your contract — the dev loop you execute — is \
+defined in `.varda/WORKFLOW.md` in this workspace. Read it and follow it.
+
+Spawn workers through the Varda spawn broker (`spawn_subtask`); merge their branches \
+in-box against the mounted workspace. You can reach ONLY your LLM API and have NO push \
+credential and NO route to a remote: pushing back out is a separate, human-gated step \
+performed on the host. \
+Stop and signal `needs_user` when the workflow calls for a human decision.
+";
+
+/// Ensure the resident task at `task_path` is runnable before `run_task_command`
+/// hands it to `runner::run_task` (which refuses anything but `Ready`). A prior
+/// `orchestrate` launch can leave the resident task in a terminal state
+/// (Failed/Review/Done/NeedsUser/Running); reset it to `Ready` so each new
+/// `varda orchestrate` invocation can relaunch the same resident task without a
+/// manual `varda task set-status ready` workaround. Recap/session history in the
+/// frontmatter and the task body are left untouched — only the status field flips.
+fn ensure_resident_task_ready(task_path: &Path) -> Result<()> {
+    let mut task_doc = task::load_task(task_path)?;
+    if task_doc.frontmatter.status != task::TaskStatus::Ready
+        && task_doc.frontmatter.status != task::TaskStatus::Backlog
+    {
+        task_doc.set_status(task::TaskStatus::Ready);
+        task::write_task(&task_doc)?;
+    }
+    Ok(())
+}
+
+/// Resolve or scaffold the RESIDENT task for `workspace`. Reuses an existing
+/// `resident-orchestrator` task under the workspace project when present; otherwise
+/// scaffolds a minimal one whose body points at `.varda/WORKFLOW.md`.
+fn resolve_or_scaffold_resident_task(
+    config: &config::Config,
+    workspace: &Path,
+    agent: &str,
+) -> Result<PathBuf> {
+    const RESIDENT_TASK_NAME: &str = "resident-orchestrator";
+    if let Ok(existing) = task::list_tasks(config, workspace) {
+        if let Some(found) = existing.into_iter().find(|t| {
+            t.path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|stem| stem.contains(RESIDENT_TASK_NAME))
+                .unwrap_or(false)
+        }) {
+            return Ok(found.path);
+        }
+    }
+    let task_path = task::create_task(
+        config,
+        RESIDENT_TASK_NAME,
+        workspace,
+        Some(agent),
+        Some(RESIDENT_TASK_BODY),
+        None,
+    )?;
+    let mut task_doc = task::load_task(&task_path)?;
+    task_doc.set_status(task::TaskStatus::Ready);
+    task::write_task(&task_doc)?;
+    Ok(task_path)
+}
+
+async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+
+    // Default to a dedicated workspace under the Varda home — never $HOME/~/dev.
+    let workspace = match workspace {
+        Some(dir) => dir.to_path_buf(),
+        None => config::varda_home()?.join("orchestrate").join("workspace"),
+    };
+    fs::create_dir_all(&workspace).with_context(|| {
+        format!(
+            "failed to create orchestration workspace {}",
+            workspace.display()
+        )
+    })?;
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+
+    // Assert every sandboxed-resident gate BEFORE any task is launched. A route
+    // that would place the resident un-sandboxed / with network / with a push
+    // credential / with an unsafe workspace mount is refused here, loudly.
+    let launch = resolve_resident_launch(&config, &workspace)?;
+
+    println!("orchestrate: resident launch validated");
+    println!("  workspace:  {} (mounted rw)", launch.workspace.display());
+    println!("  sandbox:    {} (isolating, net-denied)", launch.sandbox);
+    println!("  agent:      {}", launch.agent);
+    println!("  push creds: none (push is a separate, human-gated host step)");
+    println!(
+        "  broker:     {}",
+        if launch.broker_wired {
+            "wired (spawn_subtask available to the resident)"
+        } else {
+            "off"
+        }
+    );
+    println!(
+        "  mode:       {}",
+        if interactive {
+            "interactive (TTY attached, operator in the conversation)"
+        } else {
+            "headless (autonomous until terminal / needs_user)"
+        }
+    );
+
+    let task_path = resolve_or_scaffold_resident_task(&config, &workspace, &launch.agent)?;
+    ensure_resident_task_ready(&task_path)?;
+    println!("orchestrate: resident task {}", task_path.display());
+    println!();
+
+    // Delegate to the standard run path, which (for an orchestration-enabled route)
+    // wraps the session in the 461d interactive broker so `spawn_subtask` is served
+    // for the whole session. `--interactive` attaches the TTY (M13b); headless runs
+    // the resident autonomously until it terminates or signals needs_user.
+    run_task_command(&task_path, interactive, false).await
 }
 
 async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> Result<()> {
@@ -2115,7 +4010,53 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    let client = build_client(
+        &config,
+        &display_name,
+        agent_config,
+        &route.sandbox,
+        &route.route_mounts,
+        &route.route_env,
+        task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document
+            .frontmatter
+            .mother_project
+            .as_deref()
+            .map(Path::new),
+        task_document.frontmatter.sandbox.as_deref(),
+    )?;
+    // Wire the nested-orchestration broker onto the interactive resident: when
+    // orchestration is enabled for this project, wrap the session in
+    // `OrchestratedAgentClient` so it serves the MCP socket and exports
+    // `VARDA_MCP_SOCKET`, exactly as the batch path does. A non-orchestrated run
+    // stays a plain client (no broker, no overhead). The socket lives for the whole
+    // interactive session and is torn down root-only after children join (461b).
+    let policy = task_document
+        .frontmatter
+        .project
+        .as_deref()
+        .map(Path::new)
+        .map(|path| config.resolve_orchestration_for(path))
+        .unwrap_or_else(|| config.orchestration.clone());
+    let orchestrated_client = task_document
+        .frontmatter
+        .project
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|_| policy.enabled)
+        .map(|project_path| OrchestratedAgentClient {
+            inner: client.clone(),
+            config: config.clone(),
+            policy,
+            sandbox_primitive: resolve_sandbox_primitive(
+                &config,
+                &project_path,
+                task_document.frontmatter.sandbox.as_deref(),
+            ),
+            project_path,
+            fallback_agent: route.agent.clone(),
+            lineage: None,
+        });
     if config.git.auto_commit {
         git::commit_task_file(
             &task_path,
@@ -2124,12 +4065,14 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         println!("committed task snapshot");
     }
     let stream = !quiet && !interactive;
-    let outcome = runner::run_task(
+    let mut outcome = runner::run_task(
         &config,
         &display_name,
         route.role_instructions.as_deref(),
         &task_path,
-        &client,
+        orchestrated_client
+            .as_ref()
+            .map_or(&client as &dyn AgentClient, |c| c as &dyn AgentClient),
         interactive,
         stream,
     )
@@ -2142,6 +4085,20 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         outcome.status,
         outcome.recap_path.display()
     );
+
+    if !outcome.blocked_commands.is_empty() {
+        println!();
+        println!("blocked_commands: {}", outcome.blocked_commands.join(", "));
+        println!(
+            "hint: add these to the task's `allow_commands` frontmatter and re-run to authorize them headlessly"
+        );
+    }
+
+    let mut may_commit_files = true;
+    if config.git.auto_commit && let Some(project) = task_document.frontmatter.project.clone() {
+        may_commit_files =
+            apply_verification_gate(&task_path, &project, &route.verify, &mut outcome)?;
+    }
 
     let recap_content = fs::read_to_string(&outcome.recap_path)
         .with_context(|| format!("failed to read recap at {}", outcome.recap_path.display()))?;
@@ -2165,7 +4122,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         None
     };
     if config.git.auto_commit {
-        if let Some(project) = task_document.frontmatter.project.as_deref() {
+        if may_commit_files && let Some(project) = task_document.frontmatter.project.as_deref() {
             commit_agent_files_for_task(&task_path, project, &outcome.files_touched);
         }
         git::commit_task_update(
@@ -2204,6 +4161,92 @@ fn commit_agent_files_for_task(task_path: &Path, project: &str, files_touched: &
     }
 }
 
+/// Host-side verification gate (#674). Runs the matched route's `verify`
+/// commands against `project` BEFORE `files_touched` is committed: the box
+/// that produced the change is not a trustworthy witness (a warmed cache lets
+/// it build there while the host disagrees; in-box network/FS restrictions
+/// can also produce false self-reported failures). Appends a structured
+/// `## Verification` section to the recap on disk so a parent can tell
+/// "verified green" from "not verified" from "verified red" without
+/// re-running anything.
+///
+/// On failure, downgrades `outcome.status` to `Failed` (and rewrites the task
+/// file to match) and returns `false`: the caller must skip
+/// `commit_agent_files_for_task` so the change stays uncommitted on the
+/// worker's own `wip/` branch/worktree rather than landing broken. Returns
+/// `true` when the caller may proceed with the commit as before (verification
+/// passed, or no `verify` command is configured for the route).
+fn apply_verification_gate(
+    task_path: &Path,
+    project: &str,
+    verify_commands: &[String],
+    outcome: &mut runner::RunOutcome,
+) -> Result<bool> {
+    let project_path = Path::new(project);
+    let result = verify::run_verification(project_path, verify_commands).with_context(|| {
+        format!(
+            "failed to run host verification for task {} in {}",
+            task_path.display(),
+            project_path.display()
+        )
+    })?;
+
+    let label = result.label();
+    let note = match &result {
+        verify::VerificationOutcome::Skipped => format!(
+            "\n\n## Verification\n\nverification: {label} (no `verify` command configured for this route)\n"
+        ),
+        verify::VerificationOutcome::Passed { commands } => format!(
+            "\n\n## Verification\n\nverification: {label}\ncommands:\n{}\n",
+            commands
+                .iter()
+                .map(|c| format!("- `{c}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        verify::VerificationOutcome::Failed { command, output } => format!(
+            "\n\n## Verification\n\nverification: {label}\ncommand: `{command}`\n\n```\n{}\n```\n",
+            output.trim()
+        ),
+    };
+
+    let mut recap_content = fs::read_to_string(&outcome.recap_path).with_context(|| {
+        format!(
+            "failed to read recap at {} to append verification result",
+            outcome.recap_path.display()
+        )
+    })?;
+    recap_content.push_str(&note);
+    fs::write(&outcome.recap_path, &recap_content).with_context(|| {
+        format!(
+            "failed to append verification result to recap at {}",
+            outcome.recap_path.display()
+        )
+    })?;
+
+    if !matches!(result, verify::VerificationOutcome::Failed { .. }) {
+        return Ok(true);
+    }
+
+    if outcome.status == task::TaskStatus::NeedsUser {
+        eprintln!(
+            "verification failed for task {}; not committing files_touched, task already needs user input so status is preserved",
+            task_path.display()
+        );
+        return Ok(false);
+    }
+
+    let mut task = task::load_task(task_path)?;
+    task.set_status(task::TaskStatus::Failed);
+    task::write_task(&task)?;
+    outcome.status = task::TaskStatus::Failed;
+    eprintln!(
+        "verification failed for task {}; not committing files_touched, task settled to failed",
+        task_path.display()
+    );
+    Ok(false)
+}
+
 async fn plan_task_command(task_path: &Path) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::load_config(&config_path)?;
@@ -2215,7 +4258,21 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    let client = build_client(
+        &config,
+        &display_name,
+        agent_config,
+        &route.sandbox,
+        &route.route_mounts,
+        &route.route_env,
+        task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document
+            .frontmatter
+            .mother_project
+            .as_deref()
+            .map(Path::new),
+        task_document.frontmatter.sandbox.as_deref(),
+    )?;
     let outcome = runner::plan_task(
         &config,
         &display_name,
@@ -2262,15 +4319,22 @@ async fn resume_task_command(task_path: &Path, fresh: bool, interactive: bool) -
         println!("Captured agent resume command found:");
         println!("  {resume_command}");
         if prompt_yes_no("Resume the previous agent session?", true)? {
-            return run_captured_resume_command(
-                &config,
-                &task_path,
-                &task_document,
-                resume_command,
-            )
-            .await;
+            match run_captured_resume_command(&config, &task_path, &task_document, resume_command)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    println!(
+                        "Resuming the previous session failed ({error:#}); \
+                         falling back to a fresh session."
+                    );
+                }
+            }
+        } else {
+            println!("Starting a fresh agent session.");
         }
-        println!("Starting a fresh agent session.");
+    } else if !fresh {
+        println!("No captured resume command found for this task — starting a fresh session.");
     }
 
     run_task_command(&task_path, interactive, false).await
@@ -2299,7 +4363,21 @@ async fn run_captured_resume_command(
         .get(&route.agent)
         .expect("routing ensures the selected agent exists");
     let display_name = route.display_name().to_owned();
-    let client = acp::AcpSubprocessClient::new(&display_name, agent_config);
+    let client = build_client(
+        config,
+        &display_name,
+        agent_config,
+        &route.sandbox,
+        &route.route_mounts,
+        &route.route_env,
+        task_document.frontmatter.project.as_deref().map(Path::new),
+        task_document
+            .frontmatter
+            .mother_project
+            .as_deref()
+            .map(Path::new),
+        task_document.frontmatter.sandbox.as_deref(),
+    )?;
     if config.git.auto_commit {
         git::commit_task_file(
             task_path,
@@ -2338,6 +4416,7 @@ async fn run_captured_resume_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_tasks_command(
     task_ref: Option<&Path>,
     set_status: Option<&str>,
@@ -2376,10 +4455,10 @@ fn update_tasks_command(
                 if !filter_statuses.is_empty() && !filter_statuses.contains(&t.status) {
                     return false;
                 }
-                if let Some(agent) = filter_agent {
-                    if t.assignee.as_deref() != Some(agent) {
-                        return false;
-                    }
+                if let Some(agent) = filter_agent
+                    && t.assignee.as_deref() != Some(agent)
+                {
+                    return false;
                 }
                 true
             })
@@ -2426,6 +4505,62 @@ fn update_tasks_command(
     if config.git.auto_commit {
         let paths_ref: Vec<&Path> = task_paths.iter().map(|p| p.as_path()).collect();
         git::commit_task_files(&paths_ref, "Update tasks")?;
+        println!("committed changes");
+    }
+
+    Ok(())
+}
+
+fn delete_task_command(task_ref: &Path, yes: bool, keep_recaps: bool) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let task_path = task::resolve_task_reference(&config, task_ref)?;
+    let doc = task::load_task(&task_path)?;
+
+    // Collect the recap artifacts that belong to this task so they don't linger
+    // in the home store after the task record is gone.
+    let recap_paths: Vec<PathBuf> = if keep_recaps {
+        Vec::new()
+    } else {
+        doc.frontmatter
+            .recaps
+            .iter()
+            .map(|recap| resolve_recap_path(recap, &task_path))
+            .filter(|path| path.exists())
+            .collect()
+    };
+
+    if !yes {
+        println!("will delete task {}:", task_path.display());
+        println!("  title  → {}", doc.title());
+        println!("  status → {}", doc.frontmatter.status.as_str());
+        for recap in &recap_paths {
+            println!("  recap  → {}", recap.display());
+        }
+        if !prompt_yes_no("Proceed?", false)? {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
+    let mut removed: Vec<PathBuf> = Vec::new();
+    for recap in &recap_paths {
+        fs::remove_file(recap)
+            .with_context(|| format!("failed to remove recap {}", recap.display()))?;
+        removed.push(recap.clone());
+    }
+    fs::remove_file(&task_path)
+        .with_context(|| format!("failed to remove task {}", task_path.display()))?;
+    removed.push(task_path.clone());
+
+    println!("deleted task {}", task_path.display());
+    if !recap_paths.is_empty() {
+        println!("removed {} recap file(s)", recap_paths.len());
+    }
+
+    if config.git.auto_commit {
+        let paths_ref: Vec<&Path> = removed.iter().map(|p| p.as_path()).collect();
+        git::commit_task_deletions(&paths_ref, "Delete task")?;
         println!("committed changes");
     }
 
@@ -2523,7 +4658,7 @@ fn task_sessions(config: &config::Config, task_path: &Path) -> Result<Vec<TaskSe
         });
     }
 
-    sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified));
     Ok(sessions)
 }
 
@@ -2718,6 +4853,120 @@ mod tests {
     use gray_matter::{Matter, engine::YAML};
     use serde::Deserialize;
 
+    #[test]
+    fn resolve_env_secrets_leaves_non_sentinel_values_untouched() {
+        // No `${fnox:...}` binding ⇒ nothing is resolved (fnox is never invoked), and
+        // literal values pass through verbatim regardless of trusted/untrusted origin.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("PLAIN".to_owned(), "literal".to_owned());
+        env.insert("TILDE".to_owned(), "~/path".to_owned());
+        resolve_env_secrets(&mut env, &["PLAIN".to_owned()]).expect("no bindings must pass");
+        assert_eq!(env.get("PLAIN").unwrap(), "literal");
+        assert_eq!(env.get("TILDE").unwrap(), "~/path");
+    }
+
+    #[test]
+    fn resolve_env_secrets_refuses_untrusted_varda_binding() {
+        // A fnox binding on a key from the untrusted `.varda` origin is refused BEFORE
+        // any host resolution — repo config must not exfiltrate arbitrary host secrets.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("EXFIL".to_owned(), "${fnox:aws-prod-key}".to_owned());
+        let err = resolve_env_secrets(&mut env, &["EXFIL".to_owned()])
+            .expect_err("untrusted fnox binding must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("untrusted"),
+            "error must name the untrusted origin: {msg}"
+        );
+        assert!(msg.contains("EXFIL"), "error must name the key: {msg}");
+        // The sentinel is left in place; no value was resolved.
+        assert_eq!(env.get("EXFIL").unwrap(), "${fnox:aws-prod-key}");
+    }
+
+    #[test]
+    fn render_show_task_output_uses_the_overlaid_body_not_the_raw_home_file() {
+        // #710 follow-up: `varda task show` computed the overlaid document via
+        // `task::load_task` but printed a separate raw read of the home file
+        // instead, so it displayed the stale body even after a post-materialization
+        // edit to the repo-local definition — the one read path (get_task,
+        // run_subtask, list_tasks, CLI display) #710 named that the fix missed.
+        // This drives `render_show_task_output` with a home file/definition pair
+        // whose bodies genuinely diverge, so it fails if the CLI path regresses
+        // back to reading the raw file.
+        let root =
+            std::env::temp_dir().join(format!("varda-show-task-overlay-{}", std::process::id()));
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        std::fs::create_dir_all(&store).expect("repo store should be created");
+        std::fs::write(
+            store.join("40-policy.md"),
+            "---\nid: 40\nassignee: claude\n---\n\n# Policy Task\n\nNew body from the repo definition.\n",
+        )
+        .expect("definition should write");
+
+        let home_dir = root.join("operations");
+        std::fs::create_dir_all(&home_dir).expect("home dir should be created");
+        let home_path = home_dir.join("40-policy.md");
+        std::fs::write(
+            &home_path,
+            format!(
+                "---\nid: 40\nstatus: review\nproject: {}\nassignee: claude\n---\n\n# Policy Task\n\nOld body frozen at materialization.\n",
+                project.display()
+            ),
+        )
+        .expect("home state file should write");
+
+        let task_document = task::load_task(&home_path).expect("home state should load overlaid");
+        let output = render_show_task_output(&home_path, &task_document)
+            .expect("show output should render");
+
+        assert!(output.contains("New body from the repo definition."));
+        assert!(!output.contains("Old body frozen at materialization."));
+
+        std::fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn load_dashboard_task_detail_uses_the_overlaid_body_not_the_raw_home_file() {
+        // #710 follow-up (codex review of the CLI fix, #736): the web dashboard's
+        // task-detail view had the identical defect as `varda task show` — it
+        // loaded the overlaid `task::load_task` document (for `recaps` only) but
+        // built `markdown` from a separate raw `fs::read_to_string(&task_path)`,
+        // so the dashboard alone would still show a stale body after a
+        // post-materialization edit to the repo-local definition.
+        let root = std::env::temp_dir()
+            .join(format!("varda-dashboard-detail-overlay-{}", std::process::id()));
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        fs::write(
+            store.join("41-policy.md"),
+            "---\nid: 41\nassignee: claude\n---\n\n# Policy Task\n\nNew body from the repo definition.\n",
+        )
+        .expect("definition should write");
+
+        let home_dir = root.join("operations");
+        fs::create_dir_all(&home_dir).expect("home dir should be created");
+        let home_path = home_dir.join("41-policy.md");
+        fs::write(
+            &home_path,
+            format!(
+                "---\nid: 41\nstatus: review\nproject: {}\nassignee: claude\n---\n\n# Policy Task\n\nOld body frozen at materialization.\n",
+                project.display()
+            ),
+        )
+        .expect("home state file should write");
+
+        let config = launcher_test_config(&root);
+        let detail = load_dashboard_task_detail(&config, &home_path)
+            .expect("dashboard detail should load");
+
+        assert!(detail.markdown.contains("New body from the repo definition."));
+        assert!(!detail.markdown.contains("Old body frozen at materialization."));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
     #[derive(Debug, Deserialize)]
     struct PlanMetadata {
         plan_type: String,
@@ -2793,6 +5042,1020 @@ planner_agent: codex
         assert_eq!(plan_planner_agent(content).as_deref(), Some("codex"));
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn git_ok(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error:#}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn seed_git_repo(repo: &Path) {
+        fs::create_dir_all(repo).expect("repo dir should be created");
+        git_ok(repo, &["init"]);
+        git_ok(
+            repo,
+            &["config", "user.email", "varda-test@example.invalid"],
+        );
+        git_ok(repo, &["config", "user.name", "Varda Test"]);
+        fs::write(repo.join("README.md"), "seed\n").expect("seed file should write");
+        git_ok(repo, &["add", "README.md"]);
+        git_ok(repo, &["commit", "-m", "seed"]);
+        fs::create_dir_all(repo.join(".varda/tasks")).expect(".varda task store should exist");
+    }
+
+    fn launcher_test_config(root: &Path) -> config::Config {
+        config::Config {
+            defaults: config::Defaults {
+                operations_dir: root.join("operations").display().to_string(),
+                ..Default::default()
+            },
+            routes: Vec::new(),
+            agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
+            git: config::GitConfig { auto_commit: false },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: orchestration::OrchestrationPolicy::default(),
+        }
+    }
+
+    /// Seeds a bare task markdown file and recap file for
+    /// `apply_verification_gate` tests, under a fresh temp dir. Returns
+    /// `(task_path, recap_path)`.
+    fn seed_gate_test_task(root: &Path, status: task::TaskStatus) -> (PathBuf, PathBuf) {
+        fs::create_dir_all(root).expect("root dir should be created");
+        let task_path = root.join("task.md");
+        fs::write(
+            &task_path,
+            format!(
+                "---\nstatus: {}\n---\n\nGate test task.\n",
+                status.as_str()
+            ),
+        )
+        .expect("task file should write");
+        let recap_path = root.join("recap.md");
+        fs::write(&recap_path, "# Recap\n\nOriginal recap body.\n")
+            .expect("recap file should write");
+        (task_path, recap_path)
+    }
+
+    #[test]
+    fn apply_verification_gate_preserves_needs_user_status_on_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-verify-gate-needs-user-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let (task_path, recap_path) = seed_gate_test_task(&root, task::TaskStatus::NeedsUser);
+        let mut outcome = runner::RunOutcome {
+            status: task::TaskStatus::NeedsUser,
+            recap_path: recap_path.clone(),
+            session_log_path: root.join("session.log"),
+            files_touched: Vec::new(),
+            blocked_commands: Vec::new(),
+        };
+
+        let may_commit = apply_verification_gate(
+            &task_path,
+            &root.display().to_string(),
+            &["exit 1".to_owned()],
+            &mut outcome,
+        )
+        .expect("gate should run without error");
+
+        assert!(!may_commit, "a failing verify command must block the commit");
+        assert_eq!(
+            outcome.status,
+            task::TaskStatus::NeedsUser,
+            "a pre-existing NeedsUser status must survive a verification failure"
+        );
+
+        let reloaded = task::load_task(&task_path).expect("task should reload");
+        assert_eq!(
+            reloaded.frontmatter.status,
+            task::TaskStatus::NeedsUser,
+            "the on-disk task status must also still be NeedsUser"
+        );
+
+        let recap_content = fs::read_to_string(&recap_path).expect("recap should read");
+        assert!(
+            recap_content.contains("## Verification"),
+            "recap should still get the verification section appended: {recap_content}"
+        );
+        assert!(
+            recap_content.contains("verification: failed"),
+            "recap should report the failure: {recap_content}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_existing_worker_isolation_reruns_from_mother_not_prior_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-run-existing-isolate-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        let varda_home = root.join("home");
+        let _guard = EnvVarGuard::set(config::VARDA_HOME_ENV, &varda_home);
+        seed_git_repo(&mother);
+
+        let config = launcher_test_config(&root);
+        let task_path = task::create_task(
+            &config,
+            "Existing Worker",
+            &mother,
+            Some("claude"),
+            None,
+            None,
+        )
+        .expect("task should be created");
+        let mut task_doc = task::load_task(&task_path).expect("task should load");
+        let launcher = VardaSubtaskLauncher {
+            config,
+            project_path: mother.clone(),
+            fallback_agent: "claude".to_owned(),
+            spawn_state: orchestration::SharedSpawnState::new(),
+            worker_registry: orchestration::WorkerRegistry::new(),
+        };
+
+        let first = launcher
+            .isolate_worker(&mut task_doc, &mother, "existing-first")
+            .expect("first run should create an isolated worktree");
+        assert_eq!(
+            task_doc.frontmatter.mother_project.as_deref(),
+            Some(mother.to_str().unwrap())
+        );
+        assert_eq!(
+            task_doc.frontmatter.project.as_deref(),
+            Some(first.path.to_str().unwrap())
+        );
+
+        let second_mother = PathBuf::from(
+            task_doc
+                .frontmatter
+                .policy_project()
+                .expect("mother_project should survive the first isolation"),
+        );
+        let second = launcher
+            .isolate_worker(&mut task_doc, &second_mother, "existing-second")
+            .expect("second run should create a fresh isolated worktree");
+
+        assert_ne!(first.path, second.path);
+        assert_eq!(second_mother, mother);
+        assert!(
+            !second.path.starts_with(&first.path),
+            "second run must not nest a worktree inside the first run's worktree"
+        );
+        assert_eq!(
+            task_doc.frontmatter.mother_project.as_deref(),
+            Some(mother.to_str().unwrap())
+        );
+        assert_eq!(
+            task_doc.frontmatter.project.as_deref(),
+            Some(second.path.to_str().unwrap())
+        );
+
+        let _ = git::remove_worker_worktree(&mother, &first, true);
+        let _ = git::remove_worker_worktree(&mother, &second, true);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_sandbox_override_uses_default_worker_sandbox_and_enforces_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-worker-sandbox-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        fs::create_dir_all(&mother).expect("repo dir should be created");
+
+        let mut config = launcher_test_config(&root);
+        config.sandboxes.insert(
+            "worker".to_owned(),
+            config::SandboxConfig {
+                primitive: "docker".to_owned(),
+                ..Default::default()
+            },
+        );
+        config.orchestration = orchestration::OrchestrationPolicy {
+            enabled: true,
+            allow_agents: vec!["claude".to_owned()],
+            allow_sandboxes: vec!["worker".to_owned()],
+            default_worker_sandbox: Some("worker".to_owned()),
+            ..Default::default()
+        };
+        let launcher = VardaSubtaskLauncher {
+            config,
+            project_path: mother.clone(),
+            fallback_agent: "claude".to_owned(),
+            spawn_state: orchestration::SharedSpawnState::new(),
+            worker_registry: orchestration::WorkerRegistry::new(),
+        };
+
+        assert_eq!(
+            launcher
+                .worker_sandbox_override(&mother, None, "claude", "run")
+                .expect("default worker sandbox should be allowed")
+                .as_deref(),
+            Some("worker")
+        );
+        let err = launcher
+            .worker_sandbox_override(&mother, Some("local"), "claude", "run")
+            .expect_err("denied explicit sandbox must fail before launch");
+        assert!(err.to_string().contains("local"), "got {err:#}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn resident_tmp(name: &str) -> PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("varda-orchestrate-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Build a config whose only route places `ws` in an isolating, net-denied
+    /// sandbox with `ws` mounted rw and the spawn broker enabled — the canonical
+    /// sandboxed-resident setup. `egress`/`primitive` are tweakable so tests can
+    /// prove the gates reject unsafe variants.
+    fn resident_config(ws: &Path, primitive: &str, egress: &str) -> config::Config {
+        let toml = format!(
+            r#"[defaults]
+timeout_seconds = 600
+operations_dir = "operations"
+
+[[routes]]
+glob = "{ws}"
+agents = ["claude"]
+sandbox = "orchestration"
+mounts = ["{ws}:/workspace:rw"]
+
+[agents.claude]
+kind = "acp"
+command = "claude"
+args = []
+
+[sandboxes.orchestration]
+image = "dev:latest"
+primitive = "{primitive}"
+egress = [{egress}]
+
+[orchestration]
+enabled = true
+deny_sandboxes = ["local"]
+"#,
+            ws = ws.display(),
+        );
+        toml::from_str(&toml).expect("resident test config should parse")
+    }
+
+    #[test]
+    fn resolve_resident_launch_resolves_isolating_sandbox_with_broker() {
+        let ws = resident_tmp("ok");
+        let config = resident_config(&ws, "docker", "");
+        let launch = resolve_resident_launch(&config, &ws)
+            .expect("a well-formed sandboxed-resident route resolves");
+        assert_eq!(launch.sandbox, "orchestration");
+        assert_ne!(launch.sandbox, "local", "must not be un-sandboxed");
+        assert_eq!(launch.agent, "claude");
+        assert!(launch.broker_wired, "the spawn broker must be wired");
+        assert_eq!(launch.workspace, ws);
+    }
+
+    #[test]
+    fn resolve_resident_launch_rejects_non_llm_egress() {
+        // A non-LLM egress host (here `api.example.com`) is refused; only the fixed
+        // LLM-endpoint allowlist may be reached.
+        let ws = resident_tmp("net");
+        let config = resident_config(&ws, "microsandbox", "\"api.example.com\"");
+        let err = resolve_resident_launch(&config, &ws)
+            .expect_err("a non-LLM-endpoint egress host must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("api.example.com"), "must name the host: {msg}");
+        assert!(msg.contains("LLM"), "must state the LLM-only policy: {msg}");
+    }
+
+    #[test]
+    fn resolve_resident_launch_allows_llm_egress() {
+        // The resident may reach its LLM provider API when the provider can enforce
+        // strict egress semantics.
+        let ws = resident_tmp("llm");
+        let config = resident_config(&ws, "microsandbox", "\"api.anthropic.com\"");
+        let launch = resolve_resident_launch(&config, &ws)
+            .expect("egress limited to an LLM endpoint must resolve");
+        assert_eq!(launch.sandbox, "orchestration");
+    }
+
+    #[test]
+    fn resolve_resident_launch_allows_docker_proxy_egress() {
+        // Docker strict egress is now enforced by the forward-proxy sidecar, so a
+        // docker resident limited to its LLM endpoint resolves rather than being
+        // refused as an unenforceable downgrade.
+        let ws = resident_tmp("docker-net");
+        let config = resident_config(&ws, "docker", "\"api.anthropic.com\"");
+        let launch = resolve_resident_launch(&config, &ws)
+            .expect("docker proxy-enforced egress to an LLM endpoint must resolve");
+        assert_eq!(launch.sandbox, "orchestration");
+    }
+
+    #[test]
+    fn resolve_resident_launch_rejects_unsandboxed_resident() {
+        let ws = resident_tmp("local");
+        let config = resident_config(&ws, "local", "");
+        let err = resolve_resident_launch(&config, &ws)
+            .expect_err("an un-sandboxed resident must be rejected");
+        assert!(err.to_string().contains("isolating sandbox"), "{err}");
+    }
+
+    /// #522 regression: a resident task left in a terminal state (Failed / Review /
+    /// Done / NeedsUser / Running) by a prior `orchestrate` launch must be reset to
+    /// `Ready` so the next launch does not hit `run_task_command`'s "task ... is not
+    /// ready" bail — without a manual `varda task set-status ready` workaround. Prior
+    /// recap history must survive the reset; only the status field flips.
+    #[test]
+    fn ensure_resident_task_ready_resets_terminal_statuses() {
+        let ws = resident_tmp("ensure-ready");
+        let mut config = resident_config(&ws, "docker", "");
+        config.defaults.operations_dir = ws.join("operations").display().to_string();
+
+        let task_path = resolve_or_scaffold_resident_task(&config, &ws, "claude")
+            .expect("resident task should scaffold");
+
+        for status in [
+            task::TaskStatus::Failed,
+            task::TaskStatus::Review,
+            task::TaskStatus::Done,
+            task::TaskStatus::NeedsUser,
+            task::TaskStatus::Running,
+        ] {
+            let mut task_doc = task::load_task(&task_path).unwrap();
+            task_doc.set_status(status);
+            task_doc.set_recap(format!("prior run left task {status:?}"));
+            task::write_task(&task_doc).unwrap();
+
+            ensure_resident_task_ready(&task_path)
+                .unwrap_or_else(|err| panic!("resetting {status:?} should succeed: {err}"));
+
+            let reloaded = task::load_task(&task_path).unwrap();
+            assert_eq!(
+                reloaded.frontmatter.status,
+                task::TaskStatus::Ready,
+                "status {status:?} should have been reset to ready"
+            );
+            assert_eq!(
+                reloaded.frontmatter.recaps.last(),
+                Some(&format!("prior run left task {status:?}")),
+                "recap history must be preserved across the reset"
+            );
+        }
+    }
+
+    /// #522 regression: a fresh first-time scaffold (already `Ready`) must be left
+    /// unchanged by `ensure_resident_task_ready`.
+    #[test]
+    fn ensure_resident_task_ready_leaves_fresh_scaffold_unchanged() {
+        let ws = resident_tmp("ensure-ready-fresh");
+        let mut config = resident_config(&ws, "docker", "");
+        config.defaults.operations_dir = ws.join("operations").display().to_string();
+
+        let task_path = resolve_or_scaffold_resident_task(&config, &ws, "claude")
+            .expect("resident task should scaffold");
+        let before = task::load_task(&task_path).unwrap();
+        assert_eq!(before.frontmatter.status, task::TaskStatus::Ready);
+
+        ensure_resident_task_ready(&task_path).expect("ready check should succeed");
+
+        let after = task::load_task(&task_path).unwrap();
+        assert_eq!(after.frontmatter.status, task::TaskStatus::Ready);
+        assert_eq!(after.body, before.body, "task body must be untouched");
+        assert!(
+            after.frontmatter.recaps.is_empty(),
+            "a fresh scaffold has no recap history to preserve"
+        );
+    }
+
+    /// #522 end-to-end: simulates two `varda orchestrate` launches back to back. The
+    /// second launch must reuse (not duplicate) the same resident task and must
+    /// recover it from `Failed` to `Ready` without operator intervention.
+    #[test]
+    fn orchestrate_resident_relaunch_recovers_from_failed_status() {
+        let ws = resident_tmp("relaunch");
+        let mut config = resident_config(&ws, "docker", "");
+        config.defaults.operations_dir = ws.join("operations").display().to_string();
+
+        let first_path = resolve_or_scaffold_resident_task(&config, &ws, "claude")
+            .expect("first launch should scaffold the resident task");
+        ensure_resident_task_ready(&first_path).expect("first launch should be ready to run");
+        assert_eq!(
+            task::load_task(&first_path).unwrap().frontmatter.status,
+            task::TaskStatus::Ready
+        );
+
+        // Simulate a prior run that failed (e.g. the sandbox lost network mid-run).
+        let mut failed = task::load_task(&first_path).unwrap();
+        failed.set_status(task::TaskStatus::Failed);
+        failed.set_recap("first run failed: network egress denied");
+        task::write_task(&failed).unwrap();
+
+        let second_path = resolve_or_scaffold_resident_task(&config, &ws, "claude")
+            .expect("second launch should resolve the existing resident task");
+        assert_eq!(
+            second_path, first_path,
+            "the resident task must be reused, not duplicated, across launches"
+        );
+        ensure_resident_task_ready(&second_path)
+            .expect("second launch should recover the task to ready");
+
+        let reloaded = task::load_task(&second_path).unwrap();
+        assert_eq!(reloaded.frontmatter.status, task::TaskStatus::Ready);
+        assert_eq!(
+            reloaded.frontmatter.recaps,
+            vec!["first run failed: network egress denied".to_string()],
+            "the failure recap must survive the automatic reset"
+        );
+    }
+
+    /// Live end-to-end of the sandboxed-resident model. Requires a working docker
+    /// daemon, so it is `#[ignore]` in the deterministic suite; run with
+    /// `cargo test -- --ignored orchestrate_live_resident`.
+    ///
+    /// Scenario (driven manually / by the WORKFLOW.md resident contract):
+    ///   1. A resident boots in a docker box with `ws` mounted rw and `--network none`.
+    ///   2. It spawns ONE worker (via `spawn_subtask`) that edits a file on a branch.
+    ///   3. The resident merges that branch IN-BOX against the mounted workspace.
+    /// Assertions:
+    ///   - the merged change is visible on the HOST through the `ws` mount;
+    ///   - `~/.aws` and the host `$HOME` were never visible inside the box
+    ///     (credential-denylist + no home mount);
+    ///   - NO push occurred (net-deny + no push credential in the resident identity).
+    ///
+    /// What this harness verifies offline before the box ever boots: the launch
+    /// contract those assertions depend on — an isolating, net-denied sandbox with a
+    /// dedicated rw workspace mount and no push credential — actually holds for a
+    /// docker-backed config, and the inverse (a push credential) is refused.
+    #[test]
+    #[ignore = "requires docker"]
+    fn orchestrate_live_resident() {
+        let ws = resident_tmp("live");
+        // Real workspace shape: a git repo the resident merges worker branches into.
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&ws)
+            .status()
+            .expect("git init");
+        fs::create_dir_all(ws.join(".varda")).unwrap();
+        fs::write(ws.join(".varda/WORKFLOW.md"), "# resident contract\n").unwrap();
+
+        // The launch contract holds for the docker-backed resident route.
+        let config = resident_config(&ws, "docker", "");
+        let launch = resolve_resident_launch(&config, &ws)
+            .expect("docker-backed sandboxed resident must pass every gate");
+        assert_eq!(launch.sandbox, "orchestration");
+        assert!(launch.broker_wired);
+
+        // Injecting a git push credential into the same route is refused, so the box
+        // can never authenticate a push to a remote.
+        let mut with_push = config.clone();
+        if let Some(agent) = with_push.agents.get_mut("claude") {
+            agent.credentials = vec![config::CredentialConfig {
+                from_env: Some("GH_HOST_TOKEN".to_owned()),
+                env: Some("GITHUB_TOKEN".to_owned()),
+                ..Default::default()
+            }];
+        }
+        let err = resolve_resident_launch(&with_push, &ws)
+            .expect_err("a resident carrying a push credential must be refused");
+        assert!(err.to_string().contains("push credential"), "{err}");
+
+        // NOTE: the full in-box spawn→edit→merge flow and the host-visibility /
+        // no-home-mount / no-push assertions above are exercised by driving the real
+        // `orchestrate` command against this workspace with a live docker daemon.
+    }
+
+    #[test]
+    fn task_list_active_statuses_exclude_backlog_and_done() {
+        use task::TaskStatus;
+
+        for status in [
+            TaskStatus::Ready,
+            TaskStatus::Running,
+            TaskStatus::Review,
+            TaskStatus::NeedsUser,
+            TaskStatus::Failed,
+        ] {
+            assert!(is_active_task_status(status));
+        }
+
+        assert!(!is_active_task_status(TaskStatus::Backlog));
+        assert!(!is_active_task_status(TaskStatus::Done));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_spawned_subtasks_drains_descendant_handles_registered_during_join() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU32, Ordering},
+        };
+
+        let state = orchestration::SharedSpawnState::new();
+        let completed = Arc::new(AtomicU32::new(0));
+        let child_state = state.clone();
+        let child_completed = completed.clone();
+        state.insert_handle(
+            "child".to_owned(),
+            tokio::spawn(async move {
+                let grand_completed = child_completed.clone();
+                child_state.insert_handle(
+                    "grandchild".to_owned(),
+                    tokio::spawn(async move {
+                        grand_completed.fetch_add(1, Ordering::SeqCst);
+                    }),
+                );
+                child_completed.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        join_spawned_subtasks(&state).await;
+
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        assert_eq!(state.handle_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_orchestrated_child_returns_without_self_joining_shared_state() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let state = orchestration::SharedSpawnState::new();
+        let registry = orchestration::WorkerRegistry::new();
+        let mother = std::env::temp_dir();
+        let child_state = state.clone();
+        let child_registry = registry.clone();
+        let child_mother = mother.clone();
+        let terminal_written = Arc::new(AtomicBool::new(false));
+        let child_terminal_written = terminal_written.clone();
+
+        let child_handle = tokio::spawn(async move {
+            finish_spawned_subtasks(&child_state, &child_registry, &child_mother, false, true)
+                .await;
+            child_terminal_written.store(true, Ordering::SeqCst);
+        });
+        state.insert_handle("child".to_owned(), child_handle);
+
+        timeout(Duration::from_millis(100), async {
+            while !terminal_written.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("child run should not self-join");
+
+        timeout(
+            Duration::from_millis(100),
+            finish_spawned_subtasks(&state, &registry, &mother, true, true),
+        )
+        .await
+        .expect("root cleanup should join the completed child");
+        assert_eq!(state.handle_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_root_run_removes_registered_worker_checkout_and_branch() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-root-worker-cleanup-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        seed_git_repo(&mother);
+        let checkout_path = root.join("worker");
+        let checkout = git::create_worker_worktree(&mother, "completed", &checkout_path)
+            .expect("worker checkout should be created");
+        let registry = orchestration::WorkerRegistry::new();
+        registry.record("worker-1".to_owned(), checkout.clone());
+
+        finish_spawned_subtasks(
+            &orchestration::SharedSpawnState::new(),
+            &registry,
+            &mother,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(!checkout.path.exists(), "worker clone should be removed");
+        assert!(
+            registry.get("worker-1").is_none(),
+            "registry should be drained"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_root_run_preserves_registered_worker_checkout() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-root-worker-cleanup-failed-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        seed_git_repo(&mother);
+        let checkout_path = root.join("worker");
+        let checkout = git::create_worker_worktree(&mother, "failed", &checkout_path)
+            .expect("worker checkout should be created");
+        let registry = orchestration::WorkerRegistry::new();
+        registry.record("worker-1".to_owned(), checkout.clone());
+
+        finish_spawned_subtasks(
+            &orchestration::SharedSpawnState::new(),
+            &registry,
+            &mother,
+            true,
+            false,
+        )
+        .await;
+
+        assert!(
+            checkout.path.exists(),
+            "worker clone must survive a failed root run for human recovery"
+        );
+        assert!(
+            registry.get("worker-1").is_some(),
+            "registry must not be drained on a failed root run"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Test double for `OrchestratedAgentClient`'s inner agent: it never spawns a
+    /// real subprocess. It records what the broker wiring handed it (the injected
+    /// `orchestration_socket_path`, whether the request was interactive) and probes
+    /// the served Unix socket so a test can assert the broker was live for the whole
+    /// inner run — at entry and, after a brief hold, at exit.
+    #[derive(Clone)]
+    struct RecordingInnerClient {
+        interactive_during_run: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        observed_socket: std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>,
+        observed_addr: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        tcp_live_at_start: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        socket_live_at_start: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        socket_live_at_end: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RecordingInnerClient {
+        fn new() -> Self {
+            Self {
+                interactive_during_run: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
+                observed_socket: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                observed_addr: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                tcp_live_at_start: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                socket_live_at_start: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
+                socket_live_at_end: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+
+        fn observed_socket(&self) -> Option<String> {
+            self.observed_socket
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("inner run should have executed")
+        }
+
+        fn observed_addr(&self) -> Option<String> {
+            self.observed_addr.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AgentClient for RecordingInnerClient {
+        async fn run_task(&self, request: agent::AgentRunRequest) -> Result<agent::AgentRunResult> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.interactive_during_run
+                .store(request.interactive, SeqCst);
+            *self.observed_socket.lock().unwrap() = Some(request.orchestration_socket_path.clone());
+            *self.observed_addr.lock().unwrap() = request.orchestration_addr.clone();
+            if let Some(addr) = request.orchestration_addr.as_deref() {
+                // The TCP broker binds before the request is threaded in, so a connect
+                // must succeed immediately for the whole session.
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    self.tcp_live_at_start.store(true, SeqCst);
+                }
+            }
+            if let Some(path) = request.orchestration_socket_path.as_deref() {
+                // serve_unix_socket binds asynchronously; poll briefly for it to appear.
+                for _ in 0..100 {
+                    if Path::new(path).exists() {
+                        self.socket_live_at_start.store(true, SeqCst);
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                // Hold the session open, then confirm the broker is STILL served — the
+                // socket must span the whole session, not be torn down per-child.
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                self.socket_live_at_end
+                    .store(Path::new(path).exists(), SeqCst);
+            }
+            Ok(agent::AgentRunResult {
+                recap: "recap".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            })
+        }
+    }
+
+    fn broker_test_config() -> config::Config {
+        config::Config {
+            defaults: config::Defaults::default(),
+            routes: Vec::new(),
+            agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
+            git: config::GitConfig { auto_commit: false },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: orchestration::OrchestrationPolicy::default(),
+        }
+    }
+
+    /// Short `/tmp`-rooted project dir so the derived Unix socket path stays under
+    /// the ~104-char `sockaddr_un` limit on macOS.
+    fn broker_test_project(tag: &str) -> PathBuf {
+        let path = PathBuf::from("/tmp").join(format!(
+            "v461d-{tag}-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn interactive_broker_request(session_id: &str) -> agent::AgentRunRequest {
+        let doc = test_task_document();
+        // Mirrors runner::run_task's interactive build: socket path starts unset and is
+        // threaded in by OrchestratedAgentClient when orchestration is enabled.
+        agent::AgentRunRequest {
+            agent_name: "codex".to_owned(),
+            role_instructions: None,
+            task_path: "task.md".to_owned(),
+            frontmatter: doc.frontmatter,
+            body: doc.body,
+            timeout: std::time::Duration::from_secs(600),
+            session_id: session_id.to_owned(),
+            session_log_path: None,
+            interactive: true,
+            interpret: false,
+            stream: false,
+            resume_command: None,
+            orchestration_socket_path: None,
+            orchestration_addr: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_orchestrated_run_serves_broker_socket() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let project = broker_test_project("int");
+        let inner = RecordingInnerClient::new();
+        let client = OrchestratedAgentClient {
+            inner: inner.clone(),
+            config: broker_test_config(),
+            sandbox_primitive: "local".to_owned(),
+            policy: orchestration::OrchestrationPolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            project_path: project.clone(),
+            fallback_agent: "codex".to_owned(),
+            lineage: None,
+        };
+
+        let session_id = "root";
+        let result = client
+            .run_task(interactive_broker_request(session_id))
+            .await
+            .unwrap();
+        assert_eq!(result.recap, "recap");
+
+        // Interactive flowed THROUGH the broker instead of short-circuiting.
+        assert!(inner.interactive_during_run.load(SeqCst));
+        // The per-session socket path was threaded into the request (so env_for_request
+        // will export VARDA_MCP_SOCKET) and the broker served it live during the run.
+        let expected = project
+            .join(".varda-mcp")
+            .join(format!("{session_id}.sock"));
+        assert_eq!(
+            inner.observed_socket(),
+            Some(expected.display().to_string())
+        );
+        assert!(
+            inner.socket_live_at_start.load(SeqCst),
+            "broker socket must be served during the interactive session"
+        );
+        // Root-only teardown removes the socket and its dir after the session ends.
+        assert!(
+            !expected.exists(),
+            "socket must be torn down after the session"
+        );
+        assert!(!project.join(".varda-mcp").exists());
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_orchestrated_interactive_run_gets_no_broker() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let project = broker_test_project("plain");
+        let inner = RecordingInnerClient::new();
+        let client = OrchestratedAgentClient {
+            inner: inner.clone(),
+            config: broker_test_config(),
+            sandbox_primitive: "local".to_owned(),
+            // Orchestration disabled ⇒ the interactive path must stay exactly as today.
+            policy: orchestration::OrchestrationPolicy::default(),
+            project_path: project.clone(),
+            fallback_agent: "codex".to_owned(),
+            lineage: None,
+        };
+
+        client
+            .run_task(interactive_broker_request("interactive-plain"))
+            .await
+            .unwrap();
+
+        assert!(inner.interactive_during_run.load(SeqCst));
+        // No socket threaded in ⇒ env_for_request exports no VARDA_MCP_SOCKET.
+        assert_eq!(inner.observed_socket(), None);
+        assert!(!inner.socket_live_at_start.load(SeqCst));
+        // And no broker directory was ever created under the project.
+        assert!(!project.join(".varda-mcp").exists());
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_broker_socket_spans_whole_session_then_tears_down() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // Lifetime guarantee: the interactive resident is the root run (lineage None),
+        // so teardown is root-only — finish_spawned_subtasks joins any detached children
+        // BEFORE the server is aborted and the socket removed (461b ordering, exercised
+        // by join_spawned_subtasks_drains_* and nested_orchestrated_child_* above). Here
+        // we assert the complementary half: the socket is served for the ENTIRE inner
+        // session (start AND end), never torn down mid-session, and only removed after.
+        let project = broker_test_project("life");
+        let inner = RecordingInnerClient::new();
+        let client = OrchestratedAgentClient {
+            inner: inner.clone(),
+            config: broker_test_config(),
+            sandbox_primitive: "local".to_owned(),
+            policy: orchestration::OrchestrationPolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            project_path: project.clone(),
+            fallback_agent: "codex".to_owned(),
+            lineage: None,
+        };
+
+        let expected = project.join(".varda-mcp").join("resident.sock");
+        client
+            .run_task(interactive_broker_request("resident"))
+            .await
+            .unwrap();
+
+        assert!(
+            inner.socket_live_at_start.load(SeqCst),
+            "live at session start"
+        );
+        assert!(
+            inner.socket_live_at_end.load(SeqCst),
+            "broker must still be served at the end of the session (not per-child teardown)"
+        );
+        assert!(
+            !expected.exists(),
+            "socket removed only after the session ends"
+        );
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vm_backed_primitive_serves_broker_over_tcp_not_socket() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // An own-kernel microVM primitive cannot reach a bind-mounted Unix socket,
+        // so the broker is served over TCP and the guest env carries VARDA_MCP_ADDR
+        // (host:port) instead of a socket path — and no `.varda-mcp` socket dir is
+        // created under the project.
+        let project = broker_test_project("tcp");
+        let inner = RecordingInnerClient::new();
+        let client = OrchestratedAgentClient {
+            inner: inner.clone(),
+            config: broker_test_config(),
+            policy: orchestration::OrchestrationPolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            sandbox_primitive: "microsandbox".to_owned(),
+            project_path: project.clone(),
+            fallback_agent: "codex".to_owned(),
+            lineage: None,
+        };
+
+        client
+            .run_task(interactive_broker_request("root"))
+            .await
+            .unwrap();
+
+        // TCP addr threaded in (host:port on the loopback default bind), no socket path.
+        let addr = inner.observed_addr().expect("VARDA_MCP_ADDR must be set");
+        assert_eq!(inner.observed_socket(), None);
+        let socket_addr: std::net::SocketAddr =
+            addr.parse().expect("orchestration_addr must be host:port");
+        assert!(socket_addr.ip().is_loopback(), "host-only bind by default");
+        assert_ne!(socket_addr.port(), 0, "ephemeral port assigned");
+        // The listener was live and reachable for the whole session.
+        assert!(
+            inner.tcp_live_at_start.load(SeqCst),
+            "broker TCP listener must be reachable during the session"
+        );
+        // The TCP transport never creates the project socket dir.
+        assert!(!project.join(".varda-mcp").exists());
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn primitive_selects_tcp_only_for_microvm() {
+        // Transport predicate: own-kernel microVMs need TCP; shared-kernel / local do not.
+        assert!(config::primitive_needs_tcp_broker("microsandbox"));
+        assert!(config::primitive_needs_tcp_broker("clawk"));
+        assert!(!config::primitive_needs_tcp_broker("local"));
+        assert!(!config::primitive_needs_tcp_broker("docker"));
+    }
+
+    #[test]
+    fn broker_socket_dir_is_gitignored() {
+        // The broker socket dir lives under the resident's repo (the varda mother),
+        // so an orchestrate session must not dirty the worktree it is about to merge.
+        // Bind the ignore entry to the exact dir name the run path creates.
+        let gitignore =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|line| line.trim() == ".varda-mcp/"),
+            "'.varda-mcp/' must be gitignored so the broker socket dir stays untracked"
+        );
+    }
+
     #[test]
     fn extracts_values_from_session_log() {
         let content = "session_id=session-1\nagent=codex\ntask=/tmp/task.md\n";
@@ -2806,6 +6069,17 @@ planner_agent: codex
             Some("/tmp/task.md")
         );
         assert_eq!(session_log_value(content, "missing"), None);
+    }
+
+    #[test]
+    fn decodes_dashboard_query_params() {
+        let target = "/api/tasks/detail?path=%2Ftmp%2Ftask%20one.md&unused=true";
+
+        assert_eq!(
+            query_param(target, "path").as_deref(),
+            Some("/tmp/task one.md")
+        );
+        assert_eq!(query_param(target, "missing"), None);
     }
 
     #[test]
@@ -2831,14 +6105,225 @@ planner_agent: codex
         assert_eq!(latest_agent_resume_command(&task), None);
     }
 
+    #[test]
+    fn varda_env_floor_rejects_agent_env_and_credential_target_collisions() {
+        let mut agent = config::AgentConfig {
+            kind: config::AgentKind::Acp,
+            command: "codex".to_owned(),
+            args: Vec::new(),
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: std::collections::BTreeMap::from([("TRUSTED_AGENT".to_owned(), "x".to_owned())]),
+            auth_token_env: Some("HOST_TOKEN".to_owned()),
+            auth_token_target: Some("SANDBOX_TOKEN".to_owned()),
+            credentials: Vec::new(),
+            interactive_command: None,
+            interactive_args: None,
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let mut resolved = config::ResolvedSandbox {
+            name: "inline".to_owned(),
+            config: config::SandboxConfig::default(),
+            route_mounts: Vec::new(),
+            varda_mounts: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            varda_env_keys: vec!["TRUSTED_AGENT".to_owned()],
+            varda_file: Some(PathBuf::from("/repo/.varda")),
+        };
+
+        let err = enforce_varda_env_credential_floor(&agent, &resolved).unwrap_err();
+        assert!(err.to_string().contains("TRUSTED_AGENT"), "{err}");
+
+        agent.env.clear();
+        resolved.varda_env_keys = vec!["SANDBOX_TOKEN".to_owned()];
+        let err = enforce_varda_env_credential_floor(&agent, &resolved).unwrap_err();
+        assert!(err.to_string().contains("SANDBOX_TOKEN"), "{err}");
+    }
+
+    fn agent_for_credentials(credentials: Vec<config::CredentialConfig>) -> config::AgentConfig {
+        config::AgentConfig {
+            kind: config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: Vec::new(),
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: std::collections::BTreeMap::new(),
+            streams_output: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials,
+            interactive_command: None,
+            interactive_args: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        }
+    }
+
+    /// Exit criterion: several credentials inject per run — multiple env targets and
+    /// ≥1 file target, minted at prepare from a `command` source (the FAKE mint) plus
+    /// a `from_env` source. The scoped values reach BOTH channels.
+    #[test]
+    fn resolve_agent_credentials_mints_env_and_file_targets() {
+        // SAFETY: a uniquely-named var this test owns; set and removed within it.
+        unsafe { std::env::set_var("VARDA_TEST_CRED_HOST", "sk-host-token") };
+        let agent = agent_for_credentials(vec![
+            // command source → env target (host-minted short-lived token).
+            config::CredentialConfig {
+                command: Some("printf scoped-access-token".to_owned()),
+                env: Some("CLOUDSDK_AUTH_ACCESS_TOKEN".to_owned()),
+                ..Default::default()
+            },
+            // from_env source → env target.
+            config::CredentialConfig {
+                from_env: Some("VARDA_TEST_CRED_HOST".to_owned()),
+                env: Some("ANTHROPIC_API_KEY".to_owned()),
+                ..Default::default()
+            },
+            // command source → file target (staged read-only in the guest).
+            config::CredentialConfig {
+                command: Some("printf scoped-file-token".to_owned()),
+                file: Some("/home/agent/.config/gcloud-token".to_owned()),
+                ..Default::default()
+            },
+        ]);
+
+        let (auth_env, auth_files) = resolve_agent_credentials(&agent).unwrap();
+        unsafe { std::env::remove_var("VARDA_TEST_CRED_HOST") };
+
+        assert_eq!(
+            auth_env
+                .get("CLOUDSDK_AUTH_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("scoped-access-token")
+        );
+        assert_eq!(
+            auth_env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-host-token")
+        );
+        assert_eq!(
+            auth_files
+                .get("/home/agent/.config/gcloud-token")
+                .map(String::as_str),
+            Some("scoped-file-token")
+        );
+    }
+
+    /// Back-compat: the legacy `auth_token_env`/`auth_token_target` pair still injects
+    /// as a single env-target credential (one-entry sugar over the list).
+    #[test]
+    fn resolve_agent_credentials_back_compat_single_token() {
+        unsafe { std::env::set_var("VARDA_TEST_LEGACY_TOKEN", "sk-legacy") };
+        let mut agent = agent_for_credentials(vec![]);
+        agent.auth_token_env = Some("VARDA_TEST_LEGACY_TOKEN".to_owned());
+        agent.auth_token_target = Some("ANTHROPIC_API_KEY".to_owned());
+
+        let (auth_env, auth_files) = resolve_agent_credentials(&agent).unwrap();
+        unsafe { std::env::remove_var("VARDA_TEST_LEGACY_TOKEN") };
+
+        assert_eq!(
+            auth_env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-legacy")
+        );
+        assert!(auth_files.is_empty());
+    }
+
+    /// A missing `from_env` source is skipped (box still boots unauthenticated); a
+    /// failing or empty `command` source fails loudly (a broken mint must not silently
+    /// degrade to an unauthenticated run).
+    #[test]
+    fn resolve_agent_credentials_missing_env_skips_but_bad_command_fails() {
+        let agent = agent_for_credentials(vec![config::CredentialConfig {
+            from_env: Some("VARDA_TEST_UNSET_CRED_9x".to_owned()),
+            env: Some("SHOULD_NOT_APPEAR".to_owned()),
+            ..Default::default()
+        }]);
+        let (auth_env, _) = resolve_agent_credentials(&agent).unwrap();
+        assert!(
+            auth_env.is_empty(),
+            "missing env source must be skipped: {auth_env:?}"
+        );
+
+        // Empty output fails loudly.
+        let empty = agent_for_credentials(vec![config::CredentialConfig {
+            command: Some("true".to_owned()),
+            env: Some("X".to_owned()),
+            ..Default::default()
+        }]);
+        assert!(
+            resolve_agent_credentials(&empty).is_err(),
+            "empty command output must fail"
+        );
+
+        // Non-zero exit fails loudly.
+        let failing = agent_for_credentials(vec![config::CredentialConfig {
+            command: Some("exit 3".to_owned()),
+            env: Some("X".to_owned()),
+            ..Default::default()
+        }]);
+        assert!(
+            resolve_agent_credentials(&failing).is_err(),
+            "failed command must fail"
+        );
+    }
+
+    /// `optional = true` relaxes ONLY the empty-output case: a deliberately conditional
+    /// credential (gated on a wrapper env var) is skipped instead of failing the run,
+    /// while a mint that actually FAILS still fails loudly.
+    #[test]
+    fn optional_credential_skips_empty_output_but_still_fails_on_error() {
+        let empty = agent_for_credentials(vec![config::CredentialConfig {
+            command: Some("true".to_owned()),
+            env: Some("TF_TOKEN_app_terraform_io".to_owned()),
+            optional: true,
+            ..Default::default()
+        }]);
+        let (auth_env, auth_files) = resolve_agent_credentials(&empty).unwrap();
+        assert!(
+            auth_env.is_empty() && auth_files.is_empty(),
+            "optional empty mint must be skipped: {auth_env:?} {auth_files:?}"
+        );
+
+        // Still injects when the gate is on.
+        let gated = agent_for_credentials(vec![config::CredentialConfig {
+            command: Some("printf tfc-token".to_owned()),
+            env: Some("TF_TOKEN_app_terraform_io".to_owned()),
+            optional: true,
+            ..Default::default()
+        }]);
+        let (auth_env, _) = resolve_agent_credentials(&gated).unwrap();
+        assert_eq!(
+            auth_env.get("TF_TOKEN_app_terraform_io").map(String::as_str),
+            Some("tfc-token")
+        );
+
+        // A broken mint is NOT excused by `optional`.
+        let failing = agent_for_credentials(vec![config::CredentialConfig {
+            command: Some("exit 3".to_owned()),
+            env: Some("X".to_owned()),
+            optional: true,
+            ..Default::default()
+        }]);
+        assert!(
+            resolve_agent_credentials(&failing).is_err(),
+            "optional must not excuse a failed mint"
+        );
+    }
+
     fn test_task_document() -> task::TaskDocument {
         task::TaskDocument {
             path: PathBuf::from("task.md"),
             frontmatter: task::TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: None,
                 status: task::TaskStatus::Ready,
                 project: None,
+                mother_project: None,
                 assignee: None,
+                sandbox: None,
                 recap: None,
                 recaps: vec![],
                 plan: None,
@@ -2847,6 +6332,7 @@ planner_agent: codex
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n".to_owned(),
@@ -2881,11 +6367,15 @@ planner_agent: codex
             defaults: config::Defaults {
                 timeout_seconds: 600,
                 operations_dir: operations_dir.display().to_string(),
+                sandbox: None,
+                ..Default::default()
             },
             routes: vec![],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
             git: config::GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let sessions = task_sessions(&config, &task_path).expect("sessions should be found");
@@ -2893,6 +6383,66 @@ planner_agent: codex
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "session-1");
         assert_eq!(sessions[0].log_path, runs_dir.join("session-1.log"));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn background_launch_failure_marks_task_failed_with_recap_and_log() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-background-launch-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: codex
+requires_user: false
+---
+
+# Task
+
+Do it.
+"#,
+        )
+        .expect("task should be written");
+        let config = config::Config {
+            defaults: config::Defaults {
+                timeout_seconds: 600,
+                operations_dir: operations_dir.display().to_string(),
+                sandbox: None,
+                ..Default::default()
+            },
+            routes: vec![],
+            agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
+            git: config::GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
+        };
+
+        record_background_launch_failure(&config, &task_path, "agent binary was not found")
+            .expect("failure should be recorded");
+
+        let task = task::load_task(&task_path).expect("task should load");
+        assert_eq!(task.frontmatter.status, task::TaskStatus::Failed);
+        assert_eq!(task.frontmatter.agent_session_ids.len(), 1);
+        assert_eq!(task.frontmatter.agent_session_logs.len(), 1);
+        assert_eq!(task.frontmatter.recaps.len(), 1);
+
+        let log = fs::read_to_string(&task.frontmatter.agent_session_logs[0])
+            .expect("session log should be readable");
+        let recap =
+            fs::read_to_string(&task.frontmatter.recaps[0]).expect("recap should be readable");
+        assert!(log.contains("launch_failure=agent binary was not found"));
+        assert!(recap.contains("Agent Run Failed"));
+        assert!(recap.contains("agent binary was not found"));
 
         fs::remove_dir_all(root).expect("test directory should be removable");
     }

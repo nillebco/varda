@@ -1,0 +1,7 @@
+# Minimal sandbox image for M5 build-knob tests.
+#
+# Intentionally trivial: `FROM busybox` installs nothing heavy so the
+# `build = "./testdata/Dockerfile.rust"` path can be exercised quickly under a
+# running docker daemon. The name mirrors the milestone's example (a per-context
+# toolchain image); a real one would `RUN` a rust toolchain install here.
+FROM busybox

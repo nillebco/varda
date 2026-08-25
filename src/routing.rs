@@ -19,6 +19,16 @@ pub struct RouteMatch {
     pub glob: String,
     pub allowed_agents: Vec<String>,
     pub estimated_prompt_tokens: usize,
+    /// Effective sandbox provider for this route (`route` → `defaults` → `local`).
+    pub sandbox: String,
+    /// Project-context mounts declared on the matched route (M6a). Composed with
+    /// the sandbox's image-intrinsic mounts by the docker provider.
+    pub route_mounts: Vec<String>,
+    /// Trusted static env declared on the matched route.
+    pub route_env: std::collections::BTreeMap<String, String>,
+    /// Host-side verification commands (#674) declared on the matched route.
+    /// Empty ⇒ no gate configured for this project.
+    pub verify: Vec<String>,
 }
 
 impl RouteMatch {
@@ -57,6 +67,10 @@ pub fn match_route(
         glob: route.glob.clone(),
         allowed_agents: route.agents.clone(),
         estimated_prompt_tokens: 0,
+        sandbox: config.effective_sandbox(route).to_owned(),
+        route_mounts: route.mounts.clone(),
+        route_env: route.env.clone(),
+        verify: route.verify.clone(),
     })
 }
 
@@ -65,11 +79,14 @@ pub fn match_route_for_task(
     task: &TaskDocument,
     planning: bool,
 ) -> Result<RouteMatch> {
+    // POLICY read: route matching keys on the MOTHER repo root (via
+    // `policy_project`), not the worktree the worker mounts. For a
+    // non-orchestrated task `policy_project` is exactly `project`, so this is
+    // backward-compatible.
     let project_path = task
         .frontmatter
-        .project
-        .as_deref()
-        .map(Path::new)
+        .policy_project()
+        .map(|p| Path::new(p.as_str()))
         .context("task frontmatter is missing project")?;
     let route = find_route(config, project_path)?;
     ensure_agents_exist(config, route)?;
@@ -89,7 +106,17 @@ pub fn match_route_for_task(
         glob: route.glob.clone(),
         allowed_agents: route.agents.clone(),
         estimated_prompt_tokens,
+        sandbox: config.effective_sandbox(route).to_owned(),
+        route_mounts: route.mounts.clone(),
+        route_env: route.env.clone(),
+        verify: route.verify.clone(),
     })
+}
+
+/// Public glob-route lookup used by [`crate::config::Config::resolve_sandbox_for`]
+/// to read the central (trusted) route's sandbox name and mounts.
+pub fn find_route_public<'a>(config: &'a Config, project_path: &Path) -> Result<&'a Route> {
+    find_route(config, project_path)
 }
 
 fn find_route<'a>(config: &'a Config, project_path: &Path) -> Result<&'a Route> {
@@ -287,12 +314,11 @@ fn estimate_task_prompt_tokens(config: &Config, task: &TaskDocument, planning: b
         build_agent_instructions(timeout).len()
     };
 
-    if !planning {
-        if let Some(assignee) = task.frontmatter.assignee.as_deref() {
-            if let Some(role) = config.roles.get(assignee) {
-                characters += role.instructions.as_deref().map(str::len).unwrap_or(0);
-            }
-        }
+    if !planning
+        && let Some(assignee) = task.frontmatter.assignee.as_deref()
+        && let Some(role) = config.roles.get(assignee)
+    {
+        characters += role.instructions.as_deref().map(str::len).unwrap_or(0);
     }
 
     characters += task.path.display().to_string().len();
@@ -304,12 +330,10 @@ fn estimate_task_prompt_tokens(config: &Config, task: &TaskDocument, planning: b
     if let Some(project) = task.frontmatter.project.as_deref() {
         characters += project_instructions_len(project);
     }
-    if !planning {
-        if let Some(plan_path) = task.frontmatter.plan.as_deref() {
-            characters += fs::read_to_string(plan_path)
-                .map(|content| content.len())
-                .unwrap_or_default();
-        }
+    if !planning && let Some(plan_path) = task.frontmatter.plan.as_deref() {
+        characters += fs::read_to_string(plan_path)
+            .map(|content| content.len())
+            .unwrap_or_default();
     }
 
     characters.div_ceil(4)
@@ -338,15 +362,27 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
+                sandbox: None,
+                ..Default::default()
             },
             routes: vec![
                 Route {
                     glob: "/work/special/**".to_owned(),
                     agents: vec!["codex".to_owned()],
+                    sandbox: None,
+                    mounts: Vec::new(),
+                    env: BTreeMap::new(),
+                    orchestration: None,
+                    verify: Vec::new(),
                 },
                 Route {
                     glob: "**".to_owned(),
                     agents: vec!["fallback".to_owned()],
+                    sandbox: None,
+                    mounts: Vec::new(),
+                    env: BTreeMap::new(),
+                    orchestration: None,
+                    verify: Vec::new(),
                 },
             ],
             agents: BTreeMap::from([
@@ -361,7 +397,13 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        auth_token_env: None,
+                        auth_token_target: None,
+                        credentials: Vec::new(),
+                        streams_output: None,
                         resume_command_template: None,
+                        interpreter_agent: None,
+                        skip_recap: false,
                     },
                 ),
                 (
@@ -375,12 +417,20 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        auth_token_env: None,
+                        auth_token_target: None,
+                        credentials: Vec::new(),
+                        streams_output: None,
                         resume_command_template: None,
+                        interpreter_agent: None,
+                        skip_recap: false,
                     },
                 ),
             ]),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let route = match_route(&config, Path::new("/work/special/project"), None)
@@ -395,15 +445,27 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
+                sandbox: None,
+                ..Default::default()
             },
             routes: vec![
                 Route {
                     glob: "**/AsianDevBank/**".to_owned(),
                     agents: vec!["copilot".to_owned()],
+                    sandbox: None,
+                    mounts: Vec::new(),
+                    orchestration: None,
+                    env: BTreeMap::new(),
+                    verify: Vec::new(),
                 },
                 Route {
                     glob: "**".to_owned(),
                     agents: vec!["codex".to_owned(), "claude".to_owned()],
+                    sandbox: None,
+                    mounts: Vec::new(),
+                    orchestration: None,
+                    env: BTreeMap::new(),
+                    verify: Vec::new(),
                 },
             ],
             agents: BTreeMap::from([
@@ -418,7 +480,13 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        auth_token_env: None,
+                        auth_token_target: None,
+                        credentials: Vec::new(),
+                        streams_output: None,
                         resume_command_template: None,
+                        interpreter_agent: None,
+                        skip_recap: false,
                     },
                 ),
                 (
@@ -432,7 +500,13 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        auth_token_env: None,
+                        auth_token_target: None,
+                        credentials: Vec::new(),
+                        streams_output: None,
                         resume_command_template: None,
+                        interpreter_agent: None,
+                        skip_recap: false,
                     },
                 ),
                 (
@@ -446,12 +520,20 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        auth_token_env: None,
+                        auth_token_target: None,
+                        credentials: Vec::new(),
+                        streams_output: None,
                         resume_command_template: None,
+                        interpreter_agent: None,
+                        skip_recap: false,
                     },
                 ),
             ]),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let adb_route = match_route(
@@ -473,10 +555,17 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
+                sandbox: None,
+                ..Default::default()
             },
             routes: vec![Route {
                 glob: "**".to_owned(),
                 agents: vec!["codex".to_owned()],
+                sandbox: None,
+                mounts: Vec::new(),
+                orchestration: None,
+                env: BTreeMap::new(),
+                verify: Vec::new(),
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),
@@ -489,11 +578,19 @@ mod tests {
                     env: BTreeMap::new(),
                     interactive_command: None,
                     interactive_args: None,
+                    auth_token_env: None,
+                    auth_token_target: None,
+                    credentials: Vec::new(),
+                    streams_output: None,
                     resume_command_template: None,
+                    interpreter_agent: None,
+                    skip_recap: false,
                 },
             )]),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
 
         let error = match_route(&config, Path::new("/work/project"), Some("claude"))
@@ -508,10 +605,17 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
+                sandbox: None,
+                ..Default::default()
             },
             routes: vec![Route {
                 glob: "**".to_owned(),
                 agents: vec!["small".to_owned(), "large".to_owned()],
+                sandbox: None,
+                mounts: Vec::new(),
+                orchestration: None,
+                env: BTreeMap::new(),
+                verify: Vec::new(),
             }],
             agents: BTreeMap::from([
                 (
@@ -525,7 +629,13 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        auth_token_env: None,
+                        auth_token_target: None,
+                        credentials: Vec::new(),
+                        streams_output: None,
                         resume_command_template: None,
+                        interpreter_agent: None,
+                        skip_recap: false,
                     },
                 ),
                 (
@@ -539,20 +649,31 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        auth_token_env: None,
+                        auth_token_target: None,
+                        credentials: Vec::new(),
+                        streams_output: None,
                         resume_command_template: None,
+                        interpreter_agent: None,
+                        skip_recap: false,
                     },
                 ),
             ]),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),
             frontmatter: crate::task::TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: Some(1),
                 status: crate::task::TaskStatus::Ready,
                 project: Some("/work/project".to_owned()),
+                mother_project: None,
                 assignee: None,
+                sandbox: None,
                 recap: None,
                 recaps: vec![],
                 plan: None,
@@ -561,6 +682,7 @@ mod tests {
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo it.".to_owned(),
@@ -579,10 +701,17 @@ mod tests {
             defaults: Defaults {
                 timeout_seconds: 600,
                 operations_dir: ".varda/operations".to_owned(),
+                sandbox: None,
+                ..Default::default()
             },
             routes: vec![Route {
                 glob: "**".to_owned(),
                 agents: vec!["small".to_owned(), "large".to_owned()],
+                sandbox: None,
+                mounts: Vec::new(),
+                orchestration: None,
+                env: BTreeMap::new(),
+                verify: Vec::new(),
             }],
             agents: BTreeMap::from([
                 (
@@ -596,7 +725,13 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        auth_token_env: None,
+                        auth_token_target: None,
+                        credentials: Vec::new(),
+                        streams_output: None,
                         resume_command_template: None,
+                        interpreter_agent: None,
+                        skip_recap: false,
                     },
                 ),
                 (
@@ -610,20 +745,31 @@ mod tests {
                         env: BTreeMap::new(),
                         interactive_command: None,
                         interactive_args: None,
+                        auth_token_env: None,
+                        auth_token_target: None,
+                        credentials: Vec::new(),
+                        streams_output: None,
                         resume_command_template: None,
+                        interpreter_agent: None,
+                        skip_recap: false,
                     },
                 ),
             ]),
             roles: BTreeMap::new(),
             git: GitConfig { auto_commit: true },
+            sandboxes: std::collections::BTreeMap::new(),
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
         };
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),
             frontmatter: crate::task::TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: Some(1),
                 status: crate::task::TaskStatus::Ready,
                 project: Some("/work/project".to_owned()),
+                mother_project: None,
                 assignee: Some("small".to_owned()),
+                sandbox: None,
                 recap: None,
                 recaps: vec![],
                 plan: None,
@@ -632,6 +778,7 @@ mod tests {
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task\n\nDo it.".to_owned(),

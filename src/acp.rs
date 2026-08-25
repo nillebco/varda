@@ -1,8 +1,10 @@
 //! ACP transport support.
 
 use std::collections::BTreeMap;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -17,30 +19,190 @@ use crate::agent::{
     recap_requires_user_interaction,
 };
 use crate::config::AgentConfig;
+use crate::sandbox::{
+    CommandSpec, LaunchMode, LocalProvider, SandboxContext, SandboxProvider, SandboxSession,
+};
 
-#[derive(Debug, Clone)]
+/// Guest-visible path the staged task prompt lands at inside a non-`local`
+/// sandbox. Advertised to the agent via `VARDA_PROMPT_FILE` (M13a §5).
+///
+/// MUST live OUTSIDE the agent's `/home/agent` HOME: microsandbox's `--copy-file`
+/// creates the destination's parent dir as **root-owned** in the guest overlay,
+/// so staging into `$HOME` re-owns HOME to root and the uid-1001 `agent` can no
+/// longer write `~/.claude` (Claude Code then fails every Bash call and its own
+/// config/transcript writes with `EACCES: mkdir '/home/agent/.claude'`). Staging
+/// under `/opt/varda` keeps HOME image-owned and writable; the file lands
+/// root-owned `0644`, still world-readable so the agent can `cat` it.
+const GUEST_PROMPT_FILE: &str = "/opt/varda/prompt.txt";
+
+/// Guest-visible hostname that resolves to the HOST machine from inside an
+/// own-kernel microVM guest (`microsandbox`/`clawk`). The broker BINDS to host
+/// loopback (`127.0.0.1`), but the guest's own `127.0.0.1` is NOT the host — the
+/// guest reaches the host's loopback service by dialing `host.microsandbox.internal`
+/// instead. So for a VM-backed primitive the guest-visible broker host is this
+/// name (paired with `VARDA_MCP_PORT`), distinct from the host bind address.
+/// (msb DENIES host access by default, so the `host` net-rule group must also be
+/// allowed — see `MicrosandboxSession::wrap`.)
+const GUEST_BROKER_HOST: &str = "host.microsandbox.internal";
+
+/// M11-ext — stage every file-target credential the identity resolved
+/// ([`SandboxSession::identity_files`]) into the guest via `stage_credential_file`,
+/// so the value lands as a READ-ONLY file inside the box in BOTH launch modes
+/// (docker cp / msb `--copy-file`; cleaned on teardown). Env-target credentials
+/// fold in via the provider's `guest_env()` at wrap and need no staging. Must run
+/// after `prepare` and before `wrap` (providers bake staging into the argv).
+fn stage_identity_files(session: &dyn SandboxSession, sandbox_name: &str) -> Result<()> {
+    for (guest_path, value) in session.identity_files() {
+        session
+            .stage_credential_file(&value, &guest_path)
+            .with_context(|| {
+                format!(
+                    "failed to stage credential file '{guest_path}' into '{sandbox_name}' sandbox"
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Owns the prepared sandbox [`SandboxSession`] and guarantees `teardown()` runs
+/// on EVERY exit path — including a cancel, where the M10 idle/budget watchdog
+/// drops the in-flight `run_task` future before it reaches the inline teardown.
+///
+/// Rust has no async `Drop`, so the two paths differ:
+/// - **Normal exit** — once result/status/session metadata is captured, the caller
+///   invokes [`Self::detach_teardown`] so cleanup cannot delay task settlement.
+/// - **Cancel** — the future is dropped with the session still held, so [`Drop`]
+///   performs the same detach onto the current Tokio runtime. Sandbox teardown is
+///   idempotent `docker rm -f` / `volume rm -f`, so fire-and-forget is enough to
+///   stop `varda-sbx-*` containers/volumes from leaking on an idle/budget kill.
+struct SessionTeardownGuard {
+    session: Option<Box<dyn SandboxSession>>,
+}
+
+impl SessionTeardownGuard {
+    fn new(session: Box<dyn SandboxSession>) -> Self {
+        Self {
+            session: Some(session),
+        }
+    }
+
+    /// Borrow the live session for the `&self` calls (`wrap`, `validate_mounts`,
+    /// `extract_session_store`, …) made while the run is in flight.
+    fn session(&self) -> &dyn SandboxSession {
+        self.session
+            .as_deref()
+            .expect("session is present until teardown() or Drop consumes it")
+    }
+
+    /// Result-producing work is complete. Reclaim the sandbox asynchronously so
+    /// a slow provider teardown cannot hold a finished task open until its budget.
+    fn detach_teardown(mut self) {
+        if let Some(session) = self.session.take() {
+            spawn_session_teardown(session);
+        }
+    }
+}
+
+fn spawn_session_teardown(session: Box<dyn SandboxSession>) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let task = handle.spawn(async move {
+                if let Err(error) = session.teardown().await {
+                    eprintln!("warning: failed to tear down sandbox session: {error:#}");
+                }
+            });
+            pending_session_teardowns()
+                .lock()
+                .expect("session teardown queue poisoned")
+                .push(task);
+        }
+        Err(_) => {
+            eprintln!("warning: sandbox session dropped outside a Tokio runtime; teardown skipped");
+        }
+    }
+}
+
+fn pending_session_teardowns() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Await cleanup only after command results have settled. This keeps teardown
+/// out of the task's completion critical path without letting a one-shot CLI
+/// runtime abort outstanding sandbox cleanup on exit.
+pub(crate) async fn drain_session_teardowns() {
+    let tasks = {
+        let mut pending = pending_session_teardowns()
+            .lock()
+            .expect("session teardown queue poisoned");
+        std::mem::take(&mut *pending)
+    };
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+impl Drop for SessionTeardownGuard {
+    fn drop(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        // Cancel path: the future was dropped before the inline teardown ran.
+        // Detach teardown onto the runtime so the container/volume are still
+        // reclaimed. Best-effort — nothing awaits it, but sandbox removal is
+        // idempotent, so a fire-and-forget task is enough to prevent the leak.
+        spawn_session_teardown(session);
+    }
+}
+
+#[derive(Clone)]
 pub struct AcpSubprocessClient {
     agent_name: String,
     command: String,
     args: Vec<String>,
     working_dir: Option<String>,
     env: BTreeMap<String, String>,
+    static_env: BTreeMap<String, String>,
     interactive_command: Option<String>,
     interactive_args: Option<Vec<String>>,
     resume_command_template: Option<String>,
+    sandbox: Arc<dyn SandboxProvider>,
 }
 
 impl AcpSubprocessClient {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(agent_name: impl Into<String>, config: &AgentConfig) -> Self {
+        // Default to the identity `local` provider so callers that do not opt
+        // into sandboxing keep the exact pre-provider behavior.
+        Self::with_sandbox(agent_name, config, Arc::new(LocalProvider))
+    }
+
+    pub fn with_sandbox(
+        agent_name: impl Into<String>,
+        config: &AgentConfig,
+        sandbox: Arc<dyn SandboxProvider>,
+    ) -> Self {
+        Self::with_sandbox_env(agent_name, config, sandbox, BTreeMap::new())
+    }
+
+    pub fn with_sandbox_env(
+        agent_name: impl Into<String>,
+        config: &AgentConfig,
+        sandbox: Arc<dyn SandboxProvider>,
+        static_env: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             agent_name: agent_name.into(),
             command: config.command.clone(),
             args: config.args.clone(),
             working_dir: config.working_dir.clone(),
             env: config.env.clone(),
+            static_env,
             interactive_command: config.interactive_command.clone(),
             interactive_args: config.interactive_args.clone(),
             resume_command_template: config.resume_command_template.clone(),
+            sandbox,
         }
     }
 }
@@ -71,54 +233,237 @@ impl AcpSubprocessClient {
             return self.execute_interactive(prompt, args, request).await;
         }
         let started_at = SystemTime::now();
-        let command = expand_request_value(&self.command, request);
+        let fresh_command = expand_request_value(&self.command, request);
+        // The M12 capability check below must reflect the ORIGINAL agent command,
+        // not the "sh" wrapper a resume hop rebinds `command` to just below —
+        // otherwise a resumed hop silently loses its `allow_commands` posture.
+        let is_claude_backend = crate::capability::is_claude_backend(&fresh_command);
+        let is_resume = request.resume_command.is_some();
+        let (command, mut args) = if let Some(resume) = request.resume_command.as_deref() {
+            // Headless continuations must execute the captured resume command. Running
+            // it through the guest shell keeps the invocation inside the selected
+            // sandbox; treating it as a fresh agent command silently starts a new
+            // session and makes auto-resume illusory.
+            ("sh".to_owned(), vec!["-c".to_owned(), resume.to_owned()])
+        } else {
+            (fresh_command, args)
+        };
+
+        // M12 per-task capability allowlist: for the Claude Code backend, a
+        // headless (`-p`) run has no interactive approver, so any command not
+        // pre-authorized is denied. Materialize the task's declared
+        // `allow_commands` into a run-scoped settings file carrying
+        // `permissions.allow` and inject it via `--settings` — deterministic,
+        // scoped to exactly those commands, never a blanket bypass.
+        if is_claude_backend && !request.frontmatter.allow_commands.is_empty() {
+            if let Some(log_path) = request.session_log_path.as_deref() {
+                match crate::capability::write_claude_run_settings(
+                    Path::new(log_path),
+                    &request.frontmatter.allow_commands,
+                ) {
+                    Ok(Some(settings_path)) => {
+                        if is_resume {
+                            // args is exactly ["-c", "<resume string>"]: `--settings`
+                            // must be injected into the opaque resume string itself
+                            // (appended as trailing words on the `claude --resume ...`
+                            // command line) since pushing a separate argv entry would
+                            // hand it to `sh`, not to the wrapped `claude` invocation.
+                            if let Some(resume_arg) = args.get_mut(1) {
+                                resume_arg.push_str(" --settings ");
+                                resume_arg.push_str(&crate::capability::shell_single_quote(
+                                    &settings_path.display().to_string(),
+                                ));
+                            } else {
+                                eprintln!(
+                                    "warning: allow_commands declared but the resume \
+                                     command had no argument to inject --settings into; \
+                                     the capability allowlist was not injected"
+                                );
+                            }
+                        } else {
+                            args.push("--settings".to_owned());
+                            args.push(settings_path.display().to_string());
+                        }
+                        let _ = append_session_log(
+                            log_path,
+                            &format!(
+                                "allow_commands={:?}\nrun_settings={}\n",
+                                request.frontmatter.allow_commands,
+                                settings_path.display()
+                            ),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "warning: failed to write run settings for allow_commands: {error:#}"
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "warning: allow_commands declared but no session log path is set; \
+                     the capability allowlist was not injected"
+                );
+            }
+        }
         let working_dir = self
             .working_dir
             .as_deref()
             .map(|dir| expand_request_value(dir, request));
-        let env = env_for_request(&self.env, request);
+        let env = env_for_request(&self.env, &self.static_env, request);
         if let Some(log_path) = request.session_log_path.as_deref() {
+            // A resume hop's `args` is the captured resume command, which may embed
+            // trusted-but-sensitive operator steering text pulled from the workspace
+            // inbox (see runner.rs's `consume_operator_inbox`). Logging it verbatim
+            // here would defeat that redaction by writing the same session log via a
+            // second, independent path.
+            let logged_args = if is_resume {
+                "<redacted: resume command containing operator input>".to_owned()
+            } else {
+                format!("{args:?}")
+            };
             let _ = append_session_log(
                 log_path,
                 &format!(
-                    "session_id={}\nagent={}\ntask={}\ncommand={} args={:?}\nworking_dir={:?}\n",
+                    "session_id={}\nagent={}\ntask={}\ncommand={} args={}\nworking_dir={:?}\n",
                     request.session_id,
                     self.agent_name,
                     request.task_path,
                     command,
-                    args,
+                    logged_args,
                     working_dir
                 ),
             );
         }
 
-        let mut command_builder = Command::new(&command);
+        // Resolve the invocation, then let the sandbox provider rewrite it. For
+        // the `local` provider this is the identity, so the spawn below is
+        // byte-for-byte the same command as before providers existed.
+        let mut spec = CommandSpec {
+            program: command.clone(),
+            args: args.clone(),
+            env: env.clone(),
+            cwd: working_dir.as_deref().map(PathBuf::from),
+        };
+        let sandbox_ctx = SandboxContext {
+            project_root: Path::new(
+                request
+                    .frontmatter
+                    .project
+                    .as_deref()
+                    .unwrap_or_else(|| working_dir.as_deref().unwrap_or(".")),
+            ),
+            route_glob: "",
+            agent_kind: crate::config::AgentKind::Acp,
+            session_id: &request.session_id,
+        };
+        let session = self
+            .sandbox
+            .prepare(&sandbox_ctx)
+            .await
+            .with_context(|| format!("failed to prepare '{}' sandbox", self.sandbox.name()))?;
+        // Own the session in a guard so `teardown()` runs on EVERY exit path —
+        // including a watchdog/budget cancel that drops this future mid-run
+        // (otherwise the `varda-sbx-*` container/volume leak). All `&self` uses
+        // below go through `guard.session()`; after result metadata is captured,
+        // cleanup is detached so provider teardown cannot delay settlement.
+        let guard = SessionTeardownGuard::new(session);
+        let session = guard.session();
+        let session_store_root = session.session_store_root();
+        if session_store_root.is_none() {
+            eprintln!("WARN resume-command unavailable under sandbox");
+        }
+        // Fail loudly if a declared bind-mount source is unreachable on the host
+        // (a would-be empty in-VM stub on a VM-backed daemon) before we run.
+        session
+            .validate_mounts()
+            .with_context(|| format!("unusable mount for '{}' sandbox", self.sandbox.name()))?;
+        // M11-ext — stage any file-target credentials as read-only guest files
+        // before wrap bakes the argv. env-target credentials fold in via the
+        // provider's `guest_env()` at wrap; file targets need the live session.
+        stage_identity_files(session, self.sandbox.name())?;
+        // microVM sandboxes (msb) do NOT forward host stdin into the guest, so a
+        // batch agent that reads its prompt from stdin (e.g. `claude -p`) would
+        // wait, warn "no stdin data received", and exit 1. For those, stage the
+        // prompt as a guest FILE (via `--copy-file`) and let `wrap` redirect it
+        // into the agent's stdin IN-GUEST; the host-side stdin pipe goes unused.
+        let batch_prompt_via_file = session.prompt_via_file() && request.resume_command.is_none();
+        if batch_prompt_via_file {
+            let guest_prompt = session
+                .stage_file(&prompt, GUEST_PROMPT_FILE)
+                .context("failed to stage batch task prompt file")?;
+            spec.env
+                .insert("VARDA_PROMPT_FILE".to_owned(), guest_prompt);
+        }
+        // Live stores (local) are polled while the agent runs; extracted stores
+        // (docker volume + `docker cp`) are only discovered post-exit.
+        let store_is_live = session.store_is_live();
+        let spec = session.wrap(spec, LaunchMode::Batch).with_context(|| {
+            format!(
+                "failed to wrap command for '{}' sandbox",
+                self.sandbox.name()
+            )
+        })?;
+        // Provider-specific batch pre-start staging: docker `create` → `docker cp`
+        // any file-target credentials → `start -ai` so they actually reach the
+        // guest (its `docker run` streaming form cannot copy a file in first).
+        // local/msb return the wrapped command unchanged.
+        let spec = session.begin_batch(spec).await.with_context(|| {
+            format!(
+                "failed to begin batch session for '{}' sandbox",
+                self.sandbox.name()
+            )
+        })?;
+
+        let mut command_builder = Command::new(&spec.program);
         command_builder
-            .args(&args)
-            .envs(env)
+            .args(&spec.args)
+            .envs(&spec.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Some(working_dir) = working_dir.as_deref() {
-            command_builder.current_dir(working_dir);
+        protect_interpreter_from_terminal_sigint(&mut command_builder, request);
+        if let Some(cwd) = spec.cwd.as_deref() {
+            command_builder.current_dir(cwd);
         }
 
         let mut child = command_builder.spawn().with_context(|| {
             format!(
                 "failed to start agent '{}' with command '{}'",
-                self.agent_name, command
+                self.agent_name, spec.program
             )
         })?;
 
-        let mut stdin = child.stdin.take().context("failed to open agent stdin")?;
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .context("failed to write task prompt to agent stdin")?;
-        drop(stdin);
+        if batch_prompt_via_file || request.resume_command.is_some() {
+            // Prompt reaches the agent via the staged guest file + in-guest stdin
+            // redirect (see `prompt_via_file`), or positionally in a resume command.
+            // In either case the host-side fresh-task prompt must not also reach stdin.
+            drop(child.stdin.take());
+        } else {
+            let mut stdin = child.stdin.take().context("failed to open agent stdin")?;
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .context("failed to write task prompt to agent stdin")?;
+            drop(stdin);
+        }
 
-        self.record_external_session(request, started_at);
+        // Resume-capture depends on reaching the agent's session store on the
+        // host. For a LIVE store (host `$HOME` for `local`) discovery polls while
+        // the agent runs, exactly where it writes. For an EXTRACTED store
+        // (`docker` volume) the store is not host-visible yet, so we defer
+        // discovery until after the run has been `docker cp`-ed out (below).
+        // Handle for the async session-store discovery task; awaited after the run
+        // to build the resume command. Set for BOTH a live store (local: polled
+        // while the agent runs, below) and an extracted store (docker: recorded
+        // after `docker cp`). Previously the live handle was discarded, so `local`
+        // headless runs never produced a resume_command and auto-resume never fired.
+        let mut record_handle = None;
+        if store_is_live && let Some(session_root) = session_store_root.as_deref() {
+            record_handle = self.record_external_session(request, started_at, session_root);
+        }
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let stderr = child.stderr.take().context("failed to open agent stderr")?;
@@ -145,6 +490,44 @@ impl AcpSubprocessClient {
         let (stdout, stderr, status) = tokio::try_join!(stdout_task, stderr_task, wait_task)
             .context("failed while waiting for agent subprocess")?;
 
+        let relay_connected = session.guest_relay_connected().await;
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let value =
+                relay_connected.map_or("unknown", |v| if v { "true" } else { "false" });
+            append_session_log(log_path, &format!("\nsandbox_relay_connected={value}\n"))
+                .context("failed to persist sandbox relay state")?;
+        }
+
+        // Extracted stores (docker): the agent has exited, so materialize its
+        // session store on the host (`docker cp` from the volume) and THEN run a
+        // single discovery pass — the files already exist, so the first poll hits
+        // immediately. This is the container→host round-trip that makes
+        // resume-capture work on a VM-backed daemon with a narrow share.
+        if !store_is_live {
+            match session.extract_session_store().await {
+                Ok(()) => {
+                    if let Some(session_root) = session_store_root.as_deref() {
+                        record_handle =
+                            self.record_external_session(request, started_at, session_root);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("warning: failed to extract sandbox session store: {error:#}");
+                }
+            }
+        }
+
+        // The external session id (hence resume command) comes from the discovery
+        // task: for a live store it polled during the run; for an extracted store it
+        // ran against the copied-out store above.
+        let resume_command = match record_handle {
+            Some(handle) => {
+                let external_session_id = handle.await.ok().flatten();
+                self.build_resume_command(request, external_session_id.as_deref())
+            }
+            None => None,
+        };
+
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
         }
@@ -168,12 +551,14 @@ impl AcpSubprocessClient {
             bail!("agent '{}' produced an empty recap", self.agent_name);
         }
 
-        Ok(AgentRunResult {
+        let result = AgentRunResult {
             requires_user: recap_requires_user_interaction(&recap),
             suggested_agent: None,
             recap,
-            resume_command: None,
-        })
+            resume_command,
+        };
+        guard.detach_teardown();
+        Ok(result)
     }
 
     async fn execute_interactive(
@@ -182,12 +567,16 @@ impl AcpSubprocessClient {
         args: Vec<String>,
         request: &AgentRunRequest,
     ) -> Result<AgentRunResult> {
+        // M13a: the interactive SHELL path (an `interactive_command` is set) now
+        // runs inside docker/microsandbox too — see the sandboxed branch below.
+        // The resume and pipe-fallback sub-paths remain local-only (guarded at
+        // their own sites); `local` keeps its byte-for-byte pre-M13a behavior.
         let command = expand_request_value(&self.command, request);
         let working_dir = self
             .working_dir
             .as_deref()
             .map(|dir| expand_request_value(dir, request));
-        let mut env = env_for_request(&self.env, request);
+        let mut env = env_for_request(&self.env, &self.static_env, request);
 
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(
@@ -205,6 +594,16 @@ impl AcpSubprocessClient {
         }
 
         if let Some(resume_command) = request.resume_command.as_deref() {
+            // Resuming an interactive session under a non-identity sandbox is not
+            // part of M13a (the fresh-shell launch is); fail clearly rather than
+            // silently resuming on the host.
+            if self.sandbox.name() != "local" {
+                bail!(
+                    "resuming an interactive session under the '{}' sandbox is not supported yet; \
+                     use sandbox=\"local\"",
+                    self.sandbox.name()
+                );
+            }
             let interactive_cmd = self
                 .interactive_command
                 .as_deref()
@@ -233,6 +632,8 @@ impl AcpSubprocessClient {
                 command_builder.current_dir(working_dir);
             }
 
+            set_terminal_title_for_agent(&self.agent_name);
+
             let mut child = command_builder.spawn().with_context(|| {
                 format!(
                     "failed to resume interactive agent '{}' with command '{}'",
@@ -259,6 +660,28 @@ impl AcpSubprocessClient {
                 suggested_agent: None,
                 resume_command: None,
             });
+        }
+
+        // M13a: route the interactive SHELL (an `interactive_command` is set)
+        // through the sandbox provider when it isn't `local`. The prompt is staged
+        // INTO the guest and the user's TTY is attached; teardown is guaranteed.
+        if self.sandbox.name() != "local" {
+            if let Some(interactive_cmd) = self.interactive_command.clone() {
+                return self
+                    .execute_interactive_sandboxed(
+                        request,
+                        &interactive_cmd,
+                        &prompt,
+                        working_dir,
+                        env,
+                    )
+                    .await;
+            }
+            bail!(
+                "the pipe-based interactive fallback is not supported under the '{}' sandbox; \
+                 set `interactive_command` (e.g. \"sh\") or use sandbox=\"local\"",
+                self.sandbox.name()
+            );
         }
 
         // Write the task prompt to a temp file so truly-interactive agents can read it.
@@ -289,6 +712,8 @@ impl AcpSubprocessClient {
                 command_builder.current_dir(working_dir);
             }
 
+            set_terminal_title_for_agent(&self.agent_name);
+
             let mut child = command_builder.spawn().with_context(|| {
                 format!(
                     "failed to start interactive agent '{}' with command '{}'",
@@ -296,7 +721,10 @@ impl AcpSubprocessClient {
                 )
             })?;
 
-            let record_handle = self.record_external_session(request, started_at);
+            // Interactive runs are local-only (guarded above), so the agent's
+            // session store lives under the host's real HOME.
+            let record_handle =
+                self.record_external_session(request, started_at, &host_session_root());
 
             let status = child
                 .wait()
@@ -344,6 +772,8 @@ impl AcpSubprocessClient {
             command_builder.current_dir(working_dir);
         }
 
+        set_terminal_title_for_agent(&self.agent_name);
+
         let mut child = command_builder.spawn().with_context(|| {
             format!(
                 "failed to start agent '{}' with command '{}'",
@@ -362,7 +792,8 @@ impl AcpSubprocessClient {
             let _ = tokio::io::copy(&mut terminal_stdin, &mut stdin).await;
         });
 
-        let record_handle = self.record_external_session(request, started_at);
+        // Local-only interactive fallback: store lives under the host's HOME.
+        let record_handle = self.record_external_session(request, started_at, &host_session_root());
 
         let stdout = child.stdout.take().context("failed to open agent stdout")?;
         let log_path = request.session_log_path.clone();
@@ -403,6 +834,183 @@ impl AcpSubprocessClient {
         })
     }
 
+    /// Interactive SHELL launch inside a non-`local` sandbox (M13a §4–§6).
+    ///
+    /// Stages the task prompt INTO the guest, wraps the interactive command in
+    /// [`LaunchMode::Interactive`] (docker `-it`/create-cp-start, `msb -t`),
+    /// attaches the user's TTY with inherited stdio, then — mirroring the batch
+    /// extracted-store path — extracts the session store, records the external
+    /// session, and builds a resume command. Teardown is guaranteed via
+    /// [`SessionTeardownGuard`] on every exit path.
+    async fn execute_interactive_sandboxed(
+        &self,
+        request: &AgentRunRequest,
+        interactive_cmd: &str,
+        prompt: &str,
+        working_dir: Option<String>,
+        mut env: BTreeMap<String, String>,
+    ) -> Result<AgentRunResult> {
+        // A sandboxed interactive launch needs a real TTY: `docker -it` / `msb -t`
+        // error out otherwise. Fail clearly BEFORE we prepare the box.
+        use std::io::IsTerminal as _;
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "an interactive sandboxed run needs a terminal on stdin; \
+                 `{}` interactive requires a TTY (are you piping input or running headless?)",
+                self.sandbox.name()
+            );
+        }
+
+        let interactive_cmd = expand_request_value(interactive_cmd, request);
+        let interactive_args =
+            args_for_request(self.interactive_args.as_deref().unwrap_or(&[]), request);
+
+        let spec = CommandSpec {
+            program: interactive_cmd.clone(),
+            args: interactive_args,
+            env: env.clone(),
+            cwd: working_dir.as_deref().map(PathBuf::from),
+        };
+        let sandbox_ctx = SandboxContext {
+            project_root: Path::new(
+                request
+                    .frontmatter
+                    .project
+                    .as_deref()
+                    .unwrap_or_else(|| working_dir.as_deref().unwrap_or(".")),
+            ),
+            route_glob: "",
+            agent_kind: crate::config::AgentKind::Acp,
+            session_id: &request.session_id,
+        };
+        let session = self
+            .sandbox
+            .prepare(&sandbox_ctx)
+            .await
+            .with_context(|| format!("failed to prepare '{}' sandbox", self.sandbox.name()))?;
+        let guard = SessionTeardownGuard::new(session);
+        let session = guard.session();
+        session
+            .validate_mounts()
+            .with_context(|| format!("unusable mount for '{}' sandbox", self.sandbox.name()))?;
+
+        // Stage the prompt into a GUEST-visible file and advertise its guest path,
+        // so the interactive shell/agent can read the task without the host temp
+        // (invisible in-guest) — M13a §5. env must carry VARDA_PROMPT_FILE BEFORE
+        // wrap(), since providers bake env into the wrapped argv.
+        let guest_prompt = session
+            .stage_file(prompt, GUEST_PROMPT_FILE)
+            .context("failed to stage the task prompt into the sandbox")?;
+        env.insert("VARDA_PROMPT_FILE".to_owned(), guest_prompt.clone());
+        // M11-ext — stage file-target credentials (env targets fold in via env above).
+        stage_identity_files(session, self.sandbox.name())?;
+        let spec = CommandSpec {
+            env: env.clone(),
+            ..spec
+        };
+
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let _ = append_session_log(
+                log_path,
+                &format!(
+                    "[interactive-sandboxed]\nsandbox={}\nVARDA_PROMPT_FILE={}\n",
+                    self.sandbox.name(),
+                    guest_prompt
+                ),
+            );
+        }
+
+        let started_at = SystemTime::now();
+        let session_store_root = session.session_store_root();
+        let store_is_live = session.store_is_live();
+
+        let wrapped = session
+            .wrap(spec, LaunchMode::Interactive)
+            .with_context(|| {
+                format!(
+                    "failed to wrap interactive command for '{}' sandbox",
+                    self.sandbox.name()
+                )
+            })?;
+        // Provider-specific interactive lifecycle: docker create → cp → start -ai;
+        // msb/local return the wrapped command directly.
+        let launch = session.begin_interactive(wrapped).await.with_context(|| {
+            format!(
+                "failed to begin interactive session for '{}' sandbox",
+                self.sandbox.name()
+            )
+        })?;
+
+        // Live stores (would be local; not this path) poll during the run; the
+        // extracted docker/msb store is discovered post-exit.
+        let mut record_handle = None;
+        if store_is_live && let Some(session_root) = session_store_root.as_deref() {
+            record_handle = self.record_external_session(request, started_at, session_root);
+        }
+
+        let mut command_builder = Command::new(&launch.program);
+        command_builder
+            .args(&launch.args)
+            .envs(&launch.env)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if let Some(cwd) = launch.cwd.as_deref() {
+            command_builder.current_dir(cwd);
+        }
+
+        set_terminal_title_for_agent(&self.agent_name);
+
+        let mut child = command_builder.spawn().with_context(|| {
+            format!(
+                "failed to start interactive sandboxed agent '{}' with command '{}'",
+                self.agent_name, launch.program
+            )
+        })?;
+        let status = child
+            .wait()
+            .await
+            .context("failed to wait for interactive sandboxed agent subprocess")?;
+
+        // Extracted stores: materialize the guest session store on the host, THEN
+        // discover once (mirrors the batch extracted-store path).
+        if !store_is_live {
+            match session.extract_session_store().await {
+                Ok(()) => {
+                    if let Some(session_root) = session_store_root.as_deref() {
+                        record_handle =
+                            self.record_external_session(request, started_at, session_root);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("warning: failed to extract sandbox session store: {error:#}");
+                }
+            }
+        }
+
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
+        }
+        if !status.success() {
+            bail!("agent '{}' exited with status {}", self.agent_name, status);
+        }
+
+        let external_session_id = match record_handle {
+            Some(handle) => handle.await.ok().flatten(),
+            None => None,
+        };
+        let resume_command = self.build_resume_command(request, external_session_id.as_deref());
+
+        let result = AgentRunResult {
+            recap: "Interactive sandboxed session completed.\n\nrequires_user: false".to_owned(),
+            requires_user: false,
+            suggested_agent: None,
+            resume_command,
+        };
+        guard.detach_teardown();
+        Ok(result)
+    }
+
     fn uses_copilot(&self) -> bool {
         self.command == "copilot"
             || self
@@ -418,24 +1026,32 @@ impl AcpSubprocessClient {
         &self,
         request: &AgentRunRequest,
         started_at: SystemTime,
+        session_root: &Path,
     ) -> Option<tokio::task::JoinHandle<Option<String>>> {
         let log_path = request.session_log_path.as_deref()?.to_owned();
+        let session_root = session_root.to_path_buf();
 
         if self.command == "claude" {
             let project = request.frontmatter.project.as_deref()?.to_owned();
             let varda_session_id = request.session_id.clone();
             Some(tokio::spawn(async move {
-                record_claude_external_session(log_path, project, varda_session_id, started_at)
-                    .await
+                record_claude_external_session(
+                    session_root,
+                    log_path,
+                    project,
+                    varda_session_id,
+                    started_at,
+                )
+                .await
             }))
         } else if self.uses_copilot() {
             Some(tokio::spawn(async move {
-                record_copilot_external_session(log_path, started_at).await
+                record_copilot_external_session(session_root, log_path, started_at).await
             }))
         } else if self.command == "codex" {
             let project = request.frontmatter.project.clone();
             Some(tokio::spawn(async move {
-                record_codex_external_session(log_path, started_at, project).await
+                record_codex_external_session(session_root, log_path, started_at, project).await
             }))
         } else {
             None
@@ -443,7 +1059,12 @@ impl AcpSubprocessClient {
     }
 
     /// Build a resume command from the configured template by substituting the
-    /// agent's external session id and the task's project path. Returns None when
+    /// agent's external session id and the task's project path. The project path is
+    /// shell-single-quoted since this command is now auto-executed via `sh -c` on
+    /// the headless auto-resume path, with no human review to catch word-splitting
+    /// from an unquoted space (e.g. a macOS home directory). A `{prompt}` slot is
+    /// intentionally preserved for the runner to fill from the operator inbox just
+    /// before each continuation hop. Returns None when
     /// no template is configured or no session id was discovered.
     fn build_resume_command(
         &self,
@@ -451,24 +1072,29 @@ impl AcpSubprocessClient {
         external_session_id: Option<&str>,
     ) -> Option<String> {
         let template = self.resume_command_template.as_deref()?;
-        let session_id = external_session_id?;
-        let project = request.frontmatter.project.as_deref().unwrap_or("");
+        let session_id = crate::capability::shell_single_quote(external_session_id?);
+        let project = crate::capability::shell_single_quote(
+            request.frontmatter.project.as_deref().unwrap_or(""),
+        );
         Some(
             template
-                .replace("{external_session_id}", session_id)
-                .replace("{project}", project),
+                .replace("{external_session_id}", &session_id)
+                .replace("{project}", &project),
         )
     }
 }
 
 async fn record_claude_external_session(
+    session_root: PathBuf,
     log_path: String,
     project: String,
     varda_session_id: String,
     started_at: SystemTime,
 ) -> Option<String> {
     for _ in 0..20 {
-        if let Some(transcript) = find_claude_transcript(&project, &varda_session_id, started_at) {
+        if let Some(transcript) =
+            find_claude_transcript(&session_root, &project, &varda_session_id, started_at)
+        {
             let session_id = transcript
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -488,9 +1114,8 @@ async fn record_claude_external_session(
     None
 }
 
-fn find_copilot_process_log(started_at: SystemTime) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let logs_dir = Path::new(&home).join(".copilot/logs");
+fn find_copilot_process_log(session_root: &Path, started_at: SystemTime) -> Option<PathBuf> {
+    let logs_dir = session_root.join(".copilot/logs");
     find_copilot_process_log_in(&logs_dir, started_at)
 }
 
@@ -528,35 +1153,38 @@ fn extract_copilot_workspace_id(log_path: &Path) -> Option<String> {
 }
 
 async fn record_copilot_external_session(
+    session_root: PathBuf,
     log_path: String,
     started_at: SystemTime,
 ) -> Option<String> {
     for _ in 0..20 {
-        if let Some(process_log) = find_copilot_process_log(started_at) {
-            if let Some(workspace_id) = extract_copilot_workspace_id(&process_log) {
-                let home = std::env::var_os("HOME")?;
-                let events_path = Path::new(&home)
-                    .join(".copilot/session-state")
-                    .join(&workspace_id)
-                    .join("events.jsonl");
-                let _ = append_session_log(
-                    &log_path,
-                    &format!(
-                        "external_session_id={workspace_id}\nexternal_session_log={}\n",
-                        events_path.display()
-                    ),
-                );
-                return Some(workspace_id);
-            }
+        if let Some(process_log) = find_copilot_process_log(&session_root, started_at)
+            && let Some(workspace_id) = extract_copilot_workspace_id(&process_log)
+        {
+            let events_path = session_root
+                .join(".copilot/session-state")
+                .join(&workspace_id)
+                .join("events.jsonl");
+            let _ = append_session_log(
+                &log_path,
+                &format!(
+                    "external_session_id={workspace_id}\nexternal_session_log={}\n",
+                    events_path.display()
+                ),
+            );
+            return Some(workspace_id);
         }
         time::sleep(Duration::from_millis(500)).await;
     }
     None
 }
 
-fn find_codex_session(started_at: SystemTime, project: Option<&str>) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let sessions_base = Path::new(&home).join(".codex/sessions");
+fn find_codex_session(
+    session_root: &Path,
+    started_at: SystemTime,
+    project: Option<&str>,
+) -> Option<PathBuf> {
+    let sessions_base = session_root.join(".codex/sessions");
     let mut matches: Vec<(SystemTime, PathBuf)> = Vec::new();
 
     let years = std::fs::read_dir(&sessions_base).ok()?;
@@ -590,18 +1218,14 @@ fn find_codex_session(started_at: SystemTime, project: Option<&str>) -> Option<P
                     if modified < started_at {
                         continue;
                     }
-                    if let Some(project) = project {
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            if let Some(first_line) = content.lines().next() {
-                                if let Ok(event) =
-                                    serde_json::from_str::<serde_json::Value>(first_line)
-                                {
-                                    let cwd = event["payload"]["cwd"].as_str().unwrap_or_default();
-                                    if !cwd.starts_with(project) && cwd != project {
-                                        continue;
-                                    }
-                                }
-                            }
+                    if let Some(project) = project
+                        && let Ok(content) = std::fs::read_to_string(&path)
+                        && let Some(first_line) = content.lines().next()
+                        && let Ok(event) = serde_json::from_str::<serde_json::Value>(first_line)
+                    {
+                        let cwd = event["payload"]["cwd"].as_str().unwrap_or_default();
+                        if !cwd.starts_with(project) && cwd != project {
+                            continue;
                         }
                     }
                     matches.push((modified, path));
@@ -610,7 +1234,7 @@ fn find_codex_session(started_at: SystemTime, project: Option<&str>) -> Option<P
         }
     }
 
-    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches.sort_by_key(|item| std::cmp::Reverse(item.0));
     matches.into_iter().map(|(_, p)| p).next()
 }
 
@@ -625,12 +1249,15 @@ fn extract_codex_session_id(path: &Path) -> Option<String> {
 }
 
 async fn record_codex_external_session(
+    session_root: PathBuf,
     log_path: String,
     started_at: SystemTime,
     project: Option<String>,
 ) -> Option<String> {
     for _ in 0..20 {
-        if let Some(session_path) = find_codex_session(started_at, project.as_deref()) {
+        if let Some(session_path) =
+            find_codex_session(&session_root, started_at, project.as_deref())
+        {
             let session_id =
                 extract_codex_session_id(&session_path).unwrap_or_else(|| "unknown".to_owned());
             let _ = append_session_log(
@@ -765,9 +1392,18 @@ fn build_prompt(request: &AgentRunRequest) -> String {
         .and_then(|plan_path| std::fs::read_to_string(plan_path).ok())
         .map(|content| format!("\n## Task plan\n\n{content}\n"))
         .unwrap_or_default();
+    let orchestration_section = request
+        .orchestration_socket_path
+        .as_deref()
+        .map(|socket| {
+            format!(
+                "\n## Nested orchestration MCP\n\nA host-gated MCP broker is available at Unix socket `{socket}`. Speak newline-delimited JSON-RPC over that socket; `tools/list` advertises the available tools. The only spawn capability is `spawn_subtask`, and denials are hard errors. The broker also exposes task control-plane tools — `list_tasks`, `get_task`, and `set_task_status` — scoped to your own project; use `list_tasks` (or `.varda/tasks/*.md` in the workspace) to discover work, since there is no GitHub egress and no `varda` CLI inside this box, and call `set_task_status` on your OWN task id once you finish (running -> done/needs_user/failed only; review -> done is a human-only gate). If you are the root/orchestrator of this run, you may also call `set_task_status` on any task in your project, not just your own — an ordinary spawned worker stays self-only.\n"
+            )
+        })
+        .unwrap_or_default();
 
     format!(
-        r#"{instructions}{role_section}{instructions_section}{plan_section}
+        r#"{instructions}{role_section}{instructions_section}{plan_section}{orchestration_section}
 Agent: {agent}
 Task path: {task_path}
 Task frontmatter:
@@ -785,7 +1421,7 @@ Task markdown:
         },
         agent = request.agent_name,
         task_path = request.task_path,
-        frontmatter = serde_yaml::to_string(&request.frontmatter)
+        frontmatter = serde_yaml::to_string(&request.frontmatter.sanitized_for_prompt())
             .unwrap_or_else(|_| "<frontmatter serialization failed>".to_owned()),
         body = request.body,
     )
@@ -818,7 +1454,7 @@ Task markdown:
         instructions = build_planning_instructions(request.timeout),
         agent = request.agent_name,
         task_path = request.task_path,
-        frontmatter = serde_yaml::to_string(&request.frontmatter)
+        frontmatter = serde_yaml::to_string(&request.frontmatter.sanitized_for_prompt())
             .unwrap_or_else(|_| "<frontmatter serialization failed>".to_owned()),
         body = request.body,
     )
@@ -839,16 +1475,16 @@ fn args_for_request(args: &[String], request: &AgentRunRequest) -> Vec<String> {
         let arg = &args[index];
         resolved.push(expand_arg(arg, request, project));
 
-        if arg == "--cd" {
-            if let Some(value) = args.get(index + 1) {
-                resolved.push(if value == "." {
-                    project.to_owned()
-                } else {
-                    expand_arg(value, request, project)
-                });
-                index += 2;
-                continue;
-            }
+        if arg == "--cd"
+            && let Some(value) = args.get(index + 1)
+        {
+            resolved.push(if value == "." {
+                project.to_owned()
+            } else {
+                expand_arg(value, request, project)
+            });
+            index += 2;
+            continue;
         }
 
         index += 1;
@@ -871,6 +1507,23 @@ fn resume_args_for_command(command: &str, resume_command: &str) -> Vec<String> {
     }
 }
 
+#[cfg(unix)]
+fn protect_interpreter_from_terminal_sigint(
+    command_builder: &mut Command,
+    request: &AgentRunRequest,
+) {
+    if request.interpret {
+        command_builder.process_group(0);
+    }
+}
+
+#[cfg(not(unix))]
+fn protect_interpreter_from_terminal_sigint(
+    _command_builder: &mut Command,
+    _request: &AgentRunRequest,
+) {
+}
+
 fn expand_request_value(value: &str, request: &AgentRunRequest) -> String {
     let Some(project) = request.frontmatter.project.as_deref() else {
         return expand_varda_project(value).replace("{task}", &request.task_path);
@@ -884,11 +1537,17 @@ fn expand_varda_project(value: &str) -> String {
         .replace("{varda_home}", &default_varda_home())
 }
 
+/// Host `$HOME` as the session-store root for un-sandboxed (interactive) runs,
+/// mirroring [`crate::sandbox::LocalSession::session_store_root`].
+fn host_session_root() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+}
+
 fn default_varda_home() -> String {
-    if let Ok(home) = std::env::var("VARDA_HOME") {
-        if !home.trim().is_empty() {
-            return home;
-        }
+    if let Ok(home) = std::env::var("VARDA_HOME")
+        && !home.trim().is_empty()
+    {
+        return home;
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     std::path::Path::new(&home)
@@ -899,19 +1558,66 @@ fn default_varda_home() -> String {
 
 fn env_for_request(
     env: &BTreeMap<String, String>,
+    static_env: &BTreeMap<String, String>,
     request: &AgentRunRequest,
 ) -> BTreeMap<String, String> {
-    env.iter()
-        .map(|(key, value)| (key.clone(), expand_request_value(value, request)))
-        .collect()
+    let mut out: BTreeMap<String, String> = env
+        .iter()
+        .map(|(key, value)| (key.clone(), expand_env_value(value, request)))
+        .collect();
+    out.extend(
+        static_env
+            .iter()
+            .map(|(key, value)| (key.clone(), expand_env_value(value, request))),
+    );
+    // M8-transport: expose the per-session MCP broker to the sandboxed agent. A
+    // `local`/`docker` guest reaches it through the bind-mounted Unix socket
+    // (`VARDA_MCP_SOCKET`); an own-kernel microVM guest (microsandbox/clawk) cannot
+    // `connect()` that socket and instead dials the host over TCP, so it gets
+    // `VARDA_MCP_ADDR` (host:port) plus `VARDA_MCP_PORT` (the port alone).
+    if let Some(socket) = request.orchestration_socket_path.as_deref() {
+        out.insert("VARDA_MCP_SOCKET".to_owned(), socket.to_owned());
+    }
+    if let Some(addr) = request.orchestration_addr.as_deref() {
+        out.insert("VARDA_MCP_ADDR".to_owned(), addr.to_owned());
+        if let Some((_host, port)) = addr.rsplit_once(':') {
+            out.insert("VARDA_MCP_PORT".to_owned(), port.to_owned());
+        }
+        // Guest-visible broker HOST ≠ the host bind address. `orchestration_addr`
+        // is set only for a VM-backed TCP broker (`primitive_needs_tcp_broker`),
+        // whose broker binds host loopback — which is NOT the guest's own loopback.
+        // The guest bridge dials `host.microsandbox.internal:$VARDA_MCP_PORT`, so
+        // advertise that name as the connect host (the port stays the real bound
+        // ephemeral port from `VARDA_MCP_ADDR`).
+        out.insert("VARDA_MCP_HOST".to_owned(), GUEST_BROKER_HOST.to_owned());
+    }
+    out
+}
+
+fn expand_env_value(value: &str, request: &AgentRunRequest) -> String {
+    let expanded = expand_request_value(value, request);
+    expand_leading_tilde(&expanded)
+}
+
+fn expand_leading_tilde(value: &str) -> String {
+    if value == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| value.to_owned());
+    }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
+    }
+    value.to_owned()
 }
 
 fn find_claude_transcript(
+    session_root: &Path,
     project: &str,
     varda_session_id: &str,
     started_at: SystemTime,
 ) -> Option<PathBuf> {
-    let project_dir = claude_project_dir(project)?;
+    let project_dir = claude_project_dir(session_root, project)?;
     let entries = std::fs::read_dir(project_dir).ok()?;
     let mut matches = Vec::new();
 
@@ -939,14 +1645,13 @@ fn find_claude_transcript(
         }
     }
 
-    matches.sort_by(|left, right| right.0.cmp(&left.0));
+    matches.sort_by_key(|item| std::cmp::Reverse(item.0));
     matches.into_iter().map(|(_, path)| path).next()
 }
 
-fn claude_project_dir(project: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
+fn claude_project_dir(session_root: &Path, project: &str) -> Option<PathBuf> {
     let slug = project.replace('/', "-");
-    Some(Path::new(&home).join(".claude/projects").join(slug))
+    Some(session_root.join(".claude/projects").join(slug))
 }
 
 fn append_session_log(path: &str, content: &str) -> Result<()> {
@@ -972,13 +1677,112 @@ fn append_session_log(path: &str, content: &str) -> Result<()> {
     Ok(())
 }
 
+fn set_terminal_title_for_agent(agent_name: &str) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(terminal_title_sequence(agent_name).as_bytes());
+    let _ = stdout.flush();
+}
+
+fn terminal_title_sequence(agent_name: &str) -> String {
+    format!("\x1b]0;{}\x07", terminal_title(agent_name))
+}
+
+fn terminal_title(agent_name: &str) -> String {
+    let agent_name = agent_name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>();
+    let agent_name = agent_name.trim();
+    if agent_name.is_empty() {
+        "varda + agent".to_owned()
+    } else {
+        format!("varda + {agent_name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::time::Duration;
 
     use crate::task::{TaskFrontmatter, TaskStatus};
 
     use super::*;
+
+    /// A sandbox session that records whether `teardown()` ran, so tests can
+    /// assert the M10 leak fix fires on the cancel path without spinning docker.
+    struct RecordingSession {
+        torn_down: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl SandboxSession for RecordingSession {
+        fn wrap(&self, spec: CommandSpec, _mode: LaunchMode) -> Result<CommandSpec> {
+            Ok(spec)
+        }
+        fn session_store_root(&self) -> Option<PathBuf> {
+            None
+        }
+        async fn teardown(self: Box<Self>) -> Result<()> {
+            self.torn_down
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A completed run detaches teardown instead of waiting for provider cleanup.
+    #[tokio::test]
+    async fn teardown_guard_detaches_teardown_on_normal_exit() {
+        let torn_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SessionTeardownGuard::new(Box::new(RecordingSession {
+            torn_down: torn_down.clone(),
+        }));
+        guard.detach_teardown();
+        drain_session_teardowns().await;
+        assert!(
+            torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "normal exit must schedule sandbox teardown"
+        );
+    }
+
+    /// LEAK FIX: when the future holding the guard is cancelled (dropped) before
+    /// it can call `teardown()` inline — exactly what the idle/budget watchdog
+    /// does — the guard's `Drop` still reclaims the sandbox. No `varda-sbx-*`
+    /// container/volume is left behind on an idle-kill.
+    #[tokio::test]
+    async fn teardown_guard_runs_teardown_on_cancel() {
+        let torn_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let torn_for_fut = torn_down.clone();
+        let run = async move {
+            let _guard = SessionTeardownGuard::new(Box::new(RecordingSession {
+                torn_down: torn_for_fut,
+            }));
+            // Model an in-flight sandboxed run that never resolves; the watchdog
+            // cancels it by dropping this future, so the inline teardown below is
+            // never reached — only `Drop` can save us.
+            std::future::pending::<()>().await;
+            drop(_guard);
+        };
+
+        // Cancel the run the way `run_session_watched` does: the losing branch of
+        // a `select!` is dropped in place.
+        tokio::select! {
+            _ = run => unreachable!("the pending run cannot complete"),
+            _ = time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        // The command-level drain guarantees a one-shot runtime cannot abort the
+        // detached cleanup while exiting.
+        drain_session_teardowns().await;
+        assert!(
+            torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "a cancelled sandboxed run must still tear the session down (no varda-sbx-* leak)"
+        );
+    }
 
     #[tokio::test]
     async fn subprocess_client_sends_prompt_and_captures_recap() {
@@ -991,7 +1795,13 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
             resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("echo", &config);
 
@@ -1001,10 +1811,13 @@ mod tests {
                 role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
+                    bounds: crate::task::TaskBounds::default(),
                     id: None,
                     status: TaskStatus::Ready,
                     project: Some("/work/project".to_owned()),
+                    mother_project: None,
                     assignee: Some("echo".to_owned()),
+                    sandbox: None,
                     recap: None,
                     recaps: vec![],
                     plan: None,
@@ -1013,6 +1826,7 @@ mod tests {
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
                     agent_resume_commands: vec![],
+                    allow_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
@@ -1023,6 +1837,8 @@ mod tests {
                 interpret: false,
                 stream: false,
                 resume_command: None,
+                orchestration_socket_path: None,
+                orchestration_addr: None,
             })
             .await
             .expect("subprocess should echo prompt");
@@ -1030,6 +1846,820 @@ mod tests {
         assert!(result.recap.contains("You have at most 10 minutes"));
         assert!(result.recap.contains("Do it."));
         assert!(!result.requires_user);
+    }
+
+    #[tokio::test]
+    async fn headless_continuation_executes_resume_command_not_fresh_agent() {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "false".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("resume-test", &config);
+        let mut request = docker_request("/tmp", "resume-session");
+        request.resume_command = Some(
+            "printf '# Resumed\\n\\nresume command ran\\n\\nrequires_user: false\\n'".to_owned(),
+        );
+
+        let result = client
+            .run_task(request)
+            .await
+            .expect("resume command should run instead of configured false command");
+        assert!(result.recap.contains("resume command ran"));
+    }
+
+    #[tokio::test]
+    async fn resume_hop_still_injects_allow_commands_settings() {
+        // `command` is "claude" purely so the M12 `is_claude_backend` check fires;
+        // the actual subprocess spawned is always "sh" on the resume path, so no
+        // real `claude` binary is required for this test to run.
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("resume-settings-test", &config);
+        let log_dir = std::env::temp_dir().join(format!(
+            "varda-resume-settings-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&log_dir).expect("log dir created");
+        let log_path = log_dir.join("session.log");
+
+        let mut request = docker_request("/tmp", "resume-settings-session");
+        request.session_log_path = Some(log_path.display().to_string());
+        request.frontmatter.allow_commands = vec!["msb".to_owned()];
+        // `echo` prints every word on its command line, including any trailing
+        // `--settings <path>` this test expects M12 to append to the resume string.
+        request.resume_command = Some("echo requires_user: false".to_owned());
+
+        let result = client
+            .run_task(request)
+            .await
+            .expect("resume hop with allow_commands should still run");
+
+        assert!(
+            result.recap.contains("--settings"),
+            "the resumed invocation must still receive the injected --settings flag: {}",
+            result.recap
+        );
+
+        let log_contents = fs::read_to_string(&log_path).expect("session log readable");
+        assert!(
+            log_contents.contains("run_settings="),
+            "settings injection must still be logged on a resume hop: {log_contents}"
+        );
+        let _ = fs::remove_dir_all(&log_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_hop_settings_path_containing_a_space_stays_one_argument() {
+        // The run-scoped settings file is derived from `session_log_path`, which is
+        // ultimately rooted under VARDA_HOME or the project path — both of which can
+        // legitimately contain spaces (e.g. a macOS home directory like
+        // "/Users/John Doe/..."). If that path is spliced unquoted into the resume
+        // string handed to `sh -c`, it gets word-split instead of reaching `claude`
+        // as a single `--settings` argument.
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("resume-settings-space-test", &config);
+        let log_dir = std::env::temp_dir().join(format!(
+            "varda-resume-settings-space test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&log_dir).expect("log dir created");
+        let log_path = log_dir.join("session.log");
+
+        let mut request = docker_request("/tmp", "resume-settings-space-session");
+        request.session_log_path = Some(log_path.display().to_string());
+        request.frontmatter.allow_commands = vec!["msb".to_owned()];
+        // `printf '[%s]'` echoes each word it receives wrapped in brackets, so a
+        // settings path that got word-split (the bug) shows up as multiple bracketed
+        // segments instead of one.
+        request.resume_command = Some("printf '[%s]' requires_user: false".to_owned());
+
+        let result = client
+            .run_task(request)
+            .await
+            .expect("resume hop with a space-containing settings path should still run");
+
+        let settings_path = crate::capability::run_settings_path(&log_path);
+        let expected = format!("[{}]", settings_path.display());
+        assert!(
+            result.recap.contains(&expected),
+            "the space-containing settings path must arrive as ONE argument: {}",
+            result.recap
+        );
+        let _ = fs::remove_dir_all(&log_dir);
+    }
+
+    #[tokio::test]
+    async fn resume_hop_session_log_redacts_the_raw_resume_command() {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "false".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("resume-redact-test", &config);
+        let log_dir = std::env::temp_dir().join(format!(
+            "varda-resume-redact-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&log_dir).expect("log dir created");
+        let log_path = log_dir.join("session.log");
+
+        let mut request = docker_request("/tmp", "resume-redact-session");
+        request.session_log_path = Some(log_path.display().to_string());
+        request.resume_command = Some(
+            "printf 'requires_user: false\\n' # OPERATOR STEERING INPUT: secret inbox text"
+                .to_owned(),
+        );
+
+        let _ = client
+            .run_task(request)
+            .await
+            .expect("resume command should run");
+
+        let log_contents = fs::read_to_string(&log_path).expect("session log readable");
+        assert!(
+            !log_contents.contains("OPERATOR STEERING INPUT"),
+            "raw resume command (with operator inbox content) must not leak into the \
+             session log: {log_contents}"
+        );
+        assert!(
+            log_contents.contains("<redacted: resume command containing operator input>"),
+            "session log should record that the resume args were redacted: {log_contents}"
+        );
+        let _ = fs::remove_dir_all(&log_dir);
+    }
+
+    fn docker_request(project: &str, session_id: &str) -> AgentRunRequest {
+        AgentRunRequest {
+            agent_name: "shell".to_owned(),
+            role_instructions: None,
+            task_path: "task.md".to_owned(),
+            frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
+                id: None,
+                status: TaskStatus::Ready,
+                project: Some(project.to_owned()),
+                mother_project: None,
+                assignee: Some("shell".to_owned()),
+                sandbox: None,
+                recap: None,
+                recaps: vec![],
+                plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
+                agent_resume_commands: vec![],
+                allow_commands: vec![],
+                requires_user: false,
+            },
+            body: "# Task\n\nDo it.".to_owned(),
+            timeout: Duration::from_secs(600),
+            session_id: session_id.to_owned(),
+            session_log_path: None,
+            interactive: false,
+            interpret: false,
+            stream: false,
+            resume_command: None,
+            orchestration_socket_path: None,
+            orchestration_addr: None,
+        }
+    }
+
+    fn docker_client(command: &str, args: &[&str]) -> AcpSubprocessClient {
+        docker_client_cfg(command, args, vec![], vec![])
+    }
+
+    fn docker_client_cfg(
+        command: &str,
+        args: &[&str],
+        mounts: Vec<String>,
+        egress: Vec<String>,
+    ) -> AcpSubprocessClient {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: command.to_owned(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let sandbox_config = crate::config::SandboxConfig {
+            image: Some("busybox:latest".to_owned()),
+            mounts,
+            egress,
+            ..Default::default()
+        };
+        let merged = crate::sandbox::merge_mount_origins(&sandbox_config.mounts, &[], &[]);
+        let provider = std::sync::Arc::new(
+            crate::sandbox::DockerProvider::from_config("docker", &sandbox_config, merged)
+                .expect("docker provider"),
+        );
+        AcpSubprocessClient::with_sandbox("shell", &config, provider)
+    }
+
+    /// Like [`docker_client_cfg`] but runs the given `image` under PROXY egress mode
+    /// (`egress_mode = "proxy"`): the box is confined to the internal network and
+    /// reaches `egress` hosts only via the forward-proxy sidecar.
+    fn docker_client_proxy(
+        command: &str,
+        args: &[&str],
+        image: &str,
+        egress: Vec<String>,
+    ) -> AcpSubprocessClient {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: command.to_owned(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let sandbox_config = crate::config::SandboxConfig {
+            image: Some(image.to_owned()),
+            egress,
+            egress_mode: crate::config::EgressMode::Proxy,
+            ..Default::default()
+        };
+        let provider = std::sync::Arc::new(
+            crate::sandbox::DockerProvider::from_config("docker", &sandbox_config, Vec::new())
+                .expect("docker provider"),
+        );
+        AcpSubprocessClient::with_sandbox("shell", &config, provider)
+    }
+
+    /// #536 exit criterion (msb-parity for docker): with the forward-proxy egress
+    /// mode, an allow-listed host is REACHABLE through the proxy while any other host
+    /// is genuinely UNROUTABLE (not merely DNS-broken) — and it works with a client
+    /// that does its own DNS. `curl` exits 0 on any HTTP response (a 401 counts as
+    /// reached); a denied host fails the CONNECT at the proxy (non-zero).
+    ///
+    /// Requires a docker daemon, outbound network, and an image with `sh` + `curl`
+    /// (default `alpine/curl`) plus the tinyproxy proxy image to be pullable. Run
+    /// with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon, outbound network, and pullable proxy/curl images"]
+    async fn docker_agent_proxy_egress_enforces_allow_list() {
+        let client = docker_client_proxy(
+            "sh",
+            &[
+                "-c",
+                "if curl -sS -o /dev/null -m 12 https://api.anthropic.com/; then echo ALLOWED_REACHED; else echo ALLOWED_UNREACHABLE; fi; \
+                 if curl -sS -o /dev/null -m 12 https://github.com/; then echo BLOCKED_REACHED; else echo BLOCKED_DENIED; fi; \
+                 echo; echo 'requires_user: false'",
+            ],
+            "alpine/curl:latest",
+            vec!["api.anthropic.com".to_owned()],
+        );
+        let result = client
+            .run_task(docker_request("/tmp", "docker-proxy-egress"))
+            .await
+            .expect("docker agent should run the proxy egress probe");
+        assert!(
+            result.recap.contains("ALLOWED_REACHED"),
+            "allow-listed host must be reachable via the proxy; recap was: {}",
+            result.recap
+        );
+        assert!(
+            result.recap.contains("BLOCKED_DENIED") && !result.recap.contains("BLOCKED_REACHED"),
+            "non-allow-listed host must be unroutable; recap was: {}",
+            result.recap
+        );
+    }
+
+    #[test]
+    fn env_for_request_merges_static_env_after_agent_env_and_expands_values() {
+        let mut agent_env = BTreeMap::new();
+        agent_env.insert("SHARED".to_owned(), "agent".to_owned());
+        agent_env.insert("AGENT_ONLY".to_owned(), "{project}/agent".to_owned());
+        let mut static_env = BTreeMap::new();
+        static_env.insert("SHARED".to_owned(), "static".to_owned());
+        static_env.insert("GCLOUD_PROJECT".to_owned(), "healthy-silo-31898".to_owned());
+        static_env.insert("PROJECT_PATH".to_owned(), "{project}".to_owned());
+        static_env.insert("CACHE_DIR".to_owned(), "~/cache".to_owned());
+
+        let env = env_for_request(
+            &agent_env,
+            &static_env,
+            &docker_request("/srv/app", "env-unit"),
+        );
+
+        assert_eq!(env["SHARED"], "static");
+        assert_eq!(env["AGENT_ONLY"], "/srv/app/agent");
+        assert_eq!(env["GCLOUD_PROJECT"], "healthy-silo-31898");
+        assert_eq!(env["PROJECT_PATH"], "/srv/app");
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(env["CACHE_DIR"], format!("{home}/cache"));
+        }
+    }
+
+    #[test]
+    fn env_for_request_exports_socket_for_interactive_and_omits_it_without_socket() {
+        // 461d: the interactive resident is env-wired exactly like a batch orchestrated
+        // run — an `orchestration_socket_path` (regardless of `interactive`) exports
+        // `VARDA_MCP_SOCKET`; a request without one carries no such key (non-regression).
+        let mut interactive = docker_request("/srv/app", "interactive-broker");
+        interactive.interactive = true;
+        interactive.orchestration_socket_path = Some("/srv/app/.varda-mcp/root.sock".to_owned());
+        let with_socket = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &interactive);
+        assert_eq!(
+            with_socket["VARDA_MCP_SOCKET"],
+            "/srv/app/.varda-mcp/root.sock"
+        );
+
+        let mut plain = docker_request("/srv/app", "no-broker");
+        plain.interactive = true;
+        assert_eq!(plain.orchestration_socket_path, None);
+        let without_socket = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &plain);
+        assert!(!without_socket.contains_key("VARDA_MCP_SOCKET"));
+    }
+
+    #[test]
+    fn env_for_request_exports_tcp_addr_for_vm_backed_broker() {
+        // #541: an own-kernel microVM guest gets the TCP broker address as
+        // `VARDA_MCP_ADDR` (host:port) plus `VARDA_MCP_PORT` (the port alone), and
+        // no `VARDA_MCP_SOCKET` (the two transports are mutually exclusive).
+        let mut vm = docker_request("/srv/app", "vm-broker");
+        vm.interactive = true;
+        vm.orchestration_addr = Some("172.16.0.177:54321".to_owned());
+        let env = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &vm);
+        assert_eq!(env["VARDA_MCP_ADDR"], "172.16.0.177:54321");
+        assert_eq!(env["VARDA_MCP_PORT"], "54321");
+        assert!(!env.contains_key("VARDA_MCP_SOCKET"));
+    }
+
+    #[test]
+    fn env_for_request_advertises_host_microsandbox_internal_for_vm_broker() {
+        // #546 last-mile: the guest connect HOST must be `host.microsandbox.internal`
+        // (which resolves to the HOST from inside the guest), NOT a loopback host —
+        // the broker binds host loopback, but the guest's own loopback is not the
+        // host. The port stays the real bound ephemeral port from `VARDA_MCP_ADDR`.
+        let mut vm = docker_request("/srv/app", "vm-broker-host");
+        vm.orchestration_addr = Some("127.0.0.1:54321".to_owned());
+        let env = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &vm);
+        assert_eq!(env["VARDA_MCP_HOST"], "host.microsandbox.internal");
+        assert_eq!(env["VARDA_MCP_PORT"], "54321");
+        assert_ne!(env["VARDA_MCP_HOST"], "127.0.0.1");
+
+        // A `local`/`docker` guest (socket transport) gets no `VARDA_MCP_HOST`.
+        let mut sock = docker_request("/srv/app", "sock-broker");
+        sock.orchestration_socket_path = Some("/srv/app/.varda-mcp/root.sock".to_owned());
+        let sock_env = env_for_request(&BTreeMap::new(), &BTreeMap::new(), &sock);
+        assert!(!sock_env.contains_key("VARDA_MCP_HOST"));
+    }
+
+    /// M5: build a sandbox image from `testdata/Dockerfile.rust` (a trivial
+    /// `FROM busybox` — installs nothing heavy) and run a shell agent under it,
+    /// asserting the recap is parsed. Proves the `build` knob is honoured end to
+    /// end. Requires a running docker daemon; run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon"]
+    async fn docker_build_sandbox_returns_parsed_recap() {
+        let dockerfile = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/Dockerfile.rust");
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "cat".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let provider = std::sync::Arc::new(
+            crate::sandbox::DockerProvider::from_config(
+                "built",
+                &crate::config::SandboxConfig {
+                    build: Some(dockerfile.to_owned()),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .expect("docker provider from build config"),
+        );
+        let client = AcpSubprocessClient::with_sandbox("shell", &config, provider);
+        let result = client
+            .run_task(docker_request("/tmp", "docker-build-recap"))
+            .await
+            .expect("built docker agent should return a recap");
+        assert!(result.recap.contains("Do it."));
+        assert!(!result.requires_user);
+    }
+
+    /// Integration: a trivial shell agent under `sandbox="docker"` returns a
+    /// parsed recap. Requires a running docker daemon and network to pull
+    /// `busybox`. Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon"]
+    async fn docker_agent_returns_parsed_recap() {
+        // `cat` echoes the prompt (delivered on stdin) straight back as the recap.
+        let client = docker_client("cat", &[]);
+        let result = client
+            .run_task(docker_request("/tmp", "docker-recap"))
+            .await
+            .expect("docker agent should return a recap");
+        assert!(result.recap.contains("Do it."));
+        assert!(!result.requires_user);
+    }
+
+    /// Security assertion (the point of M1, preserved through M3): the agent
+    /// container mounts only the project and a dedicated per-session HOME — never
+    /// the host's real `$HOME` — so it CANNOT read the host's `~/.aws`. M3 sets
+    /// the container `HOME` to the session store, so `$HOME/.aws` would only test
+    /// that empty dir; probe the host's *absolute* `~/.aws` path instead to prove
+    /// the real credential dir is not mounted. Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon"]
+    async fn docker_agent_cannot_read_host_aws_credentials() {
+        // Absolute host credential path; must not be visible from inside.
+        let host_aws = host_session_root().join(".aws");
+        let host_aws = host_aws.display();
+        // Probe for the host ~/.aws inside the container; print a sentinel + recap.
+        let probe = format!(
+            "if [ -e \"{host_aws}\" ]; then echo AWS_VISIBLE; else echo AWS_HIDDEN; fi; \
+             echo; echo 'requires_user: false'"
+        );
+        let client = docker_client("sh", &["-c", probe.as_str()]);
+        let result = client
+            .run_task(docker_request("/tmp", "docker-aws"))
+            .await
+            .expect("docker agent should run the probe");
+        assert!(
+            result.recap.contains("AWS_HIDDEN"),
+            "host ~/.aws must not be visible inside the sandbox; recap was: {}",
+            result.recap
+        );
+        assert!(!result.recap.contains("AWS_VISIBLE"));
+    }
+
+    /// M2 egress exit criterion: with no allow-list the container is fully
+    /// offline, so a DNS lookup of any external host must fail. Run with
+    /// `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon"]
+    async fn docker_agent_default_deny_blocks_egress() {
+        // busybox `nslookup` fails (non-zero / no answer) with --network none.
+        let client = docker_client(
+            "sh",
+            &[
+                "-c",
+                "if nslookup example.com >/dev/null 2>&1; then echo NET_OPEN; else echo NET_BLOCKED; fi; \
+                 echo; echo 'requires_user: false'",
+            ],
+        );
+        let result = client
+            .run_task(docker_request("/tmp", "docker-egress-deny"))
+            .await
+            .expect("docker agent should run the egress probe");
+        assert!(
+            result.recap.contains("NET_BLOCKED"),
+            "default-deny must block egress; recap was: {}",
+            result.recap
+        );
+        assert!(!result.recap.contains("NET_OPEN"));
+    }
+
+    /// M2 egress exit criterion: an allow-listed host resolves (pinned) while a
+    /// non-allow-listed host does not. Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon and outbound DNS on the host"]
+    async fn docker_agent_egress_allow_list_pins_only_listed_hosts() {
+        let client = docker_client_cfg(
+            "sh",
+            &[
+                "-c",
+                // The allow-listed host is pinned into /etc/hosts via `--add-host`;
+                // the other is absent because ambient DNS is disabled and it was
+                // never pinned. We assert on the pin directly (grep is a busybox
+                // builtin; `getent` is not, and `nslookup` bypasses /etc/hosts).
+                "if grep -qw example.com /etc/hosts; then echo ALLOWED_OK; else echo ALLOWED_FAIL; fi; \
+                 if grep -qw blocked.invalid /etc/hosts; then echo BLOCKED_OPEN; else echo BLOCKED_DENIED; fi; \
+                 echo; echo 'requires_user: false'",
+            ],
+            vec![],
+            vec!["example.com".to_owned()],
+        );
+        let result = client
+            .run_task(docker_request("/tmp", "docker-egress-allow"))
+            .await
+            .expect("docker agent should run the allow-list probe");
+        assert!(
+            result.recap.contains("ALLOWED_OK"),
+            "allow-listed host must be reachable; recap was: {}",
+            result.recap
+        );
+        assert!(
+            result.recap.contains("BLOCKED_DENIED"),
+            "non-allow-listed host must be unreachable; recap was: {}",
+            result.recap
+        );
+    }
+
+    /// M15 static-env exit criterion: a static env map merged before wrapping is
+    /// visible in the guest as a regular container env var. Run with
+    /// `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon"]
+    async fn docker_agent_static_env_visible_in_guest() {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf 'GCLOUD_PROJECT=%s\\n\\nrequires_user: false\\n' \"$GCLOUD_PROJECT\""
+                    .to_owned(),
+            ],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let sandbox_config = crate::config::SandboxConfig {
+            image: Some("busybox:latest".to_owned()),
+            ..Default::default()
+        };
+        let provider = std::sync::Arc::new(
+            crate::sandbox::DockerProvider::from_config("docker", &sandbox_config, Vec::new())
+                .expect("docker provider"),
+        );
+        let client = AcpSubprocessClient::with_sandbox_env(
+            "shell",
+            &config,
+            provider,
+            BTreeMap::from([("GCLOUD_PROJECT".to_owned(), "healthy-silo-31898".to_owned())]),
+        );
+        let result = client
+            .run_task(docker_request("/tmp", "docker-static-env"))
+            .await
+            .expect("docker agent should receive static env");
+        assert!(result.recap.contains("GCLOUD_PROJECT=healthy-silo-31898"));
+    }
+
+    /// Build a client whose interactive launch runs a REAL coding agent inside the
+    /// sandbox, reading the task from the staged `VARDA_PROMPT_FILE` — exactly the
+    /// M13b default-config shape (`sh -c '<agent> "$(cat $VARDA_PROMPT_FILE)" …'`).
+    /// `command` stays the bare agent name so external-session capture (M13a) keys
+    /// off the right transcript store. Caller supplies an image that has the agent
+    /// installed + authenticated via injected identity.
+    #[cfg(test)]
+    fn interactive_agent_client(
+        command: &str,
+        interactive_shell: &str,
+        image: &str,
+    ) -> AcpSubprocessClient {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: command.to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: Some("sh".to_owned()),
+            interactive_args: Some(vec!["-c".to_owned(), interactive_shell.to_owned()]),
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let sandbox_config = crate::config::SandboxConfig {
+            image: Some(image.to_owned()),
+            ..Default::default()
+        };
+        let merged = crate::sandbox::merge_mount_origins(&sandbox_config.mounts, &[], &[]);
+        let provider = std::sync::Arc::new(
+            crate::sandbox::DockerProvider::from_config("docker", &sandbox_config, merged)
+                .expect("docker provider"),
+        );
+        AcpSubprocessClient::with_sandbox(command, &config, provider)
+    }
+
+    /// M13b live smoke — a REAL interactive agent session inside docker. These are
+    /// `#[ignore]`d because they need (1) a real TTY on stdin — `cargo test`
+    /// provides none, so run them from a terminal: `cargo test -- --ignored
+    /// --nocapture`; (2) a running docker daemon; and (3) an image with the agent
+    /// installed and authenticated via the injected identity (scoped token env /
+    /// staged file), NOT a creds-dir mount. Each drives the sandboxed interactive
+    /// launch through `run_task(interactive=true)`, attaches the user's TTY, and
+    /// asserts the session completes and teardown leaves no `varda-sbx-*` container.
+    async fn interactive_agent_smoke(command: &str, interactive_shell: &str, session: &str) {
+        use std::io::IsTerminal as _;
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "skipping {command} interactive smoke: no TTY on stdin (run from a terminal)"
+            );
+            return;
+        }
+        let client = interactive_agent_client(command, interactive_shell, "varda-agent:latest");
+        let mut request = docker_request(".", session);
+        request.interactive = true;
+        let result = client
+            .run_task(request)
+            .await
+            .unwrap_or_else(|e| panic!("{command} interactive session should complete: {e:#}"));
+        assert!(!result.requires_user);
+    }
+
+    #[tokio::test]
+    #[ignore = "live: real claude interactive under docker; needs a TTY + auth image"]
+    async fn claude_interactive_under_sandbox_smoke() {
+        interactive_agent_smoke(
+            "claude",
+            "claude \"$(cat $VARDA_PROMPT_FILE)\" --add-dir {project} --permission-mode acceptEdits",
+            "m13b-claude-smoke",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live: real codex interactive under docker; needs a TTY + auth image"]
+    async fn codex_interactive_under_sandbox_smoke() {
+        interactive_agent_smoke(
+            "codex",
+            "codex \"$(cat $VARDA_PROMPT_FILE)\" -C {project} -s workspace-write",
+            "m13b-codex-smoke",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live: real copilot interactive under docker; needs a TTY + auth image"]
+    async fn copilot_interactive_under_sandbox_smoke() {
+        interactive_agent_smoke(
+            "copilot",
+            "copilot \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {project}",
+            "m13b-copilot-smoke",
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interpreter_subprocess_uses_separate_process_group() {
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf '%s' \"$(ps -o pgid= -p $$ | tr -d ' ')\"".to_owned(),
+            ],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("shell", &config);
+
+        let result = client
+            .run_task(AgentRunRequest {
+                agent_name: "shell".to_owned(),
+                role_instructions: None,
+                task_path: "task.md".to_owned(),
+                frontmatter: TaskFrontmatter {
+                    bounds: crate::task::TaskBounds::default(),
+                    id: None,
+                    status: TaskStatus::Ready,
+                    project: Some("/work/project".to_owned()),
+                    mother_project: None,
+                    assignee: Some("shell".to_owned()),
+                    sandbox: None,
+                    recap: None,
+                    recaps: vec![],
+                    plan: None,
+                    agent_session_id: None,
+                    agent_session_log: None,
+                    agent_session_ids: vec![],
+                    agent_session_logs: vec![],
+                    agent_resume_commands: vec![],
+                    allow_commands: vec![],
+                    requires_user: false,
+                },
+                body: "# Task\n\nInterpret it.".to_owned(),
+                timeout: Duration::from_secs(600),
+                session_id: "session-1-interpret".to_owned(),
+                session_log_path: None,
+                interactive: false,
+                interpret: true,
+                stream: false,
+                resume_command: None,
+                orchestration_socket_path: None,
+                orchestration_addr: None,
+            })
+            .await
+            .expect("interpreter subprocess should run");
+
+        let child_process_group: libc::pid_t = result
+            .recap
+            .parse()
+            .expect("subprocess should print its process group");
+        let parent_process_group = unsafe { libc::getpgrp() };
+
+        assert_ne!(
+            child_process_group, parent_process_group,
+            "interpreter subprocess should not share Varda's foreground process group"
+        );
     }
 
     #[tokio::test]
@@ -1049,7 +2679,13 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
             resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -1059,10 +2695,13 @@ mod tests {
                 role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
+                    bounds: crate::task::TaskBounds::default(),
                     id: None,
                     status: TaskStatus::Ready,
                     project: Some("/work/project".to_owned()),
+                    mother_project: None,
                     assignee: Some("shell".to_owned()),
+                    sandbox: None,
                     recap: None,
                     recaps: vec![],
                     plan: None,
@@ -1071,6 +2710,7 @@ mod tests {
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
                     agent_resume_commands: vec![],
+                    allow_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
@@ -1081,6 +2721,8 @@ mod tests {
                 interpret: false,
                 stream: false,
                 resume_command: None,
+                orchestration_socket_path: None,
+                orchestration_addr: None,
             })
             .await
             .expect("subprocess should run");
@@ -1109,7 +2751,13 @@ mod tests {
             env: BTreeMap::from([("VARDA_TEST_PROJECT".to_owned(), "{project}".to_owned())]),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
             resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("shell", &config);
 
@@ -1119,10 +2767,13 @@ mod tests {
                 role_instructions: None,
                 task_path: "task.md".to_owned(),
                 frontmatter: TaskFrontmatter {
+                    bounds: crate::task::TaskBounds::default(),
                     id: None,
                     status: TaskStatus::Ready,
                     project: Some(root.display().to_string()),
+                    mother_project: None,
                     assignee: Some("shell".to_owned()),
+                    sandbox: None,
                     recap: None,
                     recaps: vec![],
                     plan: None,
@@ -1131,6 +2782,7 @@ mod tests {
                     agent_session_ids: vec![],
                     agent_session_logs: vec![],
                     agent_resume_commands: vec![],
+                    allow_commands: vec![],
                     requires_user: false,
                 },
                 body: "# Task\n\nDo it.".to_owned(),
@@ -1141,6 +2793,8 @@ mod tests {
                 interpret: false,
                 stream: false,
                 resume_command: None,
+                orchestration_socket_path: None,
+                orchestration_addr: None,
             })
             .await
             .expect("subprocess should run");
@@ -1160,10 +2814,13 @@ mod tests {
             role_instructions: None,
             task_path: "/home/user/.varda/operations/tasks/task.md".to_owned(),
             frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: None,
                 status: TaskStatus::Ready,
                 project: Some("/work/project".to_owned()),
+                mother_project: None,
                 assignee: Some("codex".to_owned()),
+                sandbox: None,
                 recap: None,
                 recaps: vec![],
                 plan: None,
@@ -1172,6 +2829,7 @@ mod tests {
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task".to_owned(),
@@ -1182,6 +2840,8 @@ mod tests {
             interpret: false,
             stream: false,
             resume_command: None,
+            orchestration_socket_path: None,
+            orchestration_addr: None,
         };
 
         let args = args_for_request(
@@ -1216,10 +2876,13 @@ mod tests {
             role_instructions: None,
             task_path: "/home/user/.varda/operations/tasks/task.md".to_owned(),
             frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: None,
                 status: TaskStatus::Ready,
                 project: Some("/work/project".to_owned()),
+                mother_project: None,
                 assignee: Some("claude".to_owned()),
+                sandbox: None,
                 recap: None,
                 recaps: vec![],
                 plan: None,
@@ -1228,6 +2891,7 @@ mod tests {
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task".to_owned(),
@@ -1238,6 +2902,8 @@ mod tests {
             interpret: false,
             stream: false,
             resume_command: None,
+            orchestration_socket_path: None,
+            orchestration_addr: None,
         };
 
         let args = args_for_request(
@@ -1307,9 +2973,15 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
             resume_command_template: Some(
-                "claude --resume {external_session_id} --add-dir {project}".to_owned(),
+                "claude --resume {external_session_id} --add-dir {project} \"{prompt}\"".to_owned(),
             ),
+            interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("claude", &config);
         let request = sample_request("claude", "/work/project");
@@ -1317,10 +2989,115 @@ mod tests {
         let resume = client.build_resume_command(&request, Some("abc-123"));
         assert_eq!(
             resume.as_deref(),
-            Some("claude --resume abc-123 --add-dir /work/project")
+            Some("claude --resume 'abc-123' --add-dir '/work/project' \"{prompt}\"")
         );
 
         assert!(client.build_resume_command(&request, None).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_resume_command_quotes_a_project_path_containing_a_space_so_sh_sees_one_argument() {
+        // Legitimate on macOS: "/Users/John Doe/project". Unquoted, `sh -c` would
+        // word-split this into two `--add-dir` arguments, silently corrupting the
+        // headless auto-resume invocation this command now feeds directly into `sh`.
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: Some(
+                "claude --resume {external_session_id} --add-dir {project}".to_owned(),
+            ),
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("claude", &config);
+        let request = sample_request("claude", "/Users/John Doe/project");
+
+        let resume = client
+            .build_resume_command(&request, Some("abc-123"))
+            .expect("template and session id present");
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '[%s]' {resume}"))
+            .output()
+            .expect("sh should run printf with the resume command");
+        assert!(output.status.success(), "shell command failed: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("shell output is utf8"),
+            "[claude][--resume][abc-123][--add-dir][/Users/John Doe/project]",
+            "the space-containing project path must arrive as ONE argument, not be word-split"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_resume_command_quotes_a_hostile_session_id_so_sh_cannot_execute_it() {
+        // `external_session_id` is derived from on-disk session storage this process
+        // doesn't fully control the naming of (a Claude transcript filename stem, the
+        // trailing 36 chars of a Codex session filename, or the first token of Copilot
+        // process log content) and is auto-executed via `sh -c` on the headless
+        // auto-resume path. Prove a hostile value can't break out of its argument.
+        let sentinel = std::env::temp_dir().join(format!(
+            "varda-resume-session-id-injection-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_file(&sentinel);
+        let hostile_session_id = format!("abc; touch {}", sentinel.display());
+
+        let config = AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: Some(
+                "claude --resume {external_session_id} --add-dir {project}".to_owned(),
+            ),
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("claude", &config);
+        let request = sample_request("claude", "/work/project");
+
+        let resume = client
+            .build_resume_command(&request, Some(&hostile_session_id))
+            .expect("template and session id present");
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '[%s]' {resume}"))
+            .output()
+            .expect("sh should run printf with the resume command");
+        assert!(output.status.success(), "shell command failed: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("shell output is utf8"),
+            format!("[claude][--resume][{hostile_session_id}][--add-dir][/work/project]"),
+            "the hostile session id must arrive as ONE inert argument, not be word-split or executed"
+        );
+        assert!(
+            !sentinel.exists(),
+            "session id metacharacters must not be executed by sh: sentinel file was created"
+        );
+        let _ = fs::remove_file(&sentinel);
     }
 
     #[test]
@@ -1334,7 +3111,13 @@ mod tests {
             env: BTreeMap::new(),
             interactive_command: None,
             interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
             resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
         };
         let client = AcpSubprocessClient::new("claude", &config);
         let request = sample_request("claude", "/work/project");
@@ -1360,6 +3143,17 @@ mod tests {
             resume_args_for_command("agent", "opaque resume string"),
             vec!["opaque resume string".to_owned()]
         );
+    }
+
+    #[test]
+    fn terminal_title_sequence_names_varda_and_agent() {
+        assert_eq!(terminal_title_sequence("codex"), "\x1b]0;varda + codex\x07");
+    }
+
+    #[test]
+    fn terminal_title_sanitizes_control_characters() {
+        assert_eq!(terminal_title("co\x1bdex\x07"), "varda + co dex");
+        assert_eq!(terminal_title("\n\t"), "varda + agent");
     }
 
     #[test]
@@ -1423,10 +3217,13 @@ mod tests {
             role_instructions: None,
             task_path: "task.md".to_owned(),
             frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
                 id: None,
                 status: TaskStatus::Ready,
                 project: Some(project.to_owned()),
+                mother_project: None,
                 assignee: Some(agent.to_owned()),
+                sandbox: None,
                 recap: None,
                 recaps: vec![],
                 plan: None,
@@ -1435,6 +3232,7 @@ mod tests {
                 agent_session_ids: vec![],
                 agent_session_logs: vec![],
                 agent_resume_commands: vec![],
+                allow_commands: vec![],
                 requires_user: false,
             },
             body: "# Task".to_owned(),
@@ -1445,6 +3243,62 @@ mod tests {
             interpret: false,
             stream: false,
             resume_command: None,
+            orchestration_socket_path: None,
+            orchestration_addr: None,
         }
+    }
+
+    /// A non-`local` provider stub for the TTY-guard test. `prepare` is never
+    /// reached — the guard fires first — so it just bails.
+    struct FakeSandboxProvider;
+    #[async_trait]
+    impl SandboxProvider for FakeSandboxProvider {
+        fn name(&self) -> &str {
+            "docker"
+        }
+        async fn prepare(&self, _ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
+            bail!("prepare should not be reached in the TTY-guard test")
+        }
+    }
+
+    fn interactive_shell_config() -> AgentConfig {
+        AgentConfig {
+            kind: crate::config::AgentKind::Acp,
+            command: "claude".to_owned(),
+            args: vec![],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: Some("sh".to_owned()),
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        }
+    }
+
+    /// M13a §4 TTY guard: a sandboxed interactive launch requires a real terminal
+    /// on stdin (`docker -it`/`msb -t` fail otherwise). Under `cargo test` stdin is
+    /// not a TTY, so the guard must bail with a clear message BEFORE preparing the
+    /// box (the stub provider's `prepare` would otherwise panic).
+    #[tokio::test]
+    async fn sandboxed_interactive_requires_a_tty() {
+        let config = interactive_shell_config();
+        let client =
+            AcpSubprocessClient::with_sandbox("sh", &config, Arc::new(FakeSandboxProvider));
+        let request = sample_request("sh", "/work/project");
+        let err = client
+            .execute_interactive_sandboxed(&request, "sh", "prompt text", None, BTreeMap::new())
+            .await
+            .expect_err("must refuse to launch without a TTY");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("needs a terminal on stdin"),
+            "unexpected error: {msg}"
+        );
     }
 }
