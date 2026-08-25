@@ -304,6 +304,15 @@ Behavior:
     repo-defined task is accepted instead of stalling in `backlog`.
   - The lookup walks up to the repo root, so `run <id>` works from any
     subdirectory of the repo, not just its top level.
+  - Materialization seeds the home file once, but the task BODY is never
+    frozen there: every later read (`get_task`, `run`, `task list`, the CLI
+    display) re-resolves the body live from `.varda/tasks/<id>-<slug>.md`. So
+    editing the committed definition after creation — e.g. an operator
+    recording a policy decision before spawning a worker — is visible on the
+    very next read, with no re-sync step. If the definition can't be resolved
+    cleanly (the store is unreadable, the definition file fails to parse, or
+    more than one definition file claims the same id), the read fails with an
+    explicit error instead of silently falling back to the stale home body.
 - `varda task list` unions the repo's definitions with the home store, so a
   clone sees every task the code ships even before it has run anything.
 - `.varda/WORKFLOW.md` documents the multi-agent contribution rules
