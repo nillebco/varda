@@ -724,6 +724,8 @@ auto_commit = true
 
 Run `varda config edit` to open the global config in `$EDITOR`. If `EDITOR` is not set, Varda falls back to `vi`.
 
+Run `varda config show` to print the central `config.toml` file exactly as it is on disk, or `varda config show --resolved` to print the fully merged config — every `include` fragment merged in, with precedence applied — as it is actually used at runtime.
+
 For now, `kind = "acp"` means Varda uses its ACP-facing agent abstraction. The concrete POC adapter drives the local Codex CLI with `codex exec` through stdin/stdout because this machine's Codex CLI does not expose a direct `--acp` flag.
 
 When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder. Varda also expands `{varda_project}` to the Varda source project directory and `{varda_home}` to the Varda control-plane directory, then passes both as additional writable directories to the default Codex, Claude, and Copilot launch commands, so interpreter and resume sessions can create follow-up Varda tasks after the current task finishes.
