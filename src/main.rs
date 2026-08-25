@@ -294,6 +294,15 @@ enum TaskCommand {
 enum ConfigCommand {
     /// Open the global Varda config in $EDITOR.
     Edit,
+    /// Print the config as loaded. With --resolved, print the FULLY MERGED config
+    /// (all `include` fragments merged in, precedence applied) as it would
+    /// actually be used — not just the raw central file's own top-level content.
+    Show {
+        /// Print the fully resolved config (includes merged, precedence applied)
+        /// instead of the raw central config.toml content.
+        #[arg(long)]
+        resolved: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -364,6 +373,20 @@ async fn run_cli() -> Result<()> {
             ConfigCommand::Edit => {
                 let config_path = config::config_file()?;
                 open_editor(&config_path)?;
+            }
+            ConfigCommand::Show { resolved } => {
+                let config_path = config::config_file()?;
+                if resolved {
+                    let config = config::load_config(&config_path)?;
+                    let content =
+                        toml::to_string_pretty(&config).context("failed to serialize config")?;
+                    println!("{content}");
+                } else {
+                    let content = fs::read_to_string(&config_path).with_context(|| {
+                        format!("failed to read config at {}", config_path.display())
+                    })?;
+                    println!("{content}");
+                }
             }
         },
         Command::Task { command } => match command {
