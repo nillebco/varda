@@ -648,40 +648,42 @@ mod tests {
     /// so a capability-relevant field can never silently ship unsummarized.
     #[test]
     fn capability_field_coverage_is_derivation_complete() {
-        const CAPABILITY_BEARING: &[&str] = &[
-            "primitive",
-            "mounts",
-            "egress",
-            "egress_mode",
-            "env",
-            "from_secret",
-            "from_fnox",
-            // AgentConfig.credentials — the `[[agents.X.credentials]]` list;
-            // wired via `AgentConfig::effective_credentials()`. NB: the string
-            // "command" is shared with AgentConfig.command (the binary to run,
-            // NOT capability-bearing) — this list can't distinguish same-named
-            // fields across structs, so classifying "command" here is
-            // conservative-correct for CredentialConfig.command (a host command
-            // source, the highest-severity capability, see gap #1) even though
-            // it sweeps in the unrelated AgentConfig.command field too.
-            "credentials",
-            "command",
-            // AgentConfig.auth_token_env / CredentialConfig.from_env — both fold
-            // through `effective_credentials()` into a host env var read
-            // (`CredentialSource::Env`), diffed via `CapabilitySummary::host_env_reads`.
-            "auth_token_env",
-            "from_env",
-        ];
-        const NOT_CAPABILITY_BEARING: &[&str] = &[
-            // SandboxConfig — image identity/build/resources, not a capability grant.
+        // Classification is scoped PER STRUCT (not one flat pair of lists) so that
+        // the same field name on two different structs — e.g. "command", which is
+        // AgentConfig.command (the binary to run, NOT capability-bearing) and
+        // CredentialConfig.command (a host command source, IS capability-bearing,
+        // the highest-severity capability a credential can request) — is checked
+        // independently for each struct instead of one classification incidentally
+        // "covering" the other's same-named, differently-meaning field.
+        const SANDBOX_CAPABILITY_BEARING: &[&str] =
+            &["primitive", "mounts", "env", "egress", "egress_mode"];
+        const SANDBOX_NOT_CAPABILITY_BEARING: &[&str] = &[
+            // image identity/build/resources, not a capability grant.
             "image",
             "build",
             "image_from",
             "egress_proxy_image",
             "memory",
             "cpus",
-            // AgentConfig — identity/behavior, not a new capability.
+        ];
+
+        const AGENT_CAPABILITY_BEARING: &[&str] = &[
+            "env",
+            // AgentConfig.credentials — the `[[agents.X.credentials]]` list;
+            // wired via `AgentConfig::effective_credentials()`.
+            "credentials",
+            // AgentConfig.auth_token_env folds through `effective_credentials()`
+            // into a host env var read (`CredentialSource::Env`), diffed via
+            // `CapabilitySummary::host_env_reads`.
+            "auth_token_env",
+        ];
+        const AGENT_NOT_CAPABILITY_BEARING: &[&str] = &[
+            // identity/behavior, not a new capability.
             "kind",
+            // AgentConfig.command is the binary to run — NOT capability-bearing.
+            // (See CredentialConfig.command below for the unrelated, capability-
+            // bearing field of the same name.)
+            "command",
             "args",
             "max_prompt_tokens",
             "working_dir",
@@ -692,16 +694,37 @@ mod tests {
             "resume_command_template",
             "interpreter_agent",
             "skip_recap",
-            // CredentialConfig — `env`/`file` are TARGETS (where the resolved value
-            // lands), not sources; `refresh_seconds`/`optional` are delivery
-            // mechanics of an already-modeled binding.
+        ];
+
+        const CREDENTIAL_CAPABILITY_BEARING: &[&str] = &[
+            // CredentialConfig.from_env / from_secret / from_fnox / command are all
+            // credential SOURCES. from_env folds through `effective_credentials()`
+            // into a host env var read (`CredentialSource::Env`), diffed via
+            // `CapabilitySummary::host_env_reads`.
+            "from_env",
+            "from_secret",
+            "from_fnox",
+            // CredentialConfig.command is a host command source — the highest-
+            // severity capability a credential can request. (See AgentConfig.command
+            // above for the unrelated, non-capability-bearing field of the same name.)
+            "command",
+        ];
+        const CREDENTIAL_NOT_CAPABILITY_BEARING: &[&str] = &[
+            // `env`/`file` are TARGETS (where the resolved value lands), not
+            // sources; `refresh_seconds`/`optional` are delivery mechanics of an
+            // already-modeled binding.
+            "env",
             "file",
             "refresh_seconds",
             "optional",
-            // Route — `glob`/`agents`/`sandbox` are routing identity (which
-            // already-summarized sandbox/agent applies), not a new grant;
-            // `orchestration`/`verify` are out of scope for this pass (tracked in
-            // the task recap as remaining work, not silently dropped).
+        ];
+
+        const ROUTE_CAPABILITY_BEARING: &[&str] = &["mounts", "env"];
+        const ROUTE_NOT_CAPABILITY_BEARING: &[&str] = &[
+            // `glob`/`agents`/`sandbox` are routing identity (which already-
+            // summarized sandbox/agent applies), not a new grant; `orchestration`/
+            // `verify` are out of scope for this pass (tracked in the task recap
+            // as remaining work, not silently dropped).
             "glob",
             "agents",
             "sandbox",
@@ -709,20 +732,56 @@ mod tests {
             "verify",
         ];
 
-        for field in SANDBOX_CONFIG_FIELDS
-            .iter()
-            .chain(AGENT_CONFIG_FIELDS)
-            .chain(CREDENTIAL_CONFIG_FIELDS)
-            .chain(ROUTE_FIELDS)
-        {
-            let covered =
-                CAPABILITY_BEARING.contains(field) || NOT_CAPABILITY_BEARING.contains(field);
-            assert!(
-                covered,
-                "field '{field}' is not classified in capability_field_coverage_is_derivation_complete; \
-                 add it to CAPABILITY_BEARING (and CapabilitySummary::from_config) or to \
-                 NOT_CAPABILITY_BEARING with a reason"
-            );
+        // Demonstrates the gap this restructuring closes: the two "command" fields
+        // are classified independently, and disagree.
+        assert!(!AGENT_CAPABILITY_BEARING.contains(&"command"));
+        assert!(CREDENTIAL_CAPABILITY_BEARING.contains(&"command"));
+
+        let structs: &[(&str, &[&str], &[&str], &[&str])] = &[
+            (
+                "SandboxConfig",
+                SANDBOX_CONFIG_FIELDS,
+                SANDBOX_CAPABILITY_BEARING,
+                SANDBOX_NOT_CAPABILITY_BEARING,
+            ),
+            (
+                "AgentConfig",
+                AGENT_CONFIG_FIELDS,
+                AGENT_CAPABILITY_BEARING,
+                AGENT_NOT_CAPABILITY_BEARING,
+            ),
+            (
+                "CredentialConfig",
+                CREDENTIAL_CONFIG_FIELDS,
+                CREDENTIAL_CAPABILITY_BEARING,
+                CREDENTIAL_NOT_CAPABILITY_BEARING,
+            ),
+            (
+                "Route",
+                ROUTE_FIELDS,
+                ROUTE_CAPABILITY_BEARING,
+                ROUTE_NOT_CAPABILITY_BEARING,
+            ),
+        ];
+
+        for (struct_name, fields, capability_bearing, not_capability_bearing) in structs {
+            for field in fields.iter() {
+                let in_bearing = capability_bearing.contains(field);
+                let in_not_bearing = not_capability_bearing.contains(field);
+                assert!(
+                    !(in_bearing && in_not_bearing),
+                    "field '{struct_name}.{field}' is classified as both capability-bearing \
+                     and not-capability-bearing; a field switching classification must have \
+                     its old classification removed"
+                );
+                assert!(
+                    in_bearing || in_not_bearing,
+                    "field '{struct_name}.{field}' is not classified in \
+                     capability_field_coverage_is_derivation_complete; add it to that struct's \
+                     CAPABILITY_BEARING list (and CapabilitySummary::from_config) or to its \
+                     NOT_CAPABILITY_BEARING list with a reason"
+                );
+            }
         }
     }
 
