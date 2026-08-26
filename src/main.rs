@@ -2670,13 +2670,23 @@ fn render_show_task_output(task_path: &Path, task_document: &task::TaskDocument)
 
 fn inspect_task_command(task_path: &Path) -> Result<()> {
     let config_path = config::config_file()?;
-    let config = config::resolve_config(&config_path)?;
+    let (config, unverified_includes) = config::resolve_config_for_diagnostics(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
     let task = task::load_task(&task_path)?;
     let fm = &task.frontmatter;
 
     println!("# Task {}", task_path.display());
     println!();
+    if !unverified_includes.is_empty() {
+        println!(
+            "⚠ UNVERIFIED CONFIG — the following include(s) failed sha256 pin verification; \
+             routes/agents/sandboxes below may reflect stale or tampered bundle content:"
+        );
+        for warning in &unverified_includes {
+            println!("  - {warning}");
+        }
+        println!();
+    }
     println!(
         "status: {:?}  assignee: {}  project: {}",
         fm.status,
