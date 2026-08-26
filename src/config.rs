@@ -58,7 +58,7 @@ pub const CODEX_RESIDENT_EGRESS_ALLOWLIST: &[&str] =
 /// route/user policy; this resident inventory is deliberately stricter.
 pub const COPILOT_RESIDENT_EGRESS_ALLOWLIST: &[&str] = &[];
 
-const DEFAULT_CONFIG: &str = r#"[defaults]
+pub(crate) const DEFAULT_CONFIG: &str = r#"[defaults]
 timeout_seconds = 600
 operations_dir = "operations"
 # M10 cooperative execution bounds (replace the old hard wall-clock kill):
@@ -1873,7 +1873,7 @@ pub fn config_file() -> Result<PathBuf> {
 
 /// Lowercase hex sha256 digest of `bytes`, in the same format an
 /// `include[].sha256` pin is written in.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher
@@ -2026,7 +2026,7 @@ const FRAGMENT_TOP_LEVEL_FIELDS: &[&str] = &[
     "requires_secrets",
     "include",
 ];
-const SANDBOX_CONFIG_FIELDS: &[&str] = &[
+pub(crate) const SANDBOX_CONFIG_FIELDS: &[&str] = &[
     "image",
     "build",
     "image_from",
@@ -2039,7 +2039,7 @@ const SANDBOX_CONFIG_FIELDS: &[&str] = &[
     "memory",
     "cpus",
 ];
-const AGENT_CONFIG_FIELDS: &[&str] = &[
+pub(crate) const AGENT_CONFIG_FIELDS: &[&str] = &[
     "kind",
     "command",
     "args",
@@ -2056,7 +2056,7 @@ const AGENT_CONFIG_FIELDS: &[&str] = &[
     "interpreter_agent",
     "skip_recap",
 ];
-const CREDENTIAL_CONFIG_FIELDS: &[&str] = &[
+pub(crate) const CREDENTIAL_CONFIG_FIELDS: &[&str] = &[
     "from_env",
     "from_secret",
     "from_fnox",
@@ -2066,7 +2066,15 @@ const CREDENTIAL_CONFIG_FIELDS: &[&str] = &[
     "refresh_seconds",
     "optional",
 ];
-const ROUTE_FIELDS: &[&str] = &["glob", "agents", "sandbox", "mounts", "env", "orchestration", "verify"];
+pub(crate) const ROUTE_FIELDS: &[&str] = &[
+    "glob",
+    "agents",
+    "sandbox",
+    "mounts",
+    "env",
+    "orchestration",
+    "verify",
+];
 
 /// Reject a key in `table` that isn't in `known` — named by `fragment_path` (the
 /// include path as written) and `location` (e.g. `"sandboxes.mydev"`) so the error

@@ -2,6 +2,7 @@ mod acp;
 mod agent;
 mod capability;
 mod config;
+mod config_approval;
 mod doctor;
 mod git;
 mod mcp_transport;
