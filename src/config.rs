@@ -1,9 +1,10 @@
 //! Varda configuration loading and initialization.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -2209,12 +2210,54 @@ fn expand_sandbox_mounts(sandbox: &mut SandboxConfig, bundle_dir: Option<&Path>)
     Ok(())
 }
 
+/// Per-key memoization cache: each key maps to its own `OnceLock`, so a cache
+/// MISS only ever blocks concurrent callers asking for the SAME key (they wait
+/// on that key's `get_or_init`), while different keys never contend with each
+/// other beyond the brief map-lock needed to fetch-or-insert their cell. A
+/// plain `HashMap<String, bool>` with a separate check-then-insert would let
+/// two threads both miss on the same key and both run `compute` — for
+/// `secret_is_resolvable` that means two redundant `fnox` shell-outs (each a
+/// potential Vault network round trip), which defeats the point of caching.
+struct MemoCache(Mutex<HashMap<String, std::sync::Arc<OnceLock<bool>>>>);
+
+impl MemoCache {
+    fn new() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+
+    fn get_or_compute(&self, key: &str, compute: impl FnOnce() -> bool) -> bool {
+        let cell = {
+            let mut cache = self.0.lock().unwrap();
+            std::sync::Arc::clone(
+                cache
+                    .entry(key.to_owned())
+                    .or_insert_with(|| std::sync::Arc::new(OnceLock::new())),
+            )
+        };
+        *cell.get_or_init(compute)
+    }
+}
+
+fn command_on_path_cache() -> &'static MemoCache {
+    static CACHE: OnceLock<MemoCache> = OnceLock::new();
+    CACHE.get_or_init(MemoCache::new)
+}
+
+fn secret_resolvable_cache() -> &'static MemoCache {
+    static CACHE: OnceLock<MemoCache> = OnceLock::new();
+    CACHE.get_or_init(MemoCache::new)
+}
+
 /// Whether `command` resolves to an executable file somewhere on `$PATH`.
+/// Cached for the lifetime of the process (keyed by command name) so that
+/// repeated `resolve_config` calls within one `varda` invocation only ever
+/// stat the filesystem once per distinct command.
 fn command_on_path(command: &str) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path_var).any(|dir| dir.join(command).is_file())
+    command_on_path_cache().get_or_compute(command, || {
+        std::env::var_os("PATH").is_some_and(|path_var| {
+            std::env::split_paths(&path_var).any(|dir| dir.join(command).is_file())
+        })
+    })
 }
 
 /// Whether stdout captured from `fnox get NAME` counts as a resolved secret.
@@ -2226,16 +2269,22 @@ fn fnox_output_is_resolved(output: &str) -> bool {
 
 /// Whether `fnox get name` resolves to a non-empty value on this host. Never
 /// surfaces the resolved value anywhere — only success/emptiness is reported.
+/// Cached for the lifetime of the process (keyed by secret name) so that
+/// repeated `resolve_config` calls within one `varda` invocation only ever
+/// shell out to `fnox` once per distinct secret — each shell-out can be a
+/// network round trip to a Vault-backed store.
 fn secret_is_resolvable(name: &str) -> bool {
-    std::process::Command::new("fnox")
-        .arg("get")
-        .arg(name)
-        .output()
-        .map(|output| {
-            output.status.success()
-                && fnox_output_is_resolved(&String::from_utf8_lossy(&output.stdout))
-        })
-        .unwrap_or(false)
+    secret_resolvable_cache().get_or_compute(name, || {
+        std::process::Command::new("fnox")
+            .arg("get")
+            .arg(name)
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && fnox_output_is_resolved(&String::from_utf8_lossy(&output.stdout))
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Fail loudly, at config-load time, when a declared `requires_commands` or
@@ -4631,6 +4680,93 @@ command = "codex"
         assert!(!fnox_output_is_resolved("\n"));
         assert!(!fnox_output_is_resolved(""));
         assert!(fnox_output_is_resolved("secret-value\n"));
+    }
+
+    /// #754: `command_on_path`/`secret_is_resolvable` must not repeat their
+    /// underlying check (a `$PATH` stat, or worse, an `fnox get` shell-out that
+    /// can be a Vault network round trip) for a name already resolved once in
+    /// this process. Tested against the shared `MemoCache` primitive directly —
+    /// not by injecting a fake command onto the real process `$PATH` (that would
+    /// mutate global state shared with every other concurrently-running test in
+    /// this binary, which is exactly the kind of soundness/flakiness hazard
+    /// `std::env::set_var` being `unsafe` exists to flag) and not by shelling
+    /// out to real `fnox`. Since both `command_on_path` and `secret_is_resolvable`
+    /// are thin wrappers around `MemoCache::get_or_compute`, proving the
+    /// primitive's contract proves both call sites.
+    #[test]
+    fn memo_cache_computes_a_key_at_most_once_across_repeated_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = MemoCache::new();
+        let calls = AtomicUsize::new(0);
+        let compute = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+
+        assert!(cache.get_or_compute("secret-a", compute));
+        assert!(cache.get_or_compute("secret-a", compute));
+        assert!(cache.get_or_compute("secret-a", compute));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "compute must run exactly once for a repeated key"
+        );
+    }
+
+    #[test]
+    fn memo_cache_computes_distinct_keys_independently() {
+        let cache = MemoCache::new();
+        assert!(cache.get_or_compute("present", || true));
+        assert!(!cache.get_or_compute("absent", || false));
+        // Re-check both: each key keeps its OWN cached result, not the other's.
+        assert!(cache.get_or_compute("present", || panic!("must be cached")));
+        assert!(!cache.get_or_compute("absent", || panic!("must be cached")));
+    }
+
+    #[test]
+    fn memo_cache_computes_a_contended_key_exactly_once_under_real_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const THREAD_COUNT: usize = 16;
+        let cache = Arc::new(MemoCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        // A `Barrier` makes the race deterministic rather than probabilistic:
+        // every thread calls `get_or_compute` at (as close to) the same instant,
+        // instead of relying on scheduler timing to make contention "likely".
+        let start = Arc::new(Barrier::new(THREAD_COUNT));
+        let threads: Vec<_> = (0..THREAD_COUNT)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let calls = Arc::clone(&calls);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    cache.get_or_compute("contended-key", || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // Widen the race window: without per-key serialization,
+                        // this makes it far more likely two threads would both
+                        // observe a cache miss and both run `compute`.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        true
+                    })
+                })
+            })
+            .collect();
+        for handle in threads {
+            assert!(handle.join().expect("worker thread must not panic"));
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "16 concurrent callers for the SAME key must trigger exactly one compute — \
+             a plain check-then-insert HashMap<String, bool> would let multiple threads \
+             race past the check before any insert lands, and (for secret_is_resolvable) \
+             each of those would be a redundant `fnox` shell-out / Vault round trip"
+        );
     }
 
     #[test]
