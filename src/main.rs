@@ -14,7 +14,7 @@ mod task;
 mod verify;
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -3712,12 +3712,44 @@ fn spawn_task_in_background(task_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bound on how much captured child stderr a launch-failure message may carry.
+/// A runaway or malicious child must not be able to inflate the bail! message or
+/// the recorded session log without limit — only the TAIL matters for diagnosis
+/// (the actual error is normally the last thing a failing process prints).
+const MAX_CAPTURED_STDERR_BYTES: usize = 4096;
+
 fn captured_stderr_suffix(stderr_capture_path: &Path) -> String {
-    let text = String::from_utf8_lossy(&fs::read(stderr_capture_path).unwrap_or_default())
-        .trim()
-        .to_string();
+    // Seek-and-read-the-tail rather than `fs::read` the whole file: a runaway
+    // child could otherwise force an unbounded allocation and I/O read just to
+    // compute a message we're going to truncate anyway.
+    let Ok(mut file) = fs::File::open(stderr_capture_path) else {
+        return String::new();
+    };
+    // A metadata failure must NOT be treated as "empty file" (that would fall
+    // through to an unbounded `read_to_end` below with no seek and no cap).
+    let Ok(total_len) = file.metadata().map(|m| m.len()) else {
+        return String::new();
+    };
+    let bound = MAX_CAPTURED_STDERR_BYTES as u64;
+    let truncated = total_len > bound;
+    if truncated && file.seek(SeekFrom::End(-(bound as i64))).is_err() {
+        return String::new();
+    }
+    // `.take(bound)` is a hard cap independent of the metadata/seek snapshot
+    // above: even if the file kept growing between `metadata()` and this read,
+    // we still never read more than `bound` bytes off disk.
+    let mut buf = Vec::new();
+    if file.take(bound).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buf).trim().to_string();
     if text.is_empty() {
         String::new()
+    } else if truncated {
+        format!(
+            ": ... (truncated, {total_len} bytes total, showing last {}) ...\n{text}",
+            MAX_CAPTURED_STDERR_BYTES
+        )
     } else {
         format!(": {text}")
     }
@@ -5001,19 +5033,29 @@ mod tests {
     }
 
     #[test]
-    fn captured_stderr_suffix_handles_output_larger_than_a_pipe_buffer() {
+    fn captured_stderr_suffix_handles_output_larger_than_a_pipe_buffer_without_deadlock() {
         // The previous pipe-based design needed a background drain thread
         // specifically because a child writing more than the OS pipe buffer
         // (~64KiB) before anything reads it can block. A file has no such
-        // ceiling by construction — verify a large write round-trips EXACTLY
-        // (not just "some large amount"). Sourced from /dev/zero + tr rather than
-        // `yes`, so there's no embedded newline for `.trim()` to eat at the edge.
+        // ceiling by construction — a 200KB write must complete without the
+        // parent ever having read anything (`child.wait()` runs before any read
+        // here). Sourced from /dev/zero + tr rather than `yes`, so there's no
+        // embedded newline for `.trim()` to eat at the boundary.
+        //
+        // Distinct HEAD/TAIL markers (not uniform filler) matter: with 200,000
+        // identical bytes, every 4096-byte window looks the same, so a naive
+        // `ends_with` assertion can't actually distinguish "kept the tail" from
+        // "kept the head" or an arbitrary middle slice. The markers make that
+        // distinction provable.
         let path =
             std::env::temp_dir().join(format!("varda-test-stderr-large-{}.log", Uuid::new_v4()));
         let file = fs::File::create(&path).expect("failed to create capture file");
         let mut child = ProcessCommand::new("sh")
             .arg("-c")
-            .arg("head -c 200000 /dev/zero | tr '\\0' 'x' >&2; exit 1")
+            .arg(
+                "{ printf 'HEAD_MARKER_UNIQUE'; head -c 200000 /dev/zero | tr '\\0' 'x'; \
+                 printf 'TAIL_MARKER_UNIQUE'; } 1>&2; exit 1",
+            )
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(file)
@@ -5022,7 +5064,46 @@ mod tests {
         child.wait().expect("child must exit");
         let suffix = captured_stderr_suffix(&path);
         let _ = fs::remove_file(&path);
-        assert_eq!(suffix, format!(": {}", "x".repeat(200_000)));
+        // #766: a runaway child must not inflate the message without bound.
+        assert!(
+            suffix.len() < 5_000,
+            "expected a bounded suffix, got {} bytes",
+            suffix.len()
+        );
+        assert!(
+            suffix.contains("truncated"),
+            "expected a truncation marker, got: {}",
+            &suffix[..200.min(suffix.len())]
+        );
+        assert!(
+            suffix.ends_with("TAIL_MARKER_UNIQUE"),
+            "expected the true TAIL of the output to be preserved"
+        );
+        assert!(
+            !suffix.contains("HEAD_MARKER_UNIQUE"),
+            "the head must have been dropped by truncation, got: {suffix}"
+        );
+    }
+
+    #[test]
+    fn captured_stderr_suffix_is_not_truncated_when_under_the_bound() {
+        let path = std::env::temp_dir().join(format!(
+            "varda-test-stderr-untruncated-{}.log",
+            Uuid::new_v4()
+        ));
+        let file = fs::File::create(&path).expect("failed to create capture file");
+        let mut child = ProcessCommand::new("sh")
+            .arg("-c")
+            .arg("echo short message 1>&2; exit 1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .spawn()
+            .expect("failed to spawn test child");
+        child.wait().expect("child must exit");
+        let suffix = captured_stderr_suffix(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(suffix, ": short message");
     }
 
     #[test]
