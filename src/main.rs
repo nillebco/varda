@@ -4234,6 +4234,30 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         )?;
         println!("committed task snapshot");
     }
+    // Pre-run dirty-set snapshot of the project repo (#816): taken before the
+    // agent runs so the post-run completeness check can tell "the run changed
+    // this" from "this was already dirty" without trusting the agent's own
+    // report of what it touched. `None` means the snapshot could not be taken
+    // (e.g. a transient `git` failure) — the completeness check below must
+    // then be skipped entirely rather than compared against a fabricated
+    // empty baseline, which would flag every pre-existing dirty path
+    // (including unrelated operator edits) as "newly" touched by the run.
+    let project_dirty_before: Option<Vec<String>> = if config.git.auto_commit {
+        match task_document.frontmatter.project.as_deref() {
+            Some(project) => match git::dirty_paths(Path::new(project)) {
+                Ok(paths) => Some(paths),
+                Err(error) => {
+                    eprintln!(
+                        "warning: failed to snapshot pre-run git state for {project}: {error:#}"
+                    );
+                    None
+                }
+            },
+            None => Some(Vec::new()),
+        }
+    } else {
+        Some(Vec::new())
+    };
     let stream = !quiet && !interactive;
     let mut outcome = runner::run_task(
         &config,
@@ -4268,6 +4292,15 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     if config.git.auto_commit && let Some(project) = task_document.frontmatter.project.clone() {
         may_commit_files =
             apply_verification_gate(&task_path, &project, &route.verify, &mut outcome)?;
+    }
+
+    if config.git.auto_commit && let Some(project) = task_document.frontmatter.project.as_deref() {
+        flag_incomplete_files_touched(
+            &task_path,
+            project,
+            project_dirty_before.as_deref(),
+            &mut outcome,
+        )?;
     }
 
     let recap_content = fs::read_to_string(&outcome.recap_path)
@@ -4415,6 +4448,95 @@ fn apply_verification_gate(
         task_path.display()
     );
     Ok(false)
+}
+
+/// Cross-check the agent's reported `Files touched` list against what the
+/// project repo actually changed during the run (#816): `commit_agent_files`
+/// stages exactly the reported paths with no completeness check, so an agent
+/// that under-reports produces a silent partial commit unless the gap is
+/// surfaced here. `before` is the project's pre-run dirty-path snapshot
+/// ([`git::dirty_paths`]); paths dirty before the run are excluded even if
+/// still dirty after, so an operator's unrelated in-flight edit is never
+/// flagged or swept in (AGENTS.md).
+///
+/// A discrepancy is printed to stderr and appended to the run's session log,
+/// and — unless the task already settled to `Failed` via the verification
+/// gate — downgrades the task to `NeedsUser` so a human decides whether to
+/// amend or split the commit, rather than letting a partial commit read as
+/// an ordinary `review`.
+///
+/// `before` is `None` when the pre-run snapshot could not be taken; in that
+/// case the check is skipped entirely rather than run against a fabricated
+/// empty baseline, which would flag every already-dirty path — including
+/// unrelated operator edits predating the run — as something the run
+/// "newly" touched.
+fn flag_incomplete_files_touched(
+    task_path: &Path,
+    project: &str,
+    before: Option<&[String]>,
+    outcome: &mut runner::RunOutcome,
+) -> Result<()> {
+    let Some(before) = before else {
+        eprintln!(
+            "warning: skipping files_touched completeness check for task {} in {project}: pre-run git snapshot unavailable",
+            task_path.display()
+        );
+        return Ok(());
+    };
+    let project_path = Path::new(project);
+    let unreported = match git::unreported_changes(project_path, before, &outcome.files_touched) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to check files_touched completeness for task {} in {}: {error:#}",
+                task_path.display(),
+                project_path.display()
+            );
+            return Ok(());
+        }
+    };
+    if unreported.is_empty() {
+        return Ok(());
+    }
+
+    let warning = format!(
+        "warning: task {} agent under-reported `Files touched`; {} file(s) changed but not listed: {}",
+        task_path.display(),
+        unreported.len(),
+        unreported.join(", ")
+    );
+    eprintln!("{warning}");
+    if let Err(error) =
+        append_to_session_log(&outcome.session_log_path, &format!("\n{warning}\n"))
+    {
+        eprintln!(
+            "warning: failed to append files_touched discrepancy to session log at {}: {error:#}",
+            outcome.session_log_path.display()
+        );
+    }
+
+    if outcome.status == task::TaskStatus::Failed {
+        return Ok(());
+    }
+
+    let mut task = task::load_task(task_path)?;
+    task.set_status(task::TaskStatus::NeedsUser);
+    task.frontmatter.requires_user = true;
+    task::write_task(&task)?;
+    outcome.status = task::TaskStatus::NeedsUser;
+    Ok(())
+}
+
+fn append_to_session_log(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open session log at {}", path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("failed to append session log at {}", path.display()))
 }
 
 async fn plan_task_command(task_path: &Path) -> Result<()> {
@@ -5650,6 +5772,212 @@ planner_agent: codex
         assert!(
             recap_content.contains("verification: failed"),
             "recap should report the failure: {recap_content}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn flag_incomplete_files_touched_downgrades_status_and_warns_on_underreport() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-files-touched-underreport-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let project = root.join("project");
+        seed_git_repo(&project);
+        let (task_path, recap_path) = seed_gate_test_task(&root, task::TaskStatus::Review);
+
+        let before = git::dirty_paths(&project).expect("pre-run snapshot should succeed");
+        assert!(before.is_empty(), "freshly seeded repo should be clean");
+
+        // Agent touches two files but only reports one.
+        fs::write(project.join("reported.txt"), "reported\n").expect("write reported file");
+        fs::write(project.join("missed.txt"), "missed\n").expect("write missed file");
+
+        let session_log_path = root.join("session.log");
+        fs::write(&session_log_path, "").expect("session log should seed");
+        let mut outcome = runner::RunOutcome {
+            status: task::TaskStatus::Review,
+            recap_path,
+            session_log_path: session_log_path.clone(),
+            files_touched: vec![project.join("reported.txt")],
+            blocked_commands: Vec::new(),
+        };
+
+        flag_incomplete_files_touched(
+            &task_path,
+            &project.display().to_string(),
+            Some(&before),
+            &mut outcome,
+        )
+        .expect("check should run without error");
+
+        assert_eq!(
+            outcome.status,
+            task::TaskStatus::NeedsUser,
+            "an under-reported change must downgrade the in-memory outcome to NeedsUser"
+        );
+        let reloaded = task::load_task(&task_path).expect("task should reload");
+        assert_eq!(
+            reloaded.frontmatter.status,
+            task::TaskStatus::NeedsUser,
+            "the on-disk task status must also become NeedsUser"
+        );
+        assert!(
+            reloaded.frontmatter.requires_user,
+            "requires_user must be set so a human is prompted"
+        );
+
+        let log_content = fs::read_to_string(&session_log_path).expect("session log should read");
+        assert!(
+            log_content.contains("missed.txt"),
+            "session log should name the missed file: {log_content}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn flag_incomplete_files_touched_is_noop_on_a_complete_report() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-files-touched-complete-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let project = root.join("project");
+        seed_git_repo(&project);
+        let (task_path, recap_path) = seed_gate_test_task(&root, task::TaskStatus::Review);
+
+        let before = git::dirty_paths(&project).expect("pre-run snapshot should succeed");
+        fs::write(project.join("reported.txt"), "reported\n").expect("write reported file");
+
+        let session_log_path = root.join("session.log");
+        fs::write(&session_log_path, "").expect("session log should seed");
+        let mut outcome = runner::RunOutcome {
+            status: task::TaskStatus::Review,
+            recap_path,
+            session_log_path: session_log_path.clone(),
+            files_touched: vec![project.join("reported.txt")],
+            blocked_commands: Vec::new(),
+        };
+
+        flag_incomplete_files_touched(
+            &task_path,
+            &project.display().to_string(),
+            Some(&before),
+            &mut outcome,
+        )
+        .expect("check should run without error");
+
+        assert_eq!(
+            outcome.status,
+            task::TaskStatus::Review,
+            "a fully reported change must leave the in-memory status untouched"
+        );
+        let reloaded = task::load_task(&task_path).expect("task should reload");
+        assert_eq!(
+            reloaded.frontmatter.status,
+            task::TaskStatus::Review,
+            "the on-disk task status must also remain untouched"
+        );
+        let log_content = fs::read_to_string(&session_log_path).expect("session log should read");
+        assert!(
+            log_content.is_empty(),
+            "no discrepancy warning should be logged: {log_content}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn flag_incomplete_files_touched_ignores_pre_existing_operator_dirt() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-files-touched-operator-dirt-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let project = root.join("project");
+        seed_git_repo(&project);
+        let (task_path, recap_path) = seed_gate_test_task(&root, task::TaskStatus::Review);
+
+        // Operator's unrelated in-flight edit, present BEFORE the run starts.
+        fs::write(project.join("operator.txt"), "unrelated work\n").expect("write operator file");
+        let before = git::dirty_paths(&project).expect("pre-run snapshot should succeed");
+        assert_eq!(before, vec!["operator.txt".to_owned()]);
+
+        // The agent makes no changes and reports nothing; operator.txt is
+        // still dirty afterward but must never be flagged or touched.
+        let session_log_path = root.join("session.log");
+        fs::write(&session_log_path, "").expect("session log should seed");
+        let mut outcome = runner::RunOutcome {
+            status: task::TaskStatus::Review,
+            recap_path,
+            session_log_path: session_log_path.clone(),
+            files_touched: Vec::new(),
+            blocked_commands: Vec::new(),
+        };
+
+        flag_incomplete_files_touched(
+            &task_path,
+            &project.display().to_string(),
+            Some(&before),
+            &mut outcome,
+        )
+        .expect("check should run without error");
+
+        assert_eq!(
+            outcome.status,
+            task::TaskStatus::Review,
+            "pre-existing operator dirt must never trigger a downgrade"
+        );
+        let reloaded = task::load_task(&task_path).expect("task should reload");
+        assert_eq!(reloaded.frontmatter.status, task::TaskStatus::Review);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn flag_incomplete_files_touched_skips_check_when_snapshot_unavailable() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-files-touched-no-snapshot-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let project = root.join("project");
+        seed_git_repo(&project);
+        let (task_path, recap_path) = seed_gate_test_task(&root, task::TaskStatus::Review);
+
+        // A real unreported change is present, but the pre-run snapshot was
+        // unavailable (`None`): the check must be skipped entirely rather
+        // than run against a fabricated empty baseline that would flag this
+        // change (or any pre-existing dirt) as newly introduced.
+        fs::write(project.join("missed.txt"), "missed\n").expect("write missed file");
+
+        let session_log_path = root.join("session.log");
+        fs::write(&session_log_path, "").expect("session log should seed");
+        let mut outcome = runner::RunOutcome {
+            status: task::TaskStatus::Review,
+            recap_path,
+            session_log_path: session_log_path.clone(),
+            files_touched: Vec::new(),
+            blocked_commands: Vec::new(),
+        };
+
+        flag_incomplete_files_touched(&task_path, &project.display().to_string(), None, &mut outcome)
+            .expect("check should run without error");
+
+        assert_eq!(
+            outcome.status,
+            task::TaskStatus::Review,
+            "an unavailable snapshot must skip the check rather than flag against an empty baseline"
+        );
+        let reloaded = task::load_task(&task_path).expect("task should reload");
+        assert_eq!(reloaded.frontmatter.status, task::TaskStatus::Review);
+        let log_content = fs::read_to_string(&session_log_path).expect("session log should read");
+        assert!(
+            log_content.is_empty(),
+            "no discrepancy warning should be logged when the check is skipped: {log_content}"
         );
 
         fs::remove_dir_all(&root).ok();

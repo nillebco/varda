@@ -52,4 +52,12 @@ Before launching an agent, Varda runs `git status --porcelain` against the proje
 
 This protects in-progress local work from being entangled with agent edits and keeps the post-run commit unambiguous. Once the listed entries are committed, stashed, or discarded, set the task back to `ready` and re-run it. The check is silently skipped when the project path is missing or not inside a git repository.
 
+## `Files touched` completeness check
+
+Varda commits exactly the paths an agent lists under `Files touched` — it does not independently verify that the list is complete. To catch an agent that under-reports, Varda snapshots the project repo's dirty paths before the run and compares them against the dirty paths after: any path that became dirty during the run but was not in `Files touched` is a discrepancy.
+
+- Paths dirty before the run are never flagged, even if they're still dirty afterward — an operator's unrelated in-progress edit is left alone, never swept in or reported.
+- A discrepancy is logged to stderr and appended to the run's session log, and downgrades the task to `needs_user` (unless the verification gate already failed it), so a human decides whether to amend or split the commit.
+- If the pre-run snapshot itself fails (e.g. a transient `git` error), the check is skipped entirely for that run rather than compared against a fabricated empty baseline — a fabricated baseline would flag every already-dirty path as newly introduced by the run.
+
 [← back to the README](../README.md)

@@ -620,6 +620,31 @@ fn expand_mount_path(raw: &Path, project_root: &Path) -> PathBuf {
     }
 }
 
+/// Host paths visible inside the guest via `mounts`/`identity_context`, plus
+/// the project root (always bound 1:1 by every boundary-crossing provider).
+/// Used by [`SandboxSession::mount_targets`] implementations so a caller can
+/// tell whether a host path — e.g. one injected by
+/// `add_varda_project_dir_to_default_agents` in `config.rs` before the
+/// sandbox is known — actually resolves inside THIS guest.
+fn guest_mount_targets(
+    project_root: &Path,
+    mounts: &[(MountOrigin, String)],
+    identity_context: &[String],
+) -> Vec<PathBuf> {
+    let mut targets = vec![project_root.to_path_buf()];
+    for (_origin, raw) in mounts {
+        if let Ok(spec) = parse_mount(raw) {
+            targets.push(expand_mount_path(&spec.target, project_root));
+        }
+    }
+    for raw in identity_context {
+        if let Ok(spec) = parse_mount(raw) {
+            targets.push(expand_mount_path(&spec.target, project_root));
+        }
+    }
+    targets
+}
+
 /// A fully-resolved subprocess invocation, before it is handed to the OS.
 ///
 /// Providers rewrite this in [`SandboxSession::wrap`]. For `local` it is the
@@ -785,6 +810,17 @@ pub trait SandboxSession: Send + Sync {
     /// No-op for providers that do not bind host paths.
     fn validate_mounts(&self) -> Result<()> {
         Ok(())
+    }
+    /// Host paths reachable inside the guest via this session's mounts, or
+    /// `None` when the session does not restrict guest filesystem visibility
+    /// (e.g. [`LocalSession`], where the guest IS the host). `Some(targets)`
+    /// means only the project root, declared mount targets, and curated
+    /// identity files are guest-visible — the caller uses this to drop a
+    /// `--add-dir <host path>` injected at config-load time (host-relative,
+    /// sandbox-unaware — see `add_varda_project_dir_to_default_agents` in
+    /// `config.rs`) when that path does not resolve inside THIS guest.
+    fn mount_targets(&self) -> Option<Vec<PathBuf>> {
+        None
     }
     /// Materialize the agent's session store on the host after the run and before
     /// teardown (e.g. `docker cp` from a per-session volume into
@@ -2233,6 +2269,14 @@ impl SandboxSession for DockerSession {
         Ok(())
     }
 
+    fn mount_targets(&self) -> Option<Vec<PathBuf>> {
+        Some(guest_mount_targets(
+            &self.project_root,
+            &self.mounts,
+            &self.identity.identity_context,
+        ))
+    }
+
     async fn extract_session_store(&self) -> Result<()> {
         // Copy the container HOME *contents* into the host session-store dir. The
         // trailing `/.` copies what is inside `home` into the (existing) host dir
@@ -2885,6 +2929,14 @@ impl SandboxSession for MicrosandboxSession {
         Ok(())
     }
 
+    fn mount_targets(&self) -> Option<Vec<PathBuf>> {
+        Some(guest_mount_targets(
+            &self.project_root,
+            &self.mounts,
+            &self.identity.identity_context,
+        ))
+    }
+
     async fn extract_session_store(&self) -> Result<()> {
         // Copy the guest HOME dir into the host session-store dir. Runs after the
         // agent exits and before teardown, so resume-capture can read it back from
@@ -3212,6 +3264,14 @@ impl SandboxSession for ClawkSession {
             check_identity_context_mount(&source, ispec.writable)?;
         }
         Ok(())
+    }
+
+    fn mount_targets(&self) -> Option<Vec<PathBuf>> {
+        Some(guest_mount_targets(
+            &self.project_root,
+            &self.mounts,
+            &self.identity.identity_context,
+        ))
     }
 
     async fn extract_session_store(&self) -> Result<()> {
@@ -6569,6 +6629,48 @@ mod tests {
                 "/ctx/adb:/ctx/adb:ro".to_owned(),
             ]
         );
+    }
+
+    /// `mount_targets()` reports the project root plus every extra mount's
+    /// TARGET (not source) — the set of host paths the caller may compare a
+    /// would-be `--add-dir` value against for guest-reachability (#784).
+    #[test]
+    fn docker_mount_targets_includes_project_root_and_mount_targets() {
+        let session = DockerSession {
+            image: "img".to_owned(),
+            project_root: PathBuf::from("/srv/app"),
+            mounts: vec![
+                (MountOrigin::Route, "/ctx/adb:ro".to_owned()),
+                (
+                    MountOrigin::Sandbox,
+                    "/host/varda:/guest/varda:ro".to_owned(),
+                ),
+            ],
+            egress_pins: vec![],
+            egress_hosts: vec![],
+            session_store: PathBuf::from("/var/varda/sessions/s1"),
+            volume: "varda-sbx-s1".to_owned(),
+            container: "varda-sbx-s1".to_owned(),
+            home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let targets = session.mount_targets().expect("docker session restricts");
+        assert!(targets.contains(&PathBuf::from("/srv/app")));
+        assert!(targets.contains(&PathBuf::from("/ctx/adb")));
+        assert!(targets.contains(&PathBuf::from("/guest/varda")));
+        assert!(!targets.contains(&PathBuf::from("/host/varda")));
+    }
+
+    /// [`LocalSession`] does not restrict guest visibility (the guest IS the
+    /// host) — `mount_targets()` must return `None`, not an empty `Some(vec![])`
+    /// which a naive caller could misread as "nothing reachable" and strip
+    /// every `--add-dir` (#784).
+    #[test]
+    fn local_session_mount_targets_is_unrestricted() {
+        assert!(LocalSession.mount_targets().is_none());
     }
 
     /// M6a exit criterion: an explicit-target route mount maps to

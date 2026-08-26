@@ -267,4 +267,31 @@ These rules are what make the sandbox meaningful; breaking any turns it into the
 4. **Never mount credential/identity directories** (`~/.claude`, `~/.codex`, `~/.copilot`, `~/.aws`, `~/.ssh`, `~/.config/gcloud`, `~/.config/fnox`, …) to "authenticate the agent" — they hold live tokens and cross-project history. Pass identity via an injected scoped token + SSH-agent forwarding + a curated read-only profile file instead. Enforced by `CREDENTIAL_DENYLIST` / `check_credential_denylist` across **all** mount origins.
 5. Extra mounts default to read-only; the host `$HOME` is never mounted.
 
+### Why these are defence-in-depth, not a guarantee
+
+Trail of Bits, [*VMs won't contain cyber-capable agents*](https://blog.trailofbits.com/2026/08/26/vms-wont-contain-cyber-capable-agents/)
+(August 2026), reports an agent autonomously finding three 0-days and escaping a VM three
+times — via a host kernel bug, via **libslirp**, and via a chain against **QEMU/KVM**. Its
+conclusion: "you can no longer assume a mere VM will contain a sufficiently advanced AI agent."
+
+Two of those three vectors do not port to this codebase, and it is worth being precise about
+why rather than claiming immunity. Varda's `microsandbox` primitive runs on **libkrun**, a
+minimal VMM with a small device model, and microsandbox credits **smoltcp** — a Rust userspace
+TCP/IP stack — rather than libslirp. So the specific libslirp bug and the QEMU device-model
+chain describe a stack varda does not run. The *class* of risk transfers intact: smoltcp and
+libkrun are a different attack surface, not an absent one, and libkrun sits on KVM (Linux) or
+Hypervisor.framework (macOS), so a hypervisor-level escape remains conceivable.
+
+The article's own recommendations line up with the invariants above and with choices already
+made elsewhere in varda: least privilege on network (allow-listed egress per sandbox, no open
+internet), pristine per-run environments (a fresh box and session store per run), and time
+limits (`max_seconds`, the idle watchdog). Its one recommendation varda does **not** yet
+implement is active monitoring of a running box.
+
+Read the invariants in that light. They are not a proof of containment; they remove the cheap
+escapes — the mounted docker socket, the handed-over control plane, the live credential
+directory — so that escaping costs an actual exploit chain rather than a misconfiguration.
+That is the property being defended, and it is why "the sandbox holds" is never a reason to
+relax one of them.
+
 [← back to the README](../README.md)
