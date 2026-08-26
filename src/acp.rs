@@ -1044,17 +1044,13 @@ impl AcpSubprocessClient {
         Ok(result)
     }
 
-    fn uses_copilot(&self) -> bool {
-        self.command == "copilot"
-            || self
-                .args
-                .iter()
-                .any(|a| a == "copilot" || a.starts_with("copilot "))
-    }
-
     /// Spawns the per-agent external-session discovery task and returns a handle whose
     /// output is the agent's own session id (when found). The spawned task also writes
     /// `external_session_id=...` to the Varda session log as a side effect.
+    ///
+    /// Dispatches on `crate::config::agent_cli_kind`, the single shared predicate for
+    /// "which CLI does this agent invocation exec" — do not reintroduce a local
+    /// `command == "..."` / substring check here (see task #783).
     fn record_external_session(
         &self,
         request: &AgentRunRequest,
@@ -1064,30 +1060,31 @@ impl AcpSubprocessClient {
         let log_path = request.session_log_path.as_deref()?.to_owned();
         let session_root = session_root.to_path_buf();
 
-        if self.command == "claude" {
-            let project = request.frontmatter.project.as_deref()?.to_owned();
-            let varda_session_id = request.session_id.clone();
-            Some(tokio::spawn(async move {
-                record_claude_external_session(
-                    session_root,
-                    log_path,
-                    project,
-                    varda_session_id,
-                    started_at,
-                )
-                .await
-            }))
-        } else if self.uses_copilot() {
-            Some(tokio::spawn(async move {
+        match crate::config::agent_cli_kind(&self.command, &self.args) {
+            Some(crate::config::AgentCli::Claude) => {
+                let project = request.frontmatter.project.as_deref()?.to_owned();
+                let varda_session_id = request.session_id.clone();
+                Some(tokio::spawn(async move {
+                    record_claude_external_session(
+                        session_root,
+                        log_path,
+                        project,
+                        varda_session_id,
+                        started_at,
+                    )
+                    .await
+                }))
+            }
+            Some(crate::config::AgentCli::Copilot) => Some(tokio::spawn(async move {
                 record_copilot_external_session(session_root, log_path, started_at).await
-            }))
-        } else if self.command == "codex" {
-            let project = request.frontmatter.project.clone();
-            Some(tokio::spawn(async move {
-                record_codex_external_session(session_root, log_path, started_at, project).await
-            }))
-        } else {
-            None
+            })),
+            Some(crate::config::AgentCli::Codex) => {
+                let project = request.frontmatter.project.clone();
+                Some(tokio::spawn(async move {
+                    record_codex_external_session(session_root, log_path, started_at, project).await
+                }))
+            }
+            None => None,
         }
     }
 
