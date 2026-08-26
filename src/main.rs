@@ -3657,20 +3657,53 @@ fn spawn_task_in_background(task_path: &Path) -> Result<()> {
     }
     let initial_session_count = initial_task.frontmatter.agent_session_ids.len();
     let exe = std::env::current_exe().context("failed to locate the varda executable")?;
-    let mut child = ProcessCommand::new(&exe)
+
+    // File-backed, not a pipe: a pipe's read end lives in THIS process, so once we
+    // exit after a successful launch it closes — and the still-running background
+    // child's next stderr write gets SIGPIPE/EPIPE. A file has no "no reader"
+    // semantics, so the child can keep writing to it for its whole lifetime
+    // regardless of whether this launcher process is still alive. It also sidesteps
+    // any drain-thread race: once `child.wait()` observes exit, the file's bytes are
+    // already durably written — no background thread, no synchronization needed.
+    let stderr_capture_path =
+        std::env::temp_dir().join(format!("varda-bg-launch-{}.stderr", Uuid::new_v4()));
+    let stderr_file = fs::File::create(&stderr_capture_path).with_context(|| {
+        format!(
+            "failed to create background launch stderr capture at {}",
+            stderr_capture_path.display()
+        )
+    })?;
+    let mut child = match ProcessCommand::new(&exe)
         .args(["task", "run"])
         .arg(&resolved)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(stderr_file)
         .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn background agent for {}",
-                resolved.display()
-            )
-        })?;
-    wait_for_background_launch(&config, &resolved, initial_session_count, &mut child)?;
+    {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = fs::remove_file(&stderr_capture_path);
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to spawn background agent for {}",
+                    resolved.display()
+                )
+            });
+        }
+    };
+    let result = wait_for_background_launch(
+        &config,
+        &resolved,
+        initial_session_count,
+        &mut child,
+        &stderr_capture_path,
+    );
+    // Best-effort cleanup. Safe even if the child is still running and holding its
+    // own fd to this file open: Unix allows unlinking a file while a process still
+    // has it open — the child keeps writing until it closes its stderr or exits.
+    let _ = fs::remove_file(&stderr_capture_path);
+    result?;
     println!(
         "task running in background: {} (pid: {})",
         resolved.display(),
@@ -3679,11 +3712,23 @@ fn spawn_task_in_background(task_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn captured_stderr_suffix(stderr_capture_path: &Path) -> String {
+    let text = String::from_utf8_lossy(&fs::read(stderr_capture_path).unwrap_or_default())
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(": {text}")
+    }
+}
+
 fn wait_for_background_launch(
     config: &config::Config,
     task_path: &Path,
     initial_session_count: usize,
     child: &mut std::process::Child,
+    stderr_capture_path: &Path,
 ) -> Result<()> {
     const BACKGROUND_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
     const BACKGROUND_LAUNCH_POLL: Duration = Duration::from_millis(100);
@@ -3705,16 +3750,17 @@ fn wait_for_background_launch(
             if recorded_launch {
                 return Ok(());
             }
+            let stderr_suffix = captured_stderr_suffix(stderr_capture_path);
             record_background_launch_failure(
                 config,
                 task_path,
                 &format!(
-                    "background child pid {} exited before recording a session (status: {status})",
+                    "background child pid {} exited before recording a session (status: {status}){stderr_suffix}",
                     child.id()
                 ),
             )?;
             anyhow::bail!(
-                "background agent for {} exited before recording a session (status: {status})",
+                "background agent for {} exited before recording a session (status: {status}){stderr_suffix}",
                 task_path.display()
             );
         }
@@ -3722,17 +3768,18 @@ fn wait_for_background_launch(
         if started.elapsed() >= BACKGROUND_LAUNCH_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
+            let stderr_suffix = captured_stderr_suffix(stderr_capture_path);
             record_background_launch_failure(
                 config,
                 task_path,
                 &format!(
-                    "background child pid {} did not record a running session within {} seconds",
+                    "background child pid {} did not record a running session within {} seconds{stderr_suffix}",
                     child.id(),
                     BACKGROUND_LAUNCH_TIMEOUT.as_secs()
                 ),
             )?;
             anyhow::bail!(
-                "background agent for {} did not record a session within {} seconds",
+                "background agent for {} did not record a session within {} seconds{stderr_suffix}",
                 task_path.display(),
                 BACKGROUND_LAUNCH_TIMEOUT.as_secs()
             );
@@ -4904,6 +4951,110 @@ mod tests {
         assert!(msg.contains("EXFIL"), "error must name the key: {msg}");
         // The sentinel is left in place; no value was resolved.
         assert_eq!(env.get("EXFIL").unwrap(), "${fnox:aws-prod-key}");
+    }
+
+    #[test]
+    fn captured_child_stderr_surfaces_in_launch_failure_suffix() {
+        // Regression guard for the 718b Tier-1/Tier-2 split: spawn_task_in_background's
+        // child (a re-exec of `varda task run`) does its own validate_requirements and
+        // fails with a precise reason on its stderr. That reason must not be discarded
+        // — it must reach the parent's failure message. File-backed, not piped: once
+        // `child.wait()` confirms exit, the bytes are already durably on disk, so
+        // there's no drain-thread race to account for.
+        let path = std::env::temp_dir().join(format!("varda-test-stderr-{}.log", Uuid::new_v4()));
+        let file = fs::File::create(&path).expect("failed to create capture file");
+        let mut child = ProcessCommand::new("sh")
+            .arg("-c")
+            .arg("echo 'config declares requirements not satisfied on this host' 1>&2; exit 1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .spawn()
+            .expect("failed to spawn test child");
+        let status = child.wait().expect("child must exit");
+        assert!(!status.success());
+        let suffix = captured_stderr_suffix(&path);
+        let _ = fs::remove_file(&path);
+        assert!(
+            suffix.contains("config declares requirements not satisfied on this host"),
+            "expected captured child stderr in suffix, got: {suffix}"
+        );
+    }
+
+    #[test]
+    fn captured_stderr_suffix_is_empty_when_child_writes_nothing() {
+        let path =
+            std::env::temp_dir().join(format!("varda-test-stderr-empty-{}.log", Uuid::new_v4()));
+        let file = fs::File::create(&path).expect("failed to create capture file");
+        let mut child = ProcessCommand::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .spawn()
+            .expect("failed to spawn test child");
+        child.wait().expect("child must exit");
+        let suffix = captured_stderr_suffix(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(suffix, "");
+    }
+
+    #[test]
+    fn captured_stderr_suffix_handles_output_larger_than_a_pipe_buffer() {
+        // The previous pipe-based design needed a background drain thread
+        // specifically because a child writing more than the OS pipe buffer
+        // (~64KiB) before anything reads it can block. A file has no such
+        // ceiling by construction — verify a large write round-trips EXACTLY
+        // (not just "some large amount"). Sourced from /dev/zero + tr rather than
+        // `yes`, so there's no embedded newline for `.trim()` to eat at the edge.
+        let path =
+            std::env::temp_dir().join(format!("varda-test-stderr-large-{}.log", Uuid::new_v4()));
+        let file = fs::File::create(&path).expect("failed to create capture file");
+        let mut child = ProcessCommand::new("sh")
+            .arg("-c")
+            .arg("head -c 200000 /dev/zero | tr '\\0' 'x' >&2; exit 1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .spawn()
+            .expect("failed to spawn test child");
+        child.wait().expect("child must exit");
+        let suffix = captured_stderr_suffix(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(suffix, format!(": {}", "x".repeat(200_000)));
+    }
+
+    #[test]
+    fn stderr_capture_file_can_be_unlinked_while_child_keeps_writing() {
+        // Regression guard for the file-vs-pipe redesign itself: a background
+        // agent that outlives its launcher must not be killed by SIGPIPE when the
+        // launcher's best-effort `fs::remove_file` cleanup (in
+        // spawn_task_in_background) races ahead of the child's remaining output.
+        // A file has no "closed reader" state, unlike a pipe, so writes after
+        // unlink keep succeeding — that's the whole point of this design.
+        //
+        // `set -e` with no trailing `exit 0` matters: without it, a SIGPIPE-killed
+        // `echo` (exit via signal, nonzero) would be masked by an unconditional
+        // final `exit 0`, and the test would pass even if writes were failing —
+        // exactly the gap the previous round's reviewer flagged.
+        let path =
+            std::env::temp_dir().join(format!("varda-test-stderr-unlink-{}.log", Uuid::new_v4()));
+        let file = fs::File::create(&path).expect("failed to create capture file");
+        let mut child = ProcessCommand::new("sh")
+            .arg("-c")
+            .arg("set -e; echo first 1>&2; sleep 0.2; echo second 1>&2")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .spawn()
+            .expect("failed to spawn test child");
+        fs::remove_file(&path).expect("failed to unlink capture file");
+        let status = child.wait().expect("child must exit");
+        assert!(
+            status.success(),
+            "child must not be killed by SIGPIPE after its capture file is unlinked"
+        );
     }
 
     #[test]
