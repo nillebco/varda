@@ -37,7 +37,7 @@ use crate::sandbox::{
 const GUEST_PROMPT_FILE: &str = "/opt/varda/prompt.txt";
 
 /// Guest-visible hostname that resolves to the HOST machine from inside an
-/// own-kernel microVM guest (`microsandbox`/`clawk`). The broker BINDS to host
+/// own-kernel microVM guest (`microsandbox`). The broker BINDS to host
 /// loopback (`127.0.0.1`), but the guest's own `127.0.0.1` is NOT the host — the
 /// guest reaches the host's loopback service by dialing `host.microsandbox.internal`
 /// instead. So for a VM-backed primitive the guest-visible broker host is this
@@ -1688,7 +1688,7 @@ fn env_for_request(
     );
     // M8-transport: expose the per-session MCP broker to the sandboxed agent. A
     // `local`/`docker` guest reaches it through the bind-mounted Unix socket
-    // (`VARDA_MCP_SOCKET`); an own-kernel microVM guest (microsandbox/clawk) cannot
+    // (`VARDA_MCP_SOCKET`); an own-kernel microVM guest (microsandbox) cannot
     // `connect()` that socket and instead dials the host over TCP, so it gets
     // `VARDA_MCP_ADDR` (host:port) plus `VARDA_MCP_PORT` (the port alone).
     if let Some(socket) = request.orchestration_socket_path.as_deref() {

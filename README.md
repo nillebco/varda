@@ -51,7 +51,7 @@ agents = ["claude"]
 sandbox = "worker"
 ```
 
-Providers: **docker**, **microsandbox** (microVM), and **clawk**. Each box gets a scoped credential minted on the host — never your `~/.aws`, never your `~/.azure` — an egress allowlist instead of open internet, and only the mounts you declare — with identity files forced read-only and credential paths denylisted.
+Providers: **docker** and **microsandbox** (microVM). Each box gets a scoped credential minted on the host — never your `~/.aws`, never your `~/.azure` — an egress allowlist instead of open internet, and only the mounts you declare — with identity files forced read-only and credential paths denylisted.
 
 Credentials are named, not embedded: config references a host env var or a secret-store key, and the value is resolved at launch. A repo-committed `.varda` is treated as untrusted and clamped to a hardening floor.
 
