@@ -2206,11 +2206,20 @@ enum LaunchContext {
 
 /// Detect [`LaunchContext`] for the current process.
 ///
-/// Sandbox detection reuses the existing `VARDA_MCP_ADDR`/`VARDA_MCP_SOCKET`
-/// guest-env signal [`crate::acp`]'s `env_for_request` already sets when it wires
-/// a sandboxed, orchestrated agent (a spawned worker or the resident — exactly
-/// the processes this decision cares about) up to reach the host's MCP broker —
-/// not a new invented signal. Neither var is ever set on a plain host launch.
+/// Sandbox detection's PRIMARY signal is [`crate::sandbox::SANDBOXED_MARKER_ENV`]
+/// (`mark_sandboxed`), which `acp.rs` sets on `CommandSpec.env` for EVERY
+/// non-`local` sandbox launch — batch or interactive, with or without
+/// orchestration's MCP broker wired. That universality matters: an interactive
+/// docker/microsandbox/clawk launch with no broker attached (a human working
+/// directly inside the sandbox on a real TTY) sets no `VARDA_MCP_ADDR`/
+/// `VARDA_MCP_SOCKET`, so relying on those alone would let such a process
+/// misclassify itself as `InteractiveTty` and get offered the approval prompt
+/// from inside the very sandbox a capability change would affect (#806).
+///
+/// The `VARDA_MCP_ADDR`/`VARDA_MCP_SOCKET` guest-env signal `env_for_request`
+/// sets when wiring an orchestrated agent to the host's MCP broker is kept as
+/// an additional fallback signal — harmless belt-and-suspenders, since it can
+/// only ever widen `Sandboxed` detection, never narrow it.
 ///
 /// Interactivity reuses the codebase's existing `std::io::IsTerminal` convention
 /// (see `main.rs`'s `--file`-less task-add prompt and `acp.rs`'s stream-to-terminal
@@ -2220,7 +2229,8 @@ enum LaunchContext {
 /// silently blocking on a prompt no one can see — the exact failure mode
 /// Decision 2 warns about for the headless case.
 fn detect_launch_context() -> LaunchContext {
-    if std::env::var_os("VARDA_MCP_ADDR").is_some()
+    if std::env::var_os(crate::sandbox::SANDBOXED_MARKER_ENV).is_some()
+        || std::env::var_os("VARDA_MCP_ADDR").is_some()
         || std::env::var_os("VARDA_MCP_SOCKET").is_some()
     {
         return LaunchContext::Sandboxed;
@@ -2325,6 +2335,8 @@ fn resolve_pin_mismatch(
     pin: &str,
     actual: &str,
 ) -> Result<String> {
+    let store = config_approval::ApprovalStore::open()
+        .context("failed to open the launch-time bundle approval store")?;
     resolve_pin_mismatch_with(
         include_path,
         entry_path,
@@ -2334,13 +2346,18 @@ fn resolve_pin_mismatch(
         actual,
         detect_launch_context(),
         prompt_capability_approval,
+        &store,
     )
 }
 
-/// Core decision logic for [`resolve_pin_mismatch`], with [`LaunchContext`] and the
-/// approval prompt injected so it's testable without a real terminal (Decision 2's
+/// Core decision logic for [`resolve_pin_mismatch`], with [`LaunchContext`], the
+/// approval prompt, AND the [`config_approval::ApprovalStore`] injected so it's
+/// testable without a real terminal or the real `VARDA_HOME` (Decision 2's
 /// TTY-prompt path is exercised by passing a fake `ask` closure; the context table
-/// itself is exercised by passing each [`LaunchContext`] variant directly).
+/// itself is exercised by passing each [`LaunchContext`] variant directly; the store
+/// seam lets tests build an isolated `ApprovalStore::open_at(tempdir)` directly
+/// instead of mutating the process-wide `VARDA_HOME` env var, which `cargo test`'s
+/// default concurrent execution would otherwise race across tests).
 ///
 /// Returns the content this include entry should actually be parsed from —
 /// callers must use the RETURNED string, not re-read the fragment file, so a
@@ -2354,9 +2371,8 @@ fn resolve_pin_mismatch_with(
     actual: &str,
     launch_context: LaunchContext,
     mut ask: impl FnMut() -> Result<bool>,
+    store: &config_approval::ApprovalStore,
 ) -> Result<String> {
-    let store = config_approval::ApprovalStore::open()
-        .context("failed to open the launch-time bundle approval store")?;
     let previously_approved = store
         .load_approved_content(include_path)
         .with_context(|| format!("failed to load a previously-approved copy of {entry_path}"))?;
@@ -5947,13 +5963,17 @@ agents = ["frag_agent"]
         }
     }
 
-    /// Isolate `ApprovalStore::open()` (which reads `VARDA_HOME`) to a fresh temp
-    /// dir for the duration of the guard, so these tests never touch the real
-    /// `~/.varda/approved-bundles`.
-    fn isolated_varda_home(root: &Path) -> EnvGuard {
-        let home = root.join("home");
-        fs::create_dir_all(&home).expect("isolated VARDA_HOME should be creatable");
-        EnvGuard::set(VARDA_HOME_ENV, home.to_str().expect("temp path should be utf8"))
+    /// Build an isolated [`config_approval::ApprovalStore`] rooted under `root`,
+    /// injected directly into [`resolve_pin_mismatch_with`] instead of via the
+    /// process-wide `VARDA_HOME` env var. `cargo test` runs tests concurrently
+    /// within one process by default, and `VARDA_HOME` is read by
+    /// `ApprovalStore::open()`; two tests mutating it at once could each
+    /// redirect the OTHER's `ApprovalStore` operations to the wrong temp dir.
+    /// Building the store directly via `open_at` sidesteps the shared env var
+    /// entirely, so these tests need no cross-test serialization.
+    fn isolated_approval_store(root: &Path) -> config_approval::ApprovalStore {
+        config_approval::ApprovalStore::open_at(root.join("home").join("approved-bundles"))
+            .expect("isolated approval store should open")
     }
 
     #[test]
@@ -5968,9 +5988,33 @@ agents = ["frag_agent"]
     }
 
     #[test]
+    fn detect_launch_context_treats_the_sandboxed_marker_as_sandboxed_ahead_of_tty_state() {
+        // #806: an interactive docker/microsandbox/clawk launch with NO
+        // orchestration broker wired sets neither VARDA_MCP_ADDR nor
+        // VARDA_MCP_SOCKET, but DOES get `mark_sandboxed`'s
+        // `crate::sandbox::SANDBOXED_MARKER_ENV` (acp.rs sets it on every
+        // non-`local` launch, batch or interactive, broker or no broker).
+        // Real stdin/stdout can't be forced into "is a terminal" from a unit
+        // test, so this cannot directly reproduce the "TTY looks interactive"
+        // half of the bug end-to-end; what it verifies is that the marker
+        // check alone is sufficient to short-circuit to `Sandboxed`, which is
+        // what makes TTY-state irrelevant — `detect_launch_context` returns
+        // from the marker check via an unconditional early `return` BEFORE
+        // the `IsTerminal` check ever runs (read directly above), so once
+        // this assertion holds, TTY state provably cannot override it,
+        // whatever this test process's own stdin/stdout happen to be.
+        let _guard = EnvGuard::set(crate::sandbox::SANDBOXED_MARKER_ENV, "1");
+        assert_eq!(
+            detect_launch_context(),
+            LaunchContext::Sandboxed,
+            "the unconditional sandbox marker must be detected as Sandboxed even with \
+             no MCP broker env vars set"
+        );
+    }
+
+    #[test]
     fn resolve_pin_mismatch_with_empty_diff_repins_silently_without_prompting() {
         let root = temp_dir("mismatch-empty-diff");
-        let _home_guard = isolated_varda_home(&root);
         let bundle_dir = root.join("bundle");
         fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
         let include_path = bundle_dir.join("frag.toml");
@@ -5980,7 +6024,7 @@ agents = ["frag_agent"]
         let new = "# a harmless comment\n[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
         fs::write(&include_path, new).expect("frag should be written");
 
-        let store = config_approval::ApprovalStore::open().expect("store should open");
+        let store = isolated_approval_store(&root);
         store
             .store_approval(&include_path, old)
             .expect("prior approval should store");
@@ -5996,6 +6040,7 @@ agents = ["frag_agent"]
             // even consulted, since the closure below panics if ever called.
             LaunchContext::Sandboxed,
             || panic!("must never prompt when the capability diff is empty"),
+            &store,
         )
         .expect("an empty-diff mismatch must silently re-pin, not refuse");
 
@@ -6015,13 +6060,13 @@ agents = ["frag_agent"]
     #[test]
     fn resolve_pin_mismatch_with_headless_refuses_without_prompting() {
         let root = temp_dir("mismatch-headless");
-        let _home_guard = isolated_varda_home(&root);
         let bundle_dir = root.join("bundle");
         fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
         let include_path = bundle_dir.join("frag.toml");
         let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
         fs::write(&include_path, new).expect("frag should be written");
 
+        let store = isolated_approval_store(&root);
         let err = resolve_pin_mismatch_with(
             &include_path,
             "frag.toml",
@@ -6031,6 +6076,7 @@ agents = ["frag_agent"]
             "cafef00d",
             LaunchContext::Headless,
             || panic!("a headless run must never block on a prompt"),
+            &store,
         )
         .expect_err("a headless run with a non-empty diff must refuse");
 
@@ -6045,13 +6091,13 @@ agents = ["frag_agent"]
     #[test]
     fn resolve_pin_mismatch_with_sandboxed_refuses_without_ever_offering_the_prompt() {
         let root = temp_dir("mismatch-sandboxed");
-        let _home_guard = isolated_varda_home(&root);
         let bundle_dir = root.join("bundle");
         fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
         let include_path = bundle_dir.join("frag.toml");
         let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
         fs::write(&include_path, new).expect("frag should be written");
 
+        let store = isolated_approval_store(&root);
         let err = resolve_pin_mismatch_with(
             &include_path,
             "frag.toml",
@@ -6064,6 +6110,7 @@ agents = ["frag_agent"]
                 "a sandboxed worker/resident must never be offered the approval prompt, \
                  even if it would answer yes"
             ),
+            &store,
         )
         .expect_err("a sandboxed run with a non-empty diff must refuse");
 
@@ -6077,7 +6124,6 @@ agents = ["frag_agent"]
     #[test]
     fn resolve_pin_mismatch_with_interactive_decline_falls_back_to_prior_approval() {
         let root = temp_dir("mismatch-decline-fallback");
-        let _home_guard = isolated_varda_home(&root);
         let bundle_dir = root.join("bundle");
         fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
         let include_path = bundle_dir.join("frag.toml");
@@ -6087,7 +6133,7 @@ agents = ["frag_agent"]
                    [[routes]]\nglob = \"b/**\"\nagents = [\"codex\"]\n";
         fs::write(&include_path, new).expect("frag should be written");
 
-        let store = config_approval::ApprovalStore::open().expect("store should open");
+        let store = isolated_approval_store(&root);
         store
             .store_approval(&include_path, old)
             .expect("prior approval should store");
@@ -6101,6 +6147,7 @@ agents = ["frag_agent"]
             "cafef00d",
             LaunchContext::InteractiveTty,
             || Ok(false),
+            &store,
         )
         .expect("declining with a prior approval must fall back, not refuse");
 
@@ -6123,13 +6170,13 @@ agents = ["frag_agent"]
     #[test]
     fn resolve_pin_mismatch_with_interactive_decline_and_no_prior_approval_refuses() {
         let root = temp_dir("mismatch-decline-no-fallback");
-        let _home_guard = isolated_varda_home(&root);
         let bundle_dir = root.join("bundle");
         fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
         let include_path = bundle_dir.join("frag.toml");
         let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
         fs::write(&include_path, new).expect("frag should be written");
 
+        let store = isolated_approval_store(&root);
         let err = resolve_pin_mismatch_with(
             &include_path,
             "frag.toml",
@@ -6139,6 +6186,7 @@ agents = ["frag_agent"]
             "cafef00d",
             LaunchContext::InteractiveTty,
             || Ok(false),
+            &store,
         )
         .expect_err("declining first use (no prior approval) must refuse — nothing to fall back to");
 
@@ -6152,14 +6200,13 @@ agents = ["frag_agent"]
     #[test]
     fn resolve_pin_mismatch_with_interactive_approval_stores_and_proceeds_with_new_content() {
         let root = temp_dir("mismatch-approve");
-        let _home_guard = isolated_varda_home(&root);
         let bundle_dir = root.join("bundle");
         fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
         let include_path = bundle_dir.join("frag.toml");
         let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
         fs::write(&include_path, new).expect("frag should be written");
 
-        let store = config_approval::ApprovalStore::open().expect("store should open");
+        let store = isolated_approval_store(&root);
 
         let result = resolve_pin_mismatch_with(
             &include_path,
@@ -6170,6 +6217,7 @@ agents = ["frag_agent"]
             "cafef00d",
             LaunchContext::InteractiveTty,
             || Ok(true),
+            &store,
         )
         .expect("approving at the prompt must proceed with the new content");
 

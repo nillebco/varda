@@ -339,7 +339,7 @@ impl ApprovalStore {
     }
 
     #[cfg(test)]
-    fn open_at(root: PathBuf) -> Result<Self> {
+    pub(crate) fn open_at(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)
             .with_context(|| format!("failed to create approval store at {}", root.display()))?;
         Ok(Self { root })
