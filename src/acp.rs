@@ -380,6 +380,18 @@ impl AcpSubprocessClient {
         session
             .validate_mounts()
             .with_context(|| format!("unusable mount for '{}' sandbox", self.sandbox.name()))?;
+        // Config-load-time injection (`add_varda_project_dir_to_default_agents`)
+        // added `--add-dir <host varda path>` before this session's sandbox — and
+        // therefore its mounts — was known. Now that it is known, drop any such
+        // flag whose path does not resolve inside THIS guest.
+        if let Some(mount_targets) = session.mount_targets() {
+            let dropped = drop_unreachable_varda_add_dirs(&mut spec, &mount_targets);
+            log_dropped_add_dirs(
+                &dropped,
+                self.sandbox.name(),
+                request.session_log_path.as_deref(),
+            );
+        }
         // M11-ext — stage any file-target credentials as read-only guest files
         // before wrap bakes the argv. env-target credentials fold in via the
         // provider's `guest_env()` at wrap; file targets need the live session.
@@ -913,6 +925,16 @@ impl AcpSubprocessClient {
             env: env.clone(),
             ..spec
         };
+        // Same host-path-vs-guest-reachability check as the batch path — see the
+        // comment at the equivalent call in `execute`.
+        if let Some(mount_targets) = session.mount_targets() {
+            let dropped = drop_unreachable_varda_add_dirs(&mut spec, &mount_targets);
+            log_dropped_add_dirs(
+                &dropped,
+                self.sandbox.name(),
+                request.session_log_path.as_deref(),
+            );
+        }
 
         if let Some(log_path) = request.session_log_path.as_deref() {
             let _ = append_session_log(
@@ -1548,6 +1570,92 @@ fn expand_varda_project(value: &str) -> String {
         .replace("{varda_home}", &default_varda_home())
 }
 
+/// Drop a `--add-dir {varda_project}`/`--add-dir {varda_home}` flag injected
+/// at config-load time (`add_varda_project_dir_to_default_agents` in
+/// `config.rs`) when the expanded HOST path is not reachable inside THIS
+/// session's guest — that injection runs before the sandbox is known, so it
+/// cannot make this call itself. `mount_targets` is
+/// `session.mount_targets()`'s `Some(..)` payload; callers must skip this
+/// entirely when that is `None` (unrestricted — e.g. `local`).
+///
+/// Handles both the argv-pair form (`["--add-dir", path]`, from `claude`/
+/// `codex` agents) and the shell-embedded form (`sh -c "copilot ... --add-dir
+/// path ..."`, from `copilot`-wrapping agents). Returns the dropped paths so
+/// the caller can log them instead of silently narrowing the agent.
+fn drop_unreachable_varda_add_dirs(
+    spec: &mut CommandSpec,
+    mount_targets: &[PathBuf],
+) -> Vec<String> {
+    let candidates = [env!("CARGO_MANIFEST_DIR").to_owned(), default_varda_home()];
+    let mut dropped = Vec::new();
+
+    for path in candidates {
+        let reachable = mount_targets
+            .iter()
+            .any(|target| Path::new(&path).starts_with(target));
+        if reachable {
+            continue;
+        }
+
+        let mut removed_any = false;
+
+        let mut index = 0;
+        while index + 1 < spec.args.len() {
+            if spec.args[index] == "--add-dir" && spec.args[index + 1] == path {
+                spec.args.drain(index..index + 2);
+                removed_any = true;
+                continue;
+            }
+            index += 1;
+        }
+
+        // Plain substring replace would also match `path` as a PREFIX of a
+        // longer, unrelated path (e.g. fragment " --add-dir /repo" matching
+        // inside " --add-dir /repo/data"), corrupting that unrelated flag.
+        // Only remove a match where `path` is immediately followed by
+        // whitespace or end-of-string.
+        let fragment = format!(" --add-dir {path}");
+        for arg in spec.args.iter_mut() {
+            let mut search_from = 0;
+            while let Some(rel_pos) = arg[search_from..].find(&fragment) {
+                let match_start = search_from + rel_pos;
+                let match_end = match_start + fragment.len();
+                let complete_match = arg[match_end..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace());
+                if complete_match {
+                    arg.replace_range(match_start..match_end, "");
+                    removed_any = true;
+                    search_from = match_start;
+                } else {
+                    search_from = match_start + 1;
+                }
+            }
+        }
+
+        if removed_any {
+            dropped.push(path);
+        }
+    }
+
+    dropped
+}
+
+/// Log a `--add-dir` dropped by [`drop_unreachable_varda_add_dirs`] to stderr
+/// and (when available) the session log, so a narrowed agent is never silent.
+fn log_dropped_add_dirs(dropped: &[String], sandbox_name: &str, log_path: Option<&str>) {
+    for path in dropped {
+        let message = format!(
+            "dropped --add-dir {path}: not reachable inside '{sandbox_name}' sandbox\n"
+        );
+        eprintln!("warning: {}", message.trim_end());
+        if let Some(log_path) = log_path {
+            let _ = append_session_log(log_path, &message);
+        }
+    }
+}
+
 /// Host `$HOME` as the session-store root for un-sandboxed (interactive) runs,
 /// mirroring [`crate::sandbox::LocalSession::session_store_root`].
 fn host_session_root() -> PathBuf {
@@ -1723,6 +1831,106 @@ mod tests {
     use crate::task::{TaskFrontmatter, TaskStatus};
 
     use super::*;
+
+    /// #784: a `--add-dir <host varda path>` unreachable in the guest (empty
+    /// `mount_targets`) is stripped from an argv-pair form arg list, leaving
+    /// unrelated args intact.
+    #[test]
+    fn drop_unreachable_varda_add_dirs_strips_argv_pairs_when_not_mounted() {
+        let varda_project = env!("CARGO_MANIFEST_DIR").to_owned();
+        let mut spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec![
+                "-p".to_owned(),
+                "--add-dir".to_owned(),
+                varda_project.clone(),
+                "--permission-mode".to_owned(),
+                "acceptEdits".to_owned(),
+            ],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let dropped = drop_unreachable_varda_add_dirs(&mut spec, &[]);
+        assert!(dropped.contains(&varda_project));
+        assert_eq!(
+            spec.args,
+            vec!["-p".to_owned(), "--permission-mode".to_owned(), "acceptEdits".to_owned()]
+        );
+    }
+
+    /// #784: when the varda project dir IS mounted into the guest (its path is
+    /// a `mount_targets` entry), the flag must survive unchanged.
+    #[test]
+    fn drop_unreachable_varda_add_dirs_keeps_mounted_path() {
+        let varda_project = env!("CARGO_MANIFEST_DIR").to_owned();
+        let mut spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec!["--add-dir".to_owned(), varda_project.clone()],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let dropped =
+            drop_unreachable_varda_add_dirs(&mut spec, &[PathBuf::from(&varda_project)]);
+        assert!(dropped.is_empty());
+        assert_eq!(spec.args, vec!["--add-dir".to_owned(), varda_project]);
+    }
+
+    /// #784: the shell-embedded form (`sh -c "copilot ... --add-dir <path> ..."`,
+    /// produced by `add_varda_dirs_to_shell_arg` in config.rs) must also be
+    /// stripped when the path is not guest-reachable, leaving the rest of the
+    /// shell command string intact.
+    #[test]
+    fn drop_unreachable_varda_add_dirs_strips_shell_embedded_form() {
+        let varda_project = env!("CARGO_MANIFEST_DIR").to_owned();
+        let varda_home = default_varda_home();
+        let mut spec = CommandSpec {
+            program: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                format!(
+                    "copilot -p \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {varda_project} --add-dir {varda_home}"
+                ),
+            ],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let dropped = drop_unreachable_varda_add_dirs(&mut spec, &[]);
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(
+            spec.args[1],
+            "copilot -p \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools"
+        );
+    }
+
+    /// #784 regression: an unreachable `--add-dir <varda_project>` must not be
+    /// removed as a PREFIX match against a longer, unrelated
+    /// `--add-dir <varda_project>/data` flag in the same shell string — only
+    /// the complete, boundary-terminated occurrence is dropped, and the
+    /// unrelated longer flag survives byte-for-byte.
+    #[test]
+    fn drop_unreachable_varda_add_dirs_does_not_corrupt_prefix_match() {
+        let varda_project = env!("CARGO_MANIFEST_DIR").to_owned();
+        let unrelated_longer_path = format!("{varda_project}/data");
+        let mut spec = CommandSpec {
+            program: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                format!(
+                    "copilot -p \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {varda_project} --add-dir {unrelated_longer_path}"
+                ),
+            ],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let dropped = drop_unreachable_varda_add_dirs(&mut spec, &[]);
+        assert!(dropped.contains(&varda_project));
+        assert_eq!(
+            spec.args[1],
+            format!(
+                "copilot -p \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools --add-dir {unrelated_longer_path}"
+            )
+        );
+    }
 
     /// A sandbox session that records whether `teardown()` ran, so tests can
     /// assert the M10 leak fix fires on the cancel path without spinning docker.
