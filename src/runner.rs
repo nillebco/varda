@@ -723,17 +723,12 @@ pub async fn run_task(
                             &session_log_path,
                             &format!("\ninterpretation_error:\n{error:#}\n"),
                         )?;
-                        AgentRunResult {
-                            recap: format!(
-                                "# Interactive Session Completed\n\nThe interactive session ended successfully but Varda's interpreter pass failed: {error}\n\nFalling back to the agent's session-end output.\n\n{}\n\nSession log: [{}]({})\n\nrequires_user: false",
-                                session_result.recap,
-                                session_log_path.display(),
-                                session_log_path.display()
-                            ),
-                            requires_user: false,
-                            suggested_agent: None,
-                            resume_command: None,
-                        }
+                        interpretation_failure_result(
+                            "interactive session",
+                            &error,
+                            &session_result.recap,
+                            &session_log_path,
+                        )
                     }
                 }
             }
@@ -882,17 +877,12 @@ pub async fn resume_interactive_task(
                     &session_log_path,
                     &format!("\ninterpretation_error:\n{error:#}\n"),
                 )?;
-                AgentRunResult {
-                    recap: format!(
-                        "# Interactive Session Completed\n\nThe resumed interactive session ended successfully but Varda's interpreter pass failed: {error}\n\nFalling back to the agent's session-end output.\n\n{}\n\nSession log: [{}]({})\n\nrequires_user: false",
-                        session_result.recap,
-                        session_log_path.display(),
-                        session_log_path.display()
-                    ),
-                    requires_user: false,
-                    suggested_agent: None,
-                    resume_command: None,
-                }
+                interpretation_failure_result(
+                    "resumed interactive session",
+                    &error,
+                    &session_result.recap,
+                    &session_log_path,
+                )
             }
         }
     };
@@ -1077,6 +1067,32 @@ fn skip_recap_result(session_log_path: &Path) -> AgentRunResult {
             session_log_path.display()
         ),
         requires_user: false,
+        suggested_agent: None,
+        resume_command: None,
+    }
+}
+
+/// Build the fallback [`AgentRunResult`] for when the post-session interpreter
+/// pass itself fails (as opposed to the driving session it was interpreting).
+/// Varda has NO outcome for the run in that case — it does not know whether the
+/// underlying work succeeded, needs the user, or failed — so this must NOT
+/// resolve to `review`, which is indistinguishable from a clean run awaiting
+/// human review. It routes to `needs_user` instead (via `requires_user: true`)
+/// so the existing notification path fires and a human looks at it; the run
+/// itself may well have succeeded, so the work is not necessarily lost.
+fn interpretation_failure_result(
+    session_kind: &str,
+    error: &anyhow::Error,
+    session_recap: &str,
+    session_log_path: &Path,
+) -> AgentRunResult {
+    AgentRunResult {
+        recap: format!(
+            "# Interpreter Pass Failed\n\nThe {session_kind} ended, but Varda's interpreter pass failed and could not produce a recap: {error:#}\n\nWhat completed: unknown — the interpreter pass could not summarize what the agent did. A human must inspect the session log to determine the real outcome.\n\nFalling back to the agent's own session-end output below.\n\n{session_recap}\n\nSession log: [{}]({})\n\nUser interaction required: yes.\n\nrequires_user: true",
+            session_log_path.display(),
+            session_log_path.display()
+        ),
+        requires_user: true,
         suggested_agent: None,
         resume_command: None,
     }
@@ -1986,6 +2002,90 @@ Help interactively.
         assert_eq!(outcome.status, TaskStatus::Review);
         assert!(recap.contains("Interpreted Recap"));
         assert!(recap.contains("Did the work."));
+    }
+
+    struct InterpretationFailingClient {
+        session_response: AgentRunResult,
+    }
+
+    #[async_trait]
+    impl AgentClient for InterpretationFailingClient {
+        async fn run_task(&self, request: AgentRunRequest) -> Result<AgentRunResult> {
+            if request.interpret {
+                anyhow::bail!("interpreter agent exited with a sandbox path error");
+            }
+            Ok(self.session_response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn interpretation_pass_failure_routes_to_needs_user_not_review() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-run-interpretation-failure-{}",
+            std::process::id()
+        ));
+        let operations_dir = root.join("operations");
+        let task_dir = operations_dir.join("tasks/codex");
+        fs::create_dir_all(&task_dir).expect("task directory should be created");
+        let task_path = task_dir.join("example.md");
+        fs::write(
+            &task_path,
+            r#"---
+status: ready
+project: /work/project
+assignee: codex
+requires_user: false
+---
+
+# Task
+
+Help interactively.
+"#,
+        )
+        .expect("task should be written");
+
+        let mut config = test_config(operations_dir.display().to_string());
+        config.git.auto_commit = false;
+        let client = InterpretationFailingClient {
+            session_response: AgentRunResult {
+                recap: "Interactive session completed.".to_owned(),
+                requires_user: false,
+                suggested_agent: None,
+                resume_command: None,
+            },
+        };
+
+        let outcome = run_task(&config, "codex", None, &task_path, &client, true, false)
+            .await
+            .expect("run_task should tolerate a failing interpreter pass");
+
+        let recap = fs::read_to_string(&outcome.recap_path).expect("recap should be readable");
+        let session_log =
+            fs::read_to_string(&outcome.session_log_path).expect("session log should be readable");
+
+        assert_ne!(
+            outcome.status,
+            TaskStatus::Review,
+            "an unknown outcome (interpreter pass failed) must never look like a clean, \
+             reviewable run — that hides the failure with no recap and no notification"
+        );
+        assert_eq!(
+            outcome.status,
+            TaskStatus::NeedsUser,
+            "an interpretation failure should stop the pipeline for a human, not silently pass"
+        );
+        assert!(
+            recap.contains("interpreter agent exited with a sandbox path error"),
+            "the recap must surface the interpretation error text: {recap}"
+        );
+        assert!(
+            recap.contains(&outcome.session_log_path.display().to_string()),
+            "the recap must point at the session log: {recap}"
+        );
+        assert!(
+            session_log.contains("interpretation_error:"),
+            "the session log must also carry the interpretation_error block: {session_log}"
+        );
     }
 
     #[tokio::test]
