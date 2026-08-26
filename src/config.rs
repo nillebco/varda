@@ -10,6 +10,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config_approval;
+
 pub const VARDA_HOME_ENV: &str = "VARDA_HOME";
 pub const CONFIG_FILENAME: &str = "config.toml";
 pub const OPERATIONS_DIRNAME: &str = "operations";
@@ -2000,7 +2002,7 @@ fn resolve_includes(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| config_dir.to_path_buf());
 
-        let content = fs::read_to_string(&include_path)
+        let mut content = fs::read_to_string(&include_path)
             .with_context(|| format!("failed to read included config fragment {}", entry.path()))?;
 
         if let Some(pin) = entry.sha256_pin() {
@@ -2012,12 +2014,14 @@ fn resolve_includes(
                 );
                 match mode {
                     VerifyMode::Strict => {
-                        bail!(
-                            "config REFUSED: pinned include {} does not match its sha256 pin \
-                             (expected {pin}, got {actual}); the bundle content has changed \
-                             since it was pinned",
-                            entry.path()
-                        );
+                        content = resolve_pin_mismatch(
+                            &include_path,
+                            entry.path(),
+                            &bundle_dir,
+                            &content,
+                            pin,
+                            &actual,
+                        )?;
                     }
                     VerifyMode::DiagnosticDegraded => {
                         eprintln!(
@@ -2181,6 +2185,238 @@ fn check_table_keys(
         }
     }
     Ok(())
+}
+
+/// Where THIS process is running, for the purpose of deciding who may be asked
+/// to approve a capability change (#765 wave 2b, Decision 2). Order of checks in
+/// [`detect_launch_context`] matters: `Sandboxed` is checked BEFORE the TTY check
+/// so a sandboxed process that happens to have a pty attached still refuses
+/// rather than ever offering the prompt — an agent must never be able to approve
+/// its own capability escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchContext {
+    /// A human is attached on a real terminal; may be prompted.
+    InteractiveTty,
+    /// `varda task run`, cron, any non-TTY run — must refuse, never block.
+    Headless,
+    /// Running inside a varda-managed sandbox (a spawned worker or the
+    /// resident) — must refuse, and must never even offer the prompt.
+    Sandboxed,
+}
+
+/// Detect [`LaunchContext`] for the current process.
+///
+/// Sandbox detection reuses the existing `VARDA_MCP_ADDR`/`VARDA_MCP_SOCKET`
+/// guest-env signal [`crate::acp`]'s `env_for_request` already sets when it wires
+/// a sandboxed, orchestrated agent (a spawned worker or the resident — exactly
+/// the processes this decision cares about) up to reach the host's MCP broker —
+/// not a new invented signal. Neither var is ever set on a plain host launch.
+///
+/// Interactivity reuses the codebase's existing `std::io::IsTerminal` convention
+/// (see `main.rs`'s `--file`-less task-add prompt and `acp.rs`'s stream-to-terminal
+/// check). Both stdin AND stdout are required to be a real terminal: a prompt
+/// whose output is redirected away is not meaningfully "shown" to anyone even if
+/// stdin happens to be a tty, and treating that as interactive would risk
+/// silently blocking on a prompt no one can see — the exact failure mode
+/// Decision 2 warns about for the headless case.
+fn detect_launch_context() -> LaunchContext {
+    if std::env::var_os("VARDA_MCP_ADDR").is_some()
+        || std::env::var_os("VARDA_MCP_SOCKET").is_some()
+    {
+        return LaunchContext::Sandboxed;
+    }
+    use std::io::IsTerminal as _;
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        LaunchContext::InteractiveTty
+    } else {
+        LaunchContext::Headless
+    }
+}
+
+/// Derive the [`config_approval::CapabilitySummary`] of a standalone fragment's
+/// content, applying the same per-fragment processing [`resolve_includes`] itself
+/// applies before merging (unknown-key rejection, mount expansion relative to
+/// `bundle_dir`, the `untrusted` provenance flag) so the summary reflects exactly
+/// what would be merged — without actually merging it into the caller's `Config`.
+/// Used to diff the previously-approved copy of a bundle against its new content;
+/// never the full merged config (approval is scoped per include file, matching
+/// [`config_approval::ApprovalStore`]'s per-bundle-path keying).
+fn fragment_capability_summary(
+    content: &str,
+    entry_path: &str,
+    bundle_dir: &Path,
+) -> Result<config_approval::CapabilitySummary> {
+    reject_unknown_fragment_keys(content, entry_path)?;
+    let mut fragment: ConfigFragment = toml::from_str(content).with_context(|| {
+        format!("failed to parse content of {entry_path} for a capability-summary diff")
+    })?;
+    if !fragment.include.is_empty() {
+        bail!(
+            "included config fragment {entry_path} declares its own `include`; \
+             nested includes are not supported"
+        );
+    }
+    for route in &mut fragment.routes {
+        expand_route_mounts(route, Some(bundle_dir))?;
+        route.untrusted = true;
+    }
+    for sandbox in fragment.sandboxes.values_mut() {
+        expand_sandbox_mounts(sandbox, Some(bundle_dir))?;
+        sandbox.untrusted = true;
+    }
+    for agent in fragment.agents.values_mut() {
+        agent.command = resolve_bundle_relative_command(&agent.command, bundle_dir);
+        if let Some(working_dir) = &agent.working_dir {
+            agent.working_dir = Some(resolve_bundle_relative_command(working_dir, bundle_dir));
+        }
+        agent.untrusted = true;
+    }
+    let mut summary_config: Config =
+        toml::from_str(DEFAULT_CONFIG).expect("DEFAULT_CONFIG template must parse");
+    summary_config.routes = fragment.routes;
+    summary_config.sandboxes = fragment.sandboxes;
+    summary_config.agents = fragment.agents;
+    Ok(config_approval::CapabilitySummary::from_config(
+        &summary_config,
+    ))
+}
+
+/// Print a capability-change diff to stderr, critical (sandbox-escape / host-code-
+/// exec) entries first — `changes` already arrives sorted that way from
+/// [`config_approval::diff_capabilities`].
+fn print_capability_diff(entry_path: &str, changes: &[config_approval::CapabilityChange]) {
+    eprintln!(
+        "config: included bundle {entry_path} changed and no longer matches its sha256 pin. \
+         Its capability surface would change as follows:"
+    );
+    for change in changes {
+        let marker = if change.critical { "!!" } else { " -" };
+        eprintln!("  {marker} {}", change.sentence);
+    }
+}
+
+/// Read a real y/N answer from the attached terminal. Only ever called from
+/// [`LaunchContext::InteractiveTty`], so stdin/stdout are known to be real
+/// terminals. EOF (`read_line` returning `Ok(0)`) reads as an empty answer, which
+/// falls through to "no" — the same safe default as an explicit decline.
+fn prompt_capability_approval() -> Result<bool> {
+    use std::io::Write as _;
+    print!("Approve this bundle's new capabilities and re-pin it? [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// On a Strict-mode pin mismatch, decide what content this include entry actually
+/// resolves to: the launch-time capability-diff approval flow (#765 wave 2b,
+/// Decisions 1-3), replacing the old unconditional refuse. Thin wrapper around
+/// [`resolve_pin_mismatch_with`] that supplies the real [`LaunchContext`] and the
+/// real interactive-prompt function; see that function for the actual logic and
+/// its unit tests for the injectable seams this split exists for.
+fn resolve_pin_mismatch(
+    include_path: &Path,
+    entry_path: &str,
+    bundle_dir: &Path,
+    new_content: &str,
+    pin: &str,
+    actual: &str,
+) -> Result<String> {
+    resolve_pin_mismatch_with(
+        include_path,
+        entry_path,
+        bundle_dir,
+        new_content,
+        pin,
+        actual,
+        detect_launch_context(),
+        prompt_capability_approval,
+    )
+}
+
+/// Core decision logic for [`resolve_pin_mismatch`], with [`LaunchContext`] and the
+/// approval prompt injected so it's testable without a real terminal (Decision 2's
+/// TTY-prompt path is exercised by passing a fake `ask` closure; the context table
+/// itself is exercised by passing each [`LaunchContext`] variant directly).
+///
+/// Returns the content this include entry should actually be parsed from —
+/// callers must use the RETURNED string, not re-read the fragment file, so a
+/// decline-fallback to previously-approved content is honored.
+fn resolve_pin_mismatch_with(
+    include_path: &Path,
+    entry_path: &str,
+    bundle_dir: &Path,
+    new_content: &str,
+    pin: &str,
+    actual: &str,
+    launch_context: LaunchContext,
+    mut ask: impl FnMut() -> Result<bool>,
+) -> Result<String> {
+    let store = config_approval::ApprovalStore::open()
+        .context("failed to open the launch-time bundle approval store")?;
+    let previously_approved = store
+        .load_approved_content(include_path)
+        .with_context(|| format!("failed to load a previously-approved copy of {entry_path}"))?;
+
+    let old_summary = match &previously_approved {
+        Some(prev) => fragment_capability_summary(prev, entry_path, bundle_dir)?,
+        None => config_approval::CapabilitySummary::default(),
+    };
+    let new_summary = fragment_capability_summary(new_content, entry_path, bundle_dir)?;
+    let changes = config_approval::diff_capabilities(&old_summary, &new_summary);
+
+    // Decision 3: nothing security-relevant changed (a comment, key reorder, or
+    // pure capability removal) — re-pin silently, never prompt.
+    if changes.is_empty() {
+        store
+            .store_approval(include_path, new_content)
+            .with_context(|| format!("failed to re-pin approved content for {entry_path}"))?;
+        return Ok(new_content.to_owned());
+    }
+
+    let refuse = |detail: &str| -> anyhow::Error {
+        anyhow::anyhow!(
+            "config REFUSED: pinned include {entry_path} does not match its sha256 pin \
+             (expected {pin}, got {actual}); the bundle content has changed since it was \
+             pinned, and its capability surface changed too — {detail}"
+        )
+    };
+
+    match launch_context {
+        LaunchContext::Sandboxed => Err(refuse(
+            "refusing inside a sandbox: approving a capability change from inside a \
+             sandboxed worker or the resident would let it approve its own escalation, \
+             so it is never even offered the prompt; approve on an interactive host launch",
+        )),
+        LaunchContext::Headless => Err(refuse(
+            "refusing in a non-interactive/headless context (no TTY attached), rather \
+             than blocking on a prompt no one can see; re-run interactively on a host \
+             terminal to review and approve",
+        )),
+        LaunchContext::InteractiveTty => {
+            print_capability_diff(entry_path, &changes);
+            if ask()? {
+                store
+                    .store_approval(include_path, new_content)
+                    .with_context(|| format!("failed to store approval for {entry_path}"))?;
+                return Ok(new_content.to_owned());
+            }
+            if let Some(prev) = previously_approved {
+                eprintln!(
+                    "config: declined; falling back to the previously-approved content for \
+                     {entry_path}"
+                );
+                return Ok(prev);
+            }
+            Err(refuse(
+                "declined at the approval prompt, and no previously-approved content \
+                 exists to fall back to",
+            ))
+        }
+    }
 }
 
 /// Parse a fragment's raw TOML text a SECOND time as a generic [`toml::Value`] and
@@ -5681,6 +5917,267 @@ agents = ["frag_agent"]
                 .any(|route| route.glob == "bundlz/**"),
             "diagnostic mode must still report the TRUE (unverified) route content"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Isolate `ApprovalStore::open()` (which reads `VARDA_HOME`) to a fresh temp
+    /// dir for the duration of the guard, so these tests never touch the real
+    /// `~/.varda/approved-bundles`.
+    fn isolated_varda_home(root: &Path) -> EnvGuard {
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("isolated VARDA_HOME should be creatable");
+        EnvGuard::set(VARDA_HOME_ENV, home.to_str().expect("temp path should be utf8"))
+    }
+
+    #[test]
+    fn detect_launch_context_treats_the_broker_env_signal_as_sandboxed() {
+        let _guard = EnvGuard::set("VARDA_MCP_ADDR", "127.0.0.1:1");
+        assert_eq!(
+            detect_launch_context(),
+            LaunchContext::Sandboxed,
+            "the VARDA_MCP_ADDR guest-env signal acp.rs sets for a sandboxed, \
+             orchestrated launch must be detected as Sandboxed"
+        );
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_empty_diff_repins_silently_without_prompting() {
+        let root = temp_dir("mismatch-empty-diff");
+        let _home_guard = isolated_varda_home(&root);
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+
+        // Old and new content differ only by a comment — same parsed capabilities.
+        let old = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        let new = "# a harmless comment\n[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let store = config_approval::ApprovalStore::open().expect("store should open");
+        store
+            .store_approval(&include_path, old)
+            .expect("prior approval should store");
+
+        let result = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            // Context is irrelevant on an empty diff — Sandboxed proves it's never
+            // even consulted, since the closure below panics if ever called.
+            LaunchContext::Sandboxed,
+            || panic!("must never prompt when the capability diff is empty"),
+        )
+        .expect("an empty-diff mismatch must silently re-pin, not refuse");
+
+        assert_eq!(result, new);
+        let stored = store
+            .load_approved_content(&include_path)
+            .expect("store should be readable");
+        assert_eq!(
+            stored.as_deref(),
+            Some(new),
+            "the approval store must be updated to the new content"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_headless_refuses_without_prompting() {
+        let root = temp_dir("mismatch-headless");
+        let _home_guard = isolated_varda_home(&root);
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let err = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            LaunchContext::Headless,
+            || panic!("a headless run must never block on a prompt"),
+        )
+        .expect_err("a headless run with a non-empty diff must refuse");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("REFUSED"));
+        assert!(message.contains("frag.toml"));
+        assert!(message.contains("non-interactive"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_sandboxed_refuses_without_ever_offering_the_prompt() {
+        let root = temp_dir("mismatch-sandboxed");
+        let _home_guard = isolated_varda_home(&root);
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let err = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            LaunchContext::Sandboxed,
+            || panic!(
+                "a sandboxed worker/resident must never be offered the approval prompt, \
+                 even if it would answer yes"
+            ),
+        )
+        .expect_err("a sandboxed run with a non-empty diff must refuse");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("REFUSED"));
+        assert!(message.contains("sandbox"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_interactive_decline_falls_back_to_prior_approval() {
+        let root = temp_dir("mismatch-decline-fallback");
+        let _home_guard = isolated_varda_home(&root);
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+
+        let old = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n\n\
+                   [[routes]]\nglob = \"b/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let store = config_approval::ApprovalStore::open().expect("store should open");
+        store
+            .store_approval(&include_path, old)
+            .expect("prior approval should store");
+
+        let result = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            LaunchContext::InteractiveTty,
+            || Ok(false),
+        )
+        .expect("declining with a prior approval must fall back, not refuse");
+
+        assert_eq!(
+            result, old,
+            "a decline must proceed with the PREVIOUSLY-APPROVED bytes, not the live ones"
+        );
+        let stored = store
+            .load_approved_content(&include_path)
+            .expect("store should be readable");
+        assert_eq!(
+            stored.as_deref(),
+            Some(old),
+            "declining must not silently re-pin the new content"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_interactive_decline_and_no_prior_approval_refuses() {
+        let root = temp_dir("mismatch-decline-no-fallback");
+        let _home_guard = isolated_varda_home(&root);
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let err = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            LaunchContext::InteractiveTty,
+            || Ok(false),
+        )
+        .expect_err("declining first use (no prior approval) must refuse — nothing to fall back to");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("REFUSED"));
+        assert!(message.contains("no previously-approved"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_interactive_approval_stores_and_proceeds_with_new_content() {
+        let root = temp_dir("mismatch-approve");
+        let _home_guard = isolated_varda_home(&root);
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let store = config_approval::ApprovalStore::open().expect("store should open");
+
+        let result = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            LaunchContext::InteractiveTty,
+            || Ok(true),
+        )
+        .expect("approving at the prompt must proceed with the new content");
+
+        assert_eq!(result, new);
+        let stored = store
+            .load_approved_content(&include_path)
+            .expect("store should be readable");
+        assert_eq!(stored.as_deref(), Some(new));
 
         fs::remove_dir_all(&root).ok();
     }
