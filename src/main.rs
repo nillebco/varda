@@ -2194,14 +2194,11 @@ fn build_client(
             let mut sandbox_untrusted_keys = Vec::new();
             if let Some(sandbox_config) = config.sandboxes.get(sandbox_name) {
                 static_env.extend(sandbox_config.env.clone());
-                sandbox_untrusted_keys = config::untrusted_env_keys_if(
-                    &sandbox_config.env,
-                    sandbox_config.untrusted,
-                );
+                sandbox_untrusted_keys =
+                    config::untrusted_env_keys_if(&sandbox_config.env, sandbox_config.untrusted);
             }
             static_env.extend(route_env.clone());
-            let route_untrusted_keys =
-                config::untrusted_env_keys_if(route_env, route_untrusted);
+            let route_untrusted_keys = config::untrusted_env_keys_if(route_env, route_untrusted);
             untrusted_env_keys = config::union_keys(sandbox_untrusted_keys, route_untrusted_keys);
             sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?
         }
