@@ -1,5 +1,6 @@
 //! Git integration.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -143,6 +144,89 @@ pub fn commit_agent_files(project_repo: &Path, files: &[PathBuf], message: &str)
     }
 
     Ok(())
+}
+
+/// Repo-relative paths with ANY local modification at `worktree` — tracked or
+/// untracked (`git status --porcelain=v1 -z`), entries with no trailing
+/// newline filtered out. Unlike [`worktree_dirty_paths`] this deliberately
+/// includes untracked files: a newly created file is exactly the kind of
+/// change an agent must report, so a snapshot that dropped it could never
+/// catch an under-reported new file (#816).
+///
+/// Uses the NUL-delimited `-z` form rather than the human-readable porcelain
+/// text: the latter can't be split-and-trimmed reliably, since rename/copy
+/// records render as `R  old -> new` (a single "path" slice would then be the
+/// whole ` -> ` composite, matching neither the old nor the new file) and
+/// paths containing spaces, non-ASCII bytes, or other special characters get
+/// quoted and C-escaped unless `core.quotepath=false`. With `-z`, each record
+/// is `XY<space><path>\0`, except a rename/copy record (`X` or `Y` is `R` or
+/// `C`) which is `XY<space><path>\0<origPath>\0` — two NUL-terminated fields,
+/// neither quoted nor escaped. For a rename, both the new and the old path
+/// are emitted, so a renamed-and-still-uncommitted file is recognized under
+/// either name.
+pub fn dirty_paths(worktree: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain=v1", "-z"])
+        .output()
+        .context("failed to check worktree status")?;
+    if !output.status.success() {
+        bail!(
+            "git status failed in {}; stderr: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut fields = stdout.split('\0').filter(|f| !f.is_empty());
+    let mut paths = Vec::new();
+    while let Some(record) = fields.next() {
+        if record.len() < 3 {
+            continue;
+        }
+        let status_code = &record[..2];
+        let path = &record[3..];
+        paths.push(path.to_owned());
+        if (status_code.contains('R') || status_code.contains('C'))
+            && let Some(orig_path) = fields.next()
+        {
+            paths.push(orig_path.to_owned());
+        }
+    }
+    Ok(paths)
+}
+
+/// Repo-relative paths that became dirty at `worktree` between a prior
+/// snapshot (`before`, from [`dirty_paths`]) and now, that are NOT present in
+/// `reported` — the discrepancy signal behind #816 ("varda commits the
+/// agent's `Files touched` list verbatim with no completeness check").
+///
+/// `before` paths are excluded even if they are still dirty afterward: an
+/// operator's unrelated in-flight edit predates the run and must never be
+/// swept in or flagged (AGENTS.md is explicit that unrelated pre-existing
+/// changes must be left alone). Only paths the run itself newly dirtied, and
+/// that the agent did not list, come back as a discrepancy.
+pub fn unreported_changes(
+    worktree: &Path,
+    before: &[String],
+    reported: &[PathBuf],
+) -> Result<Vec<String>> {
+    let absolute_repo = worktree
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", worktree.display()))?;
+    let after = dirty_paths(worktree)?;
+    let before_set: HashSet<&str> = before.iter().map(String::as_str).collect();
+    let reported_set: HashSet<String> = reported
+        .iter()
+        .filter_map(|f| repo_relative_path_lenient(&absolute_repo, f).ok())
+        .collect();
+
+    Ok(after
+        .into_iter()
+        .filter(|p| !before_set.contains(p.as_str()))
+        .filter(|p| !reported_set.contains(p))
+        .collect())
 }
 
 pub fn commit_task_files(task_paths: &[&Path], message: &str) -> Result<()> {
@@ -1495,6 +1579,114 @@ mod tests {
             ]
         );
         assert!(dependency_manifest_changes(&[PathBuf::from("/repo/src/lib.rs")]).is_empty());
+    }
+
+    #[test]
+    fn unreported_changes_flags_an_unlisted_modified_file() {
+        let repo = init_test_repo("unreported-modified");
+        seed_commit(&repo, "a.txt", "base\n");
+        seed_commit(&repo, "b.txt", "base\n");
+
+        let before = dirty_paths(&repo).expect("snapshot before run");
+        assert!(before.is_empty(), "freshly seeded repo should be clean");
+
+        // Agent modifies both a.txt and b.txt but only reports b.txt.
+        std::fs::write(repo.join("a.txt"), "changed\n").expect("write a");
+        std::fs::write(repo.join("b.txt"), "changed\n").expect("write b");
+
+        let unreported =
+            unreported_changes(&repo, &before, &[repo.join("b.txt")]).expect("diff should run");
+        assert_eq!(unreported, vec!["a.txt".to_owned()]);
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn unreported_changes_flags_an_unlisted_new_file() {
+        let repo = init_test_repo("unreported-new-file");
+        seed_commit(&repo, "seed.txt", "base\n");
+
+        let before = dirty_paths(&repo).expect("snapshot before run");
+
+        // Agent creates b.txt (untracked) but only reports a.txt.
+        std::fs::write(repo.join("a.txt"), "from-agent\n").expect("write a");
+        std::fs::write(repo.join("b.txt"), "from-agent-too\n").expect("write b");
+
+        let unreported =
+            unreported_changes(&repo, &before, &[repo.join("a.txt")]).expect("diff should run");
+        assert_eq!(unreported, vec!["b.txt".to_owned()]);
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn unreported_changes_ignores_pre_existing_operator_dirt() {
+        let repo = init_test_repo("unreported-pre-existing");
+        seed_commit(&repo, "seed.txt", "base\n");
+
+        // Operator's unrelated in-flight edit, present BEFORE the run starts.
+        std::fs::write(repo.join("operator.txt"), "unrelated work\n").expect("write operator");
+        let before = dirty_paths(&repo).expect("snapshot before run");
+        assert_eq!(before, vec!["operator.txt".to_owned()]);
+
+        // Agent reports nothing; the operator's file is still dirty afterward,
+        // untouched by the agent. It must not be flagged.
+        let unreported = unreported_changes(&repo, &before, &[]).expect("diff should run");
+        assert!(
+            unreported.is_empty(),
+            "pre-existing operator dirt must not be flagged: {unreported:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn unreported_changes_is_empty_when_report_is_complete() {
+        let repo = init_test_repo("unreported-complete");
+        seed_commit(&repo, "seed.txt", "base\n");
+
+        let before = dirty_paths(&repo).expect("snapshot before run");
+        std::fs::write(repo.join("a.txt"), "from-agent\n").expect("write a");
+
+        let unreported =
+            unreported_changes(&repo, &before, &[repo.join("a.txt")]).expect("diff should run");
+        assert!(unreported.is_empty(), "fully reported change should not be flagged");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn dirty_paths_reports_matchable_paths_for_a_rename() {
+        let repo = init_test_repo("dirty-paths-rename");
+        seed_commit(&repo, "old-name.txt", "base\n");
+
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["mv", "old-name.txt", "new-name.txt"])
+            .status()
+            .expect("git mv should run");
+        assert!(status.success(), "git mv failed");
+
+        let paths = dirty_paths(&repo).expect("dirty_paths should run");
+
+        // The composite " -> " human-readable form must never appear, and
+        // both the new and old repo-relative names must be reported so a
+        // rename still matches a reported file under either name.
+        assert!(
+            paths.iter().all(|p| !p.contains(" -> ")),
+            "dirty_paths must not report the composite rename string: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "new-name.txt"),
+            "dirty_paths should report the new name: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "old-name.txt"),
+            "dirty_paths should also report the old name: {paths:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
