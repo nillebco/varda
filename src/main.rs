@@ -2186,10 +2186,12 @@ fn build_client(
     };
     // Resolve `${fnox:NAME}` bindings on the HOST at prepare time, injecting only the
     // resolved value. Static env carries the (possibly untrusted `.varda`) sandbox/route
-    // origins; agent env is always a trusted central origin, so no key is untrusted.
+    // origins; agent env is trusted central config UNLESS the agent itself was merged
+    // in from an untrusted (fragment-`include`d) origin — see `AgentConfig::untrusted`.
     resolve_env_secrets(&mut static_env, &untrusted_env_keys)?;
     let mut agent_config = agent_config.clone();
-    resolve_env_secrets(&mut agent_config.env, &[])?;
+    let untrusted_agent_env_keys = agent_untrusted_env_keys(&agent_config);
+    resolve_env_secrets(&mut agent_config.env, &untrusted_agent_env_keys)?;
     Ok(acp::AcpSubprocessClient::with_sandbox_env(
         display_name,
         &agent_config,
@@ -2401,6 +2403,20 @@ fn resolve_credential_value(
             }
             Ok(Some(value))
         }
+    }
+}
+
+/// `agent_config.env`'s own keys when the agent was merged in from an untrusted,
+/// included fragment (see `AgentConfig::untrusted`), else empty. Fed into
+/// `resolve_env_secrets` so a fragment-sourced agent's OWN `env` map cannot bind a
+/// fnox secret directly — mirroring the refusal `resolve_agent_credentials` already
+/// applies to that agent's `credentials`/`auth_token_env`, but for the sibling
+/// static-env code path.
+fn agent_untrusted_env_keys(agent_config: &config::AgentConfig) -> Vec<String> {
+    if agent_config.untrusted {
+        agent_config.env.keys().cloned().collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -6674,6 +6690,37 @@ deny_sandboxes = ["local"]
         assert!(
             resolve_agent_credentials(&central).is_ok(),
             "a central-config agent's credentials must not be affected by the untrusted-fragment refusal"
+        );
+    }
+
+    /// Regression guard for the static-env `${fnox:...}` sibling of
+    /// `resolve_agent_credentials_refuses_untrusted_fragment_sourced_agent`: a
+    /// fragment-sourced agent's OWN `[agents.X].env` map (not `credentials`) must
+    /// also be refused when it carries a fnox sentinel — task #796 Gap 1.
+    #[test]
+    fn agent_untrusted_env_keys_covers_fragment_sourced_agent_env_only() {
+        let mut fragment_agent = agent_for_credentials(vec![]);
+        fragment_agent.untrusted = true;
+        fragment_agent.env.insert(
+            "TOKEN".to_owned(),
+            "${fnox:aws-prod-key}".to_owned(),
+        );
+        let mut env = fragment_agent.env.clone();
+        let err = resolve_env_secrets(&mut env, &agent_untrusted_env_keys(&fragment_agent))
+            .expect_err("fragment-sourced agent env fnox binding must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("untrusted"), "error must name the untrusted origin: {msg}");
+        assert!(msg.contains("TOKEN"), "error must name the key: {msg}");
+
+        // A CENTRAL-config agent (untrusted = false) binds freely through this path.
+        let mut central_agent = agent_for_credentials(vec![]);
+        central_agent.env.insert(
+            "PLAIN".to_owned(),
+            "not-a-secret".to_owned(),
+        );
+        assert!(
+            agent_untrusted_env_keys(&central_agent).is_empty(),
+            "a central-config agent must contribute no untrusted env keys"
         );
     }
 

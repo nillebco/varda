@@ -2826,6 +2826,7 @@ Help interactively.
                 orchestration: None,
                 env: BTreeMap::new(),
                 verify: Vec::new(),
+                untrusted: false,
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),

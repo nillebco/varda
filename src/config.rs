@@ -593,6 +593,14 @@ pub struct Route {
     /// say so explicitly in the recap rather than implying verification ran.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verify: Vec<String>,
+    /// Provenance, NOT a TOML field (never (de)serialized — set only by
+    /// [`resolve_includes`] after merge). `true` when this route was declared by an
+    /// included, less-trusted fragment rather than the central config. Mirrors
+    /// [`AgentConfig::untrusted`]: `resolve_sandbox_for` unions this route's own
+    /// `env` keys into `varda_env_keys` when set, so a fragment-sourced route
+    /// cannot bind a fnox secret through its own `env` map.
+    #[serde(skip)]
+    pub untrusted: bool,
 }
 
 /// How a sandbox's `egress` allow-list is ENFORCED — an explicit, honest name for
@@ -735,6 +743,14 @@ pub struct SandboxConfig {
     /// run`'s integer `--cpus` core count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<String>,
+    /// Provenance, NOT a TOML field (never (de)serialized — set only by
+    /// [`resolve_includes`] after merge). `true` when this sandbox was declared by
+    /// an included, less-trusted fragment rather than the central config. Mirrors
+    /// [`AgentConfig::untrusted`]: `resolve_sandbox_for` unions this sandbox's own
+    /// `env` keys into `varda_env_keys` when set, so a fragment-sourced sandbox
+    /// cannot bind a fnox secret through its own `env` map.
+    #[serde(skip)]
+    pub untrusted: bool,
 }
 
 /// Default isolation primitive when a `[sandboxes.<name>]` entry omits one.
@@ -838,6 +854,12 @@ impl Config {
         let route = crate::routing::find_route_public(self, project_path).ok();
         let route_mounts = route.map(|r| r.mounts.clone()).unwrap_or_default();
         let route_env = route.map(|r| r.env.clone()).unwrap_or_default();
+        // Fragment-sourced route env keys (origin: `resolve_includes`) are UNTRUSTED
+        // just like the repo-local `.varda` origin below — union both into
+        // `varda_env_keys` rather than letting one shadow the other.
+        let route_untrusted_keys = route
+            .map(|r| untrusted_env_keys_if(&r.env, r.untrusted))
+            .unwrap_or_default();
         let central_name = route
             .and_then(|r| r.sandbox.clone())
             .or_else(|| self.defaults.sandbox.clone())
@@ -855,13 +877,17 @@ impl Config {
             }
             let config = self.sandbox_config_by_name(name);
             let env = merge_static_env(&config.env, &route_env, &BTreeMap::new());
+            let varda_env_keys = union_keys(
+                untrusted_env_keys_if(&config.env, config.untrusted),
+                route_untrusted_keys.clone(),
+            );
             return Ok(ResolvedSandbox {
                 name: name.to_owned(),
                 config,
                 route_mounts,
                 varda_mounts: Vec::new(),
                 env,
-                varda_env_keys: Vec::new(),
+                varda_env_keys,
                 varda_file: None,
             });
         }
@@ -869,13 +895,17 @@ impl Config {
         let Some(varda_path) = find_nearest_varda(project_path, routing_root) else {
             let config = self.sandbox_config_by_name(&central_name);
             let env = merge_static_env(&config.env, &route_env, &BTreeMap::new());
+            let varda_env_keys = union_keys(
+                untrusted_env_keys_if(&config.env, config.untrusted),
+                route_untrusted_keys.clone(),
+            );
             return Ok(ResolvedSandbox {
                 name: central_name,
                 config,
                 route_mounts,
                 varda_mounts: Vec::new(),
                 env,
-                varda_env_keys: Vec::new(),
+                varda_env_keys,
                 varda_file: None,
             });
         };
@@ -894,13 +924,17 @@ impl Config {
                 let config = self.sandbox_config_by_name(&name);
                 self.enforce_varda_primitive_floor(&config.primitive, &varda_path)?;
                 let env = merge_static_env(&config.env, &route_env, &BTreeMap::new());
+                let varda_env_keys = union_keys(
+                    untrusted_env_keys_if(&config.env, config.untrusted),
+                    route_untrusted_keys.clone(),
+                );
                 Ok(ResolvedSandbox {
                     name,
                     config,
                     route_mounts,
                     varda_mounts: Vec::new(),
                     env,
-                    varda_env_keys: Vec::new(),
+                    varda_env_keys,
                     varda_file: Some(varda_path),
                 })
             }
@@ -915,7 +949,10 @@ impl Config {
                     &varda_path,
                 )?;
                 let env = merge_static_env(&BTreeMap::new(), &route_env, &config.env);
-                let varda_env_keys = config.env.keys().cloned().collect();
+                let varda_env_keys = union_keys(
+                    config.env.keys().cloned().collect(),
+                    route_untrusted_keys.clone(),
+                );
                 let config = SandboxConfig {
                     mounts: Vec::new(),
                     env: BTreeMap::new(),
@@ -1075,8 +1112,30 @@ impl Default for SandboxConfig {
             egress_proxy_image: None,
             memory: None,
             cpus: None,
+            untrusted: false,
         }
     }
+}
+
+/// `env`'s own keys when `untrusted`, else empty. Used to feed a fragment-sourced
+/// sandbox's/route's own env keys into `resolve_sandbox_for`'s `varda_env_keys`,
+/// the same way the repo-local `.varda` origin's keys already are.
+fn untrusted_env_keys_if(env: &BTreeMap<String, String>, untrusted: bool) -> Vec<String> {
+    if untrusted {
+        env.keys().cloned().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Union two untrusted-key lists without duplicates (small lists; O(n^2) is fine).
+fn union_keys(mut a: Vec<String>, b: Vec<String>) -> Vec<String> {
+    for key in b {
+        if !a.contains(&key) {
+            a.push(key);
+        }
+    }
+    a
 }
 
 fn merge_static_env(
@@ -1981,9 +2040,17 @@ fn resolve_includes(
 
         for route in &mut fragment.routes {
             expand_route_mounts(route, Some(&bundle_dir))?;
+            // This route comes from a less-trusted included fragment, not the
+            // central config — `resolve_sandbox_for` unions its own `env` keys
+            // into `varda_env_keys` so a fnox binding in it is refused. See the
+            // field doc on `untrusted`.
+            route.untrusted = true;
         }
         for sandbox in fragment.sandboxes.values_mut() {
             expand_sandbox_mounts(sandbox, Some(&bundle_dir))?;
+            // Same provenance flag as above, for fragment-sourced sandboxes. See
+            // the field doc on `SandboxConfig::untrusted`.
+            sandbox.untrusted = true;
         }
         for agent in fragment.agents.values_mut() {
             agent.command = resolve_bundle_relative_command(&agent.command, &bundle_dir);
@@ -2555,6 +2622,7 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
             env: BTreeMap::new(),
             orchestration: None,
             verify: Vec::new(),
+            untrusted: false,
         },
     );
     save_config(path, &config)
@@ -3310,6 +3378,7 @@ deny_sandboxes = ["local"]
             env: BTreeMap::new(),
             orchestration: None,
             verify: Vec::new(),
+            untrusted: false,
         };
         assert_eq!(config.effective_sandbox(&route_with_sandbox), "firejail");
     }
@@ -3396,6 +3465,7 @@ mod m6b_tests {
             orchestration: None,
             env: BTreeMap::new(),
             verify: Vec::new(),
+            untrusted: false,
         }];
         c
     }
@@ -3853,6 +3923,7 @@ agents = ["claude"]
                 env: BTreeMap::new(),
                 orchestration: Some(strict.clone()),
                 verify: Vec::new(),
+                untrusted: false,
             },
             Route {
                 glob: "**".to_owned(),
@@ -3862,6 +3933,7 @@ agents = ["claude"]
                 env: BTreeMap::new(),
                 orchestration: None,
                 verify: Vec::new(),
+                untrusted: false,
             },
         ];
 
@@ -4679,6 +4751,158 @@ command = "codex"
             !config.agents["codex"].untrusted,
             "a central-config agent must never be flagged untrusted by resolve_includes"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Task #796 Gap 2: sandboxes and routes need the same fragment-provenance flag
+    /// `resolve_includes_flags_fragment_sourced_agents_as_untrusted` already checks
+    /// for agents, so `resolve_sandbox_for` can refuse a fnox binding in a
+    /// fragment-sourced sandbox's/route's own `env` map.
+    #[test]
+    fn resolve_includes_flags_fragment_sourced_sandboxes_and_routes_as_untrusted() {
+        let root = temp_dir("sandbox-route-provenance");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[sandboxes.frag_sandbox]\nimage = \"frag-image\"\n\n\
+             [[routes]]\nglob = \"frag/**\"\nagents = [\"codex\"]\n",
+        )
+        .expect("frag should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.sandboxes.insert(
+            "central_sandbox".to_owned(),
+            SandboxConfig::default(),
+        );
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        assert!(
+            config.sandboxes["frag_sandbox"].untrusted,
+            "a sandbox merged in from an included fragment must be flagged untrusted"
+        );
+        assert!(
+            !config.sandboxes["central_sandbox"].untrusted,
+            "a central-config sandbox must never be flagged untrusted by resolve_includes"
+        );
+
+        let frag_route = config
+            .routes
+            .iter()
+            .find(|r| r.glob == "frag/**")
+            .expect("fragment route must be merged in");
+        assert!(
+            frag_route.untrusted,
+            "a route merged in from an included fragment must be flagged untrusted"
+        );
+        let central_route = config
+            .routes
+            .iter()
+            .find(|r| r.glob == "**")
+            .expect("central route must still be present");
+        assert!(
+            !central_route.untrusted,
+            "a central-config route must never be flagged untrusted by resolve_includes"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Task #796 Gap 2 (sandbox half): a fragment-sourced sandbox's own `env` fnox
+    /// binding must be refused via `resolve_sandbox_for`'s `varda_env_keys`, the
+    /// same way the pre-existing repo-local `.varda`-origin binding already is
+    /// (`resolve_env_secrets_refuses_untrusted_varda_binding` in `main.rs`). A
+    /// central-config sandbox's own env must be unaffected.
+    #[test]
+    fn resolve_sandbox_for_unions_fragment_sourced_sandbox_env_into_varda_env_keys() {
+        let root = temp_dir("sandbox-env-union");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[sandboxes.frag_sandbox]\nenv = { TOKEN = \"${fnox:aws-prod-key}\" }\n",
+        )
+        .expect("frag should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.sandboxes.insert(
+            "central_sandbox".to_owned(),
+            SandboxConfig {
+                env: BTreeMap::from([("SAFE".to_owned(), "${fnox:safe-secret}".to_owned())]),
+                ..Default::default()
+            },
+        );
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        let resolved = config
+            .resolve_sandbox_for(&root, &root, Some("frag_sandbox"))
+            .expect("pinned fragment sandbox should resolve");
+        assert!(
+            resolved.varda_env_keys.contains(&"TOKEN".to_owned()),
+            "a fragment-sourced sandbox's own env key must be treated as untrusted: {:?}",
+            resolved.varda_env_keys
+        );
+        let mut env = resolved.env.clone();
+        let err = crate::resolve_env_secrets(&mut env, &resolved.varda_env_keys)
+            .expect_err("fragment-sourced sandbox env fnox binding must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("untrusted"), "error must name the untrusted origin: {msg}");
+        assert!(msg.contains("TOKEN"), "error must name the key: {msg}");
+
+        let resolved_central = config
+            .resolve_sandbox_for(&root, &root, Some("central_sandbox"))
+            .expect("pinned central sandbox should resolve");
+        assert!(
+            !resolved_central.varda_env_keys.contains(&"SAFE".to_owned()),
+            "a central-config sandbox's own env key must not be treated as untrusted"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Task #796 Gap 2 (route half): a fragment-sourced route's own `env` fnox
+    /// binding must be refused via `resolve_sandbox_for`'s `varda_env_keys`.
+    #[test]
+    fn resolve_sandbox_for_unions_fragment_sourced_route_env_into_varda_env_keys() {
+        let root = temp_dir("route-env-union");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).expect("proj dir should be created");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[[routes]]\nglob = \"**\"\nagents = [\"codex\"]\n\
+             env = { TOKEN = \"${fnox:aws-prod-key}\" }\n",
+        )
+        .expect("frag should be written");
+
+        // No central routes: the fragment route is the sole match, so it is
+        // guaranteed to be the one `resolve_sandbox_for` consults.
+        let mut config: Config = toml::from_str(
+            "[defaults]\ntimeout_seconds = 600\noperations_dir = \"operations\"\n\n\
+             [agents.codex]\nkind = \"acp\"\ncommand = \"codex\"\n",
+        )
+        .expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        let resolved = config
+            .resolve_sandbox_for(&proj, &root, None)
+            .expect("sandbox should resolve via the fragment route");
+        assert!(
+            resolved.varda_env_keys.contains(&"TOKEN".to_owned()),
+            "a fragment-sourced route's own env key must be treated as untrusted: {:?}",
+            resolved.varda_env_keys
+        );
+        let mut env = resolved.env.clone();
+        let err = crate::resolve_env_secrets(&mut env, &resolved.varda_env_keys)
+            .expect_err("fragment-sourced route env fnox binding must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("untrusted"), "error must name the untrusted origin: {msg}");
+        assert!(msg.contains("TOKEN"), "error must name the key: {msg}");
 
         fs::remove_dir_all(&root).ok();
     }

@@ -456,6 +456,7 @@ mod tests {
             env: BTreeMap::new(),
             orchestration: None,
             verify: Vec::new(),
+            untrusted: false,
         });
         let summary = CapabilitySummary::from_config(&config);
         let changes = diff_capabilities(&CapabilitySummary::default(), &summary);
