@@ -1718,12 +1718,16 @@ Body.
                 orchestration: None,
                 env: std::collections::BTreeMap::new(),
                 verify: Vec::new(),
+                untrusted: false,
             }],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let project_path = Path::new("/work/project");
@@ -1781,6 +1785,9 @@ requires_user: false
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let path = create_task(&config, "Next Task", Path::new("/work/project"), None, None, None)
@@ -1816,6 +1823,9 @@ requires_user: false
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let first = create_task(&config, "Project Task", &first_project, None, None, None)
@@ -1844,6 +1854,9 @@ requires_user: false
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         }
     }
 
@@ -2351,6 +2364,9 @@ requires_user: false
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let tasks = list_tasks(&config, &project_path).expect("tasks should list");
@@ -2397,6 +2413,9 @@ requires_user: false
             git: crate::config::GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let resolved =

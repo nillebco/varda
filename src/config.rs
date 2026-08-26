@@ -1,12 +1,16 @@
 //! Varda configuration loading and initialization.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::config_approval;
 
 pub const VARDA_HOME_ENV: &str = "VARDA_HOME";
 pub const CONFIG_FILENAME: &str = "config.toml";
@@ -56,7 +60,7 @@ pub const CODEX_RESIDENT_EGRESS_ALLOWLIST: &[&str] =
 /// route/user policy; this resident inventory is deliberately stricter.
 pub const COPILOT_RESIDENT_EGRESS_ALLOWLIST: &[&str] = &[];
 
-const DEFAULT_CONFIG: &str = r#"[defaults]
+pub(crate) const DEFAULT_CONFIG: &str = r#"[defaults]
 timeout_seconds = 600
 operations_dir = "operations"
 # M10 cooperative execution bounds (replace the old hard wall-clock kill):
@@ -284,6 +288,128 @@ pub struct Config {
         skip_serializing_if = "crate::orchestration::OrchestrationPolicy::is_default"
     )]
     pub orchestration: crate::orchestration::OrchestrationPolicy,
+    /// Shareable config bundles: other TOML fragment files whose `[[routes]]` /
+    /// `[sandboxes.*]` / `[agents.*]` get merged into this config at load time.
+    /// See [`resolve_includes`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<IncludeEntry>,
+    /// Host commands this config (plus everything it includes) requires to be
+    /// present on `$PATH`. Validated at config-load time by [`validate_requirements`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_commands: Vec<String>,
+    /// Secret names this config (plus everything it includes) requires to be
+    /// resolvable via `fnox get NAME`. Validated at config-load time by
+    /// [`validate_requirements`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_secrets: Vec<String>,
+}
+
+/// One entry in `Config::include`: either a bare path string, or a
+/// `{path, sha256}` table. When `sha256` is present, [`resolve_includes`]
+/// hashes the fragment's bytes at load time and refuses (or, in a read-only
+/// diagnostic, warns) on a mismatch — see [`VerifyMode`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum IncludeEntry {
+    Path(String),
+    Detailed {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+    },
+}
+
+impl IncludeEntry {
+    /// The include path exactly AS WRITTEN in config (never the
+    /// expanded/resolved value) — safe to embed in error messages.
+    pub fn path(&self) -> &str {
+        match self {
+            IncludeEntry::Path(path) => path,
+            IncludeEntry::Detailed { path, .. } => path,
+        }
+    }
+
+    /// The pinned digest, if this entry declared one.
+    fn sha256_pin(&self) -> Option<&str> {
+        match self {
+            IncludeEntry::Path(_) => None,
+            IncludeEntry::Detailed { sha256, .. } => sha256.as_deref(),
+        }
+    }
+}
+
+/// A `sha256` pin must be exactly 64 lowercase hex characters. Anything else
+/// (wrong length, uppercase, non-hex) is a typo or a copy-paste mistake from
+/// a tool that emits uppercase digests — reject it at parse time rather than
+/// let it silently degrade into "no pin" (it would still parse as a `String`)
+/// or into a permanent, unexplainable mismatch.
+fn is_valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Validate every `include[].sha256` pin declared by the CENTRAL config at
+/// parse time — before any fragment file is read. Runs on both Tier 1
+/// (`load_config`) and Tier 2 (`resolve_config`) since it only inspects the
+/// already-parsed central config, never a fragment.
+fn validate_include_pin_formats(config: &Config) -> Result<()> {
+    for entry in &config.include {
+        if let Some(pin) = entry.sha256_pin()
+            && !is_valid_sha256_hex(pin)
+        {
+            bail!(
+                "config include entry {} has a malformed sha256 pin ('{pin}'): \
+                 expected exactly 64 lowercase hex characters",
+                entry.path()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Controls how [`resolve_includes`] reacts to a pinned include whose
+/// fragment bytes don't match its `sha256`.
+///
+/// This is an explicit, named choice required at every Tier-2 call site — not
+/// an ambient flag, thread-local, or env var — because the distinction is
+/// security-relevant: a command that launches or dispatches work must never
+/// silently inherit the degraded diagnostic behavior. [`Default`] is the
+/// strict variant, so a future call site that forgets to choose gets the
+/// safe behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerifyMode {
+    /// Refuse to load on any pin mismatch. Required for anything that
+    /// launches or dispatches work (task run, orchestrate, plan, resume, …).
+    #[default]
+    Strict,
+    /// Warn loudly and continue with the unverified fragment content.
+    /// Reserved for read-only diagnostics (`inspect`, `doctor`) that must
+    /// keep reporting the true route/agent/sandbox even when a bundle has
+    /// drifted — a diagnostic that refuses is worse than one that reports
+    /// clearly-labeled unverified content.
+    DiagnosticDegraded,
+}
+
+/// The subset of [`Config`] an included TOML fragment file may declare.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConfigFragment {
+    #[serde(default)]
+    pub routes: Vec<Route>,
+    #[serde(default)]
+    pub sandboxes: BTreeMap<String, SandboxConfig>,
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentConfig>,
+    #[serde(default)]
+    pub requires_commands: Vec<String>,
+    #[serde(default)]
+    pub requires_secrets: Vec<String>,
+    /// A fragment may NOT itself declare further includes — see the nested-include
+    /// rejection in [`resolve_includes`]. Captured here (rather than left to be
+    /// silently dropped as an unknown field) purely so that rejection can fire.
+    #[serde(default)]
+    pub include: Vec<IncludeEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -469,6 +595,14 @@ pub struct Route {
     /// say so explicitly in the recap rather than implying verification ran.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verify: Vec<String>,
+    /// Provenance, NOT a TOML field (never (de)serialized — set only by
+    /// [`resolve_includes`] after merge). `true` when this route was declared by an
+    /// included, less-trusted fragment rather than the central config. Mirrors
+    /// [`AgentConfig::untrusted`]: `resolve_sandbox_for` unions this route's own
+    /// `env` keys into `varda_env_keys` when set, so a fragment-sourced route
+    /// cannot bind a fnox secret through its own `env` map.
+    #[serde(skip)]
+    pub untrusted: bool,
 }
 
 /// How a sandbox's `egress` allow-list is ENFORCED — an explicit, honest name for
@@ -611,6 +745,14 @@ pub struct SandboxConfig {
     /// run`'s integer `--cpus` core count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<String>,
+    /// Provenance, NOT a TOML field (never (de)serialized — set only by
+    /// [`resolve_includes`] after merge). `true` when this sandbox was declared by
+    /// an included, less-trusted fragment rather than the central config. Mirrors
+    /// [`AgentConfig::untrusted`]: `resolve_sandbox_for` unions this sandbox's own
+    /// `env` keys into `varda_env_keys` when set, so a fragment-sourced sandbox
+    /// cannot bind a fnox secret through its own `env` map.
+    #[serde(skip)]
+    pub untrusted: bool,
 }
 
 /// Default isolation primitive when a `[sandboxes.<name>]` entry omits one.
@@ -714,6 +856,12 @@ impl Config {
         let route = crate::routing::find_route_public(self, project_path).ok();
         let route_mounts = route.map(|r| r.mounts.clone()).unwrap_or_default();
         let route_env = route.map(|r| r.env.clone()).unwrap_or_default();
+        // Fragment-sourced route env keys (origin: `resolve_includes`) are UNTRUSTED
+        // just like the repo-local `.varda` origin below — union both into
+        // `varda_env_keys` rather than letting one shadow the other.
+        let route_untrusted_keys = route
+            .map(|r| untrusted_env_keys_if(&r.env, r.untrusted))
+            .unwrap_or_default();
         let central_name = route
             .and_then(|r| r.sandbox.clone())
             .or_else(|| self.defaults.sandbox.clone())
@@ -731,13 +879,17 @@ impl Config {
             }
             let config = self.sandbox_config_by_name(name);
             let env = merge_static_env(&config.env, &route_env, &BTreeMap::new());
+            let varda_env_keys = union_keys(
+                untrusted_env_keys_if(&config.env, config.untrusted),
+                route_untrusted_keys.clone(),
+            );
             return Ok(ResolvedSandbox {
                 name: name.to_owned(),
                 config,
                 route_mounts,
                 varda_mounts: Vec::new(),
                 env,
-                varda_env_keys: Vec::new(),
+                varda_env_keys,
                 varda_file: None,
             });
         }
@@ -745,13 +897,17 @@ impl Config {
         let Some(varda_path) = find_nearest_varda(project_path, routing_root) else {
             let config = self.sandbox_config_by_name(&central_name);
             let env = merge_static_env(&config.env, &route_env, &BTreeMap::new());
+            let varda_env_keys = union_keys(
+                untrusted_env_keys_if(&config.env, config.untrusted),
+                route_untrusted_keys.clone(),
+            );
             return Ok(ResolvedSandbox {
                 name: central_name,
                 config,
                 route_mounts,
                 varda_mounts: Vec::new(),
                 env,
-                varda_env_keys: Vec::new(),
+                varda_env_keys,
                 varda_file: None,
             });
         };
@@ -770,13 +926,17 @@ impl Config {
                 let config = self.sandbox_config_by_name(&name);
                 self.enforce_varda_primitive_floor(&config.primitive, &varda_path)?;
                 let env = merge_static_env(&config.env, &route_env, &BTreeMap::new());
+                let varda_env_keys = union_keys(
+                    untrusted_env_keys_if(&config.env, config.untrusted),
+                    route_untrusted_keys.clone(),
+                );
                 Ok(ResolvedSandbox {
                     name,
                     config,
                     route_mounts,
                     varda_mounts: Vec::new(),
                     env,
-                    varda_env_keys: Vec::new(),
+                    varda_env_keys,
                     varda_file: Some(varda_path),
                 })
             }
@@ -791,7 +951,10 @@ impl Config {
                     &varda_path,
                 )?;
                 let env = merge_static_env(&BTreeMap::new(), &route_env, &config.env);
-                let varda_env_keys = config.env.keys().cloned().collect();
+                let varda_env_keys = union_keys(
+                    config.env.keys().cloned().collect(),
+                    route_untrusted_keys.clone(),
+                );
                 let config = SandboxConfig {
                     mounts: Vec::new(),
                     env: BTreeMap::new(),
@@ -951,8 +1114,34 @@ impl Default for SandboxConfig {
             egress_proxy_image: None,
             memory: None,
             cpus: None,
+            untrusted: false,
         }
     }
+}
+
+/// `env`'s own keys when `untrusted`, else empty. Used to feed a fragment-sourced
+/// sandbox's/route's own env keys into `resolve_sandbox_for`'s `varda_env_keys`,
+/// the same way the repo-local `.varda` origin's keys already are. `pub(crate)`
+/// so `build_client`'s no-`project_path` branch in `main.rs` can reuse it too.
+pub(crate) fn untrusted_env_keys_if(
+    env: &BTreeMap<String, String>,
+    untrusted: bool,
+) -> Vec<String> {
+    if untrusted {
+        env.keys().cloned().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Union two untrusted-key lists without duplicates (small lists; O(n^2) is fine).
+pub(crate) fn union_keys(mut a: Vec<String>, b: Vec<String>) -> Vec<String> {
+    for key in b {
+        if !a.contains(&key) {
+            a.push(key);
+        }
+    }
+    a
 }
 
 fn merge_static_env(
@@ -1059,6 +1248,17 @@ pub struct AgentConfig {
     /// `false`, so existing agents keep running the interpreter pass unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub skip_recap: bool,
+    /// Provenance, NOT a TOML field (never (de)serialized — set only by
+    /// [`resolve_includes`] after merge). `true` when this agent was declared by an
+    /// included, less-trusted fragment rather than the central config. Consulted by
+    /// `resolve_agent_credentials` in `main.rs`, which refuses to mint ANY host
+    /// credential (`credentials`/`auth_token_env`, regardless of source) for an
+    /// agent flagged this way — a fragment can declare `[[agents.X.credentials]]
+    /// command = "..."` (arbitrary host code exec) or `from_env`/`from_secret`
+    /// naming any host env var / secret, and nothing short of refusal stops it from
+    /// exfiltrating through the sandbox the moment the agent's identity resolves.
+    #[serde(skip)]
+    pub untrusted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1747,17 +1947,903 @@ pub fn config_file() -> Result<PathBuf> {
     Ok(varda_home()?.join(CONFIG_FILENAME))
 }
 
-pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
-    let path = path.as_ref();
+/// Lowercase hex sha256 digest of `bytes`, in the same format an
+/// `include[].sha256` pin is written in.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Merge every `config.include` entry's fragment into `config`.
+///
+/// Precedence: on a `sandboxes`/`agents` name collision, the CENTRAL config
+/// always wins (an included name already defined centrally is silently
+/// skipped). Among includes themselves, a LATER include wins over an earlier
+/// one. Routes have no name: central routes stay first, included routes are
+/// appended in include order.
+///
+/// `requires_commands`/`requires_secrets` declared by a fragment are unioned
+/// into `config.requires_commands`/`config.requires_secrets` (deduped).
+///
+/// CENTRAL `config.routes`/`config.sandboxes` are never touched/expanded by
+/// this function — only content coming from an included fragment goes
+/// through mount expansion.
+///
+/// When an entry declares a `sha256` pin, the exact bytes just read from the
+/// fragment (never a re-read — that would reintroduce a time-of-check/
+/// time-of-use gap) are hashed and compared against it. On mismatch, `mode`
+/// decides what happens: [`VerifyMode::Strict`] refuses the whole load;
+/// [`VerifyMode::DiagnosticDegraded`] warns loudly on stderr, continues with
+/// the unverified content, and records a human-readable warning in the
+/// returned `Vec` so the (read-only diagnostic) caller can label its output
+/// as unverified.
+fn resolve_includes(
+    config_dir: &Path,
+    config: &mut Config,
+    mode: VerifyMode,
+) -> Result<Vec<String>> {
+    let central_sandbox_names: std::collections::HashSet<String> =
+        config.sandboxes.keys().cloned().collect();
+    let central_agent_names: std::collections::HashSet<String> =
+        config.agents.keys().cloned().collect();
+    let mut unverified_warnings = Vec::new();
+
+    for entry in &config.include {
+        let expanded_path = expand_env_and_home(entry.path())
+            .with_context(|| format!("failed to resolve include path {}", entry.path()))?;
+        let include_path = PathBuf::from(resolve_bundle_relative(&expanded_path, config_dir));
+        let bundle_dir = include_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| config_dir.to_path_buf());
+
+        let mut content = fs::read_to_string(&include_path)
+            .with_context(|| format!("failed to read included config fragment {}", entry.path()))?;
+
+        if let Some(pin) = entry.sha256_pin() {
+            let actual = sha256_hex(content.as_bytes());
+            if actual != pin {
+                let message = format!(
+                    "config include {} failed sha256 verification: expected {pin}, got {actual}",
+                    entry.path()
+                );
+                match mode {
+                    VerifyMode::Strict => {
+                        content = resolve_pin_mismatch(
+                            &include_path,
+                            entry.path(),
+                            &bundle_dir,
+                            &content,
+                            pin,
+                            &actual,
+                        )?;
+                    }
+                    VerifyMode::DiagnosticDegraded => {
+                        eprintln!(
+                            "WARNING: {message}; continuing with UNVERIFIED content because \
+                             this is a read-only diagnostic command"
+                        );
+                        unverified_warnings.push(message);
+                    }
+                }
+            }
+        }
+
+        reject_unknown_fragment_keys(&content, entry.path())?;
+        let mut fragment: ConfigFragment = toml::from_str(&content).with_context(|| {
+            format!("failed to parse included config fragment {}", entry.path())
+        })?;
+        if !fragment.include.is_empty() {
+            bail!(
+                "included config fragment {} declares its own `include`; \
+                 nested includes are not supported",
+                entry.path()
+            );
+        }
+
+        for route in &mut fragment.routes {
+            expand_route_mounts(route, Some(&bundle_dir))?;
+            // This route comes from a less-trusted included fragment, not the
+            // central config — `resolve_sandbox_for` unions its own `env` keys
+            // into `varda_env_keys` so a fnox binding in it is refused. See the
+            // field doc on `untrusted`.
+            route.untrusted = true;
+        }
+        for sandbox in fragment.sandboxes.values_mut() {
+            expand_sandbox_mounts(sandbox, Some(&bundle_dir))?;
+            // Same provenance flag as above, for fragment-sourced sandboxes. See
+            // the field doc on `SandboxConfig::untrusted`.
+            sandbox.untrusted = true;
+        }
+        for agent in fragment.agents.values_mut() {
+            agent.command = resolve_bundle_relative_command(&agent.command, &bundle_dir);
+            if let Some(working_dir) = &agent.working_dir {
+                agent.working_dir = Some(resolve_bundle_relative_command(working_dir, &bundle_dir));
+            }
+            // This agent comes from a less-trusted included fragment, not the
+            // central config — `resolve_agent_credentials` (main.rs) refuses to
+            // mint any host credential for it. See the field doc on `untrusted`.
+            agent.untrusted = true;
+        }
+
+        config.routes.append(&mut fragment.routes);
+        for (name, sandbox) in fragment.sandboxes {
+            if !central_sandbox_names.contains(&name) {
+                config.sandboxes.insert(name, sandbox);
+            }
+        }
+        for (name, agent) in fragment.agents {
+            if !central_agent_names.contains(&name) {
+                config.agents.insert(name, agent);
+            }
+        }
+        for command in fragment.requires_commands {
+            if !config.requires_commands.contains(&command) {
+                config.requires_commands.push(command);
+            }
+        }
+        for secret in fragment.requires_secrets {
+            if !config.requires_secrets.contains(&secret) {
+                config.requires_secrets.push(secret);
+            }
+        }
+    }
+
+    Ok(unverified_warnings)
+}
+
+/// Field names recognized by [`ConfigFragment`] / [`SandboxConfig`] / [`AgentConfig`]
+/// / [`Route`] / [`CredentialConfig`], used by [`reject_unknown_fragment_keys`] to
+/// catch a key an included fragment sets that this varda version does not
+/// understand (a typo, or version skew between the varda that authored a shared
+/// bundle and the one loading it).
+///
+/// MAINTENANCE: there is no compile-time reflection available here, so each list
+/// must be updated BY HAND whenever a field is added to (or renamed on) the
+/// corresponding struct — this is a known trade-off, not an oversight. If a struct
+/// gains a `#[serde(rename = "...")]` field, list it under the RENAMED name (the
+/// name as it appears in TOML), matching what serde itself accepts.
+const FRAGMENT_TOP_LEVEL_FIELDS: &[&str] = &[
+    "routes",
+    "sandboxes",
+    "agents",
+    "requires_commands",
+    "requires_secrets",
+    "include",
+];
+pub(crate) const SANDBOX_CONFIG_FIELDS: &[&str] = &[
+    "image",
+    "build",
+    "image_from",
+    "primitive",
+    "mounts",
+    "env",
+    "egress",
+    "egress_mode",
+    "egress_proxy_image",
+    "memory",
+    "cpus",
+];
+pub(crate) const AGENT_CONFIG_FIELDS: &[&str] = &[
+    "kind",
+    "command",
+    "args",
+    "max_prompt_tokens",
+    "working_dir",
+    "env",
+    "streams_output",
+    "auth_token_env",
+    "auth_token_target",
+    "credentials",
+    "interactive_command",
+    "interactive_args",
+    "resume_command_template",
+    "interpreter_agent",
+    "skip_recap",
+];
+pub(crate) const CREDENTIAL_CONFIG_FIELDS: &[&str] = &[
+    "from_env",
+    "from_secret",
+    "from_fnox",
+    "command",
+    "env",
+    "file",
+    "refresh_seconds",
+    "optional",
+];
+pub(crate) const ROUTE_FIELDS: &[&str] = &[
+    "glob",
+    "agents",
+    "sandbox",
+    "mounts",
+    "env",
+    "orchestration",
+    "verify",
+];
+
+/// Reject a key in `table` that isn't in `known` — named by `fragment_path` (the
+/// include path as written) and `location` (e.g. `"sandboxes.mydev"`) so the error
+/// pinpoints exactly where the unrecognized key lives.
+fn check_table_keys(
+    table: &toml::value::Table,
+    known: &[&str],
+    fragment_path: &str,
+    location: &str,
+) -> Result<()> {
+    for key in table.keys() {
+        if !known.contains(&key.as_str()) {
+            bail!(
+                "included config fragment {fragment_path} has an unrecognized key '{key}' in \
+                 {location}; this varda version does not recognize it (possible typo or version \
+                 skew) and refuses to silently ignore it"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Where THIS process is running, for the purpose of deciding who may be asked
+/// to approve a capability change (#765 wave 2b, Decision 2). Order of checks in
+/// [`detect_launch_context`] matters: `Sandboxed` is checked BEFORE the TTY check
+/// so a sandboxed process that happens to have a pty attached still refuses
+/// rather than ever offering the prompt — an agent must never be able to approve
+/// its own capability escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchContext {
+    /// A human is attached on a real terminal; may be prompted.
+    InteractiveTty,
+    /// `varda task run`, cron, any non-TTY run — must refuse, never block.
+    Headless,
+    /// Running inside a varda-managed sandbox (a spawned worker or the
+    /// resident) — must refuse, and must never even offer the prompt.
+    Sandboxed,
+}
+
+/// Detect [`LaunchContext`] for the current process.
+///
+/// Sandbox detection's PRIMARY signal is [`crate::sandbox::SANDBOXED_MARKER_ENV`]
+/// (`mark_sandboxed`), which `acp.rs` sets on `CommandSpec.env` for EVERY
+/// non-`local` sandbox launch — batch or interactive, with or without
+/// orchestration's MCP broker wired. That universality matters: an interactive
+/// docker/microsandbox/clawk launch with no broker attached (a human working
+/// directly inside the sandbox on a real TTY) sets no `VARDA_MCP_ADDR`/
+/// `VARDA_MCP_SOCKET`, so relying on those alone would let such a process
+/// misclassify itself as `InteractiveTty` and get offered the approval prompt
+/// from inside the very sandbox a capability change would affect (#806).
+///
+/// The `VARDA_MCP_ADDR`/`VARDA_MCP_SOCKET` guest-env signal `env_for_request`
+/// sets when wiring an orchestrated agent to the host's MCP broker is kept as
+/// an additional fallback signal — harmless belt-and-suspenders, since it can
+/// only ever widen `Sandboxed` detection, never narrow it.
+///
+/// Interactivity reuses the codebase's existing `std::io::IsTerminal` convention
+/// (see `main.rs`'s `--file`-less task-add prompt and `acp.rs`'s stream-to-terminal
+/// check). Both stdin AND stdout are required to be a real terminal: a prompt
+/// whose output is redirected away is not meaningfully "shown" to anyone even if
+/// stdin happens to be a tty, and treating that as interactive would risk
+/// silently blocking on a prompt no one can see — the exact failure mode
+/// Decision 2 warns about for the headless case.
+fn detect_launch_context() -> LaunchContext {
+    if std::env::var_os(crate::sandbox::SANDBOXED_MARKER_ENV).is_some()
+        || std::env::var_os("VARDA_MCP_ADDR").is_some()
+        || std::env::var_os("VARDA_MCP_SOCKET").is_some()
+    {
+        return LaunchContext::Sandboxed;
+    }
+    use std::io::IsTerminal as _;
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        LaunchContext::InteractiveTty
+    } else {
+        LaunchContext::Headless
+    }
+}
+
+/// Derive the [`config_approval::CapabilitySummary`] of a standalone fragment's
+/// content, applying the same per-fragment processing [`resolve_includes`] itself
+/// applies before merging (unknown-key rejection, mount expansion relative to
+/// `bundle_dir`, the `untrusted` provenance flag) so the summary reflects exactly
+/// what would be merged — without actually merging it into the caller's `Config`.
+/// Used to diff the previously-approved copy of a bundle against its new content;
+/// never the full merged config (approval is scoped per include file, matching
+/// [`config_approval::ApprovalStore`]'s per-bundle-path keying).
+fn fragment_capability_summary(
+    content: &str,
+    entry_path: &str,
+    bundle_dir: &Path,
+) -> Result<config_approval::CapabilitySummary> {
+    reject_unknown_fragment_keys(content, entry_path)?;
+    let mut fragment: ConfigFragment = toml::from_str(content).with_context(|| {
+        format!("failed to parse content of {entry_path} for a capability-summary diff")
+    })?;
+    if !fragment.include.is_empty() {
+        bail!(
+            "included config fragment {entry_path} declares its own `include`; \
+             nested includes are not supported"
+        );
+    }
+    for route in &mut fragment.routes {
+        expand_route_mounts(route, Some(bundle_dir))?;
+        route.untrusted = true;
+    }
+    for sandbox in fragment.sandboxes.values_mut() {
+        expand_sandbox_mounts(sandbox, Some(bundle_dir))?;
+        sandbox.untrusted = true;
+    }
+    for agent in fragment.agents.values_mut() {
+        agent.command = resolve_bundle_relative_command(&agent.command, bundle_dir);
+        if let Some(working_dir) = &agent.working_dir {
+            agent.working_dir = Some(resolve_bundle_relative_command(working_dir, bundle_dir));
+        }
+        agent.untrusted = true;
+    }
+    let mut summary_config: Config =
+        toml::from_str(DEFAULT_CONFIG).expect("DEFAULT_CONFIG template must parse");
+    summary_config.routes = fragment.routes;
+    summary_config.sandboxes = fragment.sandboxes;
+    summary_config.agents = fragment.agents;
+    Ok(config_approval::CapabilitySummary::from_config(
+        &summary_config,
+    ))
+}
+
+/// Print a capability-change diff to stderr, critical (sandbox-escape / host-code-
+/// exec) entries first — `changes` already arrives sorted that way from
+/// [`config_approval::diff_capabilities`].
+fn print_capability_diff(entry_path: &str, changes: &[config_approval::CapabilityChange]) {
+    eprintln!(
+        "config: included bundle {entry_path} changed and no longer matches its sha256 pin. \
+         Its capability surface would change as follows:"
+    );
+    for change in changes {
+        let marker = if change.critical { "!!" } else { " -" };
+        eprintln!("  {marker} {}", change.sentence);
+    }
+}
+
+/// Read a real y/N answer from the attached terminal. Only ever called from
+/// [`LaunchContext::InteractiveTty`], so stdin/stdout are known to be real
+/// terminals. EOF (`read_line` returning `Ok(0)`) reads as an empty answer, which
+/// falls through to "no" — the same safe default as an explicit decline.
+fn prompt_capability_approval() -> Result<bool> {
+    use std::io::Write as _;
+    print!("Approve this bundle's new capabilities and re-pin it? [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// On a Strict-mode pin mismatch, decide what content this include entry actually
+/// resolves to: the launch-time capability-diff approval flow (#765 wave 2b,
+/// Decisions 1-3), replacing the old unconditional refuse. Thin wrapper around
+/// [`resolve_pin_mismatch_with`] that supplies the real [`LaunchContext`] and the
+/// real interactive-prompt function; see that function for the actual logic and
+/// its unit tests for the injectable seams this split exists for.
+fn resolve_pin_mismatch(
+    include_path: &Path,
+    entry_path: &str,
+    bundle_dir: &Path,
+    new_content: &str,
+    pin: &str,
+    actual: &str,
+) -> Result<String> {
+    let store = config_approval::ApprovalStore::open()
+        .context("failed to open the launch-time bundle approval store")?;
+    resolve_pin_mismatch_with(
+        include_path,
+        entry_path,
+        bundle_dir,
+        new_content,
+        pin,
+        actual,
+        detect_launch_context(),
+        prompt_capability_approval,
+        &store,
+    )
+}
+
+/// Core decision logic for [`resolve_pin_mismatch`], with [`LaunchContext`], the
+/// approval prompt, AND the [`config_approval::ApprovalStore`] injected so it's
+/// testable without a real terminal or the real `VARDA_HOME` (Decision 2's
+/// TTY-prompt path is exercised by passing a fake `ask` closure; the context table
+/// itself is exercised by passing each [`LaunchContext`] variant directly; the store
+/// seam lets tests build an isolated `ApprovalStore::open_at(tempdir)` directly
+/// instead of mutating the process-wide `VARDA_HOME` env var, which `cargo test`'s
+/// default concurrent execution would otherwise race across tests).
+///
+/// Returns the content this include entry should actually be parsed from —
+/// callers must use the RETURNED string, not re-read the fragment file, so a
+/// decline-fallback to previously-approved content is honored.
+fn resolve_pin_mismatch_with(
+    include_path: &Path,
+    entry_path: &str,
+    bundle_dir: &Path,
+    new_content: &str,
+    pin: &str,
+    actual: &str,
+    launch_context: LaunchContext,
+    mut ask: impl FnMut() -> Result<bool>,
+    store: &config_approval::ApprovalStore,
+) -> Result<String> {
+    let previously_approved = store
+        .load_approved_content(include_path)
+        .with_context(|| format!("failed to load a previously-approved copy of {entry_path}"))?;
+
+    let old_summary = match &previously_approved {
+        Some(prev) => fragment_capability_summary(prev, entry_path, bundle_dir)?,
+        None => config_approval::CapabilitySummary::default(),
+    };
+    let new_summary = fragment_capability_summary(new_content, entry_path, bundle_dir)?;
+    let changes = config_approval::diff_capabilities(&old_summary, &new_summary);
+
+    // Decision 3: nothing security-relevant changed (a comment, key reorder, or
+    // pure capability removal) — re-pin silently, never prompt.
+    if changes.is_empty() {
+        store
+            .store_approval(include_path, new_content)
+            .with_context(|| format!("failed to re-pin approved content for {entry_path}"))?;
+        return Ok(new_content.to_owned());
+    }
+
+    let refuse = |detail: &str| -> anyhow::Error {
+        anyhow::anyhow!(
+            "config REFUSED: pinned include {entry_path} does not match its sha256 pin \
+             (expected {pin}, got {actual}); the bundle content has changed since it was \
+             pinned, and its capability surface changed too — {detail}"
+        )
+    };
+
+    match launch_context {
+        LaunchContext::Sandboxed => Err(refuse(
+            "refusing inside a sandbox: approving a capability change from inside a \
+             sandboxed worker or the resident would let it approve its own escalation, \
+             so it is never even offered the prompt; approve on an interactive host launch",
+        )),
+        LaunchContext::Headless => Err(refuse(
+            "refusing in a non-interactive/headless context (no TTY attached), rather \
+             than blocking on a prompt no one can see; re-run interactively on a host \
+             terminal to review and approve",
+        )),
+        LaunchContext::InteractiveTty => {
+            print_capability_diff(entry_path, &changes);
+            if ask()? {
+                store
+                    .store_approval(include_path, new_content)
+                    .with_context(|| format!("failed to store approval for {entry_path}"))?;
+                return Ok(new_content.to_owned());
+            }
+            if let Some(prev) = previously_approved {
+                eprintln!(
+                    "config: declined; falling back to the previously-approved content for \
+                     {entry_path}"
+                );
+                return Ok(prev);
+            }
+            Err(refuse(
+                "declined at the approval prompt, and no previously-approved content \
+                 exists to fall back to",
+            ))
+        }
+    }
+}
+
+/// Parse a fragment's raw TOML text a SECOND time as a generic [`toml::Value`] and
+/// reject any key the corresponding typed struct doesn't recognize.
+///
+/// The lenient, typed `toml::from_str::<ConfigFragment>` parse used elsewhere in
+/// [`resolve_includes`] silently drops unknown fields (serde's default behavior for
+/// a struct without `deny_unknown_fields`). That is fine — even desirable — for the
+/// CENTRAL `config.toml`, which is edited by the same operator who runs it. But a
+/// fragment/bundle may be authored on a different varda version and shared across
+/// hosts: a security-relevant key this version doesn't recognize yet would silently
+/// vanish, with the sandbox coming up on defaults for whatever it was meant to set.
+///
+/// `SandboxConfig`/`AgentConfig`/`Route`/`ConfigFragment` deliberately do NOT get
+/// `#[serde(deny_unknown_fields)]` directly — those types are shared verbatim by the
+/// central config's own (deliberately permissive) parsing, and making them strict
+/// would also make central-config parsing strict. This check applies strictness
+/// ONLY to fragment-sourced content, by re-parsing the same text out-of-band.
+fn reject_unknown_fragment_keys(raw: &str, fragment_path: &str) -> Result<()> {
+    let value: toml::Value = toml::from_str(raw).with_context(|| {
+        format!("failed to parse included config fragment {fragment_path}")
+    })?;
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+
+    check_table_keys(table, FRAGMENT_TOP_LEVEL_FIELDS, fragment_path, "top level")?;
+
+    if let Some(sandboxes) = table.get("sandboxes").and_then(toml::Value::as_table) {
+        for (name, sandbox) in sandboxes {
+            if let Some(sandbox_table) = sandbox.as_table() {
+                check_table_keys(
+                    sandbox_table,
+                    SANDBOX_CONFIG_FIELDS,
+                    fragment_path,
+                    &format!("sandboxes.{name}"),
+                )?;
+            }
+        }
+    }
+
+    if let Some(agents) = table.get("agents").and_then(toml::Value::as_table) {
+        for (name, agent) in agents {
+            let Some(agent_table) = agent.as_table() else {
+                continue;
+            };
+            check_table_keys(
+                agent_table,
+                AGENT_CONFIG_FIELDS,
+                fragment_path,
+                &format!("agents.{name}"),
+            )?;
+            if let Some(credentials) = agent_table.get("credentials").and_then(toml::Value::as_array)
+            {
+                for (idx, cred) in credentials.iter().enumerate() {
+                    if let Some(cred_table) = cred.as_table() {
+                        check_table_keys(
+                            cred_table,
+                            CREDENTIAL_CONFIG_FIELDS,
+                            fragment_path,
+                            &format!("agents.{name}.credentials[{idx}]"),
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(routes) = table.get("routes").and_then(toml::Value::as_array) {
+        for (idx, route) in routes.iter().enumerate() {
+            if let Some(route_table) = route.as_table() {
+                check_table_keys(
+                    route_table,
+                    ROUTE_FIELDS,
+                    fragment_path,
+                    &format!("routes[{idx}]"),
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Expand `${env:NAME}` references and a leading `~` in a plain (non-mount)
+/// string, e.g. an include path. `${env:NAME}` errors if `NAME` is unset.
+fn expand_env_and_home(value: &str) -> Result<String> {
+    let mut result = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${env:") {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + "${env:".len()..];
+        let end = after
+            .find('}')
+            .context("malformed ${env:NAME} reference: missing closing '}'")?;
+        let name = &after[..end];
+        let resolved = std::env::var(name).with_context(|| {
+            format!("environment variable '{name}' referenced by ${{env:{name}}} is not set")
+        })?;
+        result.push_str(&resolved);
+        rest = &after[end + 1..];
+    }
+    result.push_str(rest);
+
+    if let Some(stripped) = result.strip_prefix('~')
+        && (stripped.is_empty() || stripped.starts_with('/'))
+    {
+        let home = std::env::var("HOME").context("HOME is not set, cannot expand '~'")?;
+        result = format!("{home}{stripped}");
+    }
+
+    Ok(result)
+}
+
+/// Resolve a bundle-relative path/value against `base_dir` (the directory the
+/// value's OWN config fragment lives in). Values already absolute pass
+/// through unchanged. Values containing the literal substring `{project}`
+/// ALSO pass through unchanged: `{project}` is a symbolic placeholder
+/// resolved later, at sandbox-launch time, by `crate::sandbox::expand_mount_path`
+/// against the matched project root — resolving it here as a literal relative
+/// path would corrupt it (e.g. "{project}/vendor" would become
+/// "<bundle_dir>/{project}/vendor").
+fn resolve_bundle_relative(value: &str, base_dir: &Path) -> String {
+    if value.contains("{project}") {
+        return value.to_owned();
+    }
+    let candidate = Path::new(value);
+    if candidate.is_absolute() {
+        value.to_owned()
+    } else {
+        base_dir.join(candidate).to_string_lossy().into_owned()
+    }
+}
+
+fn resolve_bundle_relative_command(value: &str, base_dir: &Path) -> String {
+    resolve_bundle_relative(value, base_dir)
+}
+
+/// Split a `source[:target][:mode]` mount spec on `:`, keeping any
+/// `${env:NAME}` reference atomic (a `:` inside `${env:...}` is part of the
+/// reference syntax, never a segment delimiter).
+fn split_mount_segments(spec: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    while i < spec.len() {
+        if spec[i..].starts_with("${env:") {
+            match spec[i..].find('}') {
+                Some(rel_end) => {
+                    i += rel_end + 1;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        if spec.as_bytes()[i] == b':' {
+            segments.push(spec[seg_start..i].to_owned());
+            seg_start = i + 1;
+        }
+        i += 1;
+    }
+    segments.push(spec[seg_start..].to_owned());
+    segments
+}
+
+/// Expand `${env:NAME}` (and, for the `source` segment, a leading `~`) within
+/// one mount segment. If a resolved `${env:NAME}` value itself contains `:`,
+/// error WITHOUT embedding the resolved value in the message (it may be
+/// credential-bearing) — name only the mount, segment role, and env var NAME.
+fn expand_mount_segment(segment: &str, mount_desc: &str, segment_role: &str) -> Result<String> {
+    let mut result = String::new();
+    let mut rest = segment;
+    while let Some(start) = rest.find("${env:") {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + "${env:".len()..];
+        let end = after.find('}').with_context(|| {
+            format!("mount '{mount_desc}' ({segment_role} segment): malformed ${{env:NAME}} reference, missing closing '}}'")
+        })?;
+        let name = &after[..end];
+        let value = std::env::var(name).with_context(|| {
+            format!("mount '{mount_desc}' ({segment_role} segment): environment variable '{name}' referenced by ${{env:{name}}} is not set")
+        })?;
+        if value.contains(':') {
+            bail!(
+                "mount '{mount_desc}' ({segment_role} segment): value resolved from ${{env:{name}}} contains ':', which is not allowed in a mount segment"
+            );
+        }
+        result.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    result.push_str(rest);
+
+    if segment_role == "source"
+        && let Some(stripped) = result.strip_prefix('~')
+        && (stripped.is_empty() || stripped.starts_with('/'))
+    {
+        let home = std::env::var("HOME").with_context(|| {
+            format!(
+                "mount '{mount_desc}' ({segment_role} segment): HOME is not set, cannot expand '~'"
+            )
+        })?;
+        result = format!("{home}{stripped}");
+    }
+
+    Ok(result)
+}
+
+fn expand_relocatable_mount(spec: &str, bundle_dir: Option<&Path>) -> Result<String> {
+    let segments = split_mount_segments(spec);
+    let mut expanded = Vec::with_capacity(segments.len());
+    for (idx, segment) in segments.iter().enumerate() {
+        let role = match idx {
+            0 => "source",
+            1 => "target",
+            _ => "mode",
+        };
+        let mut value = expand_mount_segment(segment, spec, role)?;
+        if idx == 0
+            && let Some(base) = bundle_dir
+        {
+            value = resolve_bundle_relative(&value, base);
+        }
+        expanded.push(value);
+    }
+    Ok(expanded.join(":"))
+}
+
+fn expand_route_mounts(route: &mut Route, bundle_dir: Option<&Path>) -> Result<()> {
+    for mount in &mut route.mounts {
+        *mount = expand_relocatable_mount(mount, bundle_dir)?;
+    }
+    Ok(())
+}
+
+fn expand_sandbox_mounts(sandbox: &mut SandboxConfig, bundle_dir: Option<&Path>) -> Result<()> {
+    for mount in &mut sandbox.mounts {
+        *mount = expand_relocatable_mount(mount, bundle_dir)?;
+    }
+    Ok(())
+}
+
+/// Per-key memoization cache: each key maps to its own `OnceLock`, so a cache
+/// MISS only ever blocks concurrent callers asking for the SAME key (they wait
+/// on that key's `get_or_init`), while different keys never contend with each
+/// other beyond the brief map-lock needed to fetch-or-insert their cell. A
+/// plain `HashMap<String, bool>` with a separate check-then-insert would let
+/// two threads both miss on the same key and both run `compute` — for
+/// `secret_is_resolvable` that means two redundant `fnox` shell-outs (each a
+/// potential Vault network round trip), which defeats the point of caching.
+struct MemoCache(Mutex<HashMap<String, std::sync::Arc<OnceLock<bool>>>>);
+
+impl MemoCache {
+    fn new() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+
+    fn get_or_compute(&self, key: &str, compute: impl FnOnce() -> bool) -> bool {
+        let cell = {
+            let mut cache = self.0.lock().unwrap();
+            std::sync::Arc::clone(
+                cache
+                    .entry(key.to_owned())
+                    .or_insert_with(|| std::sync::Arc::new(OnceLock::new())),
+            )
+        };
+        *cell.get_or_init(compute)
+    }
+}
+
+fn command_on_path_cache() -> &'static MemoCache {
+    static CACHE: OnceLock<MemoCache> = OnceLock::new();
+    CACHE.get_or_init(MemoCache::new)
+}
+
+fn secret_resolvable_cache() -> &'static MemoCache {
+    static CACHE: OnceLock<MemoCache> = OnceLock::new();
+    CACHE.get_or_init(MemoCache::new)
+}
+
+/// Whether `command` resolves to an executable file somewhere on `$PATH`.
+/// Cached for the lifetime of the process (keyed by command name) so that
+/// repeated `resolve_config` calls within one `varda` invocation only ever
+/// stat the filesystem once per distinct command.
+fn command_on_path(command: &str) -> bool {
+    command_on_path_cache().get_or_compute(command, || {
+        std::env::var_os("PATH").is_some_and(|path_var| {
+            std::env::split_paths(&path_var).any(|dir| dir.join(command).is_file())
+        })
+    })
+}
+
+/// Whether stdout captured from `fnox get NAME` counts as a resolved secret.
+/// A bare newline (fnox exits 0 but the secret is unset/empty) must NOT count
+/// as resolved — only non-whitespace content does.
+fn fnox_output_is_resolved(output: &str) -> bool {
+    !output.trim().is_empty()
+}
+
+/// Whether `fnox get name` resolves to a non-empty value on this host. Never
+/// surfaces the resolved value anywhere — only success/emptiness is reported.
+/// Cached for the lifetime of the process (keyed by secret name) so that
+/// repeated `resolve_config` calls within one `varda` invocation only ever
+/// shell out to `fnox` once per distinct secret — each shell-out can be a
+/// network round trip to a Vault-backed store.
+fn secret_is_resolvable(name: &str) -> bool {
+    secret_resolvable_cache().get_or_compute(name, || {
+        std::process::Command::new("fnox")
+            .arg("get")
+            .arg(name)
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && fnox_output_is_resolved(&String::from_utf8_lossy(&output.stdout))
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Fail loudly, at config-load time, when a declared `requires_commands` or
+/// `requires_secrets` dependency is not satisfied on this host — listing
+/// EVERY missing item in ONE error, not stopping at the first.
+fn validate_requirements(config: &Config) -> Result<()> {
+    let mut missing = Vec::new();
+
+    for command in &config.requires_commands {
+        if !command_on_path(command) {
+            missing.push(format!("command '{command}' not found on $PATH"));
+        }
+    }
+    for secret in &config.requires_secrets {
+        if !secret_is_resolvable(secret) {
+            missing.push(format!(
+                "secret '{secret}' not resolvable via `fnox get {secret}`"
+            ));
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "config declares requirements not satisfied on this host:\n  - {}",
+        missing.join("\n  - ")
+    );
+}
+
+fn parse_central_config(path: &Path) -> Result<Config> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
     let mut config: Config = toml::from_str(&content)
         .with_context(|| format!("failed to parse config at {}", path.display()))?;
     resolve_config_paths(path, &mut config)?;
+    validate_include_pin_formats(&config)?;
+
+    Ok(config)
+}
+
+/// Tier 1: parses only the central `config.toml` file itself. Does NOT resolve
+/// `include`d bundle fragments and does NOT validate `requires_commands`/`requires_secrets`.
+/// `config.include` is populated from parsing but left unprocessed — `sandboxes`/`agents`/
+/// `routes` reflect only the central file's own content. Cheap and side-effect free (no
+/// fragment file reads, no `fnox` shell-outs, no sha256 verification — a pin's FORMAT is
+/// still validated here since that only inspects the already-parsed central config). Use
+/// this for call sites that don't need bundle-sourced routes/agents/sandboxes to be correct.
+pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
+    let path = path.as_ref();
+    let mut config = parse_central_config(path)?;
     remove_legacy_codex_exec_args(&mut config);
     add_varda_project_dir_to_default_agents(&mut config);
 
     Ok(config)
+}
+
+/// Tier 2: central-config parsing, then `resolve_includes` (merges bundle fragments'
+/// `[[routes]]`/`[sandboxes.*]`/`[agents.*]`, verifying any `sha256` pin against the exact
+/// bytes read), then the same agent-normalization steps as `load_config` (now applied to the
+/// merged agent set, matching the pre-split behavior), then `validate_requirements` (enforces
+/// `requires_commands`/`requires_secrets`).
+///
+/// Runs in [`VerifyMode::Strict`]: a pin mismatch refuses the whole load. This is the correct
+/// default for anything that launches or dispatches work — use this call site unless you have
+/// a specific, read-only diagnostic reason not to (see [`resolve_config_for_diagnostics`]).
+pub fn resolve_config(path: impl AsRef<Path>) -> Result<Config> {
+    resolve_config_with_mode(path.as_ref(), VerifyMode::Strict).map(|(config, _warnings)| config)
+}
+
+/// Tier 2, in [`VerifyMode::DiagnosticDegraded`]: identical to [`resolve_config`] except a
+/// pinned include whose bytes don't match its `sha256` does NOT refuse the load — it warns
+/// loudly (stderr) and continues with the unverified fragment content, and the returned `Vec`
+/// names every include that failed verification so the caller can label its output as
+/// unverified.
+///
+/// Reserved for READ-ONLY diagnostic commands (`inspect`, `doctor`) that must keep reporting
+/// the true route/agent/sandbox even when a bundle has drifted. Anything that launches or
+/// dispatches work (task run, orchestrate, plan, resume, spawn, …) MUST use [`resolve_config`]
+/// instead — refusing is the safe behavior there.
+pub fn resolve_config_for_diagnostics(path: impl AsRef<Path>) -> Result<(Config, Vec<String>)> {
+    resolve_config_with_mode(path.as_ref(), VerifyMode::DiagnosticDegraded)
+}
+
+fn resolve_config_with_mode(path: &Path, mode: VerifyMode) -> Result<(Config, Vec<String>)> {
+    let mut config = parse_central_config(path)?;
+    let config_dir = path
+        .parent()
+        .with_context(|| format!("config path {} has no parent", path.display()))?;
+    let warnings = resolve_includes(config_dir, &mut config, mode)?;
+    remove_legacy_codex_exec_args(&mut config);
+    add_varda_project_dir_to_default_agents(&mut config);
+    validate_requirements(&config)?;
+
+    Ok((config, warnings))
 }
 
 pub fn save_config(path: impl AsRef<Path>, config: &Config) -> Result<()> {
@@ -1792,6 +2878,7 @@ pub fn add_project_route(path: impl AsRef<Path>, glob: String, agents: Vec<Strin
             env: BTreeMap::new(),
             orchestration: None,
             verify: Vec::new(),
+            untrusted: false,
         },
     );
     save_config(path, &config)
@@ -1967,6 +3054,7 @@ mod tests {
 
     fn agent_with_credentials(credentials: Vec<CredentialConfig>) -> AgentConfig {
         AgentConfig {
+            untrusted: false,
             kind: AgentKind::Acp,
             command: "claude".to_owned(),
             args: vec![],
@@ -2546,6 +3634,7 @@ deny_sandboxes = ["local"]
             env: BTreeMap::new(),
             orchestration: None,
             verify: Vec::new(),
+            untrusted: false,
         };
         assert_eq!(config.effective_sandbox(&route_with_sandbox), "firejail");
     }
@@ -2632,6 +3721,7 @@ mod m6b_tests {
             orchestration: None,
             env: BTreeMap::new(),
             verify: Vec::new(),
+            untrusted: false,
         }];
         c
     }
@@ -3089,6 +4179,7 @@ agents = ["claude"]
                 env: BTreeMap::new(),
                 orchestration: Some(strict.clone()),
                 verify: Vec::new(),
+                untrusted: false,
             },
             Route {
                 glob: "**".to_owned(),
@@ -3098,6 +4189,7 @@ agents = ["claude"]
                 env: BTreeMap::new(),
                 orchestration: None,
                 verify: Vec::new(),
+                untrusted: false,
             },
         ];
 
@@ -3814,5 +4906,1327 @@ mod resident_tests {
             &resident_policy(),
         )
         .expect("a workspace with a clean, credential-free remote must pass");
+    }
+}
+
+#[cfg(test)]
+mod bundle_include_tests {
+    use super::*;
+
+    fn minimal_config_toml() -> String {
+        r#"[defaults]
+timeout_seconds = 600
+operations_dir = "operations"
+
+[[routes]]
+glob = "**"
+agents = ["codex"]
+
+[agents.codex]
+kind = "acp"
+command = "codex"
+"#
+        .to_owned()
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "varda-bundle-{tag}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        dir
+    }
+
+    #[test]
+    fn resolve_includes_central_wins_and_later_include_wins_among_fragments() {
+        let root = temp_dir("precedence");
+
+        fs::write(
+            root.join("frag1.toml"),
+            "[sandboxes.shared]\nimage = \"frag1-image\"\n\n[sandboxes.dup]\nimage = \"frag1-dup\"\n",
+        )
+        .expect("frag1 should be written");
+        fs::write(
+            root.join("frag2.toml"),
+            "[sandboxes.shared]\nimage = \"frag2-image\"\n\n[sandboxes.dup]\nimage = \"frag2-dup\"\n",
+        )
+        .expect("frag2 should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.sandboxes.insert(
+            "shared".to_owned(),
+            SandboxConfig {
+                image: Some("central-image".to_owned()),
+                ..Default::default()
+            },
+        );
+        config.include = vec![
+            IncludeEntry::Path("frag1.toml".to_owned()),
+            IncludeEntry::Path("frag2.toml".to_owned()),
+        ];
+
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        assert_eq!(
+            config.sandboxes["shared"].image.as_deref(),
+            Some("central-image"),
+            "a name already defined centrally must never be overwritten by an include"
+        );
+        assert_eq!(
+            config.sandboxes["dup"].image.as_deref(),
+            Some("frag2-dup"),
+            "among includes themselves, a later include must win over an earlier one"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_includes_flags_fragment_sourced_agents_as_untrusted() {
+        let root = temp_dir("agent-provenance");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[agents.frag_agent]\nkind = \"acp\"\ncommand = \"true\"\n",
+        )
+        .expect("frag should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        assert!(
+            config.agents["frag_agent"].untrusted,
+            "an agent merged in from an included fragment must be flagged untrusted"
+        );
+        assert!(
+            !config.agents["codex"].untrusted,
+            "a central-config agent must never be flagged untrusted by resolve_includes"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Task #796 Gap 2: sandboxes and routes need the same fragment-provenance flag
+    /// `resolve_includes_flags_fragment_sourced_agents_as_untrusted` already checks
+    /// for agents, so `resolve_sandbox_for` can refuse a fnox binding in a
+    /// fragment-sourced sandbox's/route's own `env` map.
+    #[test]
+    fn resolve_includes_flags_fragment_sourced_sandboxes_and_routes_as_untrusted() {
+        let root = temp_dir("sandbox-route-provenance");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[sandboxes.frag_sandbox]\nimage = \"frag-image\"\n\n\
+             [[routes]]\nglob = \"frag/**\"\nagents = [\"codex\"]\n",
+        )
+        .expect("frag should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.sandboxes.insert(
+            "central_sandbox".to_owned(),
+            SandboxConfig::default(),
+        );
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        assert!(
+            config.sandboxes["frag_sandbox"].untrusted,
+            "a sandbox merged in from an included fragment must be flagged untrusted"
+        );
+        assert!(
+            !config.sandboxes["central_sandbox"].untrusted,
+            "a central-config sandbox must never be flagged untrusted by resolve_includes"
+        );
+
+        let frag_route = config
+            .routes
+            .iter()
+            .find(|r| r.glob == "frag/**")
+            .expect("fragment route must be merged in");
+        assert!(
+            frag_route.untrusted,
+            "a route merged in from an included fragment must be flagged untrusted"
+        );
+        let central_route = config
+            .routes
+            .iter()
+            .find(|r| r.glob == "**")
+            .expect("central route must still be present");
+        assert!(
+            !central_route.untrusted,
+            "a central-config route must never be flagged untrusted by resolve_includes"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Task #796 Gap 2 (sandbox half): a fragment-sourced sandbox's own `env` fnox
+    /// binding must be refused via `resolve_sandbox_for`'s `varda_env_keys`, the
+    /// same way the pre-existing repo-local `.varda`-origin binding already is
+    /// (`resolve_env_secrets_refuses_untrusted_varda_binding` in `main.rs`). A
+    /// central-config sandbox's own env must be unaffected.
+    #[test]
+    fn resolve_sandbox_for_unions_fragment_sourced_sandbox_env_into_varda_env_keys() {
+        let root = temp_dir("sandbox-env-union");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[sandboxes.frag_sandbox]\nenv = { TOKEN = \"${fnox:aws-prod-key}\" }\n",
+        )
+        .expect("frag should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.sandboxes.insert(
+            "central_sandbox".to_owned(),
+            SandboxConfig {
+                env: BTreeMap::from([("SAFE".to_owned(), "${fnox:safe-secret}".to_owned())]),
+                ..Default::default()
+            },
+        );
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        let resolved = config
+            .resolve_sandbox_for(&root, &root, Some("frag_sandbox"))
+            .expect("pinned fragment sandbox should resolve");
+        assert!(
+            resolved.varda_env_keys.contains(&"TOKEN".to_owned()),
+            "a fragment-sourced sandbox's own env key must be treated as untrusted: {:?}",
+            resolved.varda_env_keys
+        );
+        let mut env = resolved.env.clone();
+        let err = crate::resolve_env_secrets(&mut env, &resolved.varda_env_keys)
+            .expect_err("fragment-sourced sandbox env fnox binding must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("untrusted"), "error must name the untrusted origin: {msg}");
+        assert!(msg.contains("TOKEN"), "error must name the key: {msg}");
+
+        let resolved_central = config
+            .resolve_sandbox_for(&root, &root, Some("central_sandbox"))
+            .expect("pinned central sandbox should resolve");
+        assert!(
+            !resolved_central.varda_env_keys.contains(&"SAFE".to_owned()),
+            "a central-config sandbox's own env key must not be treated as untrusted"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Task #796 Gap 2 (route half): a fragment-sourced route's own `env` fnox
+    /// binding must be refused via `resolve_sandbox_for`'s `varda_env_keys`.
+    #[test]
+    fn resolve_sandbox_for_unions_fragment_sourced_route_env_into_varda_env_keys() {
+        let root = temp_dir("route-env-union");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).expect("proj dir should be created");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[[routes]]\nglob = \"**\"\nagents = [\"codex\"]\n\
+             env = { TOKEN = \"${fnox:aws-prod-key}\" }\n",
+        )
+        .expect("frag should be written");
+
+        // No central routes: the fragment route is the sole match, so it is
+        // guaranteed to be the one `resolve_sandbox_for` consults.
+        let mut config: Config = toml::from_str(
+            "[defaults]\ntimeout_seconds = 600\noperations_dir = \"operations\"\n\n\
+             [agents.codex]\nkind = \"acp\"\ncommand = \"codex\"\n",
+        )
+        .expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        let resolved = config
+            .resolve_sandbox_for(&proj, &root, None)
+            .expect("sandbox should resolve via the fragment route");
+        assert!(
+            resolved.varda_env_keys.contains(&"TOKEN".to_owned()),
+            "a fragment-sourced route's own env key must be treated as untrusted: {:?}",
+            resolved.varda_env_keys
+        );
+        let mut env = resolved.env.clone();
+        let err = crate::resolve_env_secrets(&mut env, &resolved.varda_env_keys)
+            .expect_err("fragment-sourced route env fnox binding must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("untrusted"), "error must name the untrusted origin: {msg}");
+        assert!(msg.contains("TOKEN"), "error must name the key: {msg}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn project_placeholder_mount_passes_through_include_expansion_untouched() {
+        let root = temp_dir("project-placeholder");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[sandboxes.from_frag]\nmounts = [\"{project}/vendor:/vendor:ro\"]\n",
+        )
+        .expect("frag should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        assert_eq!(
+            config.sandboxes["from_frag"].mounts,
+            vec!["{project}/vendor:/vendor:ro".to_owned()],
+            "a {{project}} placeholder must stay literal, not be resolved against the bundle dir"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn central_sandboxes_and_routes_are_never_touched_when_there_are_no_includes() {
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.sandboxes.insert(
+            "central".to_owned(),
+            SandboxConfig {
+                mounts: vec!["./relative-central:/x:ro".to_owned()],
+                ..Default::default()
+            },
+        );
+        config.routes[0].mounts = vec!["./relative-route:/y:ro".to_owned()];
+
+        let root = temp_dir("no-includes");
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        assert_eq!(
+            config.sandboxes["central"].mounts,
+            vec!["./relative-central:/x:ro".to_owned()],
+            "central sandbox mounts must never be expanded by resolve_includes"
+        );
+        assert_eq!(
+            config.routes[0].mounts,
+            vec!["./relative-route:/y:ro".to_owned()],
+            "central route mounts must never be expanded by resolve_includes"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn include_read_error_references_as_written_path_not_resolved_value() {
+        let root = temp_dir("error-leak");
+        // SAFETY: test-only env var, unique name, no concurrent access to it.
+        unsafe {
+            std::env::set_var("VARDA_TEST_BUNDLE_SECRET_DIR", "super-secret-directory-name");
+        }
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path(
+            "${env:VARDA_TEST_BUNDLE_SECRET_DIR}/missing-fragment.toml".to_owned(),
+        )];
+
+        let err = resolve_includes(&root, &mut config, VerifyMode::Strict)
+            .expect_err("a nonexistent include file must fail to resolve");
+        let message = format!("{err:#}");
+
+        unsafe {
+            std::env::remove_var("VARDA_TEST_BUNDLE_SECRET_DIR");
+        }
+
+        assert!(
+            message.contains("${env:VARDA_TEST_BUNDLE_SECRET_DIR}/missing-fragment.toml"),
+            "error must reference the include path as written: {message}"
+        );
+        assert!(
+            !message.contains("super-secret-directory-name"),
+            "error must never embed the resolved/expanded path value: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pinned_include_with_matching_sha256_loads_normally() {
+        let root = temp_dir("pin-match");
+        let frag = "[sandboxes.pinned]\nimage = \"pinned-image\"\n";
+        fs::write(root.join("frag.toml"), frag).expect("frag should be written");
+        let pin = sha256_hex(frag.as_bytes());
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Detailed {
+            path: "frag.toml".to_owned(),
+            sha256: Some(pin),
+        }];
+
+        let warnings = resolve_includes(&root, &mut config, VerifyMode::Strict)
+            .expect("a pin matching the fragment's bytes must load normally");
+        assert!(
+            warnings.is_empty(),
+            "a matching pin must not produce any unverified warning"
+        );
+        assert_eq!(
+            config.sandboxes["pinned"].image.as_deref(),
+            Some("pinned-image")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pinned_include_with_mismatched_sha256_refuses_in_strict_mode() {
+        let root = temp_dir("pin-mismatch-strict");
+        let frag = "[sandboxes.pinned]\nimage = \"pinned-image\"\n";
+        fs::write(root.join("frag.toml"), frag).expect("frag should be written");
+        let stale_pin = sha256_hex(b"this is not the fragment's content");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Detailed {
+            path: "frag.toml".to_owned(),
+            sha256: Some(stale_pin.clone()),
+        }];
+
+        let err = resolve_includes(&root, &mut config, VerifyMode::Strict)
+            .expect_err("a sha256 mismatch must refuse the load in strict mode");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("REFUSED"),
+            "the error must be unambiguous that config was REFUSED, not merely unreadable: {message}"
+        );
+        assert!(
+            message.contains("frag.toml"),
+            "error must name the file: {message}"
+        );
+        assert!(
+            message.contains(&stale_pin),
+            "error must include the expected digest: {message}"
+        );
+        assert!(
+            message.contains(&sha256_hex(frag.as_bytes())),
+            "error must include the actual digest: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pinned_include_with_mismatched_sha256_warns_and_continues_in_diagnostic_mode() {
+        let root = temp_dir("pin-mismatch-diagnostic");
+        let frag = "[sandboxes.pinned]\nimage = \"pinned-image\"\n";
+        fs::write(root.join("frag.toml"), frag).expect("frag should be written");
+        let stale_pin = sha256_hex(b"this is not the fragment's content");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Detailed {
+            path: "frag.toml".to_owned(),
+            sha256: Some(stale_pin),
+        }];
+
+        let warnings = resolve_includes(&root, &mut config, VerifyMode::DiagnosticDegraded)
+            .expect("a diagnostic-mode mismatch must not refuse the load");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the mismatch must be reported back to the caller as a warning"
+        );
+        assert!(warnings[0].contains("frag.toml"));
+        assert_eq!(
+            config.sandboxes["pinned"].image.as_deref(),
+            Some("pinned-image"),
+            "diagnostic mode must still merge the unverified fragment content"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unpinned_include_is_unaffected_by_verify_mode() {
+        let root = temp_dir("pin-absent");
+        let frag = "[sandboxes.unpinned]\nimage = \"unpinned-image\"\n";
+        fs::write(root.join("frag.toml"), frag).expect("frag should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+
+        let warnings = resolve_includes(&root, &mut config, VerifyMode::Strict)
+            .expect("an unpinned include must load exactly as before");
+        assert!(warnings.is_empty());
+        assert_eq!(
+            config.sandboxes["unpinned"].image.as_deref(),
+            Some("unpinned-image")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn malformed_sha256_pin_is_rejected_at_central_config_parse_time() {
+        for bad_pin in [
+            "too-short",
+            &"a".repeat(63),
+            &"A".repeat(64), // uppercase
+            &"g".repeat(64), // non-hex
+        ] {
+            let mut config: Config =
+                toml::from_str(&minimal_config_toml()).expect("base config should parse");
+            config.include = vec![IncludeEntry::Detailed {
+                path: "frag.toml".to_owned(),
+                sha256: Some(bad_pin.to_owned()),
+            }];
+
+            let err = validate_include_pin_formats(&config)
+                .expect_err(&format!("'{bad_pin}' must be rejected as a malformed pin"));
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("malformed"),
+                "error must clearly say the pin is malformed: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_sha256_pin_format_is_accepted_at_parse_time() {
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Detailed {
+            path: "frag.toml".to_owned(),
+            sha256: Some("a".repeat(64)),
+        }];
+
+        validate_include_pin_formats(&config).expect("64 lowercase hex characters must be valid");
+    }
+
+    #[test]
+    fn colon_in_resolved_env_value_errors_without_leaking_the_value() {
+        // SAFETY: test-only env var, unique name, no concurrent access to it.
+        unsafe {
+            std::env::set_var("VARDA_TEST_MOUNT_COLON_VALUE", "abc:def-super-secret");
+        }
+
+        let result =
+            expand_relocatable_mount("${env:VARDA_TEST_MOUNT_COLON_VALUE}:/target:ro", None);
+
+        unsafe {
+            std::env::remove_var("VARDA_TEST_MOUNT_COLON_VALUE");
+        }
+
+        let err = result.expect_err("a resolved value containing ':' must be rejected");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("VARDA_TEST_MOUNT_COLON_VALUE"),
+            "error must name the offending env var: {message}"
+        );
+        assert!(
+            !message.contains("abc:def-super-secret"),
+            "error must never embed the resolved value itself: {message}"
+        );
+    }
+
+    #[test]
+    fn requires_commands_naming_missing_command_fails_load_with_its_name() {
+        let root = temp_dir("requires-commands-missing");
+        let path = root.join("config.toml");
+        let content = format!(
+            "requires_commands = [\"definitely-not-a-real-command-xyz123\"]\n{}",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        let err = resolve_config(&path).expect_err("missing required command must fail load");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("definitely-not-a-real-command-xyz123"),
+            "error must name the missing command: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn requires_secrets_naming_unresolvable_secret_fails_load_with_its_name() {
+        let root = temp_dir("requires-secrets-missing");
+        let path = root.join("config.toml");
+        let content = format!(
+            "requires_secrets = [\"definitely-not-a-real-secret-xyz123\"]\n{}",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        let err = resolve_config(&path).expect_err("unresolvable required secret must fail load");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("definitely-not-a-real-secret-xyz123"),
+            "error must name the missing secret: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn requires_commands_and_requires_secrets_both_missing_report_one_error_with_both_names() {
+        let root = temp_dir("requires-both-missing");
+        let path = root.join("config.toml");
+        let content = format!(
+            "requires_commands = [\"definitely-not-a-real-command-abc123\"]\nrequires_secrets = [\"definitely-not-a-real-secret-abc123\"]\n{}",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        let err = resolve_config(&path).expect_err("both missing requirements must fail load");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("definitely-not-a-real-command-abc123"),
+            "single error must contain the missing command name: {message}"
+        );
+        assert!(
+            message.contains("definitely-not-a-real-secret-abc123"),
+            "single error must contain the missing secret name: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fnox_output_is_resolved_treats_blank_output_as_unresolved() {
+        assert!(!fnox_output_is_resolved("\n"));
+        assert!(!fnox_output_is_resolved(""));
+        assert!(fnox_output_is_resolved("secret-value\n"));
+    }
+
+    /// #754: `command_on_path`/`secret_is_resolvable` must not repeat their
+    /// underlying check (a `$PATH` stat, or worse, an `fnox get` shell-out that
+    /// can be a Vault network round trip) for a name already resolved once in
+    /// this process. Tested against the shared `MemoCache` primitive directly —
+    /// not by injecting a fake command onto the real process `$PATH` (that would
+    /// mutate global state shared with every other concurrently-running test in
+    /// this binary, which is exactly the kind of soundness/flakiness hazard
+    /// `std::env::set_var` being `unsafe` exists to flag) and not by shelling
+    /// out to real `fnox`. Since both `command_on_path` and `secret_is_resolvable`
+    /// are thin wrappers around `MemoCache::get_or_compute`, proving the
+    /// primitive's contract proves both call sites.
+    #[test]
+    fn memo_cache_computes_a_key_at_most_once_across_repeated_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = MemoCache::new();
+        let calls = AtomicUsize::new(0);
+        let compute = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+
+        assert!(cache.get_or_compute("secret-a", compute));
+        assert!(cache.get_or_compute("secret-a", compute));
+        assert!(cache.get_or_compute("secret-a", compute));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "compute must run exactly once for a repeated key"
+        );
+    }
+
+    #[test]
+    fn memo_cache_computes_distinct_keys_independently() {
+        let cache = MemoCache::new();
+        assert!(cache.get_or_compute("present", || true));
+        assert!(!cache.get_or_compute("absent", || false));
+        // Re-check both: each key keeps its OWN cached result, not the other's.
+        assert!(cache.get_or_compute("present", || panic!("must be cached")));
+        assert!(!cache.get_or_compute("absent", || panic!("must be cached")));
+    }
+
+    #[test]
+    fn memo_cache_computes_a_contended_key_exactly_once_under_real_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const THREAD_COUNT: usize = 16;
+        let cache = Arc::new(MemoCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        // A `Barrier` makes the race deterministic rather than probabilistic:
+        // every thread calls `get_or_compute` at (as close to) the same instant,
+        // instead of relying on scheduler timing to make contention "likely".
+        let start = Arc::new(Barrier::new(THREAD_COUNT));
+        let threads: Vec<_> = (0..THREAD_COUNT)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let calls = Arc::clone(&calls);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    cache.get_or_compute("contended-key", || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // Widen the race window: without per-key serialization,
+                        // this makes it far more likely two threads would both
+                        // observe a cache miss and both run `compute`.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        true
+                    })
+                })
+            })
+            .collect();
+        for handle in threads {
+            assert!(handle.join().expect("worker thread must not panic"));
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "16 concurrent callers for the SAME key must trigger exactly one compute — \
+             a plain check-then-insert HashMap<String, bool> would let multiple threads \
+             race past the check before any insert lands, and (for secret_is_resolvable) \
+             each of those would be a redundant `fnox` shell-out / Vault round trip"
+        );
+    }
+
+    #[test]
+    fn included_fragment_requires_commands_are_unioned_and_validated_on_load() {
+        let root = temp_dir("requires-from-fragment");
+        fs::write(
+            root.join("frag.toml"),
+            "requires_commands = [\"definitely-not-a-real-command-from-fragment\"]\n",
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        let content = format!(
+            "include = [\"frag.toml\"]\n{}",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        let err =
+            resolve_config(&path).expect_err("a fragment's unresolved requirement must fail load");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("definitely-not-a-real-command-from-fragment"),
+            "error must name the command required by the included fragment: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn nested_include_in_a_fragment_fails_with_fragment_path_and_clear_message() {
+        let root = temp_dir("nested-include");
+        fs::write(
+            root.join("inner.toml"),
+            "[sandboxes.inner]\nimage = \"inner-image\"\n",
+        )
+        .expect("inner fragment should be written");
+        fs::write(
+            root.join("outer.toml"),
+            "include = [\"inner.toml\"]\n[sandboxes.outer]\nimage = \"outer-image\"\n",
+        )
+        .expect("outer fragment should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("outer.toml".to_owned())];
+
+        let err = resolve_includes(&root, &mut config, VerifyMode::Strict)
+            .expect_err("a fragment declaring its own `include` must be rejected");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("outer.toml"),
+            "error must name the fragment that declared the nested include: {message}"
+        );
+        assert!(
+            message.to_lowercase().contains("nested include"),
+            "error must clearly state nested includes are unsupported: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fragment_with_unrecognized_top_level_key_fails_to_load() {
+        let root = temp_dir("unknown-top-level");
+        fs::write(
+            root.join("frag.toml"),
+            "totally_unknown_field = true\n[sandboxes.frag]\nimage = \"frag-image\"\n",
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .expect("config should be written");
+
+        let err = resolve_config(&path).expect_err("unrecognized top-level fragment key must fail");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("totally_unknown_field"),
+            "error must name the unrecognized key: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fragment_with_unrecognized_key_inside_sandbox_table_fails_to_load() {
+        let root = temp_dir("unknown-sandbox-key");
+        fs::write(
+            root.join("frag.toml"),
+            "[sandboxes.mydev]\nimage = \"frag-image\"\ntotally_unknown_sandbox_key = 1\n",
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .expect("config should be written");
+
+        let err = resolve_config(&path)
+            .expect_err("unrecognized key inside a fragment's [sandboxes.X] must fail");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("sandboxes.mydev"),
+            "error must name the table the unrecognized key was found in: {message}"
+        );
+        assert!(
+            message.contains("totally_unknown_sandbox_key"),
+            "error must name the unrecognized key: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fragment_with_unrecognized_key_inside_agent_credentials_fails_to_load() {
+        let root = temp_dir("unknown-credential-key");
+        fs::write(
+            root.join("frag.toml"),
+            "[agents.frag_agent]\nkind = \"acp\"\ncommand = \"codex\"\n\n[[agents.frag_agent.credentials]]\nfrom_env = \"MY_TOKEN\"\nenv = \"TOKEN\"\ntotally_unknown_credential_key = 1\n",
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .expect("config should be written");
+
+        let err = resolve_config(&path)
+            .expect_err("unrecognized key inside a fragment credential entry must fail");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("totally_unknown_credential_key"),
+            "error must name the unrecognized key: {message}"
+        );
+        assert!(
+            message.contains("agents.frag_agent.credentials"),
+            "error must name the credentials entry it was found in: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fragment_using_only_recognized_and_absent_optional_keys_loads_successfully() {
+        let root = temp_dir("recognized-only");
+        fs::write(
+            root.join("frag.toml"),
+            r#"[sandboxes.frag]
+image = "frag-image"
+
+[agents.frag_agent]
+kind = "acp"
+command = "codex"
+
+[[agents.frag_agent.credentials]]
+from_env = "MY_TOKEN"
+env = "TOKEN"
+
+[[routes]]
+glob = "frag/**"
+agents = ["frag_agent"]
+"#,
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .expect("config should be written");
+
+        let config = resolve_config(&path)
+            .expect("a fragment using only recognized keys must load successfully");
+
+        assert!(config.sandboxes.contains_key("frag"));
+        assert!(config.agents.contains_key("frag_agent"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn central_config_with_stray_unknown_key_still_loads_unaffected() {
+        let root = temp_dir("central-stray-key");
+        let path = root.join("config.toml");
+        let content = format!(
+            "{}\n[sandboxes.central]\nimage = \"central-image\"\ntotally_unknown_central_key = 1\n",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        let config = load_config(&path).expect(
+            "a stray unknown key in the CENTRAL config must be tolerated exactly as before this change",
+        );
+
+        assert_eq!(
+            config.sandboxes["central"].image.as_deref(),
+            Some("central-image")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tier1_load_config_skips_requirement_validation_that_tier2_resolve_config_enforces() {
+        let root = temp_dir("tier1-skips-requirements");
+        let path = root.join("config.toml");
+        let content = format!(
+            "requires_commands = [\"definitely-not-a-real-command-tier1\"]\n{}",
+            minimal_config_toml()
+        );
+        fs::write(&path, content).expect("config should be written");
+
+        load_config(&path).expect("Tier 1 load_config must not run validate_requirements at all");
+        let err = resolve_config(&path)
+            .expect_err("Tier 2 resolve_config must still enforce requires_commands");
+        assert!(
+            format!("{err:#}").contains("definitely-not-a-real-command-tier1"),
+            "resolve_config error must name the missing command"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bundle_sourced_route_is_visible_via_resolve_config_but_not_via_load_config() {
+        let root = temp_dir("tier-route-visibility");
+        fs::write(
+            root.join("frag.toml"),
+            "[[routes]]\nglob = \"bundle/**\"\nagents = [\"codex\"]\n",
+        )
+        .expect("frag should be written");
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .expect("config should be written");
+
+        let tier1 =
+            load_config(&path).expect("Tier 1 load_config should still parse the central file");
+        assert!(
+            !tier1.routes.iter().any(|route| route.glob == "bundle/**"),
+            "Tier 1 load_config must not merge include-sourced routes"
+        );
+
+        let tier2 = resolve_config(&path).expect("Tier 2 resolve_config should resolve includes");
+        assert!(
+            tier2.routes.iter().any(|route| route.glob == "bundle/**"),
+            "Tier 2 resolve_config must merge include-sourced routes"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tier1_load_config_ignores_a_pinned_include_pointing_at_a_nonexistent_file() {
+        let root = temp_dir("tier1-pin-nonexistent");
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "include = [{{ path = \"does-not-exist.toml\", sha256 = \"{}\" }}]\n{}",
+                "a".repeat(64),
+                minimal_config_toml()
+            ),
+        )
+        .expect("config should be written");
+
+        load_config(&path).expect(
+            "Tier 1 load_config must not read fragment files at all, even a pinned one \
+             pointing at a nonexistent file",
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_config_refuses_but_resolve_config_for_diagnostics_warns_on_a_flipped_byte() {
+        let root = temp_dir("tier2-strict-vs-diagnostic");
+        let frag_path = root.join("frag.toml");
+        let original_frag = "[[routes]]\nglob = \"bundle/**\"\nagents = [\"codex\"]\n";
+        fs::write(&frag_path, original_frag).expect("frag should be written");
+        let pin = sha256_hex(original_frag.as_bytes());
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "include = [{{ path = \"frag.toml\", sha256 = \"{pin}\" }}]\n{}",
+                minimal_config_toml()
+            ),
+        )
+        .expect("config should be written");
+
+        // Flip a byte in the fragment so it no longer matches its pin.
+        fs::write(
+            &frag_path,
+            "[[routes]]\nglob = \"bundlz/**\"\nagents = [\"codex\"]\n",
+        )
+        .expect("frag should be rewritable");
+
+        let err = resolve_config(&path).expect_err(
+            "a launch/dispatch call site (resolve_config) must refuse a flipped-byte fragment",
+        );
+        let message = format!("{err:#}");
+        assert!(message.contains("REFUSED"));
+        assert!(message.contains("frag.toml"));
+        assert!(message.contains(&pin));
+
+        let (diagnostic_config, warnings) = resolve_config_for_diagnostics(&path).expect(
+            "a read-only diagnostic call site must keep working on a flipped-byte fragment",
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the diagnostic caller must be told which include is unverified"
+        );
+        assert!(warnings[0].contains("frag.toml"));
+        assert!(
+            diagnostic_config
+                .routes
+                .iter()
+                .any(|route| route.glob == "bundlz/**"),
+            "diagnostic mode must still report the TRUE (unverified) route content"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Build an isolated [`config_approval::ApprovalStore`] rooted under `root`,
+    /// injected directly into [`resolve_pin_mismatch_with`] instead of via the
+    /// process-wide `VARDA_HOME` env var. `cargo test` runs tests concurrently
+    /// within one process by default, and `VARDA_HOME` is read by
+    /// `ApprovalStore::open()`; two tests mutating it at once could each
+    /// redirect the OTHER's `ApprovalStore` operations to the wrong temp dir.
+    /// Building the store directly via `open_at` sidesteps the shared env var
+    /// entirely, so these tests need no cross-test serialization.
+    fn isolated_approval_store(root: &Path) -> config_approval::ApprovalStore {
+        config_approval::ApprovalStore::open_at(root.join("home").join("approved-bundles"))
+            .expect("isolated approval store should open")
+    }
+
+    #[test]
+    fn detect_launch_context_treats_the_broker_env_signal_as_sandboxed() {
+        let _guard = EnvGuard::set("VARDA_MCP_ADDR", "127.0.0.1:1");
+        assert_eq!(
+            detect_launch_context(),
+            LaunchContext::Sandboxed,
+            "the VARDA_MCP_ADDR guest-env signal acp.rs sets for a sandboxed, \
+             orchestrated launch must be detected as Sandboxed"
+        );
+    }
+
+    #[test]
+    fn detect_launch_context_treats_the_sandboxed_marker_as_sandboxed_ahead_of_tty_state() {
+        // #806: an interactive docker/microsandbox/clawk launch with NO
+        // orchestration broker wired sets neither VARDA_MCP_ADDR nor
+        // VARDA_MCP_SOCKET, but DOES get `mark_sandboxed`'s
+        // `crate::sandbox::SANDBOXED_MARKER_ENV` (acp.rs sets it on every
+        // non-`local` launch, batch or interactive, broker or no broker).
+        // Real stdin/stdout can't be forced into "is a terminal" from a unit
+        // test, so this cannot directly reproduce the "TTY looks interactive"
+        // half of the bug end-to-end; what it verifies is that the marker
+        // check alone is sufficient to short-circuit to `Sandboxed`, which is
+        // what makes TTY-state irrelevant — `detect_launch_context` returns
+        // from the marker check via an unconditional early `return` BEFORE
+        // the `IsTerminal` check ever runs (read directly above), so once
+        // this assertion holds, TTY state provably cannot override it,
+        // whatever this test process's own stdin/stdout happen to be.
+        let _guard = EnvGuard::set(crate::sandbox::SANDBOXED_MARKER_ENV, "1");
+        assert_eq!(
+            detect_launch_context(),
+            LaunchContext::Sandboxed,
+            "the unconditional sandbox marker must be detected as Sandboxed even with \
+             no MCP broker env vars set"
+        );
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_empty_diff_repins_silently_without_prompting() {
+        let root = temp_dir("mismatch-empty-diff");
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+
+        // Old and new content differ only by a comment — same parsed capabilities.
+        let old = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        let new = "# a harmless comment\n[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let store = isolated_approval_store(&root);
+        store
+            .store_approval(&include_path, old)
+            .expect("prior approval should store");
+
+        let result = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            // Context is irrelevant on an empty diff — Sandboxed proves it's never
+            // even consulted, since the closure below panics if ever called.
+            LaunchContext::Sandboxed,
+            || panic!("must never prompt when the capability diff is empty"),
+            &store,
+        )
+        .expect("an empty-diff mismatch must silently re-pin, not refuse");
+
+        assert_eq!(result, new);
+        let stored = store
+            .load_approved_content(&include_path)
+            .expect("store should be readable");
+        assert_eq!(
+            stored.as_deref(),
+            Some(new),
+            "the approval store must be updated to the new content"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_headless_refuses_without_prompting() {
+        let root = temp_dir("mismatch-headless");
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let store = isolated_approval_store(&root);
+        let err = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            LaunchContext::Headless,
+            || panic!("a headless run must never block on a prompt"),
+            &store,
+        )
+        .expect_err("a headless run with a non-empty diff must refuse");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("REFUSED"));
+        assert!(message.contains("frag.toml"));
+        assert!(message.contains("non-interactive"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_sandboxed_refuses_without_ever_offering_the_prompt() {
+        let root = temp_dir("mismatch-sandboxed");
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let store = isolated_approval_store(&root);
+        let err = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            LaunchContext::Sandboxed,
+            || panic!(
+                "a sandboxed worker/resident must never be offered the approval prompt, \
+                 even if it would answer yes"
+            ),
+            &store,
+        )
+        .expect_err("a sandboxed run with a non-empty diff must refuse");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("REFUSED"));
+        assert!(message.contains("sandbox"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_interactive_decline_falls_back_to_prior_approval() {
+        let root = temp_dir("mismatch-decline-fallback");
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+
+        let old = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n\n\
+                   [[routes]]\nglob = \"b/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let store = isolated_approval_store(&root);
+        store
+            .store_approval(&include_path, old)
+            .expect("prior approval should store");
+
+        let result = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            LaunchContext::InteractiveTty,
+            || Ok(false),
+            &store,
+        )
+        .expect("declining with a prior approval must fall back, not refuse");
+
+        assert_eq!(
+            result, old,
+            "a decline must proceed with the PREVIOUSLY-APPROVED bytes, not the live ones"
+        );
+        let stored = store
+            .load_approved_content(&include_path)
+            .expect("store should be readable");
+        assert_eq!(
+            stored.as_deref(),
+            Some(old),
+            "declining must not silently re-pin the new content"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_interactive_decline_and_no_prior_approval_refuses() {
+        let root = temp_dir("mismatch-decline-no-fallback");
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let store = isolated_approval_store(&root);
+        let err = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            LaunchContext::InteractiveTty,
+            || Ok(false),
+            &store,
+        )
+        .expect_err("declining first use (no prior approval) must refuse — nothing to fall back to");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("REFUSED"));
+        assert!(message.contains("no previously-approved"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_pin_mismatch_with_interactive_approval_stores_and_proceeds_with_new_content() {
+        let root = temp_dir("mismatch-approve");
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be creatable");
+        let include_path = bundle_dir.join("frag.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&include_path, new).expect("frag should be written");
+
+        let store = isolated_approval_store(&root);
+
+        let result = resolve_pin_mismatch_with(
+            &include_path,
+            "frag.toml",
+            &bundle_dir,
+            new,
+            "deadbeef",
+            "cafef00d",
+            LaunchContext::InteractiveTty,
+            || Ok(true),
+            &store,
+        )
+        .expect("approving at the prompt must proceed with the new content");
+
+        assert_eq!(result, new);
+        let stored = store
+            .load_approved_content(&include_path)
+            .expect("store should be readable");
+        assert_eq!(stored.as_deref(), Some(new));
+
+        fs::remove_dir_all(&root).ok();
     }
 }

@@ -21,6 +21,7 @@ use crate::agent::{
 use crate::config::AgentConfig;
 use crate::sandbox::{
     CommandSpec, LaunchMode, LocalProvider, SandboxContext, SandboxProvider, SandboxSession,
+    mark_sandboxed,
 };
 
 /// Guest-visible path the staged task prompt lands at inside a non-`local`
@@ -399,6 +400,10 @@ impl AcpSubprocessClient {
         // Live stores (local) are polled while the agent runs; extracted stores
         // (docker volume + `docker cp`) are only discovered post-exit.
         let store_is_live = session.store_is_live();
+        // Prove "running inside a sandbox" to the guest process regardless of
+        // whether orchestration's MCP broker is wired (#806) — must run before
+        // `wrap()`, which bakes `env` into the wrapped argv for some providers.
+        mark_sandboxed(&mut spec, self.sandbox.name());
         let spec = session.wrap(spec, LaunchMode::Batch).with_context(|| {
             format!(
                 "failed to wrap command for '{}' sandbox",
@@ -904,7 +909,7 @@ impl AcpSubprocessClient {
         env.insert("VARDA_PROMPT_FILE".to_owned(), guest_prompt.clone());
         // M11-ext — stage file-target credentials (env targets fold in via env above).
         stage_identity_files(session, self.sandbox.name())?;
-        let spec = CommandSpec {
+        let mut spec = CommandSpec {
             env: env.clone(),
             ..spec
         };
@@ -924,6 +929,12 @@ impl AcpSubprocessClient {
         let session_store_root = session.session_store_root();
         let store_is_live = session.store_is_live();
 
+        // Prove "running inside a sandbox" to the guest process regardless of
+        // whether orchestration's MCP broker is wired (#806) — must run before
+        // `wrap()`, which bakes `env` into the wrapped argv for some providers.
+        // This function is only reached for a non-`local` sandbox (guarded at
+        // the call site), so the marker always applies here.
+        mark_sandboxed(&mut spec, self.sandbox.name());
         let wrapped = session
             .wrap(spec, LaunchMode::Interactive)
             .with_context(|| {
@@ -1787,6 +1798,7 @@ mod tests {
     #[tokio::test]
     async fn subprocess_client_sends_prompt_and_captures_recap() {
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "cat".to_owned(),
             args: vec![],
@@ -1851,6 +1863,7 @@ mod tests {
     #[tokio::test]
     async fn headless_continuation_executes_resume_command_not_fresh_agent() {
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "false".to_owned(),
             args: vec![],
@@ -1886,6 +1899,7 @@ mod tests {
         // the actual subprocess spawned is always "sh" on the resume path, so no
         // real `claude` binary is required for this test to run.
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "claude".to_owned(),
             args: vec![],
@@ -1947,6 +1961,7 @@ mod tests {
         // string handed to `sh -c`, it gets word-split instead of reaching `claude`
         // as a single `--settings` argument.
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "claude".to_owned(),
             args: vec![],
@@ -1998,6 +2013,7 @@ mod tests {
     #[tokio::test]
     async fn resume_hop_session_log_redacts_the_raw_resume_command() {
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "false".to_owned(),
             args: vec![],
@@ -2096,6 +2112,7 @@ mod tests {
         egress: Vec<String>,
     ) -> AcpSubprocessClient {
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: command.to_owned(),
             args: args.iter().map(|a| a.to_string()).collect(),
@@ -2136,6 +2153,7 @@ mod tests {
         egress: Vec<String>,
     ) -> AcpSubprocessClient {
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: command.to_owned(),
             args: args.iter().map(|a| a.to_string()).collect(),
@@ -2294,6 +2312,7 @@ mod tests {
     async fn docker_build_sandbox_returns_parsed_recap() {
         let dockerfile = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/Dockerfile.rust");
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "cat".to_owned(),
             args: vec![],
@@ -2446,6 +2465,7 @@ mod tests {
     #[ignore = "requires a running docker daemon"]
     async fn docker_agent_static_env_visible_in_guest() {
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "sh".to_owned(),
             args: vec![
@@ -2500,6 +2520,7 @@ mod tests {
         image: &str,
     ) -> AcpSubprocessClient {
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: command.to_owned(),
             args: vec![],
@@ -2591,6 +2612,7 @@ mod tests {
     #[tokio::test]
     async fn interpreter_subprocess_uses_separate_process_group() {
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "sh".to_owned(),
             args: vec![
@@ -2668,6 +2690,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("temp directory should be created");
         let log_path = root.join("session.log");
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "sh".to_owned(),
             args: vec![
@@ -2740,6 +2763,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("temp directory should be created");
         let root = std::fs::canonicalize(root).expect("temp directory should canonicalize");
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "sh".to_owned(),
             args: vec![
@@ -2965,6 +2989,7 @@ mod tests {
     #[test]
     fn build_resume_command_substitutes_session_id_and_project() {
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "claude".to_owned(),
             args: vec![],
@@ -3002,6 +3027,7 @@ mod tests {
         // word-split this into two `--add-dir` arguments, silently corrupting the
         // headless auto-resume invocation this command now feeds directly into `sh`.
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "claude".to_owned(),
             args: vec![],
@@ -3057,6 +3083,7 @@ mod tests {
         let hostile_session_id = format!("abc; touch {}", sentinel.display());
 
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "claude".to_owned(),
             args: vec![],
@@ -3103,6 +3130,7 @@ mod tests {
     #[test]
     fn build_resume_command_returns_none_without_template() {
         let config = AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "claude".to_owned(),
             args: vec![],
@@ -3263,6 +3291,7 @@ mod tests {
 
     fn interactive_shell_config() -> AgentConfig {
         AgentConfig {
+            untrusted: false,
             kind: crate::config::AgentKind::Acp,
             command: "claude".to_owned(),
             args: vec![],

@@ -2029,6 +2029,7 @@ Help interactively.
         config.agents.insert(
             "claude".to_owned(),
             AgentConfig {
+                untrusted: false,
                 command: "sh".to_owned(),
                 args: vec![
                     "-c".to_owned(),
@@ -2040,6 +2041,7 @@ Help interactively.
         config.agents.insert(
             "shell".to_owned(),
             AgentConfig {
+                untrusted: false,
                 command: "sh".to_owned(),
                 interpreter_agent: Some("claude".to_owned()),
                 ..base
@@ -2130,6 +2132,7 @@ Help interactively.
         config.agents.insert(
             "shell".to_owned(),
             AgentConfig {
+                untrusted: false,
                 command: "sh".to_owned(),
                 skip_recap: true,
                 ..base
@@ -2823,10 +2826,12 @@ Help interactively.
                 orchestration: None,
                 env: BTreeMap::new(),
                 verify: Vec::new(),
+                untrusted: false,
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),
                 AgentConfig {
+                    untrusted: false,
                     kind: AgentKind::Acp,
                     command: "codex".to_owned(),
                     args: vec![],
@@ -2848,6 +2853,9 @@ Help interactively.
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         }
     }
 }

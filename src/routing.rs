@@ -29,6 +29,13 @@ pub struct RouteMatch {
     /// Host-side verification commands (#674) declared on the matched route.
     /// Empty ⇒ no gate configured for this project.
     pub verify: Vec<String>,
+    /// `true` when the matched route was declared by an included,
+    /// less-trusted fragment rather than the central config (mirrors
+    /// [`Route::untrusted`]). `build_client`'s no-project path unions
+    /// `route_env`'s keys into `untrusted_env_keys` when this is set, so a
+    /// fragment-sourced route cannot bind a fnox secret through its own
+    /// `env` map even when there is no project-scoped `.varda` resolution.
+    pub untrusted: bool,
 }
 
 impl RouteMatch {
@@ -71,6 +78,7 @@ pub fn match_route(
         route_mounts: route.mounts.clone(),
         route_env: route.env.clone(),
         verify: route.verify.clone(),
+        untrusted: route.untrusted,
     })
 }
 
@@ -110,6 +118,7 @@ pub fn match_route_for_task(
         route_mounts: route.mounts.clone(),
         route_env: route.env.clone(),
         verify: route.verify.clone(),
+        untrusted: route.untrusted,
     })
 }
 
@@ -374,6 +383,7 @@ mod tests {
                     env: BTreeMap::new(),
                     orchestration: None,
                     verify: Vec::new(),
+                    untrusted: false,
                 },
                 Route {
                     glob: "**".to_owned(),
@@ -383,12 +393,14 @@ mod tests {
                     env: BTreeMap::new(),
                     orchestration: None,
                     verify: Vec::new(),
+                    untrusted: false,
                 },
             ],
             agents: BTreeMap::from([
                 (
                     "codex".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "codex".to_owned(),
                         args: vec!["--acp".to_owned()],
@@ -409,6 +421,7 @@ mod tests {
                 (
                     "fallback".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "other".to_owned(),
                         args: vec![],
@@ -431,6 +444,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let route = match_route(&config, Path::new("/work/special/project"), None)
@@ -457,6 +473,7 @@ mod tests {
                     orchestration: None,
                     env: BTreeMap::new(),
                     verify: Vec::new(),
+                    untrusted: false,
                 },
                 Route {
                     glob: "**".to_owned(),
@@ -466,12 +483,14 @@ mod tests {
                     orchestration: None,
                     env: BTreeMap::new(),
                     verify: Vec::new(),
+                    untrusted: false,
                 },
             ],
             agents: BTreeMap::from([
                 (
                     "codex".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "codex".to_owned(),
                         args: vec![],
@@ -492,6 +511,7 @@ mod tests {
                 (
                     "claude".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "claude".to_owned(),
                         args: vec![],
@@ -512,6 +532,7 @@ mod tests {
                 (
                     "copilot".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "gh".to_owned(),
                         args: vec![],
@@ -534,6 +555,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let adb_route = match_route(
@@ -566,10 +590,12 @@ mod tests {
                 orchestration: None,
                 env: BTreeMap::new(),
                 verify: Vec::new(),
+                untrusted: false,
             }],
             agents: BTreeMap::from([(
                 "codex".to_owned(),
                 AgentConfig {
+                    untrusted: false,
                     kind: AgentKind::Acp,
                     command: "codex".to_owned(),
                     args: vec![],
@@ -591,6 +617,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
 
         let error = match_route(&config, Path::new("/work/project"), Some("claude"))
@@ -616,11 +645,13 @@ mod tests {
                 orchestration: None,
                 env: BTreeMap::new(),
                 verify: Vec::new(),
+                untrusted: false,
             }],
             agents: BTreeMap::from([
                 (
                     "small".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "small".to_owned(),
                         args: vec![],
@@ -641,6 +672,7 @@ mod tests {
                 (
                     "large".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "large".to_owned(),
                         args: vec![],
@@ -663,6 +695,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),
@@ -712,11 +747,13 @@ mod tests {
                 orchestration: None,
                 env: BTreeMap::new(),
                 verify: Vec::new(),
+                untrusted: false,
             }],
             agents: BTreeMap::from([
                 (
                     "small".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "small".to_owned(),
                         args: vec![],
@@ -737,6 +774,7 @@ mod tests {
                 (
                     "large".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "large".to_owned(),
                         args: vec![],
@@ -759,6 +797,9 @@ mod tests {
             git: GitConfig { auto_commit: true },
             sandboxes: std::collections::BTreeMap::new(),
             orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
         };
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),

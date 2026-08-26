@@ -506,6 +506,21 @@ varda task migrate-status
 
 It rewrites every `status: pending` file under the configured operations task directory to `status: review`, preserves all other frontmatter and the task body, is idempotent, and reports how many files were changed.
 
+## Inspect And Repair A Run
+
+Five `varda task` subcommands exist for looking at a run after the fact; they are the first thing to reach for when a task misbehaves.
+
+| Command | What it does |
+| --- | --- |
+| `varda task inspect <TASK>` | Runtime diagnostics for a task: resolved agent config, the matched route, session logs, and any live processes. Start here when a run is behaving unexpectedly. |
+| `varda task doctor <TASK>` | Probes the **latest** run by cross-checking independent authorities — the sandbox provider's own view of the box and the session log — and reports whether it booted, produced output, and reached a terminal state. Use it when a task looks stuck: it distinguishes "still working", "finished but the recap is late", and "the box died". |
+| `varda task show <TASK>` | The task body (with any repo-local `.varda/` definition overlaid) plus its recap. |
+| `varda task edit <TASK>` | Opens the markdown task in `$EDITOR`. |
+| `varda task resolve <TASK>` | Prints the resolved file path for a task id or path — useful in scripts and when an id is ambiguous. |
+| `varda task delete <TASK>` | Deletes the task's runtime **state** file and its recaps from the home store. The repo-local `.varda/tasks/` definition, if any, is not touched. |
+
+> A task id resolves through both the home state store and the repo-local `.varda/tasks/` definitions. When the two disagree, `varda task show` renders the overlaid body — the same one the runner uses — while the raw file on disk may differ.
+
 ## Resume A Task
 
 When an agent needs user input, the task is left in this state:
@@ -724,6 +739,8 @@ auto_commit = true
 
 Run `varda config edit` to open the global config in `$EDITOR`. If `EDITOR` is not set, Varda falls back to `vi`.
 
+Run `varda config show` to print the central `config.toml` file exactly as it is on disk, or `varda config show --resolved` to print the fully merged config — every `include` fragment merged in, with precedence applied — as it is actually used at runtime.
+
 For now, `kind = "acp"` means Varda uses its ACP-facing agent abstraction. The concrete POC adapter drives the local Codex CLI with `codex exec` through stdin/stdout because this machine's Codex CLI does not expose a direct `--acp` flag.
 
 When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder. Varda also expands `{varda_project}` to the Varda source project directory and `{varda_home}` to the Varda control-plane directory, then passes both as additional writable directories to the default Codex, Claude, and Copilot launch commands, so interpreter and resume sessions can create follow-up Varda tasks after the current task finishes.
@@ -753,6 +770,8 @@ These are the main config knobs that shape execution. The shipped default config
 | Orchestration defaults | `[orchestration] enabled = true; max_depth = 2; max_fanout = 4; global_child_budget = 16; deny_sandboxes = ["local"]` gates sandboxed subtask spawning. |
 | Route orchestration override | `[routes.orchestration] enabled = false` disables spawning for that matched route. |
 | Repo-local tasks and config | `.varda/tasks/<id>-<slug>.md` stores committed task definitions; `.varda/config.toml` can carry repo workflow rules while runtime state remains in `$VARDA_HOME`. |
+| Shareable config bundles | `include = ["team-bundle.toml"]` merges another TOML fragment's `[[routes]]`/`[sandboxes.*]`/`[agents.*]` into the central config; a central name always wins over an included one, and among includes a later one wins. The table form `{ path = "...", sha256 = "..." }` pins the fragment: at load time `varda` hashes the exact bytes it read and compares against the pin. A malformed pin (not 64 lowercase hex characters) is rejected when the central config is parsed, before any fragment is read. An entry without `sha256` is unaffected. The read-only `task inspect` and `task doctor` commands warn loudly and continue with the unverified content on a mismatch, so they can still report the true (if possibly stale) route/agent/sandbox. Commands that launch or dispatch work (`task run`, `orchestrate`, `plan`, `resume`, …) go through launch-time bundle approval on a mismatch instead of refusing outright: `varda` diffs the bundle's *capabilities* (not raw bytes) against the last-approved copy it keeps under `~/.varda/approved-bundles/` — sandbox escapes and host-command execution first, worded as plain consequences — and if nothing security-relevant changed (a comment, a key reorder, a pure capability removal) it silently re-pins and proceeds without prompting. If the capability surface *did* change, only an interactive human on an attached terminal is ever asked to approve; a headless run (`task run` under cron, no TTY) and any process already running inside a varda-managed sandbox (a spawned worker or the resident) always refuse outright instead — the latter can never be offered the prompt, since a sandboxed process approving its own capability escalation would defeat the control. Declining the prompt falls back to the previously-approved bundle when one exists (rather than leaving the run with nothing to run), or refuses outright on a first use with nothing to fall back to. A fragment declaring its own `include` is rejected (nested includes are not supported), and any key inside a fragment that this `varda` version does not recognize (typo, or version skew with whoever authored the bundle) fails config load loudly instead of being silently dropped; the central `config.toml` itself stays as permissive as before. |
+| Host requirement validation | `requires_commands = ["fnox"]` and `requires_secrets = ["tfc-token"]` (also settable inside an included fragment) fail `varda`'s config load loudly, listing every unmet requirement, when a command is missing from `$PATH` or a secret does not resolve via `fnox get NAME`. |
 
 Credential entries must name exactly one source (`from_env`, `from_secret`, `from_fnox`, or `command`) and one target (`env` or `file`). Store secret names, not resolved secret values, in config.
 
@@ -960,7 +979,7 @@ glob = "infra/**"
 env = { HCLOUD_TOKEN = "${fnox:hcloud-token}" }
 ```
 
-Only a **whole-value** `"${fnox:NAME}"` is a binding (never a substring of a larger literal), so the resolved secret is never embedded in — nor logged as part of — a bigger string. A missing/failed/empty fnox resolution **fails the run loudly** (redacted: only the key and secret *name* are surfaced, never the value). A fnox binding declared by an **untrusted `.varda`** is **refused** — repo-committed config must not be able to bind an arbitrary host secret and exfiltrate it through the agent's env; use the trusted central `config.toml` for fnox-bound env.
+Only a **whole-value** `"${fnox:NAME}"` is a binding (never a substring of a larger literal), so the resolved secret is never embedded in — nor logged as part of — a bigger string. A missing/failed/empty fnox resolution **fails the run loudly** (redacted: only the key and secret *name* are surfaced, never the value). A fnox binding declared by an **untrusted origin** is **refused** — repo-committed config must not be able to bind an arbitrary host secret and exfiltrate it through the agent's env; use the trusted central `config.toml` for fnox-bound env. Untrusted origins are the per-folder `.varda` (see below) **and** any `[agents.X]`/`[sandboxes.X]`/`[[routes]]` merged in from an `include`d fragment rather than declared directly in the central config — a shared bundle is exactly as untrusted for this purpose as a repo-committed `.varda`, and the same refusal applies to that fragment's own `credentials`/`auth_token_env` (see above).
 
 **2. Git identity via SSH-agent forwarding (channel 2).** Forward the host **SSH agent socket** so `git push` signs/authenticates on the host and **private keys never enter the box** (`ls ~/.ssh` in-guest stays empty). The read-only git identity is forwarded as `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env so commits are attributed correctly without mounting `~/.gitconfig`.
 
@@ -982,18 +1001,10 @@ identity_context = ["~/.claude/CLAUDE.md:/root/CLAUDE.md:ro", "~/profile.md:/roo
 
 Files only (never a whole dotdir, never `projects/` transcripts); the credential-**filename** denylist still applies, so a `.credentials.json` can never sneak in even when the file lives inside an otherwise-denylisted dir. All three channels are off by default — nothing is forwarded unless you opt in.
 
-#### Isolation invariants (never violate these)
-
-These rules are what make the sandbox meaningful; they also gate the future nested-orchestration broker:
-
-1. **Never mount the docker socket** (`/var/run/docker.sock`) into an agent container — it is equivalent to host root.
-2. **Never mount `~/.varda`** or install the `varda` binary into an agent container — it hands the agent the control plane.
-3. **No `--privileged` and no docker-in-docker** for agent containers.
-4. **Extra mounts default `:ro`; the host `$HOME` is never mounted** — the session store uses a dedicated per-session volume/dir, not a host `$HOME` bind.
-
 Current limitations:
 
 - **Resume is `local`-only.** Fresh interactive sessions run under `docker`/`microsandbox` (the real `claude`/`codex`/`copilot` agents attach to your TTY inside the box — see [Interactive sandbox](#interactive-sandbox-real-agents-tty-prompt-staging-injected-auth-and-the-docker-lifecycle)). **Resuming** an interactive session under a non-`local` sandbox still returns a clear error and remains `local`-only.
+
 ### Per-folder `.varda` overrides
 
 A project subtree can pin its own sandbox by placing a `.varda` file in (or above) the task's project directory. At launch Varda walks up from the project path to the git root and uses the **nearest** `.varda`, with precedence:
@@ -1046,7 +1057,7 @@ A "master" agent task running inside a sandbox may need to **decompose work** an
 The host-side policy engine and the live broker both live in `src/orchestration.rs`:
 
 - **Policy engine** — `OrchestrationPolicy` + `SpawnLedger::authorize`/`authorize_and_record`. Every cap is a **hard error** (`SpawnDenied`), never a silent truncation. Safe defaults: spawning is **disabled**, and the `local` (no-isolation) sandbox is denied so a spawned subtask cannot escape the box. `max_fanout` bounds **concurrent** children per parent, not a lifetime total: `SpawnLedger::release` frees a parent's slot the first time `await_subtask`/`await_subtasks` observes that child reach a terminal status, so a resident that runs many sequential waves over a long session is never permanently capped after its first `max_fanout` spawns (#716). `global_child_budget` is the separate, genuinely cumulative lifetime/cost ceiling and is never decremented.
-- **Broker** — `SpawnBroker` uses shared spawn state containing the ledger plus a **lineage registry** (task id → tree depth), a host `SubtaskLauncher` seam, and a host `SubtaskResults` seam (the collect side). It speaks MCP JSON-RPC (`handle_rpc`): `tools/list` advertises exactly `spawn_subtask`, `await_subtask`, `await_subtasks`, and `subtask_result`, and each `spawn_subtask` call is gated through `authorize_and_record` **before** the host is asked to launch. A denial comes back as an MCP tool error (`isError: true`) carrying the `SpawnDenied` reason. The caller **never supplies its own depth** — the broker looks it up from the lineage registry, so a compromised master cannot claim a shallow depth to dodge the recursion cap, and an unknown caller cannot spawn at all. If the host launch fails after authorization, the ledger is rolled back (`SpawnLedger::unrecord`) so a failed attempt consumes no budget.
+- **Broker** — `SpawnBroker` uses shared spawn state containing the ledger plus a **lineage registry** (task id → tree depth), a host `SubtaskLauncher` seam, and a host `SubtaskResults` seam (the collect side). It speaks MCP JSON-RPC (`handle_rpc`): `tools/list` advertises exactly eleven tools — the spawn side (`spawn_subtask`, `run_subtask`), the collect side (`await_subtask`, `await_subtasks`, `subtask_result`, `subtask_diff`), the integrate side (`integrate_subtasks`), and the task-board surface (`list_tasks`, `get_task`, `create_task`, `set_task_status`) — and each `spawn_subtask` call is gated through `authorize_and_record` **before** the host is asked to launch. A denial comes back as an MCP tool error (`isError: true`) carrying the `SpawnDenied` reason. The caller **never supplies its own depth** — the broker looks it up from the lineage registry, so a compromised master cannot claim a shallow depth to dodge the recursion cap, and an unknown caller cannot spawn at all. If the host launch fails after authorization, the ledger is rolled back (`SpawnLedger::unrecord`) so a failed attempt consumes no budget.
 - **Collect channel** — `await_subtask*` **block** by polling the `SubtaskResults` seam on a ~1s interval until the child reaches a **terminal** status (`done`/`failed`/`needs_user`/`review`), bounded by an absolute ceiling (30 min) so a wedged-but-still-resolvable child returns a timeout error rather than hanging forever. A subtask id that cannot be RESOLVED at all — unknown id, an ambiguous duplicate, or a failed state load — is a distinct outcome (`SubtaskStatus::Unresolved`) from "still running" and is surfaced as a tool error immediately, without waiting out the ceiling (#653). `subtask_result` resolves the child's recap and parses its `Files touched` / `Blocked commands` sections (the same `parse_files_touched`/`parse_blocked_commands` the runner uses) — it returns no resume command, since resuming is a resident host action, not a worker's. The concrete host `SubtaskResults` (`VardaSubtaskResults`) resolves a subtask id → home STATE via `task::lookup_task_state` and reads the recap file; the resident (un-sandboxed) host reuses the same impl directly. `task::find_task_by_id` (which `lookup_task_state` calls) resolves an id through a persistent id→path index (`operations/tasks/.task_index.json`) instead of rescanning every task file on every poll; a cache miss or stale entry falls back to a full-tree scan that also rebuilds the index, so a missing/corrupt index self-heals rather than staying slow (#653).
 - **Transport** — when the effective orchestration policy is enabled for a task, the run path starts a per-session MCP transport (`src/mcp_transport.rs`) that speaks newline-delimited JSON-RPC and dispatches into the live broker; no host process or docker capability is handed to the agent. Spawn authorization holds the shared broker state only while checking and recording policy, then releases it before the synchronous child run starts, so other MCP connections are not blocked on the global broker state for the whole child run. **The transport is selected by the sandbox primitive** (`config::primitive_needs_tcp_broker`):
   - `local`/`docker` (shared kernel) — a per-session **Unix socket** under the mounted project tree (`{project}/.varda-mcp/{session}.sock`), passed to the sandbox as `VARDA_MCP_SOCKET`. The guest reaches it through the bind mount.

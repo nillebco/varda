@@ -181,7 +181,18 @@ fn persisted_boot_probe(log: &str) -> Option<Probe> {
 }
 
 pub fn doctor_task_command(task_ref: &Path) -> Result<()> {
-    let config = config::load_config(&config::config_file()?)?;
+    let (config, unverified_includes) =
+        config::resolve_config_for_diagnostics(&config::config_file()?)?;
+    if !unverified_includes.is_empty() {
+        println!(
+            "⚠ UNVERIFIED CONFIG — the following include(s) failed sha256 pin verification; \
+             sandbox/routing diagnostics below may reflect stale or tampered bundle content:"
+        );
+        for warning in &unverified_includes {
+            println!("  - {warning}");
+        }
+        println!();
+    }
     let task_path = task::resolve_task_reference(&config, task_ref)?;
     let document = task::load_task(&task_path)?;
     let Some(session_id) = document.frontmatter.agent_session_ids.last() else {

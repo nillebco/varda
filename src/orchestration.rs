@@ -1542,8 +1542,12 @@ impl<L: SubtaskLauncher> SpawnBroker<L> {
             .is_some_and(|depth| *depth == 0)
     }
 
-    /// The MCP `tools/list` manifest: exactly the narrow spawn tool plus the
-    /// collect-side read-backs. Nothing else is advertised across the boundary.
+    /// The MCP `tools/list` manifest: the spawn side (`spawn_subtask`,
+    /// `run_subtask`), the collect-side read-backs (`await_subtask`,
+    /// `await_subtasks`, `subtask_result`, `subtask_diff`), the integrate side
+    /// (`integrate_subtasks`), and the task-board surface (`list_tasks`,
+    /// `get_task`, `create_task`, `set_task_status`). Nothing else is
+    /// advertised across the boundary.
     pub fn tool_manifest() -> Value {
         json!({
             "tools": [
