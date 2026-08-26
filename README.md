@@ -128,6 +128,8 @@ make install   # install to ~/.local/bin
 
 ## Current limitations
 
-- The Codex integration is a subprocess POC, not a full ACP protocol client yet.
+- Agents are driven as subprocesses — spawn the CLI, pipe the prompt on stdin, scrape the recap
+  from stdout — not over the Agent Client Protocol. `kind = "acp"` is a vestigial config field
+  with a single legal value that selects nothing.
 - Notification is file-backed JSON plus terminal output, with a best-effort macOS native signal for tasks that need user input.
 - Task handoff to another agent is represented by `review` plus recap metadata; automatic reassignment is not implemented yet.
