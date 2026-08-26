@@ -342,7 +342,10 @@ impl IncludeEntry {
 /// let it silently degrade into "no pin" (it would still parse as a `String`)
 /// or into a permanent, unexplainable mismatch.
 fn is_valid_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Validate every `include[].sha256` pin declared by the CENTRAL config at
@@ -1903,7 +1906,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// the unverified content, and records a human-readable warning in the
 /// returned `Vec` so the (read-only diagnostic) caller can label its output
 /// as unverified.
-fn resolve_includes(config_dir: &Path, config: &mut Config, mode: VerifyMode) -> Result<Vec<String>> {
+fn resolve_includes(
+    config_dir: &Path,
+    config: &mut Config,
+    mode: VerifyMode,
+) -> Result<Vec<String>> {
     let central_sandbox_names: std::collections::HashSet<String> =
         config.sandboxes.keys().cloned().collect();
     let central_agent_names: std::collections::HashSet<String> =
@@ -4733,7 +4740,10 @@ command = "codex"
             warnings.is_empty(),
             "a matching pin must not produce any unverified warning"
         );
-        assert_eq!(config.sandboxes["pinned"].image.as_deref(), Some("pinned-image"));
+        assert_eq!(
+            config.sandboxes["pinned"].image.as_deref(),
+            Some("pinned-image")
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -4760,7 +4770,10 @@ command = "codex"
             message.contains("REFUSED"),
             "the error must be unambiguous that config was REFUSED, not merely unreadable: {message}"
         );
-        assert!(message.contains("frag.toml"), "error must name the file: {message}");
+        assert!(
+            message.contains("frag.toml"),
+            "error must name the file: {message}"
+        );
         assert!(
             message.contains(&stale_pin),
             "error must include the expected digest: {message}"
@@ -5358,8 +5371,11 @@ agents = ["frag_agent"]
         .expect("config should be written");
 
         // Flip a byte in the fragment so it no longer matches its pin.
-        fs::write(&frag_path, "[[routes]]\nglob = \"bundlz/**\"\nagents = [\"codex\"]\n")
-            .expect("frag should be rewritable");
+        fs::write(
+            &frag_path,
+            "[[routes]]\nglob = \"bundlz/**\"\nagents = [\"codex\"]\n",
+        )
+        .expect("frag should be rewritable");
 
         let err = resolve_config(&path).expect_err(
             "a launch/dispatch call site (resolve_config) must refuse a flipped-byte fragment",
