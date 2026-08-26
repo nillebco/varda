@@ -1718,6 +1718,7 @@ Body.
                 orchestration: None,
                 env: std::collections::BTreeMap::new(),
                 verify: Vec::new(),
+                untrusted: false,
             }],
             agents: std::collections::BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
