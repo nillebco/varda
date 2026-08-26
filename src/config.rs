@@ -1183,6 +1183,17 @@ pub struct AgentConfig {
     /// `false`, so existing agents keep running the interpreter pass unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub skip_recap: bool,
+    /// Provenance, NOT a TOML field (never (de)serialized — set only by
+    /// [`resolve_includes`] after merge). `true` when this agent was declared by an
+    /// included, less-trusted fragment rather than the central config. Consulted by
+    /// `resolve_agent_credentials` in `main.rs`, which refuses to mint ANY host
+    /// credential (`credentials`/`auth_token_env`, regardless of source) for an
+    /// agent flagged this way — a fragment can declare `[[agents.X.credentials]]
+    /// command = "..."` (arbitrary host code exec) or `from_env`/`from_secret`
+    /// naming any host env var / secret, and nothing short of refusal stops it from
+    /// exfiltrating through the sandbox the moment the agent's identity resolves.
+    #[serde(skip)]
+    pub untrusted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1979,6 +1990,10 @@ fn resolve_includes(
             if let Some(working_dir) = &agent.working_dir {
                 agent.working_dir = Some(resolve_bundle_relative_command(working_dir, &bundle_dir));
             }
+            // This agent comes from a less-trusted included fragment, not the
+            // central config — `resolve_agent_credentials` (main.rs) refuses to
+            // mint any host credential for it. See the field doc on `untrusted`.
+            agent.untrusted = true;
         }
 
         config.routes.append(&mut fragment.routes);
@@ -2715,6 +2730,7 @@ mod tests {
 
     fn agent_with_credentials(credentials: Vec<CredentialConfig>) -> AgentConfig {
         AgentConfig {
+            untrusted: false,
             kind: AgentKind::Acp,
             command: "claude".to_owned(),
             args: vec![],
@@ -4634,6 +4650,34 @@ command = "codex"
             config.sandboxes["dup"].image.as_deref(),
             Some("frag2-dup"),
             "among includes themselves, a later include must win over an earlier one"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_includes_flags_fragment_sourced_agents_as_untrusted() {
+        let root = temp_dir("agent-provenance");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[agents.frag_agent]\nkind = \"acp\"\ncommand = \"true\"\n",
+        )
+        .expect("frag should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
+
+        assert!(
+            config.agents["frag_agent"].untrusted,
+            "an agent merged in from an included fragment must be flagged untrusted"
+        );
+        assert!(
+            !config.agents["codex"].untrusted,
+            "a central-config agent must never be flagged untrusted by resolve_includes"
         );
 
         fs::remove_dir_all(&root).ok();

@@ -2029,6 +2029,7 @@ Help interactively.
         config.agents.insert(
             "claude".to_owned(),
             AgentConfig {
+                untrusted: false,
                 command: "sh".to_owned(),
                 args: vec![
                     "-c".to_owned(),
@@ -2040,6 +2041,7 @@ Help interactively.
         config.agents.insert(
             "shell".to_owned(),
             AgentConfig {
+                untrusted: false,
                 command: "sh".to_owned(),
                 interpreter_agent: Some("claude".to_owned()),
                 ..base
@@ -2130,6 +2132,7 @@ Help interactively.
         config.agents.insert(
             "shell".to_owned(),
             AgentConfig {
+                untrusted: false,
                 command: "sh".to_owned(),
                 skip_recap: true,
                 ..base
@@ -2827,6 +2830,7 @@ Help interactively.
             agents: BTreeMap::from([(
                 "codex".to_owned(),
                 AgentConfig {
+                    untrusted: false,
                     kind: AgentKind::Acp,
                     command: "codex".to_owned(),
                     args: vec![],
