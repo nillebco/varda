@@ -164,7 +164,13 @@ Run `varda config edit` to open the global config in `$EDITOR`. If `EDITOR` is n
 
 Run `varda config show` to print the central `config.toml` file exactly as it is on disk, or `varda config show --resolved` to print the fully merged config — every `include` fragment merged in, with precedence applied — as it is actually used at runtime.
 
-For now, `kind = "acp"` means Varda uses its ACP-facing agent abstraction. The concrete POC adapter drives the local Codex CLI with `codex exec` through stdin/stdout because this machine's Codex CLI does not expose a direct `--acp` flag.
+`kind = "acp"` is currently the only legal value, and it selects nothing: `AgentKind` is a
+single-variant enum that is constructed everywhere and matched on nowhere. Varda does not
+implement the Agent Client Protocol for any agent. Every agent — Codex, Claude, Copilot,
+opencode — is launched as a subprocess, with the prompt piped on stdin (or staged as a guest
+file under a sandbox) and the recap scraped from stdout. The only per-agent branching is
+session-id discovery, which reads each CLI's own on-disk session store to build a resume
+command; that is file scraping, not protocol negotiation.
 
 When the generated Codex args contain `--cd "."`, Varda replaces that `.` at runtime with the task's `project` path. That is what makes the tracked project writable to Codex under `--sandbox workspace-write`, even though the task file itself lives in the global Varda control-plane folder. Varda also expands `{varda_project}` to the Varda source project directory and `{varda_home}` to the Varda control-plane directory, then passes both as additional writable directories to the default Codex, Claude, and Copilot launch commands, so interpreter and resume sessions can create follow-up Varda tasks after the current task finishes.
 

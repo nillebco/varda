@@ -22,7 +22,7 @@ Route your project to an agent, then write a task:
 ```sh
 varda project add "/path/to/project/**" --agents claude,codex
 cd /path/to/project
-varda task add "Summarize this project"     # opens $EDITOR
+varda task add "Summarize this project" --edit   # --edit opens $EDITOR
 varda task run <task>                       # or: varda run  (runs everything ready)
 varda task show <task>                      # the recap
 ```
@@ -51,7 +51,7 @@ agents = ["claude"]
 sandbox = "worker"
 ```
 
-Providers: **docker**, **microsandbox** (microVM), and **clawk**. Each box gets a scoped credential minted on the host — never your `~/.aws`, never your `~/.azure` — an egress allowlist instead of open internet, and a workspace mount that is the only writable path.
+Providers: **docker**, **microsandbox** (microVM), and **clawk**. Each box gets a scoped credential minted on the host — never your `~/.aws`, never your `~/.azure` — an egress allowlist instead of open internet, and only the mounts you declare — with identity files forced read-only and credential paths denylisted.
 
 Credentials are named, not embedded: config references a host env var or a secret-store key, and the value is resolved at launch. A repo-committed `.varda` is treated as untrusted and clamped to a hardening floor.
 
@@ -128,6 +128,8 @@ make install   # install to ~/.local/bin
 
 ## Current limitations
 
-- The Codex integration is a subprocess POC, not a full ACP protocol client yet.
+- Agents are driven as subprocesses — spawn the CLI, pipe the prompt on stdin, scrape the recap
+  from stdout — not over the Agent Client Protocol. `kind = "acp"` is a vestigial config field
+  with a single legal value that selects nothing.
 - Notification is file-backed JSON plus terminal output, with a best-effort macOS native signal for tasks that need user input.
 - Task handoff to another agent is represented by `review` plus recap metadata; automatic reassignment is not implemented yet.
