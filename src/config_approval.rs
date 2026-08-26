@@ -402,6 +402,7 @@ mod tests {
         credentials: Vec<CredentialConfig>,
     ) -> AgentConfig {
         AgentConfig {
+            untrusted: false,
             kind: AgentKind::Acp,
             command: "true".to_owned(),
             args: Vec::new(),

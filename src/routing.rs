@@ -389,6 +389,7 @@ mod tests {
                 (
                     "codex".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "codex".to_owned(),
                         args: vec!["--acp".to_owned()],
@@ -409,6 +410,7 @@ mod tests {
                 (
                     "fallback".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "other".to_owned(),
                         args: vec![],
@@ -475,6 +477,7 @@ mod tests {
                 (
                     "codex".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "codex".to_owned(),
                         args: vec![],
@@ -495,6 +498,7 @@ mod tests {
                 (
                     "claude".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "claude".to_owned(),
                         args: vec![],
@@ -515,6 +519,7 @@ mod tests {
                 (
                     "copilot".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "gh".to_owned(),
                         args: vec![],
@@ -576,6 +581,7 @@ mod tests {
             agents: BTreeMap::from([(
                 "codex".to_owned(),
                 AgentConfig {
+                    untrusted: false,
                     kind: AgentKind::Acp,
                     command: "codex".to_owned(),
                     args: vec![],
@@ -630,6 +636,7 @@ mod tests {
                 (
                     "small".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "small".to_owned(),
                         args: vec![],
@@ -650,6 +657,7 @@ mod tests {
                 (
                     "large".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "large".to_owned(),
                         args: vec![],
@@ -729,6 +737,7 @@ mod tests {
                 (
                     "small".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "small".to_owned(),
                         args: vec![],
@@ -749,6 +758,7 @@ mod tests {
                 (
                     "large".to_owned(),
                     AgentConfig {
+                        untrusted: false,
                         kind: AgentKind::Acp,
                         command: "large".to_owned(),
                         args: vec![],
