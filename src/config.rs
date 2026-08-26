@@ -1267,6 +1267,104 @@ pub enum AgentKind {
     Acp,
 }
 
+/// Which underlying CLI an agent invocation ultimately execs, whether it's called
+/// directly (`command = "copilot"`) or through a `sh -c "<setup>; exec copilot ..."`
+/// wrapper. This is the single source of truth for "is this a copilot/claude/codex
+/// agent" — session-capture (`acp.rs`) and `--add-dir` injection (`config.rs`) must
+/// both derive from it rather than each re-deriving their own string match, or they
+/// drift out of sync (task #783: `starts_with` vs `contains` disagreed on any agent
+/// whose shell arg ran setup before invoking the CLI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCli {
+    Claude,
+    Copilot,
+    Codex,
+}
+
+impl AgentCli {
+    fn from_binary(token: &str) -> Option<Self> {
+        match token {
+            "claude" => Some(AgentCli::Claude),
+            "copilot" => Some(AgentCli::Copilot),
+            "codex" => Some(AgentCli::Codex),
+            _ => None,
+        }
+    }
+}
+
+/// Resolves the CLI an agent invocation execs. For a bare command this is just the
+/// command itself; for a `sh -c "<script>"` wrapper it's the command word of the last
+/// shell segment (split on `;`, `&&`, `||`, `|`, newlines, with a leading `exec `
+/// stripped) that names a known CLI — so a setup preamble like
+/// `mkdir -p "$HOME/.copilot"; exec copilot ...` resolves to `Copilot`, not `None`,
+/// and doesn't false-match on `.copilot` substrings inside the preamble either.
+pub fn agent_cli_kind(command: &str, args: &[String]) -> Option<AgentCli> {
+    if let Some(kind) = AgentCli::from_binary(command) {
+        return Some(kind);
+    }
+
+    if command == "sh" && args.first().is_some_and(|arg| arg == "-c") {
+        if let Some(script) = args.get(1) {
+            return shell_script_cli_kind(script);
+        }
+    }
+
+    None
+}
+
+/// Splits `script` into segments on `;`, `&`, `|`, and newline, but only when those
+/// characters appear outside a single- or double-quoted span — a naive substring
+/// split would treat a separator character inside a quoted string literal (e.g.
+/// `echo 'x; copilot foo'`) as a real segment boundary (task #783). A backslash
+/// outside single quotes (whether inside a double-quoted span or bare) escapes the
+/// following character, so `\"` doesn't close a quote and `\;` outside any quote
+/// isn't treated as a segment boundary either, as a reasonable approximation of
+/// shell quoting; single-quoted spans have no escape mechanism, matching POSIX
+/// shell semantics.
+fn shell_script_cli_kind(script: &str) -> Option<AgentCli> {
+    let chars: Vec<char> = script.chars().collect();
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if !in_single && c == '\\' && i + 1 < chars.len() {
+            current.push(c);
+            current.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+        } else if matches!(c, ';' | '&' | '|' | '\n') && !in_single && !in_double {
+            segments.push(std::mem::take(&mut current));
+            i += 1;
+            continue;
+        }
+        current.push(c);
+        i += 1;
+    }
+    segments.push(current);
+
+    let mut found = None;
+    for segment in segments {
+        let mut token = segment.trim();
+        if let Some(rest) = token.strip_prefix("exec ") {
+            token = rest.trim_start();
+        }
+        let first_word = token.split_whitespace().next().unwrap_or("");
+        let binary = first_word.rsplit('/').next().unwrap_or(first_word);
+        if let Some(kind) = AgentCli::from_binary(binary) {
+            found = Some(kind);
+        }
+    }
+    found
+}
+
 /// One scoped credential injection for a sandboxed agent (M11-ext).
 ///
 /// Each entry names exactly one **source** — where the scoped value is minted on
@@ -2939,11 +3037,10 @@ fn add_varda_project_dir_to_default_agents(config: &mut Config) {
         match agent.command.as_str() {
             "codex" => add_codex_varda_project_dir(agent),
             "claude" => add_varda_dirs_as_arg_pairs(&mut agent.args),
-            "sh" if agent.args.first().is_some_and(|arg| arg == "-c")
-                && agent
-                    .args
-                    .get(1)
-                    .is_some_and(|arg| arg.contains("copilot ")) =>
+            "sh" if matches!(
+                agent_cli_kind(&agent.command, &agent.args),
+                Some(AgentCli::Copilot)
+            ) =>
             {
                 add_varda_dirs_to_shell_arg(&mut agent.args);
             }
@@ -2958,10 +3055,7 @@ fn add_varda_project_dir_to_default_agents(config: &mut Config) {
             let is_wrapped_agent = agent
                 .interactive_args
                 .as_deref()
-                .and_then(|args| args.get(1))
-                .is_some_and(|arg| {
-                    arg.contains("codex ") || arg.contains("claude ") || arg.contains("copilot ")
-                });
+                .is_some_and(|args| agent_cli_kind("sh", args).is_some());
             if is_wrapped_agent && let Some(args) = agent.interactive_args.as_mut() {
                 add_varda_dirs_to_shell_arg(args);
             }
@@ -3071,6 +3165,113 @@ mod tests {
             interpreter_agent: None,
             skip_recap: false,
         }
+    }
+
+    #[test]
+    fn agent_cli_kind_agrees_across_real_config_shapes() {
+        // Bare command, as used by the default `claude`/`codex` agents.
+        assert_eq!(agent_cli_kind("claude", &[]), Some(AgentCli::Claude));
+        assert_eq!(
+            agent_cli_kind("codex", &["exec".to_owned()]),
+            Some(AgentCli::Codex)
+        );
+
+        // `sh -c "copilot ..."`, as used by the default `copilot` agent.
+        let bare_wrapped = vec![
+            "-c".to_owned(),
+            "copilot -p \"$(cat)\" --allow-all-tools -s".to_owned(),
+        ];
+        assert_eq!(agent_cli_kind("sh", &bare_wrapped), Some(AgentCli::Copilot));
+
+        // `sh -c "<setup>; exec copilot ..."`, as used by `adb-copilot` (task #783):
+        // a trustedFolders preamble runs before the CLI is exec'd. The preamble's
+        // `.copilot` substring must NOT cause a false match on its own, and the
+        // segment that actually execs copilot must be found despite the preamble.
+        let setup_wrapped = vec![
+            "-c".to_owned(),
+            "mkdir -p \"$HOME/.copilot\"; exec copilot -p \"$(cat)\" --allow-all-tools -s"
+                .to_owned(),
+        ];
+        assert_eq!(
+            agent_cli_kind("sh", &setup_wrapped),
+            Some(AgentCli::Copilot)
+        );
+
+        // A setup preamble ending in `&&` rather than `;`, and no `exec`.
+        let and_wrapped = vec![
+            "-c".to_owned(),
+            "mkdir -p \"$HOME/.copilot\" && copilot -p \"$(cat)\"".to_owned(),
+        ];
+        assert_eq!(agent_cli_kind("sh", &and_wrapped), Some(AgentCli::Copilot));
+
+        // Unknown CLI wrapped in sh -c resolves to None, not a false positive.
+        let unknown_wrapped = vec!["-c".to_owned(), "opencode run --auto".to_owned()];
+        assert_eq!(agent_cli_kind("sh", &unknown_wrapped), None);
+    }
+
+    #[test]
+    fn agent_cli_kind_ignores_separators_inside_quoted_strings() {
+        assert_eq!(
+            agent_cli_kind("sh", &["-c".to_owned(), "echo 'x; copilot foo'".to_owned()]),
+            None,
+            "a separator character inside a quoted string must not be treated as a real segment boundary"
+        );
+    }
+
+    #[test]
+    fn agent_cli_kind_ignores_backslash_escaped_separator_outside_quotes() {
+        assert_eq!(
+            agent_cli_kind("sh", &["-c".to_owned(), "echo x\\; copilot foo".to_owned()]),
+            None,
+            "a backslash-escaped separator outside any quote must not be treated as a real segment boundary"
+        );
+    }
+
+    #[test]
+    fn add_varda_project_dir_to_default_agents_injects_for_setup_wrapped_copilot() {
+        // Regression test for task #783: an agent whose shell arg runs setup before
+        // `exec copilot ...` must still get the `--add-dir` injection, using the same
+        // `agent_cli_kind` predicate that drives session-capture in acp.rs.
+        let mut config: Config = toml::from_str(DEFAULT_CONFIG).expect("default config parses");
+        config.agents.insert(
+            "adb-copilot".to_owned(),
+            AgentConfig {
+                untrusted: false,
+                kind: AgentKind::Acp,
+                command: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "mkdir -p \"$HOME/.copilot\"; exec copilot -p \"$(cat)\" --allow-all-tools -s"
+                        .to_owned(),
+                ],
+                max_prompt_tokens: None,
+                working_dir: None,
+                env: BTreeMap::new(),
+                streams_output: None,
+                auth_token_env: None,
+                auth_token_target: None,
+                credentials: vec![],
+                interactive_command: None,
+                interactive_args: None,
+                resume_command_template: None,
+                interpreter_agent: None,
+                skip_recap: false,
+            },
+        );
+
+        add_varda_project_dir_to_default_agents(&mut config);
+
+        let args = &config.agents["adb-copilot"].args;
+        assert!(
+            args[1].contains("--add-dir {varda_project}"),
+            "expected varda_project add-dir injection, got: {}",
+            args[1]
+        );
+        assert!(
+            args[1].contains("--add-dir {varda_home}"),
+            "expected varda_home add-dir injection, got: {}",
+            args[1]
+        );
     }
 
     #[test]
