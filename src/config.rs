@@ -1119,8 +1119,12 @@ impl Default for SandboxConfig {
 
 /// `env`'s own keys when `untrusted`, else empty. Used to feed a fragment-sourced
 /// sandbox's/route's own env keys into `resolve_sandbox_for`'s `varda_env_keys`,
-/// the same way the repo-local `.varda` origin's keys already are.
-fn untrusted_env_keys_if(env: &BTreeMap<String, String>, untrusted: bool) -> Vec<String> {
+/// the same way the repo-local `.varda` origin's keys already are. `pub(crate)`
+/// so `build_client`'s no-`project_path` branch in `main.rs` can reuse it too.
+pub(crate) fn untrusted_env_keys_if(
+    env: &BTreeMap<String, String>,
+    untrusted: bool,
+) -> Vec<String> {
     if untrusted {
         env.keys().cloned().collect()
     } else {
@@ -1129,7 +1133,7 @@ fn untrusted_env_keys_if(env: &BTreeMap<String, String>, untrusted: bool) -> Vec
 }
 
 /// Union two untrusted-key lists without duplicates (small lists; O(n^2) is fine).
-fn union_keys(mut a: Vec<String>, b: Vec<String>) -> Vec<String> {
+pub(crate) fn union_keys(mut a: Vec<String>, b: Vec<String>) -> Vec<String> {
     for key in b {
         if !a.contains(&key) {
             a.push(key);

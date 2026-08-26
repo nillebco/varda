@@ -29,6 +29,13 @@ pub struct RouteMatch {
     /// Host-side verification commands (#674) declared on the matched route.
     /// Empty ⇒ no gate configured for this project.
     pub verify: Vec<String>,
+    /// `true` when the matched route was declared by an included,
+    /// less-trusted fragment rather than the central config (mirrors
+    /// [`Route::untrusted`]). `build_client`'s no-project path unions
+    /// `route_env`'s keys into `untrusted_env_keys` when this is set, so a
+    /// fragment-sourced route cannot bind a fnox secret through its own
+    /// `env` map even when there is no project-scoped `.varda` resolution.
+    pub untrusted: bool,
 }
 
 impl RouteMatch {
@@ -71,6 +78,7 @@ pub fn match_route(
         route_mounts: route.mounts.clone(),
         route_env: route.env.clone(),
         verify: route.verify.clone(),
+        untrusted: route.untrusted,
     })
 }
 
@@ -110,6 +118,7 @@ pub fn match_route_for_task(
         route_mounts: route.mounts.clone(),
         route_env: route.env.clone(),
         verify: route.verify.clone(),
+        untrusted: route.untrusted,
     })
 }
 
