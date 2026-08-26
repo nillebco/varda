@@ -1138,6 +1138,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         config::DEFAULT_SANDBOX_PROVIDER,
         &[],
         &std::collections::BTreeMap::new(),
+        false,
         None,
         None,
         None,
@@ -2121,9 +2122,14 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
 /// (walked up to the routing root) wins over the central route, the untrusted
 /// `.varda` origin is clamped by the hardening floor, and the three mount origins
 /// (`Sandbox`/`Route`/`Varda`) are merged into the provider. When `project_path`
-/// is `None` (no project context, e.g. plan transformation) the trusted-only
-/// by-name path is used with `sandbox_name`/`route_mounts`. `local` yields the
-/// identity provider; any other name must have a matching `[sandboxes.<name>]`.
+/// is `None` (no project context, e.g. a task with no `frontmatter.project`, or
+/// plan transformation) the by-name path is used with `sandbox_name`/
+/// `route_mounts`/`route_env`: no live `.varda` is resolved, but a fragment-
+/// sourced (`.untrusted`) sandbox's or route's own env is still gated the same
+/// way `resolve_sandbox_for`'s `varda_env_keys` gates it on the `Some` path —
+/// `route_untrusted` carries that flag in since this path has no `Route` struct
+/// to read it from directly. `local` yields the identity provider; any other
+/// name must have a matching `[sandboxes.<name>]`.
 #[allow(clippy::too_many_arguments)]
 fn build_client(
     config: &config::Config,
@@ -2132,6 +2138,7 @@ fn build_client(
     sandbox_name: &str,
     route_mounts: &[String],
     route_env: &std::collections::BTreeMap<String, String>,
+    route_untrusted: bool,
     project_path: Option<&Path>,
     policy_path: Option<&Path>,
     pinned_sandbox: Option<&str>,
@@ -2141,8 +2148,10 @@ fn build_client(
     // whichever provider is selected. `local` ignores them (no boundary to cross).
     let identity = resolve_sandbox_identity(config, agent_config)?;
     let mut static_env = std::collections::BTreeMap::new();
-    // Keys from the UNTRUSTED `.varda` origin, retained so `resolve_env_secrets`
-    // refuses a fnox binding from repo-committed config (see its doc).
+    // Keys from the UNTRUSTED `.varda`/sandbox/route origin, retained so
+    // `resolve_env_secrets` refuses a fnox binding from repo-committed config
+    // (see its doc). Always overwritten below — both match arms assign it.
+    #[allow(unused_assignments)]
     let mut untrusted_env_keys: Vec<String> = Vec::new();
     let provider = match project_path {
         Some(project_path) => {
@@ -2177,10 +2186,23 @@ fn build_client(
             sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &identity)?
         }
         None => {
+            // No project context ⇒ no `resolve_sandbox_for` call to compute
+            // `varda_env_keys`, but the sandbox/route env still needs the same
+            // fragment-sourced (`.untrusted`) origin gating so a fnox binding
+            // smuggled in through an included sandbox/route fragment is refused
+            // here too, not only on the `Some(project_path)` path.
+            let mut sandbox_untrusted_keys = Vec::new();
             if let Some(sandbox_config) = config.sandboxes.get(sandbox_name) {
                 static_env.extend(sandbox_config.env.clone());
+                sandbox_untrusted_keys = config::untrusted_env_keys_if(
+                    &sandbox_config.env,
+                    sandbox_config.untrusted,
+                );
             }
             static_env.extend(route_env.clone());
+            let route_untrusted_keys =
+                config::untrusted_env_keys_if(route_env, route_untrusted);
+            untrusted_env_keys = config::union_keys(sandbox_untrusted_keys, route_untrusted_keys);
             sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?
         }
     };
@@ -2538,6 +2560,7 @@ async fn run_task_path_for_parallel(
         &route.sandbox,
         &route.route_mounts,
         &route.route_env,
+        route.untrusted,
         task_document.frontmatter.project.as_deref().map(Path::new),
         task_document
             .frontmatter
@@ -4166,6 +4189,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         &route.sandbox,
         &route.route_mounts,
         &route.route_env,
+        route.untrusted,
         task_document.frontmatter.project.as_deref().map(Path::new),
         task_document
             .frontmatter
@@ -4414,6 +4438,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
         &route.sandbox,
         &route.route_mounts,
         &route.route_env,
+        route.untrusted,
         task_document.frontmatter.project.as_deref().map(Path::new),
         task_document
             .frontmatter
@@ -4519,6 +4544,7 @@ async fn run_captured_resume_command(
         &route.sandbox,
         &route.route_mounts,
         &route.route_env,
+        route.untrusted,
         task_document.frontmatter.project.as_deref().map(Path::new),
         task_document
             .frontmatter
@@ -5030,6 +5056,151 @@ mod tests {
         assert!(msg.contains("EXFIL"), "error must name the key: {msg}");
         // The sentinel is left in place; no value was resolved.
         assert_eq!(env.get("EXFIL").unwrap(), "${fnox:aws-prod-key}");
+    }
+
+    fn config_with_sandbox(name: &str, sandbox: config::SandboxConfig) -> config::Config {
+        let mut sandboxes = std::collections::BTreeMap::new();
+        sandboxes.insert(name.to_owned(), sandbox);
+        config::Config {
+            defaults: config::Defaults {
+                timeout_seconds: 600,
+                operations_dir: "operations".to_owned(),
+                sandbox: None,
+                ..Default::default()
+            },
+            routes: vec![],
+            agents: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
+            git: config::GitConfig { auto_commit: true },
+            sandboxes,
+            orchestration: crate::orchestration::OrchestrationPolicy::default(),
+            include: Vec::new(),
+            requires_commands: Vec::new(),
+            requires_secrets: Vec::new(),
+        }
+    }
+
+    /// Task #798 (follow-up to #796/#797): `build_client`'s `project_path: None`
+    /// branch — taken whenever a task's frontmatter has no `project` (a common,
+    /// live case, not a corner case) — bypassed `resolve_sandbox_for` entirely and
+    /// left `untrusted_env_keys` empty regardless of whether the sandbox/route
+    /// that contributed `static_env` was fragment-sourced. A fragment-sourced
+    /// SANDBOX's own `${fnox:...}` env binding must be refused on this path too,
+    /// mirroring `resolve_sandbox_for_unions_fragment_sourced_sandbox_env_into_varda_env_keys`
+    /// in `config.rs` for the `Some(project_path)` path.
+    #[test]
+    fn build_client_none_project_refuses_fragment_sourced_sandbox_fnox_binding() {
+        let config = config_with_sandbox(
+            "frag_sandbox",
+            config::SandboxConfig {
+                primitive: "local".to_owned(),
+                env: std::collections::BTreeMap::from([(
+                    "TOKEN".to_owned(),
+                    "${fnox:aws-prod-key}".to_owned(),
+                )]),
+                untrusted: true,
+                ..Default::default()
+            },
+        );
+        let agent_config = agent_for_credentials(vec![]);
+        let err = build_client(
+            &config,
+            "agent",
+            &agent_config,
+            "frag_sandbox",
+            &[],
+            &std::collections::BTreeMap::new(),
+            false,
+            None,
+            None,
+            None,
+        )
+        .map(|_| ())
+        .expect_err(
+            "fragment-sourced sandbox env fnox binding must be refused with no project_path",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("untrusted"),
+            "error must name the untrusted origin: {msg}"
+        );
+        assert!(msg.contains("TOKEN"), "error must name the key: {msg}");
+    }
+
+    /// Route half of the same gap: a fragment-sourced ROUTE's own `${fnox:...}`
+    /// env binding must be refused via `build_client`'s `None` branch too. Before
+    /// this fix `route_untrusted` did not exist as a parameter at all, so this
+    /// binding resolved unchecked.
+    #[test]
+    fn build_client_none_project_refuses_fragment_sourced_route_fnox_binding() {
+        let config = config_with_sandbox("unused", config::SandboxConfig::default());
+        let agent_config = agent_for_credentials(vec![]);
+        let route_env = std::collections::BTreeMap::from([(
+            "TOKEN".to_owned(),
+            "${fnox:aws-prod-key}".to_owned(),
+        )]);
+        let err = build_client(
+            &config,
+            "agent",
+            &agent_config,
+            config::DEFAULT_SANDBOX_PROVIDER,
+            &[],
+            &route_env,
+            true,
+            None,
+            None,
+            None,
+        )
+        .map(|_| ())
+        .expect_err(
+            "fragment-sourced route env fnox binding must be refused with no project_path",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("untrusted"),
+            "error must name the untrusted origin: {msg}"
+        );
+        assert!(msg.contains("TOKEN"), "error must name the key: {msg}");
+    }
+
+    /// A CENTRAL-config sandbox's and route's own env must be unaffected by the
+    /// untrusted-fragment refusal on the same `None`-project path (literal, non-
+    /// `fnox` values so the assertion doesn't depend on a real `fnox` binary being
+    /// on the host).
+    #[test]
+    fn build_client_none_project_allows_central_sandbox_and_route_env() {
+        let config = config_with_sandbox(
+            "central_sandbox",
+            config::SandboxConfig {
+                primitive: "local".to_owned(),
+                env: std::collections::BTreeMap::from([(
+                    "SAFE".to_owned(),
+                    "literal-value".to_owned(),
+                )]),
+                untrusted: false,
+                ..Default::default()
+            },
+        );
+        let agent_config = agent_for_credentials(vec![]);
+        let route_env = std::collections::BTreeMap::from([(
+            "ROUTE_SAFE".to_owned(),
+            "route-literal".to_owned(),
+        )]);
+        build_client(
+            &config,
+            "agent",
+            &agent_config,
+            "central_sandbox",
+            &[],
+            &route_env,
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect(
+            "central-config sandbox/route env must not be affected by the untrusted-fragment refusal",
+        );
     }
 
     #[test]
