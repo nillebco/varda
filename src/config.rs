@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const VARDA_HOME_ENV: &str = "VARDA_HOME";
 pub const CONFIG_FILENAME: &str = "config.toml";
@@ -302,8 +303,9 @@ pub struct Config {
 }
 
 /// One entry in `Config::include`: either a bare path string, or a
-/// `{path, sha256}` table. The `sha256` is stored for a FUTURE verification
-/// pass and is not checked yet.
+/// `{path, sha256}` table. When `sha256` is present, [`resolve_includes`]
+/// hashes the fragment's bytes at load time and refuses (or, in a read-only
+/// diagnostic, warns) on a mismatch — see [`VerifyMode`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum IncludeEntry {
@@ -324,6 +326,65 @@ impl IncludeEntry {
             IncludeEntry::Detailed { path, .. } => path,
         }
     }
+
+    /// The pinned digest, if this entry declared one.
+    fn sha256_pin(&self) -> Option<&str> {
+        match self {
+            IncludeEntry::Path(_) => None,
+            IncludeEntry::Detailed { sha256, .. } => sha256.as_deref(),
+        }
+    }
+}
+
+/// A `sha256` pin must be exactly 64 lowercase hex characters. Anything else
+/// (wrong length, uppercase, non-hex) is a typo or a copy-paste mistake from
+/// a tool that emits uppercase digests — reject it at parse time rather than
+/// let it silently degrade into "no pin" (it would still parse as a `String`)
+/// or into a permanent, unexplainable mismatch.
+fn is_valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Validate every `include[].sha256` pin declared by the CENTRAL config at
+/// parse time — before any fragment file is read. Runs on both Tier 1
+/// (`load_config`) and Tier 2 (`resolve_config`) since it only inspects the
+/// already-parsed central config, never a fragment.
+fn validate_include_pin_formats(config: &Config) -> Result<()> {
+    for entry in &config.include {
+        if let Some(pin) = entry.sha256_pin()
+            && !is_valid_sha256_hex(pin)
+        {
+            bail!(
+                "config include entry {} has a malformed sha256 pin ('{pin}'): \
+                 expected exactly 64 lowercase hex characters",
+                entry.path()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Controls how [`resolve_includes`] reacts to a pinned include whose
+/// fragment bytes don't match its `sha256`.
+///
+/// This is an explicit, named choice required at every Tier-2 call site — not
+/// an ambient flag, thread-local, or env var — because the distinction is
+/// security-relevant: a command that launches or dispatches work must never
+/// silently inherit the degraded diagnostic behavior. [`Default`] is the
+/// strict variant, so a future call site that forgets to choose gets the
+/// safe behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerifyMode {
+    /// Refuse to load on any pin mismatch. Required for anything that
+    /// launches or dispatches work (task run, orchestrate, plan, resume, …).
+    #[default]
+    Strict,
+    /// Warn loudly and continue with the unverified fragment content.
+    /// Reserved for read-only diagnostics (`inspect`, `doctor`) that must
+    /// keep reporting the true route/agent/sandbox even when a bundle has
+    /// drifted — a diagnostic that refuses is worse than one that reports
+    /// clearly-labeled unverified content.
+    DiagnosticDegraded,
 }
 
 /// The subset of [`Config`] an included TOML fragment file may declare.
@@ -1807,6 +1868,18 @@ pub fn config_file() -> Result<PathBuf> {
     Ok(varda_home()?.join(CONFIG_FILENAME))
 }
 
+/// Lowercase hex sha256 digest of `bytes`, in the same format an
+/// `include[].sha256` pin is written in.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Merge every `config.include` entry's fragment into `config`.
 ///
 /// Precedence: on a `sandboxes`/`agents` name collision, the CENTRAL config
@@ -1821,11 +1894,21 @@ pub fn config_file() -> Result<PathBuf> {
 /// CENTRAL `config.routes`/`config.sandboxes` are never touched/expanded by
 /// this function — only content coming from an included fragment goes
 /// through mount expansion.
-fn resolve_includes(config_dir: &Path, config: &mut Config) -> Result<()> {
+///
+/// When an entry declares a `sha256` pin, the exact bytes just read from the
+/// fragment (never a re-read — that would reintroduce a time-of-check/
+/// time-of-use gap) are hashed and compared against it. On mismatch, `mode`
+/// decides what happens: [`VerifyMode::Strict`] refuses the whole load;
+/// [`VerifyMode::DiagnosticDegraded`] warns loudly on stderr, continues with
+/// the unverified content, and records a human-readable warning in the
+/// returned `Vec` so the (read-only diagnostic) caller can label its output
+/// as unverified.
+fn resolve_includes(config_dir: &Path, config: &mut Config, mode: VerifyMode) -> Result<Vec<String>> {
     let central_sandbox_names: std::collections::HashSet<String> =
         config.sandboxes.keys().cloned().collect();
     let central_agent_names: std::collections::HashSet<String> =
         config.agents.keys().cloned().collect();
+    let mut unverified_warnings = Vec::new();
 
     for entry in &config.include {
         let expanded_path = expand_env_and_home(entry.path())
@@ -1838,6 +1921,34 @@ fn resolve_includes(config_dir: &Path, config: &mut Config) -> Result<()> {
 
         let content = fs::read_to_string(&include_path)
             .with_context(|| format!("failed to read included config fragment {}", entry.path()))?;
+
+        if let Some(pin) = entry.sha256_pin() {
+            let actual = sha256_hex(content.as_bytes());
+            if actual != pin {
+                let message = format!(
+                    "config include {} failed sha256 verification: expected {pin}, got {actual}",
+                    entry.path()
+                );
+                match mode {
+                    VerifyMode::Strict => {
+                        bail!(
+                            "config REFUSED: pinned include {} does not match its sha256 pin \
+                             (expected {pin}, got {actual}); the bundle content has changed \
+                             since it was pinned",
+                            entry.path()
+                        );
+                    }
+                    VerifyMode::DiagnosticDegraded => {
+                        eprintln!(
+                            "WARNING: {message}; continuing with UNVERIFIED content because \
+                             this is a read-only diagnostic command"
+                        );
+                        unverified_warnings.push(message);
+                    }
+                }
+            }
+        }
+
         reject_unknown_fragment_keys(&content, entry.path())?;
         let mut fragment: ConfigFragment = toml::from_str(&content).with_context(|| {
             format!("failed to parse included config fragment {}", entry.path())
@@ -1886,7 +1997,7 @@ fn resolve_includes(config_dir: &Path, config: &mut Config) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(unverified_warnings)
 }
 
 /// Field names recognized by [`ConfigFragment`] / [`SandboxConfig`] / [`AgentConfig`]
@@ -2321,6 +2432,7 @@ fn parse_central_config(path: &Path) -> Result<Config> {
     let mut config: Config = toml::from_str(&content)
         .with_context(|| format!("failed to parse config at {}", path.display()))?;
     resolve_config_paths(path, &mut config)?;
+    validate_include_pin_formats(&config)?;
 
     Ok(config)
 }
@@ -2329,8 +2441,9 @@ fn parse_central_config(path: &Path) -> Result<Config> {
 /// `include`d bundle fragments and does NOT validate `requires_commands`/`requires_secrets`.
 /// `config.include` is populated from parsing but left unprocessed — `sandboxes`/`agents`/
 /// `routes` reflect only the central file's own content. Cheap and side-effect free (no
-/// fragment file reads, no `fnox` shell-outs). Use this for call sites that don't need
-/// bundle-sourced routes/agents/sandboxes to be correct.
+/// fragment file reads, no `fnox` shell-outs, no sha256 verification — a pin's FORMAT is
+/// still validated here since that only inspects the already-parsed central config). Use
+/// this for call sites that don't need bundle-sourced routes/agents/sandboxes to be correct.
 pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
     let path = path.as_ref();
     let mut config = parse_central_config(path)?;
@@ -2341,24 +2454,43 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<Config> {
 }
 
 /// Tier 2: central-config parsing, then `resolve_includes` (merges bundle fragments'
-/// `[[routes]]`/`[sandboxes.*]`/`[agents.*]`), then the same agent-normalization steps as
-/// `load_config` (now applied to the merged agent set, matching the pre-split behavior),
-/// then `validate_requirements` (enforces `requires_commands`/`requires_secrets`).
-/// Functionally identical to the pre-split `load_config`. Use this for call sites whose
-/// correctness depends on bundle-sourced routes/agents/sandboxes (routing/dispatch
-/// decisions, sandbox resolution).
+/// `[[routes]]`/`[sandboxes.*]`/`[agents.*]`, verifying any `sha256` pin against the exact
+/// bytes read), then the same agent-normalization steps as `load_config` (now applied to the
+/// merged agent set, matching the pre-split behavior), then `validate_requirements` (enforces
+/// `requires_commands`/`requires_secrets`).
+///
+/// Runs in [`VerifyMode::Strict`]: a pin mismatch refuses the whole load. This is the correct
+/// default for anything that launches or dispatches work — use this call site unless you have
+/// a specific, read-only diagnostic reason not to (see [`resolve_config_for_diagnostics`]).
 pub fn resolve_config(path: impl AsRef<Path>) -> Result<Config> {
-    let path = path.as_ref();
+    resolve_config_with_mode(path.as_ref(), VerifyMode::Strict).map(|(config, _warnings)| config)
+}
+
+/// Tier 2, in [`VerifyMode::DiagnosticDegraded`]: identical to [`resolve_config`] except a
+/// pinned include whose bytes don't match its `sha256` does NOT refuse the load — it warns
+/// loudly (stderr) and continues with the unverified fragment content, and the returned `Vec`
+/// names every include that failed verification so the caller can label its output as
+/// unverified.
+///
+/// Reserved for READ-ONLY diagnostic commands (`inspect`, `doctor`) that must keep reporting
+/// the true route/agent/sandbox even when a bundle has drifted. Anything that launches or
+/// dispatches work (task run, orchestrate, plan, resume, spawn, …) MUST use [`resolve_config`]
+/// instead — refusing is the safe behavior there.
+pub fn resolve_config_for_diagnostics(path: impl AsRef<Path>) -> Result<(Config, Vec<String>)> {
+    resolve_config_with_mode(path.as_ref(), VerifyMode::DiagnosticDegraded)
+}
+
+fn resolve_config_with_mode(path: &Path, mode: VerifyMode) -> Result<(Config, Vec<String>)> {
     let mut config = parse_central_config(path)?;
     let config_dir = path
         .parent()
         .with_context(|| format!("config path {} has no parent", path.display()))?;
-    resolve_includes(config_dir, &mut config)?;
+    let warnings = resolve_includes(config_dir, &mut config, mode)?;
     remove_legacy_codex_exec_args(&mut config);
     add_varda_project_dir_to_default_agents(&mut config);
     validate_requirements(&config)?;
 
-    Ok(config)
+    Ok((config, warnings))
 }
 
 pub fn save_config(path: impl AsRef<Path>, config: &Config) -> Result<()> {
@@ -4476,7 +4608,7 @@ command = "codex"
             IncludeEntry::Path("frag2.toml".to_owned()),
         ];
 
-        resolve_includes(&root, &mut config).expect("includes should resolve");
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
 
         assert_eq!(
             config.sandboxes["shared"].image.as_deref(),
@@ -4506,7 +4638,7 @@ command = "codex"
             toml::from_str(&minimal_config_toml()).expect("base config should parse");
         config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
 
-        resolve_includes(&root, &mut config).expect("includes should resolve");
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
 
         assert_eq!(
             config.sandboxes["from_frag"].mounts,
@@ -4531,7 +4663,7 @@ command = "codex"
         config.routes[0].mounts = vec!["./relative-route:/y:ro".to_owned()];
 
         let root = temp_dir("no-includes");
-        resolve_includes(&root, &mut config).expect("includes should resolve");
+        resolve_includes(&root, &mut config, VerifyMode::Strict).expect("includes should resolve");
 
         assert_eq!(
             config.sandboxes["central"].mounts,
@@ -4561,7 +4693,7 @@ command = "codex"
             "${env:VARDA_TEST_BUNDLE_SECRET_DIR}/missing-fragment.toml".to_owned(),
         )];
 
-        let err = resolve_includes(&root, &mut config)
+        let err = resolve_includes(&root, &mut config, VerifyMode::Strict)
             .expect_err("a nonexistent include file must fail to resolve");
         let message = format!("{err:#}");
 
@@ -4579,6 +4711,155 @@ command = "codex"
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pinned_include_with_matching_sha256_loads_normally() {
+        let root = temp_dir("pin-match");
+        let frag = "[sandboxes.pinned]\nimage = \"pinned-image\"\n";
+        fs::write(root.join("frag.toml"), frag).expect("frag should be written");
+        let pin = sha256_hex(frag.as_bytes());
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Detailed {
+            path: "frag.toml".to_owned(),
+            sha256: Some(pin),
+        }];
+
+        let warnings = resolve_includes(&root, &mut config, VerifyMode::Strict)
+            .expect("a pin matching the fragment's bytes must load normally");
+        assert!(
+            warnings.is_empty(),
+            "a matching pin must not produce any unverified warning"
+        );
+        assert_eq!(config.sandboxes["pinned"].image.as_deref(), Some("pinned-image"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pinned_include_with_mismatched_sha256_refuses_in_strict_mode() {
+        let root = temp_dir("pin-mismatch-strict");
+        let frag = "[sandboxes.pinned]\nimage = \"pinned-image\"\n";
+        fs::write(root.join("frag.toml"), frag).expect("frag should be written");
+        let stale_pin = sha256_hex(b"this is not the fragment's content");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Detailed {
+            path: "frag.toml".to_owned(),
+            sha256: Some(stale_pin.clone()),
+        }];
+
+        let err = resolve_includes(&root, &mut config, VerifyMode::Strict)
+            .expect_err("a sha256 mismatch must refuse the load in strict mode");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("REFUSED"),
+            "the error must be unambiguous that config was REFUSED, not merely unreadable: {message}"
+        );
+        assert!(message.contains("frag.toml"), "error must name the file: {message}");
+        assert!(
+            message.contains(&stale_pin),
+            "error must include the expected digest: {message}"
+        );
+        assert!(
+            message.contains(&sha256_hex(frag.as_bytes())),
+            "error must include the actual digest: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pinned_include_with_mismatched_sha256_warns_and_continues_in_diagnostic_mode() {
+        let root = temp_dir("pin-mismatch-diagnostic");
+        let frag = "[sandboxes.pinned]\nimage = \"pinned-image\"\n";
+        fs::write(root.join("frag.toml"), frag).expect("frag should be written");
+        let stale_pin = sha256_hex(b"this is not the fragment's content");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Detailed {
+            path: "frag.toml".to_owned(),
+            sha256: Some(stale_pin),
+        }];
+
+        let warnings = resolve_includes(&root, &mut config, VerifyMode::DiagnosticDegraded)
+            .expect("a diagnostic-mode mismatch must not refuse the load");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the mismatch must be reported back to the caller as a warning"
+        );
+        assert!(warnings[0].contains("frag.toml"));
+        assert_eq!(
+            config.sandboxes["pinned"].image.as_deref(),
+            Some("pinned-image"),
+            "diagnostic mode must still merge the unverified fragment content"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unpinned_include_is_unaffected_by_verify_mode() {
+        let root = temp_dir("pin-absent");
+        let frag = "[sandboxes.unpinned]\nimage = \"unpinned-image\"\n";
+        fs::write(root.join("frag.toml"), frag).expect("frag should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+
+        let warnings = resolve_includes(&root, &mut config, VerifyMode::Strict)
+            .expect("an unpinned include must load exactly as before");
+        assert!(warnings.is_empty());
+        assert_eq!(
+            config.sandboxes["unpinned"].image.as_deref(),
+            Some("unpinned-image")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn malformed_sha256_pin_is_rejected_at_central_config_parse_time() {
+        for bad_pin in [
+            "too-short",
+            &"a".repeat(63),
+            &"A".repeat(64), // uppercase
+            &"g".repeat(64), // non-hex
+        ] {
+            let mut config: Config =
+                toml::from_str(&minimal_config_toml()).expect("base config should parse");
+            config.include = vec![IncludeEntry::Detailed {
+                path: "frag.toml".to_owned(),
+                sha256: Some(bad_pin.to_owned()),
+            }];
+
+            let err = validate_include_pin_formats(&config)
+                .expect_err(&format!("'{bad_pin}' must be rejected as a malformed pin"));
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("malformed"),
+                "error must clearly say the pin is malformed: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_sha256_pin_format_is_accepted_at_parse_time() {
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Detailed {
+            path: "frag.toml".to_owned(),
+            sha256: Some("a".repeat(64)),
+        }];
+
+        validate_include_pin_formats(&config).expect("64 lowercase hex characters must be valid");
     }
 
     #[test]
@@ -4815,7 +5096,7 @@ command = "codex"
             toml::from_str(&minimal_config_toml()).expect("base config should parse");
         config.include = vec![IncludeEntry::Path("outer.toml".to_owned())];
 
-        let err = resolve_includes(&root, &mut config)
+        let err = resolve_includes(&root, &mut config, VerifyMode::Strict)
             .expect_err("a fragment declaring its own `include` must be rejected");
         let message = format!("{err:#}");
 
@@ -5031,6 +5312,78 @@ agents = ["frag_agent"]
         assert!(
             tier2.routes.iter().any(|route| route.glob == "bundle/**"),
             "Tier 2 resolve_config must merge include-sourced routes"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tier1_load_config_ignores_a_pinned_include_pointing_at_a_nonexistent_file() {
+        let root = temp_dir("tier1-pin-nonexistent");
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "include = [{{ path = \"does-not-exist.toml\", sha256 = \"{}\" }}]\n{}",
+                "a".repeat(64),
+                minimal_config_toml()
+            ),
+        )
+        .expect("config should be written");
+
+        load_config(&path).expect(
+            "Tier 1 load_config must not read fragment files at all, even a pinned one \
+             pointing at a nonexistent file",
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_config_refuses_but_resolve_config_for_diagnostics_warns_on_a_flipped_byte() {
+        let root = temp_dir("tier2-strict-vs-diagnostic");
+        let frag_path = root.join("frag.toml");
+        let original_frag = "[[routes]]\nglob = \"bundle/**\"\nagents = [\"codex\"]\n";
+        fs::write(&frag_path, original_frag).expect("frag should be written");
+        let pin = sha256_hex(original_frag.as_bytes());
+
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "include = [{{ path = \"frag.toml\", sha256 = \"{pin}\" }}]\n{}",
+                minimal_config_toml()
+            ),
+        )
+        .expect("config should be written");
+
+        // Flip a byte in the fragment so it no longer matches its pin.
+        fs::write(&frag_path, "[[routes]]\nglob = \"bundlz/**\"\nagents = [\"codex\"]\n")
+            .expect("frag should be rewritable");
+
+        let err = resolve_config(&path).expect_err(
+            "a launch/dispatch call site (resolve_config) must refuse a flipped-byte fragment",
+        );
+        let message = format!("{err:#}");
+        assert!(message.contains("REFUSED"));
+        assert!(message.contains("frag.toml"));
+        assert!(message.contains(&pin));
+
+        let (diagnostic_config, warnings) = resolve_config_for_diagnostics(&path).expect(
+            "a read-only diagnostic call site must keep working on a flipped-byte fragment",
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the diagnostic caller must be told which include is unverified"
+        );
+        assert!(warnings[0].contains("frag.toml"));
+        assert!(
+            diagnostic_config
+                .routes
+                .iter()
+                .any(|route| route.glob == "bundlz/**"),
+            "diagnostic mode must still report the TRUE (unverified) route content"
         );
 
         fs::remove_dir_all(&root).ok();
