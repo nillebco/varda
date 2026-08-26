@@ -36,7 +36,7 @@ pub struct AgentRunRequest {
     /// bind mount.
     pub orchestration_socket_path: Option<String>,
     /// Host `host:port` for the nested-orchestration MCP broker served over TCP,
-    /// used for own-kernel microVM primitives (`microsandbox`/`clawk`) whose guest
+    /// used for own-kernel microVM primitives (`microsandbox`) whose guest
     /// cannot `connect()` the bind-mounted Unix socket but reaches the host over
     /// TCP. When present, Varda exports it as `VARDA_MCP_ADDR` (and the port alone
     /// as `VARDA_MCP_PORT`). Mutually exclusive with `orchestration_socket_path`.

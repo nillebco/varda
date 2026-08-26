@@ -1945,8 +1945,8 @@ struct OrchestratedAgentClient<C: AgentClient = acp::AcpSubprocessClient> {
     project_path: PathBuf,
     fallback_agent: String,
     lineage: Option<SpawnLineage>,
-    /// Resolved sandbox primitive for this run (`local`/`docker`/`microsandbox`/
-    /// `clawk`). Selects the broker transport: own-kernel microVMs cannot reach a
+    /// Resolved sandbox primitive for this run (`local`/`docker`/`microsandbox`).
+    /// Selects the broker transport: own-kernel microVMs cannot reach a
     /// bind-mounted Unix socket, so they get the TCP transport
     /// ([`config::primitive_needs_tcp_broker`]); everything else keeps the socket.
     sandbox_primitive: String,
@@ -2063,7 +2063,7 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
                 self.project_path.clone(),
             ),
         );
-        // Transport selection by primitive. Own-kernel microVMs (microsandbox/clawk)
+        // Transport selection by primitive. Own-kernel microVMs (microsandbox)
         // share the project tree over virtio-fs, which exposes the socket FILE but
         // not its AF_UNIX endpoint, so an in-guest connect() is refused; those guests
         // reach the host over TCP instead. `local`/`docker` see the real socket
@@ -6842,7 +6842,6 @@ deny_sandboxes = ["local"]
     fn primitive_selects_tcp_only_for_microvm() {
         // Transport predicate: own-kernel microVMs need TCP; shared-kernel / local do not.
         assert!(config::primitive_needs_tcp_broker("microsandbox"));
-        assert!(config::primitive_needs_tcp_broker("clawk"));
         assert!(!config::primitive_needs_tcp_broker("local"));
         assert!(!config::primitive_needs_tcp_broker("docker"));
     }

@@ -13,7 +13,7 @@
 //!   tree, so a sandboxed master reaches it through the bind mount without
 //!   receiving any host process capability.
 //! - **TCP** ([`bind_tcp`] + [`serve_tcp`]) — for own-kernel microVM primitives
-//!   (`microsandbox`, `clawk`) the project bind mount shares the socket *file*
+//!   (`microsandbox`) the project bind mount shares the socket *file*
 //!   over virtio-fs but NOT the AF_UNIX endpoint, so an in-guest `connect()` is
 //!   refused. The guest instead reaches the host over TCP (its default gateway),
 //!   so the broker binds a host TCP listener on an ephemeral port and advertises

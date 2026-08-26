@@ -479,7 +479,7 @@ pub struct Defaults {
     pub identity_context: Vec<String>,
     /// M11 git-identity forwarding. When true, forward the host SSH agent SOCKET
     /// (`$SSH_AUTH_SOCK`) into the box so `git push` signs/authenticates on the
-    /// host and private keys never enter it (clawk-style). Off by default.
+    /// host and private keys never enter it. Off by default.
     #[serde(default, skip_serializing_if = "is_false")]
     pub forward_ssh_agent: bool,
     /// M11 git-identity forwarding: read-only `user.name` / `user.email` handed to
@@ -614,10 +614,10 @@ pub struct Route {
 /// allow-listed hostnames (`--add-host`), so a *hostname* not on the list cannot
 /// resolve — but an agent that already knows an IP can still open a raw connection
 /// to ANY address. That is NOT a firewall, and must never be claimed as
-/// clawk/microsandbox-equivalent.
+/// microsandbox-equivalent.
 ///
 /// `Strict` is the conservative DEFAULT: a non-empty allow-list is honored only when
-/// the provider can actually firewall egress. microsandbox/clawk firewall at the IP
+/// the provider can actually firewall egress. microsandbox firewalls at the IP
 /// level in-guest; the docker provider routes a non-empty strict allow-list through
 /// the allow-listing forward-proxy sidecar (see [`EgressMode::Proxy`]) so it is
 /// enforced rather than refused — never a silent downgrade to DNS-pin.
@@ -648,7 +648,7 @@ pub enum EgressMode {
 /// Whether `(primitive, mode)` provides REAL egress enforcement — a non-allow-listed
 /// host is genuinely unreachable, not merely unresolvable by name.
 ///
-/// - `microsandbox`/`clawk` firewall egress in-guest/natively at the IP level under
+/// - `microsandbox` firewalls egress in-guest/natively at the IP level under
 ///   any strict mode.
 /// - `docker` enforces via an allow-listing forward-proxy sidecar (see
 ///   [`EgressMode::Proxy`]) under `Strict` or `Proxy`: the sandbox is confined to an
@@ -660,7 +660,7 @@ pub fn egress_is_enforced(primitive: &str, mode: EgressMode) -> bool {
     match mode {
         EgressMode::DnsPin => false,
         EgressMode::Strict | EgressMode::Proxy => {
-            matches!(primitive, "microsandbox" | "clawk" | "docker")
+            matches!(primitive, "microsandbox" | "docker")
         }
     }
 }
@@ -675,7 +675,7 @@ pub fn docker_uses_egress_proxy(primitive: &str, mode: EgressMode) -> bool {
 /// Whether the spawn broker must be served over TCP (rather than a project-mounted
 /// Unix socket) for this `primitive`.
 ///
-/// Own-kernel microVM primitives (`microsandbox`, `clawk`) share the project tree
+/// Own-kernel microVM primitives (`microsandbox`) share the project tree
 /// over virtio-fs, which exposes the socket *file* but not its AF_UNIX endpoint —
 /// an in-guest `connect()` is refused. Those guests reach the host over TCP (their
 /// default gateway) instead. `local` and shared-kernel `docker` see the real
@@ -684,9 +684,9 @@ pub fn docker_uses_egress_proxy(primitive: &str, mode: EgressMode) -> bool {
 /// NB: docker-on-a-VM (Colima / Docker Desktop) has the same virtio-fs limitation
 /// as a microVM, but varda cannot portably tell a VM-backed docker host from a
 /// native-Linux one, so `docker` stays on the unix socket here; a VM-backed docker
-/// host that needs the broker should use `microsandbox`/`clawk`.
+/// host that needs the broker should use `microsandbox`.
 pub fn primitive_needs_tcp_broker(primitive: &str) -> bool {
-    matches!(primitive, "microsandbox" | "clawk")
+    primitive == "microsandbox"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -710,7 +710,7 @@ pub struct SandboxConfig {
     /// `image`/`build` when both are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_from: Option<String>,
-    /// Isolation primitive: `"docker"` | `"microsandbox"` | `"clawk"` | `"local"`.
+    /// Isolation primitive: `"docker"` | `"microsandbox"` | `"local"`.
     /// Orthogonal to the image/rootfs: the same OCI image can run under docker
     /// (shared kernel) or an own-kernel microVM.
     #[serde(default = "default_primitive")]
@@ -1854,23 +1854,23 @@ pub fn enforce_resident_launch(
         );
     }
 
-    // G2 — clawk-parity egress semantics. A non-empty resident allow-list is only
-    // acceptable when the provider can close the direct-IP bypass surface. Docker's
-    // compatibility mode is DNS-pin only (`--dns 0.0.0.0` + `--add-host`), so it
-    // blocks undeclared hostnames but still permits raw direct-IP egress on the
-    // bridge network. For residents, do not silently downgrade that guarantee.
+    // G2 — microsandbox-parity egress semantics. A non-empty resident allow-list is
+    // only acceptable when the provider can close the direct-IP bypass surface.
+    // Docker's compatibility mode is DNS-pin only (`--dns 0.0.0.0` + `--add-host`),
+    // so it blocks undeclared hostnames but still permits raw direct-IP egress on
+    // the bridge network. For residents, do not silently downgrade that guarantee.
     if !sandbox.egress.is_empty() {
         if sandbox.egress_mode == EgressMode::DnsPin {
             bail!(
                 "resident sandbox '{sandbox_name}' declares non-empty egress with `egress_mode = \"dns-pin\"`; \
                  residents require enforced egress because DNS pinning still allows direct-IP bypass. Use \
-                 `microsandbox`/`clawk`, docker under strict/proxy egress, or set `egress = []` for fully offline."
+                 `microsandbox`, docker under strict/proxy egress, or set `egress = []` for fully offline."
             );
         }
         if !egress_is_enforced(&sandbox.primitive, sandbox.egress_mode) {
             bail!(
                 "resident sandbox '{sandbox_name}' uses primitive '{}' with non-empty egress in `{:?}` mode, \
-                 but this provider cannot enforce egress. Use `microsandbox`/`clawk`, docker (enforced via an \
+                 but this provider cannot enforce egress. Use `microsandbox`, docker (enforced via an \
                  allow-listing forward-proxy sidecar), or set `egress = []` for fully offline.",
                 sandbox.primitive,
                 sandbox.egress_mode
@@ -2308,7 +2308,7 @@ enum LaunchContext {
 /// (`mark_sandboxed`), which `acp.rs` sets on `CommandSpec.env` for EVERY
 /// non-`local` sandbox launch — batch or interactive, with or without
 /// orchestration's MCP broker wired. That universality matters: an interactive
-/// docker/microsandbox/clawk launch with no broker attached (a human working
+/// docker/microsandbox launch with no broker attached (a human working
 /// directly inside the sandbox on a real TTY) sets no `VARDA_MCP_ADDR`/
 /// `VARDA_MCP_SOCKET`, so relying on those alone would let such a process
 /// misclassify itself as `InteractiveTty` and get offered the approval prompt
@@ -6190,7 +6190,7 @@ agents = ["frag_agent"]
 
     #[test]
     fn detect_launch_context_treats_the_sandboxed_marker_as_sandboxed_ahead_of_tty_state() {
-        // #806: an interactive docker/microsandbox/clawk launch with NO
+        // #806: an interactive docker/microsandbox launch with NO
         // orchestration broker wired sets neither VARDA_MCP_ADDR nor
         // VARDA_MCP_SOCKET, but DOES get `mark_sandboxed`'s
         // `crate::sandbox::SANDBOXED_MARKER_ENV` (acp.rs sets it on every
