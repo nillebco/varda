@@ -633,6 +633,29 @@ pub struct CommandSpec {
     pub cwd: Option<PathBuf>,
 }
 
+/// Env var proving "this process is running inside a varda-managed sandbox,"
+/// set unconditionally by [`mark_sandboxed`] for every non-`local` launch —
+/// unlike `VARDA_MCP_ADDR`/`VARDA_MCP_SOCKET` (set only when orchestration's
+/// MCP broker is wired), this is the one signal proven to hold for an
+/// interactive docker/microsandbox/clawk launch with no broker attached too
+/// (#806). [`crate::config::detect_launch_context`] checks this first.
+pub const SANDBOXED_MARKER_ENV: &str = "VARDA_SANDBOXED";
+
+/// Insert [`SANDBOXED_MARKER_ENV`] into `spec.env` for any non-`local`
+/// provider — `local` crosses no sandbox boundary (matches
+/// `resolve_sandbox_identity`'s "local ignores them, no boundary to cross").
+///
+/// Callers MUST call this BEFORE [`SandboxSession::wrap`]: boundary-crossing
+/// providers (docker) fold `env` into the wrapped command's argv/`-e` flags
+/// and empty the map, so inserting after `wrap()` would silently drop the
+/// marker for exactly the launches it exists to cover.
+pub fn mark_sandboxed(spec: &mut CommandSpec, provider_name: &str) {
+    if provider_name != "local" {
+        spec.env
+            .insert(SANDBOXED_MARKER_ENV.to_owned(), "1".to_owned());
+    }
+}
+
 /// How an agent subprocess is launched (M13a §1). This is *how you launch*, not
 /// part of the command data, so it is a `wrap()` parameter rather than a
 /// [`CommandSpec`] field.
@@ -3377,6 +3400,40 @@ mod tests {
     }
     use super::*;
     use std::path::Path;
+
+    fn empty_spec() -> CommandSpec {
+        CommandSpec {
+            program: "agent".to_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn mark_sandboxed_sets_the_marker_for_every_non_local_provider() {
+        for provider_name in ["docker", "microsandbox", "clawk"] {
+            let mut spec = empty_spec();
+            mark_sandboxed(&mut spec, provider_name);
+            assert_eq!(
+                spec.env.get(SANDBOXED_MARKER_ENV).map(String::as_str),
+                Some("1"),
+                "provider '{provider_name}' must get the sandbox marker regardless of \
+                 LaunchMode (mark_sandboxed itself has no mode input — callers apply it \
+                 identically for Batch and Interactive)"
+            );
+        }
+    }
+
+    #[test]
+    fn mark_sandboxed_leaves_local_unmarked() {
+        let mut spec = empty_spec();
+        mark_sandboxed(&mut spec, "local");
+        assert!(
+            !spec.env.contains_key(SANDBOXED_MARKER_ENV),
+            "local crosses no sandbox boundary and must never get the marker"
+        );
+    }
 
     fn ctx<'a>(project_root: &'a Path) -> SandboxContext<'a> {
         ctx_with_id(project_root, "session-1")

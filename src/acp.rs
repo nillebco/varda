@@ -21,6 +21,7 @@ use crate::agent::{
 use crate::config::AgentConfig;
 use crate::sandbox::{
     CommandSpec, LaunchMode, LocalProvider, SandboxContext, SandboxProvider, SandboxSession,
+    mark_sandboxed,
 };
 
 /// Guest-visible path the staged task prompt lands at inside a non-`local`
@@ -399,6 +400,10 @@ impl AcpSubprocessClient {
         // Live stores (local) are polled while the agent runs; extracted stores
         // (docker volume + `docker cp`) are only discovered post-exit.
         let store_is_live = session.store_is_live();
+        // Prove "running inside a sandbox" to the guest process regardless of
+        // whether orchestration's MCP broker is wired (#806) — must run before
+        // `wrap()`, which bakes `env` into the wrapped argv for some providers.
+        mark_sandboxed(&mut spec, self.sandbox.name());
         let spec = session.wrap(spec, LaunchMode::Batch).with_context(|| {
             format!(
                 "failed to wrap command for '{}' sandbox",
@@ -904,7 +909,7 @@ impl AcpSubprocessClient {
         env.insert("VARDA_PROMPT_FILE".to_owned(), guest_prompt.clone());
         // M11-ext — stage file-target credentials (env targets fold in via env above).
         stage_identity_files(session, self.sandbox.name())?;
-        let spec = CommandSpec {
+        let mut spec = CommandSpec {
             env: env.clone(),
             ..spec
         };
@@ -924,6 +929,12 @@ impl AcpSubprocessClient {
         let session_store_root = session.session_store_root();
         let store_is_live = session.store_is_live();
 
+        // Prove "running inside a sandbox" to the guest process regardless of
+        // whether orchestration's MCP broker is wired (#806) — must run before
+        // `wrap()`, which bakes `env` into the wrapped argv for some providers.
+        // This function is only reached for a non-`local` sandbox (guarded at
+        // the call site), so the marker always applies here.
+        mark_sandboxed(&mut spec, self.sandbox.name());
         let wrapped = session
             .wrap(spec, LaunchMode::Interactive)
             .with_context(|| {
