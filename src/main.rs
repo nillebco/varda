@@ -2931,6 +2931,26 @@ struct DashboardStatusUpdate {
     status: task::TaskStatus,
 }
 
+#[derive(Debug, Deserialize)]
+struct DashboardBulkStatusUpdate {
+    paths: Vec<String>,
+    status: task::TaskStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardBulkItemResult {
+    path: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardBulkStatusResponse {
+    ok: bool,
+    results: Vec<DashboardBulkItemResult>,
+}
+
 fn spawn_dashboard_daemon(project: Option<&Path>, all_projects: bool, port: u16) -> Result<()> {
     let exe = std::env::current_exe().context("failed to locate the varda executable")?;
     let mut command = ProcessCommand::new(&exe);
@@ -3004,18 +3024,10 @@ fn handle_dashboard_connection(
     project: Option<&Path>,
     all_projects: bool,
 ) -> Result<()> {
-    let mut buffer = [0; 4096];
-    let read = stream
-        .read(&mut buffer)
-        .context("failed to read dashboard request")?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
-    let request_line = request.lines().next().unwrap_or("");
-    let method = request_line.split_whitespace().next().unwrap_or("");
-    let target = request_line.split_whitespace().nth(1).unwrap_or("/");
-    let body = request
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or("");
+    let (method, target, body) = read_dashboard_request(stream)?;
+    let method = method.as_str();
+    let target = target.as_str();
+    let body = body.as_str();
 
     match (method, target.split('?').next().unwrap_or("/")) {
         ("GET", "/" | "/index.html") => {
@@ -3041,8 +3053,104 @@ fn handle_dashboard_connection(
             update_dashboard_task_status(config, update)?;
             write_http_response(stream, "200 OK", "application/json", "{\"ok\":true}")
         }
+        ("POST", "/api/tasks/status/bulk") => {
+            let update: DashboardBulkStatusUpdate = serde_json::from_str(body)
+                .context("failed to decode dashboard bulk status update")?;
+            let response = update_dashboard_tasks_status_bulk(config, update)?;
+            let json = serde_json::to_string(&response)
+                .context("failed to encode dashboard bulk status response")?;
+            write_http_response(stream, "200 OK", "application/json", &json)
+        }
         ("GET", "/healthz") => write_http_response(stream, "200 OK", "text/plain", "ok\n"),
         _ => write_http_response(stream, "404 Not Found", "text/plain", "not found\n"),
+    }
+}
+
+/// Read a dashboard HTTP request off `stream`, returning `(method, target, body)`.
+///
+/// Unlike a single fixed-size `read`, this keeps reading until the header
+/// terminator is seen and then, per `Content-Length`, until the full body has
+/// arrived. A bulk status update can carry well over a hundred task paths —
+/// comfortably past the 4096-byte single-read buffer this replaced, which
+/// would silently truncate the JSON body and fail to parse.
+fn read_dashboard_request(stream: &mut TcpStream) -> Result<(String, String, String)> {
+    const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let header_end = loop {
+        if let Some(pos) = find_subslice(&buffer, b"\r\n\r\n") {
+            break pos;
+        }
+        if buffer.len() > MAX_REQUEST_BYTES {
+            anyhow::bail!("dashboard request headers exceeded the size limit");
+        }
+        let read = stream
+            .read(&mut chunk)
+            .context("failed to read dashboard request")?;
+        if read == 0 {
+            break buffer.len();
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+
+    let header_bytes = &buffer[..header_end];
+    let headers = String::from_utf8_lossy(header_bytes).into_owned();
+    let body_start = (header_end + 4).min(buffer.len());
+    let mut body = buffer[body_start..].to_vec();
+
+    let content_length: usize = headers
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+        .min(MAX_REQUEST_BYTES);
+
+    while body.len() < content_length {
+        let read = stream
+            .read(&mut chunk)
+            .context("failed to read dashboard request body")?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length.min(body.len()));
+
+    let request_line = headers.lines().next().unwrap_or("");
+    let method = request_line
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    let target = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_owned();
+    let body = String::from_utf8_lossy(&body).into_owned();
+    Ok((method, target, body))
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn validate_dashboard_target_status(status: task::TaskStatus) -> Result<()> {
+    use task::TaskStatus;
+    match status {
+        TaskStatus::Done | TaskStatus::Backlog | TaskStatus::Ready => Ok(()),
+        other => anyhow::bail!(
+            "dashboard status updates do not support status '{}'",
+            other.as_str()
+        ),
     }
 }
 
@@ -3050,26 +3158,12 @@ fn update_dashboard_task_status(
     config: &config::Config,
     update: DashboardStatusUpdate,
 ) -> Result<()> {
-    use task::TaskStatus;
-    match update.status {
-        TaskStatus::Done | TaskStatus::Backlog | TaskStatus::Ready => {}
-        other => anyhow::bail!(
-            "dashboard status updates do not support status '{}'",
-            other.as_str()
-        ),
-    }
+    validate_dashboard_target_status(update.status)?;
 
-    let task_path = task::resolve_task_reference(config, Path::new(&update.path))?;
-    let mut task_document = task::load_task(&task_path)?;
-    if task_document.frontmatter.status == update.status {
+    let Some(task_path) = apply_dashboard_status_update(config, &update.path, update.status)?
+    else {
         return Ok(());
-    }
-
-    task_document.set_status(update.status);
-    if update.status == TaskStatus::Done {
-        task_document.frontmatter.requires_user = false;
-    }
-    task::write_task(&task_document)?;
+    };
 
     if config.git.auto_commit {
         git::commit_task_file(
@@ -3083,6 +3177,89 @@ fn update_dashboard_task_status(
     }
 
     Ok(())
+}
+
+/// Apply `status` to the task at `path`, writing the task file if the status
+/// actually changed. Returns the resolved task path when a write happened, or
+/// `None` when the task was already at `status` (a no-op the caller should
+/// treat as success without committing).
+fn apply_dashboard_status_update(
+    config: &config::Config,
+    path: &str,
+    status: task::TaskStatus,
+) -> Result<Option<PathBuf>> {
+    use task::TaskStatus;
+
+    let task_path = task::resolve_task_reference(config, Path::new(path))?;
+    let mut task_document = task::load_task(&task_path)?;
+    if task_document.frontmatter.status == status {
+        return Ok(None);
+    }
+
+    task_document.set_status(status);
+    if status == TaskStatus::Done {
+        task_document.frontmatter.requires_user = false;
+    }
+    task::write_task(&task_document)?;
+
+    Ok(Some(task_path))
+}
+
+/// Apply a status transition to many tasks in one request. Reuses
+/// [`apply_dashboard_status_update`] and the same `Done | Backlog | Ready`
+/// validation as the single-task path, so the bulk path can never accept a
+/// status the single path refuses.
+///
+/// Each path is applied independently and best-effort: one bad path (missing
+/// file, already-deleted task, etc.) is reported as a per-item failure and
+/// does not block the rest of the batch. Every task file that was actually
+/// written is staged and committed together in a SINGLE commit (when
+/// `config.git.auto_commit` is set), rather than one commit per task.
+fn update_dashboard_tasks_status_bulk(
+    config: &config::Config,
+    update: DashboardBulkStatusUpdate,
+) -> Result<DashboardBulkStatusResponse> {
+    validate_dashboard_target_status(update.status)?;
+
+    let mut results = Vec::with_capacity(update.paths.len());
+    let mut written_paths: Vec<PathBuf> = Vec::new();
+
+    for path in &update.paths {
+        match apply_dashboard_status_update(config, path, update.status) {
+            Ok(Some(task_path)) => {
+                written_paths.push(task_path);
+                results.push(DashboardBulkItemResult {
+                    path: path.clone(),
+                    ok: true,
+                    error: None,
+                });
+            }
+            Ok(None) => results.push(DashboardBulkItemResult {
+                path: path.clone(),
+                ok: true,
+                error: None,
+            }),
+            Err(error) => results.push(DashboardBulkItemResult {
+                path: path.clone(),
+                ok: false,
+                error: Some(format!("{error:#}")),
+            }),
+        }
+    }
+
+    if config.git.auto_commit && !written_paths.is_empty() {
+        let refs: Vec<&Path> = written_paths.iter().map(PathBuf::as_path).collect();
+        let message = format!(
+            "Mark {} task{} {}",
+            refs.len(),
+            if refs.len() == 1 { "" } else { "s" },
+            update.status.as_str()
+        );
+        git::commit_task_files(&refs, &message)?;
+    }
+
+    let ok = results.iter().all(|item| item.ok);
+    Ok(DashboardBulkStatusResponse { ok, results })
 }
 
 fn write_http_response(
@@ -3253,9 +3430,18 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     .board { display: grid; grid-template-columns: repeat(7, minmax(200px, 1fr)); gap: 12px; overflow-x: auto; padding: 16px; }
     .column { min-width: 220px; border: 1px solid transparent; border-radius: 8px; padding: 4px; }
     .column.drop-target { border-color: var(--accent); background: #edf7f2; }
-    .column h2 { display: flex; justify-content: space-between; align-items: center; margin: 0 0 10px; font-size: 13px; text-transform: uppercase; color: var(--muted); letter-spacing: 0; }
+    .column h2 { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin: 0 0 8px; font-size: 13px; text-transform: uppercase; color: var(--muted); letter-spacing: 0; }
+    .column h2 .h2-left { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .column h2 .h2-left span:not(.select-all) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .count { border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; background: var(--panel); color: var(--muted); }
-    .task { width: 100%; text-align: left; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 10px; margin-bottom: 10px; cursor: pointer; box-shadow: 0 1px 2px rgba(25, 32, 44, 0.05); }
+    .bulk-bar { display: flex; gap: 6px; margin: 0 0 10px; }
+    .bulk-bar select { flex: 0 0 auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); font-size: 12px; padding: 0 4px; }
+    .bulk-bar button { flex: 1 1 auto; border: 1px solid var(--accent); border-radius: 6px; background: #edf7f2; color: var(--accent); font-size: 12px; font-weight: 650; padding: 6px 8px; cursor: pointer; }
+    .bulk-bar button:hover { background: var(--accent); color: #fff; }
+    .task-card { position: relative; margin-bottom: 10px; }
+    .task-select { position: absolute; top: 18px; right: 18px; cursor: pointer; }
+    .task { width: 100%; text-align: left; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 10px; padding-right: 30px; margin-bottom: 0; cursor: pointer; box-shadow: 0 1px 2px rgba(25, 32, 44, 0.05); }
+    .task.checked { border-color: var(--accent); background: #f4faf7; }
     .task[draggable="true"] { cursor: grab; }
     .task.dragging { opacity: 0.55; }
     .task:hover, .task.selected { border-color: var(--accent); }
@@ -3293,11 +3479,16 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   </main>
   <script>
     const statuses = ["backlog", "ready", "running", "needs_user", "failed", "review", "done"];
+    const bulkTargetStatuses = ["done", "backlog", "ready"];
     let payload = { tasks: [], projects: [], statuses };
     let selectedPath = "";
     let selectedDetail = null;
     let detailLoadingPath = "";
     let initializedFilters = false;
+    // Bulk-selection state, keyed on task `path` (not object identity) so it
+    // survives the periodic /api/tasks refresh, which rebuilds `payload.tasks`
+    // from scratch every 30s.
+    let selectedPaths = new Set();
 
     function label(value) {
       return value.replaceAll("_", " ");
@@ -3408,12 +3599,44 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           };
         }
         const tasks = payload.tasks.filter(task => task.status === status && taskMatches(task));
+        const selectedInColumn = tasks.filter(task => selectedPaths.has(task.path));
         const heading = document.createElement("h2");
-        heading.innerHTML = `<span>${label(status)}</span><span class="count">${tasks.length}</span>`;
+        const headingLeft = document.createElement("span");
+        headingLeft.className = "h2-left";
+        const selectAll = document.createElement("input");
+        selectAll.type = "checkbox";
+        selectAll.className = "select-all";
+        selectAll.title = tasks.length ? "Select all in this column" : "No tasks to select";
+        selectAll.disabled = tasks.length === 0;
+        selectAll.checked = tasks.length > 0 && selectedInColumn.length === tasks.length;
+        selectAll.onclick = event => {
+          event.stopPropagation();
+          if (selectAll.checked) tasks.forEach(task => selectedPaths.add(task.path));
+          else tasks.forEach(task => selectedPaths.delete(task.path));
+          renderBoard();
+        };
+        const statusLabel = document.createElement("span");
+        statusLabel.textContent = label(status);
+        headingLeft.appendChild(selectAll);
+        headingLeft.appendChild(statusLabel);
+        const count = document.createElement("span");
+        count.className = "count";
+        count.textContent = tasks.length;
+        heading.appendChild(headingLeft);
+        heading.appendChild(count);
         column.appendChild(heading);
+
+        if (selectedInColumn.length > 0) {
+          column.appendChild(renderBulkBar(status, selectedInColumn));
+        }
+
         for (const task of tasks) {
+          const card = document.createElement("div");
+          card.className = "task-card";
+
           const button = document.createElement("button");
-          button.className = `task${task.path === selectedPath ? " selected" : ""}`;
+          const isChecked = selectedPaths.has(task.path);
+          button.className = `task${task.path === selectedPath ? " selected" : ""}${isChecked ? " checked" : ""}`;
           button.type = "button";
           button.draggable = task.status !== "done";
           button.ondragstart = event => {
@@ -3439,7 +3662,22 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
           badges[0].textContent = id;
           badges[1].textContent = task.assignee || "-";
           if (projectChip) badges[2].textContent = projectChip;
-          column.appendChild(button);
+          card.appendChild(button);
+
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.className = "task-select";
+          checkbox.title = "Select for bulk action";
+          checkbox.checked = isChecked;
+          checkbox.onclick = event => {
+            event.stopPropagation();
+            if (checkbox.checked) selectedPaths.add(task.path);
+            else selectedPaths.delete(task.path);
+            renderBoard();
+          };
+          card.appendChild(checkbox);
+
+          column.appendChild(card);
         }
         board.appendChild(column);
       }
@@ -3466,6 +3704,76 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       }
       renderBoard();
       await refresh();
+    }
+
+    // Bulk action control for a column: a target-status picker plus a button
+    // labelled with the live selection count, so the scale of the action is
+    // visible before the click.
+    function renderBulkBar(status, selectedTasks) {
+      const bar = document.createElement("div");
+      bar.className = "bulk-bar";
+
+      const select = document.createElement("select");
+      for (const target of bulkTargetStatuses) {
+        const option = document.createElement("option");
+        option.value = target;
+        option.textContent = label(target);
+        if (target === (status === "done" ? "backlog" : "done")) option.selected = true;
+        select.appendChild(option);
+      }
+
+      const button = document.createElement("button");
+      button.type = "button";
+      const updateLabel = () => {
+        button.textContent = `Move ${selectedTasks.length} to ${label(select.value)}`;
+      };
+      updateLabel();
+      select.onchange = updateLabel;
+      button.onclick = async () => {
+        const target = select.value;
+        const paths = selectedTasks.map(task => task.path);
+        const count = paths.length;
+        if (!confirm(`Move ${count} task${count === 1 ? "" : "s"} to ${label(target)}? This cannot be undone.`)) {
+          return;
+        }
+        try {
+          await bulkUpdateTaskStatus(paths, target);
+        } catch (error) {
+          document.getElementById("details").textContent = `Bulk update failed: ${error}`;
+        }
+      };
+
+      bar.appendChild(select);
+      bar.appendChild(button);
+      return bar;
+    }
+
+    async function bulkUpdateTaskStatus(paths, status) {
+      const response = await fetch("/api/tasks/status/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paths, status })
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const result = await response.json();
+      const failed = (result.results || []).filter(item => !item.ok);
+      for (const item of result.results || []) {
+        selectedPaths.delete(item.path);
+        if (item.ok) {
+          const task = payload.tasks.find(task => task.path === item.path);
+          if (task) task.status = status;
+        }
+      }
+      renderBoard();
+      await refresh();
+      if (failed.length > 0) {
+        const lines = failed.map(item => `${item.path}: ${item.error || "failed"}`).join("\n");
+        document.getElementById("details").textContent =
+          `${failed.length} of ${result.results.length} task(s) failed to update to ${label(status)}:\n${lines}`;
+      }
+      return result;
     }
 
     function renderDetails(task) {
@@ -5555,6 +5863,278 @@ mod tests {
 
         assert!(detail.markdown.contains("New body from the repo definition."));
         assert!(!detail.markdown.contains("Old body frozen at materialization."));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    /// A bulk status update over ~a hundred task paths comfortably exceeds the
+    /// 4096-byte buffer the dashboard's request reader used to fill with a
+    /// single non-looping `read`, silently truncating the JSON body. This
+    /// drives a real loopback TCP connection with a body written in small
+    /// chunks (mimicking how the body actually arrives over the wire) well
+    /// past that old limit, proving the fix reads the whole thing.
+    #[test]
+    fn read_dashboard_request_handles_bodies_larger_than_a_single_tcp_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have an addr");
+
+        let body = "x".repeat(50_000);
+        let request = format!(
+            "POST /api/tasks/status/bulk HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let client_body = body.clone();
+        let request_bytes = request.into_bytes();
+        let handle = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("client should connect");
+            for chunk in request_bytes.chunks(1024) {
+                stream.write_all(chunk).expect("client write should succeed");
+            }
+            drop(client_body);
+        });
+
+        let (mut server_stream, _) = listener.accept().expect("listener should accept");
+        let (method, target, parsed_body) =
+            read_dashboard_request(&mut server_stream).expect("request should be read fully");
+
+        handle.join().expect("client thread should finish");
+
+        assert_eq!(method, "POST");
+        assert_eq!(target, "/api/tasks/status/bulk");
+        assert_eq!(
+            parsed_body.len(),
+            body.len(),
+            "body must not be truncated at the old 4096-byte read boundary"
+        );
+        assert_eq!(parsed_body, body);
+    }
+
+    /// Git-inits `root` and configures a local commit identity, mirroring the
+    /// real dashboard's `config.git.auto_commit` path so bulk-commit tests can
+    /// assert on real `git log` output rather than inspecting the code.
+    fn init_git_repo_for_dashboard_test(root: &Path) {
+        fs::create_dir_all(root).expect("repo root should be created");
+        let status = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init failed");
+        for (key, value) in [
+            ("user.email", "varda-test@example.com"),
+            ("user.name", "Varda Test"),
+            ("commit.gpgsign", "false"),
+        ] {
+            let status = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["config", "--local", key, value])
+                .status()
+                .expect("git config should run");
+            assert!(status.success(), "git config {key} failed");
+        }
+    }
+
+    fn seed_dashboard_review_task(home_dir: &Path, id: u64) -> String {
+        let path = home_dir.join(format!("{id}-task.md"));
+        fs::write(
+            &path,
+            format!("---\nid: {id}\nstatus: review\n---\n\n# Task {id}\n"),
+        )
+        .expect("task file should write");
+        path.display().to_string()
+    }
+
+    /// Core requirement of task #805: a naive bulk implementation that looped
+    /// the single-task commit call would produce one commit PER task. This
+    /// proves N tasks moved in one bulk request land in exactly ONE commit
+    /// covering all N files, verified via `git log`/`git show`, not by reading
+    /// the implementation.
+    #[test]
+    fn bulk_status_update_moves_multiple_tasks_in_a_single_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-dashboard-bulk-commit-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        init_git_repo_for_dashboard_test(&root);
+        let home_dir = root.join("operations");
+        fs::create_dir_all(&home_dir).expect("home dir should be created");
+
+        let paths: Vec<String> = (1..=3)
+            .map(|id| seed_dashboard_review_task(&home_dir, id))
+            .collect();
+
+        let mut config = launcher_test_config(&root);
+        config.git.auto_commit = true;
+
+        let response = update_dashboard_tasks_status_bulk(
+            &config,
+            DashboardBulkStatusUpdate {
+                paths: paths.clone(),
+                status: task::TaskStatus::Done,
+            },
+        )
+        .expect("bulk update should succeed");
+
+        assert!(response.ok);
+        assert_eq!(response.results.len(), 3);
+        assert!(response.results.iter().all(|item| item.ok));
+
+        for path in &paths {
+            let document = task::load_task(Path::new(path)).expect("task should reload");
+            assert_eq!(document.frontmatter.status, task::TaskStatus::Done);
+        }
+
+        let log = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log should run");
+        let log_stdout = String::from_utf8_lossy(&log.stdout);
+        assert_eq!(
+            log_stdout.lines().count(),
+            1,
+            "expected exactly one commit for the whole batch, got: {log_stdout}"
+        );
+
+        let show = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["show", "--stat", "HEAD"])
+            .output()
+            .expect("git show should run");
+        let show_stdout = String::from_utf8_lossy(&show.stdout);
+        for id in 1..=3 {
+            assert!(
+                show_stdout.contains(&format!("{id}-task.md")),
+                "single commit should include task {id}: {show_stdout}"
+            );
+        }
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn bulk_status_update_makes_no_commit_when_auto_commit_disabled() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-dashboard-bulk-no-commit-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        init_git_repo_for_dashboard_test(&root);
+        let home_dir = root.join("operations");
+        fs::create_dir_all(&home_dir).expect("home dir should be created");
+
+        let paths: Vec<String> = (1..=2)
+            .map(|id| seed_dashboard_review_task(&home_dir, id))
+            .collect();
+
+        let config = launcher_test_config(&root); // auto_commit: false
+        let response = update_dashboard_tasks_status_bulk(
+            &config,
+            DashboardBulkStatusUpdate {
+                paths,
+                status: task::TaskStatus::Done,
+            },
+        )
+        .expect("bulk update should succeed");
+        assert!(response.results.iter().all(|item| item.ok));
+
+        let log = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log should run");
+        assert!(
+            String::from_utf8_lossy(&log.stdout).trim().is_empty(),
+            "no commit should be made when auto_commit is disabled"
+        );
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    /// The bulk path must accept exactly the statuses the single-task path
+    /// accepts — no widening of allowed transitions.
+    #[test]
+    fn bulk_status_update_refuses_disallowed_status_like_the_single_task_path() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-dashboard-bulk-disallowed-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        init_git_repo_for_dashboard_test(&root);
+        let home_dir = root.join("operations");
+        fs::create_dir_all(&home_dir).expect("home dir should be created");
+        let path = seed_dashboard_review_task(&home_dir, 1);
+
+        let config = launcher_test_config(&root);
+        let error = update_dashboard_tasks_status_bulk(
+            &config,
+            DashboardBulkStatusUpdate {
+                paths: vec![path],
+                status: task::TaskStatus::Review,
+            },
+        )
+        .expect_err("bulk update to an unsupported status must be refused");
+        assert!(
+            error.to_string().contains("do not support status"),
+            "{error}"
+        );
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    /// One bad path (never existed) must be reported as a per-item failure
+    /// without blocking the rest of the batch — best-effort, not atomic.
+    #[test]
+    fn bulk_status_update_reports_one_bad_path_as_failed_and_still_applies_the_rest() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-dashboard-bulk-partial-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        init_git_repo_for_dashboard_test(&root);
+        let home_dir = root.join("operations");
+        fs::create_dir_all(&home_dir).expect("home dir should be created");
+
+        let good_path = seed_dashboard_review_task(&home_dir, 1);
+        let bad_path = home_dir.join("999-missing.md").display().to_string();
+
+        let mut config = launcher_test_config(&root);
+        config.git.auto_commit = true;
+
+        let response = update_dashboard_tasks_status_bulk(
+            &config,
+            DashboardBulkStatusUpdate {
+                paths: vec![good_path.clone(), bad_path.clone()],
+                status: task::TaskStatus::Done,
+            },
+        )
+        .expect("bulk update should succeed overall even with one bad path");
+
+        assert!(!response.ok);
+        let good_result = response
+            .results
+            .iter()
+            .find(|item| item.path == good_path)
+            .expect("good path should have a result");
+        assert!(good_result.ok, "good path should have applied");
+        let bad_result = response
+            .results
+            .iter()
+            .find(|item| item.path == bad_path)
+            .expect("bad path should have a result");
+        assert!(!bad_result.ok, "bad path should be reported as failed");
+        assert!(bad_result.error.is_some());
+
+        let document = task::load_task(Path::new(&good_path)).expect("good task should reload");
+        assert_eq!(document.frontmatter.status, task::TaskStatus::Done);
 
         fs::remove_dir_all(root).expect("test directory should be removable");
     }
