@@ -662,7 +662,7 @@ pub struct CommandSpec {
 /// set unconditionally by [`mark_sandboxed`] for every non-`local` launch —
 /// unlike `VARDA_MCP_ADDR`/`VARDA_MCP_SOCKET` (set only when orchestration's
 /// MCP broker is wired), this is the one signal proven to hold for an
-/// interactive docker/microsandbox/clawk launch with no broker attached too
+/// interactive docker/microsandbox launch with no broker attached too
 /// (#806). [`crate::config::detect_launch_context`] checks this first.
 pub const SANDBOXED_MARKER_ENV: &str = "VARDA_SANDBOXED";
 
@@ -1283,94 +1283,6 @@ fn strip_jsonc(text: &str) -> String {
     // `out` only ever drops whole comment/comma byte spans and copies other
     // bytes verbatim, so multi-byte UTF-8 sequences stay intact.
     String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
-}
-
-fn command_on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
-}
-
-/// Provider backed by the `clawk` CLI. Unlike the old stub, this constructs a
-/// real clawk launch when the binary is available, while failing before session
-/// construction with the contractually clear error when it is not.
-pub struct ClawkProvider {
-    name: String,
-    image: Option<String>,
-    build: Option<String>,
-    mounts: Vec<(MountOrigin, String)>,
-    egress: Vec<String>,
-    identity: SandboxIdentity,
-    command_exists: fn(&str) -> bool,
-}
-
-impl ClawkProvider {
-    pub fn with_identity(mut self, identity: SandboxIdentity) -> Self {
-        self.identity = identity;
-        self
-    }
-
-    pub fn from_config(
-        name: &str,
-        config: &SandboxConfig,
-        mounts: Vec<(MountOrigin, String)>,
-    ) -> Result<Self> {
-        Ok(Self {
-            name: name.to_owned(),
-            image: config.image.clone().filter(|image| !image.is_empty()),
-            build: config.build.clone().filter(|build| !build.is_empty()),
-            mounts,
-            egress: config.egress.clone(),
-            identity: SandboxIdentity::default(),
-            command_exists: command_on_path,
-        })
-    }
-
-    #[cfg(test)]
-    fn with_command_exists(mut self, command_exists: fn(&str) -> bool) -> Self {
-        self.command_exists = command_exists;
-        self
-    }
-
-    async fn resolve_image(&self) -> Result<Option<String>> {
-        if let Some(build) = &self.build {
-            return Ok(Some(build_image(&self.name, build).await?));
-        }
-        Ok(self.image.clone())
-    }
-}
-
-#[async_trait]
-impl SandboxProvider for ClawkProvider {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    async fn prepare(&self, ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
-        if !(self.command_exists)("clawk") {
-            bail!("sandbox primitive 'clawk' requires the clawk CLI on PATH");
-        }
-        let session_store = varda_sessions_root().join(ctx.session_id);
-        std::fs::create_dir_all(&session_store).with_context(|| {
-            format!(
-                "failed to create sandbox session store {}",
-                session_store.display()
-            )
-        })?;
-        let handle = sanitize_docker_name(ctx.session_id);
-        Ok(Box::new(ClawkSession {
-            image: self.resolve_image().await?,
-            project_root: ctx.project_root.to_path_buf(),
-            mounts: self.mounts.clone(),
-            egress: self.egress.clone(),
-            session_store,
-            sandbox: format!("varda-sbx-{handle}"),
-            home: "/home/agent".to_owned(),
-            identity: self.identity.clone(),
-            staged_files: std::sync::Mutex::new(Vec::new()),
-        }))
-    }
 }
 
 #[async_trait]
@@ -3025,294 +2937,6 @@ impl SandboxSession for MicrosandboxSession {
     }
 }
 
-pub struct ClawkSession {
-    image: Option<String>,
-    project_root: PathBuf,
-    mounts: Vec<(MountOrigin, String)>,
-    /// Egress allow-list applied before launch through `clawk network allow`.
-    egress: Vec<String>,
-    /// Host dir the guest HOME is copied into after the run. clawk's session
-    /// store is not assumed live on the host, so resume discovery runs post-exit.
-    session_store: PathBuf,
-    sandbox: String,
-    home: String,
-    identity: SandboxIdentity,
-    staged_files: std::sync::Mutex<Vec<(PathBuf, String)>>,
-}
-
-impl ClawkSession {
-    fn record_staged(&self, content: &str, guest_path: &str, read_only: bool) -> Result<String> {
-        let tmp = write_stage_temp(content, read_only)?;
-        self.staged_files
-            .lock()
-            .expect("staged_files mutex poisoned")
-            .push((tmp, guest_path.to_owned()));
-        Ok(guest_path.to_owned())
-    }
-
-    async fn apply_network_allowlist(&self) -> Result<()> {
-        for host in &self.egress {
-            let output = tokio::process::Command::new("clawk")
-                .args(["network", "allow", &self.sandbox, host])
-                .output()
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to spawn `clawk network allow {}` for sandbox '{}'",
-                        host, self.sandbox
-                    )
-                })?;
-            if !output.status.success() {
-                bail!(
-                    "`clawk network allow {} {host}` failed with status {}; stderr: {}",
-                    self.sandbox,
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl SandboxSession for ClawkSession {
-    fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec> {
-        ensure_worktree_gitdir_visible(&self.project_root, &self.mounts)?;
-        let proj = self.project_root.display().to_string();
-        let cwd = spec
-            .cwd
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| proj.clone());
-
-        // Centralized clawk CLI shape. Normal tests assert this construction; live
-        // tests are ignored because this repository must not require clawk locally.
-        let mut args = vec![
-            "run".to_owned(),
-            "--name".to_owned(),
-            self.sandbox.clone(),
-            "--project".to_owned(),
-            proj.clone(),
-            "--home".to_owned(),
-            self.home.clone(),
-        ];
-        if matches!(mode, LaunchMode::Interactive) {
-            args.push("--tty".to_owned());
-        }
-        if let Some(image) = &self.image {
-            args.push("--image".to_owned());
-            args.push(image.clone());
-        }
-        if self.egress.is_empty() {
-            args.push("--network".to_owned());
-            args.push("none".to_owned());
-        } else {
-            args.push("--network".to_owned());
-            args.push("default-deny".to_owned());
-        }
-
-        args.push("--mount".to_owned());
-        args.push(format!("{proj}:{proj}:rw"));
-        let mut seen_targets: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        for (_origin, raw) in &self.mounts {
-            let cspec = parse_mount(raw).with_context(|| {
-                format!("invalid mount '{raw}' for clawk sandbox '{}'", self.sandbox)
-            })?;
-            let source = expand_mount_path(&cspec.source, &self.project_root);
-            let target = expand_mount_path(&cspec.target, &self.project_root);
-            check_credential_denylist(&source)?;
-            if source.is_file() {
-                bail!(
-                    "clawk sandbox '{}' does not support file bind mount '{}'; mount a directory or stage a file credential instead",
-                    self.sandbox,
-                    source.display()
-                );
-            }
-            if !seen_targets.insert(target.clone()) {
-                continue;
-            }
-            args.push("--mount".to_owned());
-            args.push(format!(
-                "{}:{}:{}",
-                source.display(),
-                target.display(),
-                if cspec.writable { "rw" } else { "ro" }
-            ));
-        }
-
-        for raw in &self.identity.identity_context {
-            let ispec = parse_mount(raw).with_context(|| {
-                format!(
-                    "invalid identity_context mount '{raw}' for clawk sandbox '{}'",
-                    self.sandbox
-                )
-            })?;
-            let source = expand_mount_path(&ispec.source, &self.project_root);
-            let target = expand_mount_path(&ispec.target, &self.project_root);
-            check_control_plane_denylist(&source)?;
-            check_identity_context_mount(&source, ispec.writable)?;
-            if !seen_targets.insert(target.clone()) {
-                continue;
-            }
-            args.push("--mount-file".to_owned());
-            args.push(format!("{}:{}:ro", source.display(), target.display()));
-        }
-
-        if let Some(sock) = &self.identity.ssh_auth_sock {
-            args.push("--mount-file".to_owned());
-            args.push(format!("{sock}:{SSH_AGENT_GUEST_SOCK}:ro"));
-        }
-        {
-            let staged = self
-                .staged_files
-                .lock()
-                .expect("staged_files mutex poisoned");
-            for (host_temp, guest_path) in staged.iter() {
-                args.push("--copy-file".to_owned());
-                args.push(format!("{}:{guest_path}", host_temp.display()));
-            }
-        }
-        args.push("--workdir".to_owned());
-        args.push(cwd);
-
-        let mut env = spec.env;
-        env.extend(self.identity.guest_env());
-        env.insert("HOME".to_owned(), self.home.clone());
-        for (key, value) in &env {
-            args.push("--env".to_owned());
-            args.push(format!("{key}={value}"));
-        }
-        args.push("--".to_owned());
-        args.push(spec.program);
-        args.extend(spec.args);
-
-        Ok(CommandSpec {
-            program: "clawk".to_owned(),
-            args,
-            env: BTreeMap::new(),
-            cwd: None,
-        })
-    }
-
-    fn stage_file(&self, content: &str, guest_path: &str) -> Result<String> {
-        self.record_staged(content, guest_path, false)
-    }
-
-    fn stage_credential_file(&self, content: &str, guest_path: &str) -> Result<String> {
-        self.record_staged(content, guest_path, true)
-    }
-
-    fn identity_files(&self) -> BTreeMap<String, String> {
-        self.identity.auth_files.clone()
-    }
-
-    async fn begin_batch(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
-        self.apply_network_allowlist().await?;
-        Ok(wrapped)
-    }
-
-    async fn begin_interactive(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
-        self.apply_network_allowlist().await?;
-        Ok(wrapped)
-    }
-
-    fn session_store_root(&self) -> Option<PathBuf> {
-        Some(self.session_store.clone())
-    }
-
-    fn store_is_live(&self) -> bool {
-        false
-    }
-
-    fn validate_mounts(&self) -> Result<()> {
-        if !self.project_root.exists() {
-            bail!(
-                "sandbox project mount source '{}' does not exist on the host (check the path / VM share)",
-                self.project_root.display()
-            );
-        }
-        for (origin, raw) in &self.mounts {
-            let cspec = parse_mount(raw).with_context(|| {
-                format!("invalid mount '{raw}' for clawk sandbox '{}'", self.sandbox)
-            })?;
-            let source = expand_mount_path(&cspec.source, &self.project_root);
-            check_credential_denylist(&source)?;
-            if !source.exists() {
-                bail!(
-                    "sandbox {origin:?} mount source '{}' does not exist on the host (check the path / VM share)",
-                    source.display()
-                );
-            }
-            if source.is_file() {
-                bail!(
-                    "clawk sandbox '{}' does not support file bind mount '{}'; mount a directory or stage a file credential instead",
-                    self.sandbox,
-                    source.display()
-                );
-            }
-        }
-        for raw in &self.identity.identity_context {
-            let ispec = parse_mount(raw).with_context(|| {
-                format!(
-                    "invalid identity_context mount '{raw}' for clawk sandbox '{}'",
-                    self.sandbox
-                )
-            })?;
-            let source = expand_mount_path(&ispec.source, &self.project_root);
-            check_control_plane_denylist(&source)?;
-            check_identity_context_mount(&source, ispec.writable)?;
-        }
-        Ok(())
-    }
-
-    fn mount_targets(&self) -> Option<Vec<PathBuf>> {
-        Some(guest_mount_targets(
-            &self.project_root,
-            &self.mounts,
-            &self.identity.identity_context,
-        ))
-    }
-
-    async fn extract_session_store(&self) -> Result<()> {
-        let src = format!("{}:{}", self.sandbox, self.home);
-        let dst = self.session_store.display().to_string();
-        let output = tokio::process::Command::new("clawk")
-            .args(["cp", &src, &dst])
-            .output()
-            .await
-            .with_context(|| {
-                format!("failed to spawn `clawk cp` from sandbox '{}'", self.sandbox)
-            })?;
-        if !output.status.success() {
-            bail!(
-                "`clawk cp {src} {dst}` failed with status {}; stderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
-    }
-
-    async fn teardown(self: Box<Self>) -> Result<()> {
-        for (host_temp, _) in std::mem::take(
-            &mut *self
-                .staged_files
-                .lock()
-                .expect("staged_files mutex poisoned"),
-        ) {
-            let _ = std::fs::remove_file(&host_temp);
-        }
-        let _ = tokio::process::Command::new("clawk")
-            .args(["destroy", &self.sandbox])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-        Ok(())
-    }
-}
-
 /// Resolve the effective provider for a sandbox name against the config.
 ///
 /// Dispatch is driven by the resolved [`SandboxConfig::primitive`] (the "what
@@ -3321,7 +2945,6 @@ impl SandboxSession for ClawkSession {
 /// - `"local"` → [`LocalProvider`] (no isolation)
 /// - `"docker"` → [`DockerProvider`] (shared-kernel container)
 /// - `"microsandbox"` → [`MicrosandboxProvider`] (own-kernel microVM via `msb`)
-/// - `"clawk"` → [`ClawkProvider`] (own-kernel microVM via `clawk`)
 ///
 /// The bare name `"local"` with no `[sandboxes.local]` entry stays a shortcut
 /// for the identity provider; any other name must have a `[sandboxes.<name>]`
@@ -3363,6 +2986,17 @@ pub fn provider_from_config(
              `egress = []`."
         );
     }
+    // The removed-primitive check must run before the egress-enforcement check below:
+    // `egress_is_enforced("clawk", ...)` now returns `false` like any other
+    // non-enforcing primitive, so without this early bail a `clawk` sandbox with
+    // non-empty strict/proxy egress would hit the generic "cannot enforce egress"
+    // message instead of the clear "clawk was removed" refusal (found in cross-review
+    // of #817).
+    if config.primitive == "clawk" {
+        bail!(
+            "sandbox '{name}' has primitive 'clawk', which was removed; use local, docker, or microsandbox"
+        );
+    }
     if !config.egress.is_empty()
         && config.egress_mode != EgressMode::DnsPin
         && !egress_is_enforced(&config.primitive, config.egress_mode)
@@ -3370,7 +3004,7 @@ pub fn provider_from_config(
         bail!(
             "sandbox '{name}' declares non-empty `egress` in `{:?}` mode, but primitive '{}' cannot \
              enforce egress. Docker enforces strict/proxy egress via an allow-listing forward-proxy \
-             sidecar; `microsandbox`/`clawk` firewall natively. Set `egress_mode = \"dns-pin\"` for the \
+             sidecar; `microsandbox` firewalls natively. Set `egress_mode = \"dns-pin\"` for the \
              legacy docker name-pin, or set `egress = []` for offline.",
             config.egress_mode,
             config.primitive
@@ -3387,11 +3021,8 @@ pub fn provider_from_config(
             MicrosandboxProvider::from_config(name, config, mounts)?
                 .with_identity(identity.clone()),
         )),
-        "clawk" => Ok(std::sync::Arc::new(
-            ClawkProvider::from_config(name, config, mounts)?.with_identity(identity.clone()),
-        )),
         other => bail!(
-            "sandbox '{name}' has unknown primitive '{other}' (expected local, docker, microsandbox, or clawk)"
+            "sandbox '{name}' has unknown primitive '{other}' (expected local, docker, or microsandbox)"
         ),
     }
 }
@@ -3472,7 +3103,7 @@ mod tests {
 
     #[test]
     fn mark_sandboxed_sets_the_marker_for_every_non_local_provider() {
-        for provider_name in ["docker", "microsandbox", "clawk"] {
+        for provider_name in ["docker", "microsandbox"] {
             let mut spec = empty_spec();
             mark_sandboxed(&mut spec, provider_name);
             assert_eq!(
@@ -4690,7 +4321,7 @@ mod tests {
 
     /// M5: `primitive` selects the boundary kind independently of the image.
     /// An explicit `primitive = "local"` yields the identity provider even with
-    /// an image set; microsandbox/clawk yield real providers.
+    /// an image set; microsandbox yields a real provider.
     #[test]
     fn provider_for_dispatches_on_primitive() {
         let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
@@ -4709,19 +4340,16 @@ mod tests {
             "local"
         );
 
-        for primitive in ["microsandbox", "clawk"] {
-            sandboxes.insert(
-                "vm".to_owned(),
-                SandboxConfig {
-                    image: Some("busybox".to_owned()),
-                    primitive: primitive.to_owned(),
-                    ..Default::default()
-                },
-            );
-            let provider =
-                provider_for("vm", &sandboxes, &[], &SandboxIdentity::default()).unwrap();
-            assert_eq!(provider.name(), "vm");
-        }
+        sandboxes.insert(
+            "vm".to_owned(),
+            SandboxConfig {
+                image: Some("busybox".to_owned()),
+                primitive: "microsandbox".to_owned(),
+                ..Default::default()
+            },
+        );
+        let provider = provider_for("vm", &sandboxes, &[], &SandboxIdentity::default()).unwrap();
+        assert_eq!(provider.name(), "vm");
 
         // An unknown primitive is rejected outright.
         sandboxes.insert(
@@ -4733,6 +4361,75 @@ mod tests {
             },
         );
         assert!(provider_for("weird", &sandboxes, &[], &SandboxIdentity::default()).is_err());
+    }
+
+    /// The `clawk` primitive was removed outright (no shim, no alias). A config
+    /// still naming it must be refused with a clear, named error — and, above
+    /// all, must NEVER silently fall back to `local`: that would turn a config
+    /// typo into an unsandboxed host run, which is the single worst outcome
+    /// this codebase guards against.
+    #[test]
+    fn clawk_primitive_is_refused_and_never_falls_back_to_local() {
+        let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
+        sandboxes.insert(
+            "legacy".to_owned(),
+            SandboxConfig {
+                image: Some("busybox".to_owned()),
+                primitive: "clawk".to_owned(),
+                ..Default::default()
+            },
+        );
+        // The `Err` match arm alone already proves this never resolves to a
+        // working (silently-`local`) provider; the message assertions confirm
+        // the refusal is contractually clear rather than a generic error.
+        let message = match provider_for("legacy", &sandboxes, &[], &SandboxIdentity::default()) {
+            Ok(_) => panic!("a 'clawk' primitive must be refused, not silently accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains("clawk"),
+            "error must name the removed primitive; got: {message}"
+        );
+        assert!(
+            message.contains("local") && message.contains("docker") && message.contains("microsandbox"),
+            "error must name the valid primitives; got: {message}"
+        );
+    }
+
+    /// Cross-review of #817 found that `egress_is_enforced("clawk", ...)` now
+    /// returns `false` like any other non-enforcing primitive, so a `clawk`
+    /// sandbox paired with non-empty strict/proxy `egress` used to fall into the
+    /// generic "primitive cannot enforce egress" bail in `provider_from_config`
+    /// BEFORE ever reaching the dedicated removed-primitive refusal — giving a
+    /// confusing error that neither names `clawk` as removed nor lists the valid
+    /// primitives. The removed-primitive check must run first regardless of the
+    /// sandbox's egress configuration.
+    #[test]
+    fn clawk_primitive_is_refused_even_with_non_empty_strict_egress() {
+        let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
+        sandboxes.insert(
+            "legacy".to_owned(),
+            SandboxConfig {
+                image: Some("busybox".to_owned()),
+                primitive: "clawk".to_owned(),
+                egress: vec!["example.com".to_owned()],
+                egress_mode: EgressMode::Strict,
+                ..Default::default()
+            },
+        );
+        let message = match provider_for("legacy", &sandboxes, &[], &SandboxIdentity::default()) {
+            Ok(_) => panic!("a 'clawk' primitive must be refused, not silently accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains("clawk") && message.contains("removed"),
+            "a clawk sandbox with non-empty strict egress must still hit the clear \
+             removed-primitive refusal, not the generic egress-enforcement error; got: {message}"
+        );
+        assert!(
+            message.contains("local") && message.contains("docker") && message.contains("microsandbox"),
+            "error must name the valid primitives; got: {message}"
+        );
     }
 
     /// M4: `msb run` argv shape — image positional after flags, command after
@@ -6023,164 +5720,26 @@ mod tests {
         );
     }
 
-    /// clawk parses and resolves, but `prepare()` fails with the contractually
-    /// clear missing-runtime message when the CLI is not on PATH. The command
-    /// lookup is a fake seam so this test never depends on the developer machine.
+    /// A staged credential host temp is private (`0o444`, private dir — shared
+    /// coverage for every provider via `write_stage_temp`, exercised elsewhere
+    /// for docker) AND is actually removed by a normal, successful `teardown()`
+    /// — not just on an error path (docker's teardown-cleanup tests only cover
+    /// the `create`/`cp`-failure guard). This was previously covered only via
+    /// the now-removed clawk provider; ported to microsandbox, the surviving
+    /// own-kernel microVM primitive, to keep that normal-path guarantee tested.
     #[tokio::test]
-    async fn clawk_provider_prepare_errors_clearly_when_runtime_missing() {
-        fn missing(_: &str) -> bool {
-            false
-        }
-        let provider = ClawkProvider::from_config(
-            "vm",
-            &SandboxConfig {
-                primitive: "clawk".to_owned(),
-                ..Default::default()
-            },
-            Vec::new(),
-        )
-        .unwrap()
-        .with_command_exists(missing);
-        let root = Path::new("/proj");
-        let err = match provider.prepare(&ctx(root)).await {
-            Ok(_) => panic!("prepare should not succeed without clawk"),
-            Err(err) => err.to_string(),
-        };
-        assert_eq!(
-            err,
-            "sandbox primitive 'clawk' requires the clawk CLI on PATH"
-        );
-    }
-
-    /// clawk argv shape: project rw mount, extra mounts with Varda's ro/rw
-    /// grammar, default-deny network when egress is present, env/identity folded
-    /// into guest flags, command after `--`. Pure unit test; needs no clawk.
-    #[test]
-    fn clawk_wrap_produces_expected_argv() {
-        let mut auth_env = BTreeMap::new();
-        auth_env.insert("ANTHROPIC_API_KEY".to_owned(), "scoped".to_owned());
-        let session = ClawkSession {
-            image: Some("varda:latest".to_owned()),
-            project_root: PathBuf::from("/proj"),
-            mounts: vec![
-                (MountOrigin::Sandbox, "/cache:/cache:ro".to_owned()),
-                (MountOrigin::Route, "/shared:/shared:rw".to_owned()),
-            ],
-            egress: vec!["api.openai.com".to_owned()],
-            session_store: PathBuf::from("/host/store"),
-            sandbox: "varda-sbx-abc".to_owned(),
-            home: "/home/agent".to_owned(),
-            identity: SandboxIdentity {
-                auth_env,
-                git_name: Some("Varda Bot".to_owned()),
-                git_email: Some("bot@example.com".to_owned()),
-                ..Default::default()
-            },
-            staged_files: std::sync::Mutex::new(Vec::new()),
-        };
-        let mut env = BTreeMap::new();
-        env.insert("FOO".to_owned(), "bar".to_owned());
-        let wrapped = session
-            .wrap(
-                CommandSpec {
-                    program: "codex".to_owned(),
-                    args: vec!["--print".to_owned(), "-".to_owned()],
-                    env,
-                    cwd: None,
-                },
-                LaunchMode::Batch,
-            )
-            .unwrap();
-        assert_eq!(wrapped.program, "clawk");
-        assert_eq!(
-            wrapped.args,
-            vec![
-                "run",
-                "--name",
-                "varda-sbx-abc",
-                "--project",
-                "/proj",
-                "--home",
-                "/home/agent",
-                "--image",
-                "varda:latest",
-                "--network",
-                "default-deny",
-                "--mount",
-                "/proj:/proj:rw",
-                "--mount",
-                "/cache:/cache:ro",
-                "--mount",
-                "/shared:/shared:rw",
-                "--workdir",
-                "/proj",
-                "--env",
-                "ANTHROPIC_API_KEY=scoped",
-                "--env",
-                "FOO=bar",
-                "--env",
-                "GIT_AUTHOR_EMAIL=bot@example.com",
-                "--env",
-                "GIT_AUTHOR_NAME=Varda Bot",
-                "--env",
-                "GIT_COMMITTER_EMAIL=bot@example.com",
-                "--env",
-                "GIT_COMMITTER_NAME=Varda Bot",
-                "--env",
-                "HOME=/home/agent",
-                "--",
-                "codex",
-                "--print",
-                "-",
-            ]
-        );
-        assert!(wrapped.env.is_empty());
-        assert!(wrapped.cwd.is_none());
-        assert!(!session.store_is_live());
-        assert_eq!(
-            session.session_store_root(),
-            Some(PathBuf::from("/host/store"))
-        );
-    }
-
-    #[test]
-    fn clawk_rejects_unsupported_file_mounts_loudly() {
-        let dir = std::env::temp_dir().join(format!("varda-clawk-file-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("data.txt");
-        std::fs::write(&file, "data").unwrap();
-        let session = ClawkSession {
-            image: None,
-            project_root: dir.clone(),
-            mounts: vec![(MountOrigin::Route, format!("{}:/data:ro", file.display()))],
-            egress: Vec::new(),
-            session_store: PathBuf::from("/host/store"),
-            sandbox: "varda-sbx-file".to_owned(),
-            home: "/home/agent".to_owned(),
-            identity: SandboxIdentity::default(),
-            staged_files: std::sync::Mutex::new(Vec::new()),
-        };
-        let err = session
-            .validate_mounts()
-            .expect_err("file-level clawk mount must be rejected");
-        assert!(
-            err.to_string().contains("does not support file bind mount"),
-            "unexpected error: {err:#}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn clawk_staged_credential_is_private_and_cleaned() {
+    async fn microsandbox_staged_credential_is_private_and_cleaned() {
         use std::os::unix::fs::PermissionsExt as _;
-        let session = Box::new(ClawkSession {
-            image: None,
+        let session = Box::new(MicrosandboxSession {
+            image: "busybox".to_owned(),
             project_root: PathBuf::from("/proj"),
             mounts: Vec::new(),
             egress: Vec::new(),
             session_store: PathBuf::from("/host/store"),
             sandbox: "varda-sbx-clean".to_owned(),
             home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         });
@@ -6193,51 +5752,6 @@ mod tests {
         assert_credential_dir_is_private(&host_temp);
         session.teardown().await.unwrap();
         assert!(!host_temp.exists());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires the clawk runtime"]
-    async fn clawk_live_smoke_requires_installed_runtime() {
-        if !command_on_path("clawk") {
-            return;
-        }
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("clawk-it-proj");
-        std::fs::create_dir_all(&root).unwrap();
-        let provider = ClawkProvider::from_config(
-            "clawk",
-            &SandboxConfig {
-                primitive: "clawk".to_owned(),
-                ..Default::default()
-            },
-            Vec::new(),
-        )
-        .unwrap();
-        let session = provider
-            .prepare(&ctx_with_id(&root, "clawk-it-1"))
-            .await
-            .unwrap();
-        let spec = session
-            .wrap(
-                CommandSpec {
-                    program: "sh".to_owned(),
-                    args: vec!["-c".to_owned(), "printf clawk-ok".to_owned()],
-                    env: BTreeMap::new(),
-                    cwd: Some(root),
-                },
-                LaunchMode::Batch,
-            )
-            .unwrap();
-        let final_spec = session.begin_batch(spec).await.unwrap();
-        let out = tokio::process::Command::new(&final_spec.program)
-            .args(&final_spec.args)
-            .output()
-            .await
-            .expect("failed to run clawk");
-        session.teardown().await.ok();
-        assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "clawk-ok");
     }
 
     /// M5: a `build` sandbox defers image resolution to `prepare()`; a missing

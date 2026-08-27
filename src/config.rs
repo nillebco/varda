@@ -479,7 +479,7 @@ pub struct Defaults {
     pub identity_context: Vec<String>,
     /// M11 git-identity forwarding. When true, forward the host SSH agent SOCKET
     /// (`$SSH_AUTH_SOCK`) into the box so `git push` signs/authenticates on the
-    /// host and private keys never enter it (clawk-style). Off by default.
+    /// host and private keys never enter it. Off by default.
     #[serde(default, skip_serializing_if = "is_false")]
     pub forward_ssh_agent: bool,
     /// M11 git-identity forwarding: read-only `user.name` / `user.email` handed to
@@ -614,10 +614,10 @@ pub struct Route {
 /// allow-listed hostnames (`--add-host`), so a *hostname* not on the list cannot
 /// resolve — but an agent that already knows an IP can still open a raw connection
 /// to ANY address. That is NOT a firewall, and must never be claimed as
-/// clawk/microsandbox-equivalent.
+/// microsandbox-equivalent.
 ///
 /// `Strict` is the conservative DEFAULT: a non-empty allow-list is honored only when
-/// the provider can actually firewall egress. microsandbox/clawk firewall at the IP
+/// the provider can actually firewall egress. microsandbox firewalls at the IP
 /// level in-guest; the docker provider routes a non-empty strict allow-list through
 /// the allow-listing forward-proxy sidecar (see [`EgressMode::Proxy`]) so it is
 /// enforced rather than refused — never a silent downgrade to DNS-pin.
@@ -648,7 +648,7 @@ pub enum EgressMode {
 /// Whether `(primitive, mode)` provides REAL egress enforcement — a non-allow-listed
 /// host is genuinely unreachable, not merely unresolvable by name.
 ///
-/// - `microsandbox`/`clawk` firewall egress in-guest/natively at the IP level under
+/// - `microsandbox` firewalls egress in-guest/natively at the IP level under
 ///   any strict mode.
 /// - `docker` enforces via an allow-listing forward-proxy sidecar (see
 ///   [`EgressMode::Proxy`]) under `Strict` or `Proxy`: the sandbox is confined to an
@@ -660,7 +660,7 @@ pub fn egress_is_enforced(primitive: &str, mode: EgressMode) -> bool {
     match mode {
         EgressMode::DnsPin => false,
         EgressMode::Strict | EgressMode::Proxy => {
-            matches!(primitive, "microsandbox" | "clawk" | "docker")
+            matches!(primitive, "microsandbox" | "docker")
         }
     }
 }
@@ -675,7 +675,7 @@ pub fn docker_uses_egress_proxy(primitive: &str, mode: EgressMode) -> bool {
 /// Whether the spawn broker must be served over TCP (rather than a project-mounted
 /// Unix socket) for this `primitive`.
 ///
-/// Own-kernel microVM primitives (`microsandbox`, `clawk`) share the project tree
+/// Own-kernel microVM primitives (`microsandbox`) share the project tree
 /// over virtio-fs, which exposes the socket *file* but not its AF_UNIX endpoint —
 /// an in-guest `connect()` is refused. Those guests reach the host over TCP (their
 /// default gateway) instead. `local` and shared-kernel `docker` see the real
@@ -684,9 +684,9 @@ pub fn docker_uses_egress_proxy(primitive: &str, mode: EgressMode) -> bool {
 /// NB: docker-on-a-VM (Colima / Docker Desktop) has the same virtio-fs limitation
 /// as a microVM, but varda cannot portably tell a VM-backed docker host from a
 /// native-Linux one, so `docker` stays on the unix socket here; a VM-backed docker
-/// host that needs the broker should use `microsandbox`/`clawk`.
+/// host that needs the broker should use `microsandbox`.
 pub fn primitive_needs_tcp_broker(primitive: &str) -> bool {
-    matches!(primitive, "microsandbox" | "clawk")
+    primitive == "microsandbox"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -710,7 +710,7 @@ pub struct SandboxConfig {
     /// `image`/`build` when both are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_from: Option<String>,
-    /// Isolation primitive: `"docker"` | `"microsandbox"` | `"clawk"` | `"local"`.
+    /// Isolation primitive: `"docker"` | `"microsandbox"` | `"local"`.
     /// Orthogonal to the image/rootfs: the same OCI image can run under docker
     /// (shared kernel) or an own-kernel microVM.
     #[serde(default = "default_primitive")]
@@ -1854,23 +1854,23 @@ pub fn enforce_resident_launch(
         );
     }
 
-    // G2 — clawk-parity egress semantics. A non-empty resident allow-list is only
-    // acceptable when the provider can close the direct-IP bypass surface. Docker's
-    // compatibility mode is DNS-pin only (`--dns 0.0.0.0` + `--add-host`), so it
-    // blocks undeclared hostnames but still permits raw direct-IP egress on the
-    // bridge network. For residents, do not silently downgrade that guarantee.
+    // G2 — microsandbox-parity egress semantics. A non-empty resident allow-list is
+    // only acceptable when the provider can close the direct-IP bypass surface.
+    // Docker's compatibility mode is DNS-pin only (`--dns 0.0.0.0` + `--add-host`),
+    // so it blocks undeclared hostnames but still permits raw direct-IP egress on
+    // the bridge network. For residents, do not silently downgrade that guarantee.
     if !sandbox.egress.is_empty() {
         if sandbox.egress_mode == EgressMode::DnsPin {
             bail!(
                 "resident sandbox '{sandbox_name}' declares non-empty egress with `egress_mode = \"dns-pin\"`; \
                  residents require enforced egress because DNS pinning still allows direct-IP bypass. Use \
-                 `microsandbox`/`clawk`, docker under strict/proxy egress, or set `egress = []` for fully offline."
+                 `microsandbox`, docker under strict/proxy egress, or set `egress = []` for fully offline."
             );
         }
         if !egress_is_enforced(&sandbox.primitive, sandbox.egress_mode) {
             bail!(
                 "resident sandbox '{sandbox_name}' uses primitive '{}' with non-empty egress in `{:?}` mode, \
-                 but this provider cannot enforce egress. Use `microsandbox`/`clawk`, docker (enforced via an \
+                 but this provider cannot enforce egress. Use `microsandbox`, docker (enforced via an \
                  allow-listing forward-proxy sidecar), or set `egress = []` for fully offline.",
                 sandbox.primitive,
                 sandbox.egress_mode
@@ -2132,42 +2132,7 @@ fn resolve_includes(
             }
         }
 
-        reject_unknown_fragment_keys(&content, entry.path())?;
-        let mut fragment: ConfigFragment = toml::from_str(&content).with_context(|| {
-            format!("failed to parse included config fragment {}", entry.path())
-        })?;
-        if !fragment.include.is_empty() {
-            bail!(
-                "included config fragment {} declares its own `include`; \
-                 nested includes are not supported",
-                entry.path()
-            );
-        }
-
-        for route in &mut fragment.routes {
-            expand_route_mounts(route, Some(&bundle_dir))?;
-            // This route comes from a less-trusted included fragment, not the
-            // central config — `resolve_sandbox_for` unions its own `env` keys
-            // into `varda_env_keys` so a fnox binding in it is refused. See the
-            // field doc on `untrusted`.
-            route.untrusted = true;
-        }
-        for sandbox in fragment.sandboxes.values_mut() {
-            expand_sandbox_mounts(sandbox, Some(&bundle_dir))?;
-            // Same provenance flag as above, for fragment-sourced sandboxes. See
-            // the field doc on `SandboxConfig::untrusted`.
-            sandbox.untrusted = true;
-        }
-        for agent in fragment.agents.values_mut() {
-            agent.command = resolve_bundle_relative_command(&agent.command, &bundle_dir);
-            if let Some(working_dir) = &agent.working_dir {
-                agent.working_dir = Some(resolve_bundle_relative_command(working_dir, &bundle_dir));
-            }
-            // This agent comes from a less-trusted included fragment, not the
-            // central config — `resolve_agent_credentials` (main.rs) refuses to
-            // mint any host credential for it. See the field doc on `untrusted`.
-            agent.untrusted = true;
-        }
+        let mut fragment = parse_and_process_fragment(&content, entry.path(), &bundle_dir)?;
 
         config.routes.append(&mut fragment.routes);
         for (name, sandbox) in fragment.sandboxes {
@@ -2193,6 +2158,55 @@ fn resolve_includes(
     }
 
     Ok(unverified_warnings)
+}
+
+/// Parse a fragment's raw `content` and apply the per-fragment processing shared by
+/// [`resolve_includes`]'s merge loop and [`fragment_capability_summary`]: unknown-key
+/// rejection, nested-include rejection, mount expansion relative to `bundle_dir`, and
+/// flagging every route/sandbox/agent as `untrusted`. Extracting this into one
+/// function (rather than two hand-synced copies) is what makes the two call sites
+/// incapable of drifting — see #765 follow-up / cross-review #806.
+fn parse_and_process_fragment(
+    content: &str,
+    entry_path: &str,
+    bundle_dir: &Path,
+) -> Result<ConfigFragment> {
+    reject_unknown_fragment_keys(content, entry_path)?;
+    let mut fragment: ConfigFragment = toml::from_str(content)
+        .with_context(|| format!("failed to parse included config fragment {entry_path}"))?;
+    if !fragment.include.is_empty() {
+        bail!(
+            "included config fragment {entry_path} declares its own `include`; \
+             nested includes are not supported"
+        );
+    }
+
+    for route in &mut fragment.routes {
+        expand_route_mounts(route, Some(bundle_dir))?;
+        // This route comes from a less-trusted included fragment, not the
+        // central config — `resolve_sandbox_for` unions its own `env` keys
+        // into `varda_env_keys` so a fnox binding in it is refused. See the
+        // field doc on `untrusted`.
+        route.untrusted = true;
+    }
+    for sandbox in fragment.sandboxes.values_mut() {
+        expand_sandbox_mounts(sandbox, Some(bundle_dir))?;
+        // Same provenance flag as above, for fragment-sourced sandboxes. See
+        // the field doc on `SandboxConfig::untrusted`.
+        sandbox.untrusted = true;
+    }
+    for agent in fragment.agents.values_mut() {
+        agent.command = resolve_bundle_relative_command(&agent.command, bundle_dir);
+        if let Some(working_dir) = &agent.working_dir {
+            agent.working_dir = Some(resolve_bundle_relative_command(working_dir, bundle_dir));
+        }
+        // This agent comes from a less-trusted included fragment, not the
+        // central config — `resolve_agent_credentials` (main.rs) refuses to
+        // mint any host credential for it. See the field doc on `untrusted`.
+        agent.untrusted = true;
+    }
+
+    Ok(fragment)
 }
 
 /// Field names recognized by [`ConfigFragment`] / [`SandboxConfig`] / [`AgentConfig`]
@@ -2308,7 +2322,7 @@ enum LaunchContext {
 /// (`mark_sandboxed`), which `acp.rs` sets on `CommandSpec.env` for EVERY
 /// non-`local` sandbox launch — batch or interactive, with or without
 /// orchestration's MCP broker wired. That universality matters: an interactive
-/// docker/microsandbox/clawk launch with no broker attached (a human working
+/// docker/microsandbox launch with no broker attached (a human working
 /// directly inside the sandbox on a real TTY) sets no `VARDA_MCP_ADDR`/
 /// `VARDA_MCP_SOCKET`, so relying on those alone would let such a process
 /// misclassify itself as `InteractiveTty` and get offered the approval prompt
@@ -2342,43 +2356,18 @@ fn detect_launch_context() -> LaunchContext {
 }
 
 /// Derive the [`config_approval::CapabilitySummary`] of a standalone fragment's
-/// content, applying the same per-fragment processing [`resolve_includes`] itself
-/// applies before merging (unknown-key rejection, mount expansion relative to
-/// `bundle_dir`, the `untrusted` provenance flag) so the summary reflects exactly
-/// what would be merged — without actually merging it into the caller's `Config`.
-/// Used to diff the previously-approved copy of a bundle against its new content;
-/// never the full merged config (approval is scoped per include file, matching
+/// content, via the same [`parse_and_process_fragment`] helper [`resolve_includes`]
+/// itself calls before merging, so the summary reflects exactly what would be
+/// merged — without actually merging it into the caller's `Config`. Used to diff the
+/// previously-approved copy of a bundle against its new content; never the full
+/// merged config (approval is scoped per include file, matching
 /// [`config_approval::ApprovalStore`]'s per-bundle-path keying).
 fn fragment_capability_summary(
     content: &str,
     entry_path: &str,
     bundle_dir: &Path,
 ) -> Result<config_approval::CapabilitySummary> {
-    reject_unknown_fragment_keys(content, entry_path)?;
-    let mut fragment: ConfigFragment = toml::from_str(content).with_context(|| {
-        format!("failed to parse content of {entry_path} for a capability-summary diff")
-    })?;
-    if !fragment.include.is_empty() {
-        bail!(
-            "included config fragment {entry_path} declares its own `include`; \
-             nested includes are not supported"
-        );
-    }
-    for route in &mut fragment.routes {
-        expand_route_mounts(route, Some(bundle_dir))?;
-        route.untrusted = true;
-    }
-    for sandbox in fragment.sandboxes.values_mut() {
-        expand_sandbox_mounts(sandbox, Some(bundle_dir))?;
-        sandbox.untrusted = true;
-    }
-    for agent in fragment.agents.values_mut() {
-        agent.command = resolve_bundle_relative_command(&agent.command, bundle_dir);
-        if let Some(working_dir) = &agent.working_dir {
-            agent.working_dir = Some(resolve_bundle_relative_command(working_dir, bundle_dir));
-        }
-        agent.untrusted = true;
-    }
+    let fragment = parse_and_process_fragment(content, entry_path, bundle_dir)?;
     let mut summary_config: Config =
         toml::from_str(DEFAULT_CONFIG).expect("DEFAULT_CONFIG template must parse");
     summary_config.routes = fragment.routes;
@@ -5268,6 +5257,137 @@ command = "codex"
         fs::remove_dir_all(&root).ok();
     }
 
+    /// #765 follow-up (task #812): `resolve_includes` and `fragment_capability_summary`
+    /// must share the exact same per-fragment processing (unknown-key rejection,
+    /// mount expansion, `untrusted` flagging) rather than two hand-synced copies that
+    /// could drift. This exercises the extracted [`parse_and_process_fragment`]
+    /// helper directly, so a future change that reintroduces a hand-copied variant
+    /// at either call site (rather than calling this helper) is not covered by this
+    /// test — but a regression IN the helper itself is caught here.
+    #[test]
+    fn parse_and_process_fragment_expands_mounts_and_flags_untrusted() {
+        let root = temp_dir("parse-and-process-fragment");
+
+        let content = "[sandboxes.frag_sandbox]\nimage = \"frag-image\"\n\
+                        mounts = [\"./data:/data:rw\"]\n\n\
+                       [agents.frag_agent]\nkind = \"acp\"\ncommand = \"true\"\n\n\
+                       [[routes]]\nglob = \"frag/**\"\nagents = [\"codex\"]\n";
+
+        let fragment = parse_and_process_fragment(content, "frag.toml", &root)
+            .expect("well-formed fragment should parse and process");
+
+        let sandbox = &fragment.sandboxes["frag_sandbox"];
+        assert!(
+            sandbox.untrusted,
+            "fragment sandbox must be flagged untrusted"
+        );
+        assert_eq!(
+            sandbox.mounts,
+            vec![root.join("./data").to_string_lossy().into_owned() + ":/data:rw"],
+            "a relative mount source must expand relative to bundle_dir"
+        );
+        assert!(
+            fragment.agents["frag_agent"].untrusted,
+            "fragment agent must be flagged untrusted"
+        );
+        assert!(
+            fragment.routes[0].untrusted,
+            "fragment route must be flagged untrusted"
+        );
+
+        let unknown_key_err = parse_and_process_fragment(
+            "[sandboxes.x]\nnot_a_real_field = true\n",
+            "bad.toml",
+            &root,
+        )
+        .expect_err("an unrecognized key must be rejected");
+        assert!(
+            unknown_key_err.to_string().contains("not_a_real_field"),
+            "error must name the offending key: {unknown_key_err}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// #765 follow-up (task #812): guards against `resolve_includes`'s merge loop
+    /// and `fragment_capability_summary` drifting apart. Both now call the same
+    /// [`parse_and_process_fragment`] helper, so the capability surface a human
+    /// reviews before approving a bundle (`fragment_capability_summary`) must equal
+    /// the capability surface the SAME fragment content actually contributes once
+    /// merged (`resolve_includes` + `CapabilitySummary::from_config`). Central-only
+    /// entries are disjoint by name from fragment-sourced ones here, so the merged
+    /// summary must equal the union of the central-only summary and the
+    /// fragment-only summary; if a future edit makes the two code paths diverge
+    /// (e.g. mount expansion applied on one side only), this union equality breaks.
+    #[test]
+    fn fragment_capability_summary_matches_resolve_includes_merge() {
+        let root = temp_dir("capability-summary-parity");
+
+        let content = "[sandboxes.frag_sandbox]\nimage = \"frag-image\"\n\
+                        mounts = [\"./data:/data:rw\"]\n\n\
+                       [agents.frag_agent]\nkind = \"acp\"\ncommand = \"true\"\n\n\
+                       [[routes]]\nglob = \"frag/**\"\nagents = [\"codex\"]\n";
+        fs::write(root.join("frag.toml"), content).expect("frag should be written");
+
+        let central_config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        let central_summary = config_approval::CapabilitySummary::from_config(&central_config);
+
+        let mut merged_config = central_config.clone();
+        merged_config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+        resolve_includes(&root, &mut merged_config, VerifyMode::Strict)
+            .expect("includes should resolve");
+        let merged_summary = config_approval::CapabilitySummary::from_config(&merged_config);
+
+        let direct_summary = fragment_capability_summary(content, "frag.toml", &root)
+            .expect("capability summary should derive from fragment content");
+
+        assert_eq!(
+            merged_summary.sandboxes,
+            central_summary
+                .sandboxes
+                .union(&direct_summary.sandboxes)
+                .cloned()
+                .collect(),
+            "merged sandboxes must equal central ∪ fragment-derived"
+        );
+        assert_eq!(
+            merged_summary.agents,
+            central_summary
+                .agents
+                .union(&direct_summary.agents)
+                .cloned()
+                .collect(),
+            "merged agents must equal central ∪ fragment-derived"
+        );
+        assert_eq!(
+            merged_summary.route_globs,
+            central_summary
+                .route_globs
+                .union(&direct_summary.route_globs)
+                .cloned()
+                .collect(),
+            "merged route globs must equal central ∪ fragment-derived"
+        );
+        assert_eq!(
+            merged_summary.rw_mounts_outside_project,
+            central_summary
+                .rw_mounts_outside_project
+                .union(&direct_summary.rw_mounts_outside_project)
+                .cloned()
+                .collect(),
+            "merged rw-outside-project mounts (post-expansion) must equal central ∪ \
+             fragment-derived — this is the field that would catch mount-expansion drift"
+        );
+        assert!(
+            !direct_summary.rw_mounts_outside_project.is_empty(),
+            "sanity check: the fragment's relative mount must have expanded to an \
+             outside-project rw mount in the direct summary too, or this test proves nothing"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// Task #796 Gap 2 (sandbox half): a fragment-sourced sandbox's own `env` fnox
     /// binding must be refused via `resolve_sandbox_for`'s `varda_env_keys`, the
     /// same way the pre-existing repo-local `.varda`-origin binding already is
@@ -6190,7 +6310,7 @@ agents = ["frag_agent"]
 
     #[test]
     fn detect_launch_context_treats_the_sandboxed_marker_as_sandboxed_ahead_of_tty_state() {
-        // #806: an interactive docker/microsandbox/clawk launch with NO
+        // #806: an interactive docker/microsandbox launch with NO
         // orchestration broker wired sets neither VARDA_MCP_ADDR nor
         // VARDA_MCP_SOCKET, but DOES get `mark_sandboxed`'s
         // `crate::sandbox::SANDBOXED_MARKER_ENV` (acp.rs sets it on every
