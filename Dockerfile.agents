@@ -70,9 +70,12 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && /home/agent/.cargo/bin/rustup component add clippy rustfmt
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
 
-# Warm this project's locked crate graph into the image-owned Cargo home so cargo
-# can verify varda even when guest DNS or crates.io egress is unavailable. Copy
-# only the manifests to keep this layer reusable when application sources change.
+# Warm this project's locked crate graph into the image-owned Cargo home so a
+# worker box can build/test varda with NO route to crates.io at all (#832):
+# crates.io/static.crates.io/index.crates.io are removed from
+# [sandboxes.worker].egress, so this warmed cache is the ONLY source of crates —
+# there is no network fallback. Copy only the manifests to keep this layer
+# reusable when application sources change.
 WORKDIR /tmp/varda-deps
 COPY --chown=agent:agent Cargo.toml Cargo.lock ./
 # `cargo fetch` parses the manifest, and a manifest with no target is an error
@@ -80,14 +83,20 @@ COPY --chown=agent:agent Cargo.toml Cargo.lock ./
 # succeeds — only the dependency graph matters here, never this source file.
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs
 RUN cargo fetch --locked
-# Deliberately NOT setting CARGO_NET_OFFLINE=true here. The warmed cache above is
-# what makes a worker build survive flaky egress; pinning the whole image offline
-# adds nothing on the happy path and turns the FIRST dependency change after an
-# image build into "error: no matching package named X found" — the exact
-# signature #669 was filed about, but permanent and with no network to blame.
-# Let cargo fetch when the lockfile genuinely moved; set CARGO_NET_OFFLINE per-run
-# (msb `--env`) if a specific run must be provably network-free.
 WORKDIR /home/agent
+
+# Offline by default (#832): with crates.io off the worker's egress allowlist,
+# a `cargo` invocation that needed the network would otherwise hang/fail with a
+# confusing connect error inside a box that has no route out. CARGO_NET_OFFLINE
+# makes cargo use ONLY the warmed cache above and fail FAST and CLEARLY — "no
+# matching package named `X` found ... you are using --offline" — the moment a
+# `Cargo.lock` change outruns this image. That error means: rebuild the image
+# (`make agents-image`) so `cargo fetch --locked` re-warms the cache on the
+# host (which has real network), then retry. Previously this was deliberately
+# left unset so a lockfile change could still fetch over the (then-permitted)
+# crates.io egress; #832 removes that egress, so the network fallback this
+# comment used to describe no longer exists — offline must be explicit instead.
+ENV CARGO_NET_OFFLINE=true
 
 # codex ChatGPT-subscription auth home (#521). The `[agents.codex]` prelude decodes
 # the host's ChatGPT OAuth auth.json (injected as CODEX_AUTH_B64) into
