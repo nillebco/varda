@@ -427,6 +427,19 @@ pub struct WorkerCheckout {
     pub path: PathBuf,
     /// The `wip/<slug>` branch the clone has checked out.
     pub branch: String,
+    /// The mother repo's branch that was checked out when this worktree was
+    /// created off its `HEAD` (task #833). This is the merge-back TARGET,
+    /// captured once at launch time rather than re-read from the mother's
+    /// `HEAD` at merge time — so a branch switch in the mother mid-run cannot
+    /// silently redirect where this worker's changes land. `None` when the
+    /// mother was in detached-`HEAD` state at creation time.
+    pub target_branch: Option<String>,
+    /// The mother's exact `HEAD` commit at launch time, recorded only when
+    /// `target_branch` is `None` (the mother was detached). There is no
+    /// branch name to compare against in that case, so the commit is the only
+    /// signal that can catch the mother moving out from under a detached
+    /// launch before merge-back (follow-up to task #833).
+    pub target_head: Option<String>,
 }
 
 /// The result of integrating a worker branch onto an integration branch.
@@ -459,9 +472,36 @@ pub fn create_worker_worktree(
     // accumulate or block reuse of a path removed out-of-band.
     run_git_in(&repo, ["worktree", "prune"])
         .context("failed to prune stale worker worktree metadata")?;
+    // Capture the mother's branch NOW, before the clone below runs, and pin the
+    // clone to it explicitly with `--branch` rather than letting `git clone`
+    // implicitly follow whatever the mother's `HEAD` resolves to at that later
+    // moment. This is the merge-back target recorded on the checkout (task
+    // #833): both what the worker branches from and where its branch is later
+    // allowed to merge are fixed here, closing the gap a `git checkout` in the
+    // mother between these two steps could otherwise open.
+    let target_branch = current_branch(&repo)?;
+    // When the mother is detached there is no branch name to pin the merge-back
+    // target to, so the exact commit is recorded instead — the only thing that
+    // can later prove the mother has (or hasn't) moved.
+    //
+    // `current_branch` and `head_commit` above are two separate `git`
+    // subprocess calls, so there is a theoretical residual race if the
+    // mother's `HEAD` moves between these two specific calls (not the
+    // multi-second, human-paced race between capture and clone that task #833
+    // is actually about — this window is two sequential local subprocesses
+    // apart by milliseconds). Accepted as impractically narrow to close.
+    let target_head = if target_branch.is_none() {
+        Some(head_commit(&repo)?)
+    } else {
+        None
+    };
     let branch = format!("wip/{slug}");
-    let output = Command::new("git")
-        .args(["clone", "--no-hardlinks"])
+    let mut clone_cmd = Command::new("git");
+    clone_cmd.args(["clone", "--no-hardlinks"]);
+    if let Some(base) = &target_branch {
+        clone_cmd.args(["--branch", base.as_str()]);
+    }
+    let output = clone_cmd
         .arg(&repo)
         .arg(worktree_path)
         .output()
@@ -475,6 +515,22 @@ pub fn create_worker_worktree(
         );
     }
     copy_git_identity(&repo, worktree_path)?;
+    // The `--branch` flag above pins the named-branch case, but a detached
+    // mother has no branch name to pin to: the plain `git clone` that just ran
+    // simply followed whatever the mother's `HEAD` pointed at when the clone
+    // itself executed, which can differ from `target_head` captured moments
+    // earlier if the mother moved in between (the exact race task #833 item 4
+    // asks to close). Explicitly checking out the captured commit here — before
+    // branching off it below — makes the worker's base provably `target_head`
+    // rather than whatever the clone happened to land on.
+    if let Some(head) = &target_head {
+        run_git_in(worktree_path, ["checkout", head.as_str()]).with_context(|| {
+            format!(
+                "failed to pin detached worker clone at {} to captured HEAD {head}",
+                worktree_path.display()
+            )
+        })?;
+    }
     run_git_in(worktree_path, ["checkout", "-b", branch.as_str()]).with_context(|| {
         format!(
             "failed to create worker branch {branch} in clone at {}",
@@ -484,7 +540,59 @@ pub fn create_worker_worktree(
     Ok(WorkerCheckout {
         path: worktree_path.to_path_buf(),
         branch,
+        target_branch,
+        target_head,
     })
+}
+
+/// The branch checked out at `repo`, or `None` when `HEAD` is detached.
+/// `git rev-parse --abbrev-ref HEAD` prints the literal string `HEAD` in the
+/// detached case, which is not a real branch name, so that is mapped to
+/// `None` rather than trusted as one.
+pub fn current_branch(repo: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .context("failed to determine current branch")?;
+    if !output.status.success() {
+        bail!(
+            "git rev-parse --abbrev-ref HEAD failed in {}; stderr: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let branch = String::from_utf8(output.stdout)
+        .context("branch name was not valid UTF-8")?
+        .trim()
+        .to_owned();
+    if branch.is_empty() || branch == "HEAD" {
+        Ok(None)
+    } else {
+        Ok(Some(branch))
+    }
+}
+
+/// The commit `repo`'s `HEAD` currently resolves to, as a full SHA.
+fn head_commit(repo: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("failed to determine HEAD commit")?;
+    if !output.status.success() {
+        bail!(
+            "git rev-parse HEAD failed in {}; stderr: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("HEAD commit was not valid UTF-8")?
+        .trim()
+        .to_owned())
 }
 
 fn copy_git_identity(source_repo: &Path, clone: &Path) -> Result<()> {
@@ -636,6 +744,56 @@ pub fn merge_worker_branch(
     worker: &WorkerCheckout,
 ) -> Result<MergeOutcome> {
     let worker_branch = &worker.branch;
+
+    // Refuse LOUDLY rather than silently merging onto whatever branch happens
+    // to be checked out now (task #833): the worker's merge-back target was
+    // fixed at launch time, so if the integration worktree has moved off it
+    // since — an operator `git checkout` elsewhere in the same working copy —
+    // merging here would land the worker's changes on the wrong branch with no
+    // signal that anything went wrong.
+    match &worker.target_branch {
+        Some(expected) => {
+            let actual = current_branch(integration_worktree)?;
+            if actual.as_deref() != Some(expected.as_str()) {
+                let actual_desc = actual.as_deref().unwrap_or("a detached HEAD");
+                bail!(
+                    "refusing to merge {worker_branch} into {}: it was launched against branch \
+                     '{expected}', but the integration worktree is now on {actual_desc}. \
+                     Check out '{expected}' there and retry, or resolve this manually.",
+                    integration_worktree.display()
+                );
+            }
+        }
+        None => {
+            // Launched against a detached HEAD: there is no branch name to
+            // compare, so "unchanged" means still detached at the exact same
+            // commit. Anything else — moved to a named branch, or moved to a
+            // different commit while still detached — is the identical
+            // silent-redirection bug reopened, so a bare `None == None` on
+            // `target_branch` alone must never be treated as a match.
+            let expected_head = worker
+                .target_head
+                .as_deref()
+                .expect("detached-launch checkout must record its HEAD commit");
+            let actual_branch = current_branch(integration_worktree)?;
+            let actual_head = head_commit(integration_worktree)?;
+            let unchanged = actual_branch.is_none() && actual_head == expected_head;
+            if !unchanged {
+                let actual_desc = match &actual_branch {
+                    Some(branch) => format!("branch '{branch}' (commit {actual_head})"),
+                    None => format!("a detached HEAD at commit {actual_head}"),
+                };
+                bail!(
+                    "refusing to merge {worker_branch} into {}: it was launched against a \
+                     detached HEAD at commit {expected_head}, but the integration worktree is \
+                     now on {actual_desc}. Check out commit {expected_head} there and retry, or \
+                     resolve this manually.",
+                    integration_worktree.display()
+                );
+            }
+        }
+    }
+
     let fetch = Command::new("git")
         .arg("-C")
         .arg(integration_worktree)
@@ -1242,6 +1400,13 @@ mod tests {
         ));
         let integration =
             create_worker_worktree(&repo, "integration", &int_path).expect("integration worktree");
+        // Merge-back targets the mother's branch, not the integration clone's
+        // own `wip/integration` branch (task #833) — check it out first.
+        let base_branch = current_branch(&repo)
+            .expect("current branch")
+            .expect("mother repo should be on a branch");
+        run_git_in(&integration.path, ["checkout", base_branch.as_str()])
+            .expect("checkout base branch in integration worktree");
 
         // First worker merges cleanly; the second conflicts on the same file.
         let first = merge_worker_branch(&integration.path, &a).expect("merge a");
@@ -1326,6 +1491,13 @@ mod tests {
         // merge still fails — this must be surfaced as an error, not a conflict.
         let int_path = unique_worktree_path(&repo, "int");
         let integration = create_worker_worktree(&repo, "integration", &int_path).expect("int wt");
+        // Merge-back targets the mother's branch, not the integration clone's
+        // own `wip/integration` branch (task #833) — check it out first.
+        let base_branch = current_branch(&repo)
+            .expect("current branch")
+            .expect("mother repo should be on a branch");
+        run_git_in(&integration.path, ["checkout", base_branch.as_str()])
+            .expect("checkout base branch in integration worktree");
         // Install pre-merge-commit in this clone's independent git directory.
         let common_dir = String::from_utf8(
             Command::new("git")
@@ -1372,6 +1544,217 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    fn rev_parse(repo: &std::path::Path, rev: &str) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", rev])
+            .output()
+            .expect("git rev-parse should run");
+        assert!(output.status.success(), "git rev-parse {rev} failed");
+        String::from_utf8(output.stdout)
+            .expect("rev-parse output should be UTF-8")
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn create_worker_worktree_pins_detached_launch_to_captured_head() {
+        let repo = init_test_repo("detached-head-pin");
+        seed_commit(&repo, "first.txt", "first\n");
+        // Sanity check for the explicit post-clone checkout in
+        // `create_worker_worktree`'s detached-launch path — NOT a reproduction
+        // of the race it defends against. A plain `git clone` of a source
+        // already sitting on a detached HEAD lands on that same commit with no
+        // intervening mutation, so this test would still pass with the
+        // explicit checkout removed; it cannot deterministically exercise the
+        // narrow window between capturing `target_head` and the clone
+        // subprocess actually running, which would need a synchronization
+        // point (e.g. a git hook) to inject a concurrent HEAD move. Accepted
+        // as the same class of residual as the `current_branch`/`head_commit`
+        // TOCTOU documented above `target_head`'s capture in
+        // `create_worker_worktree`.
+        let detached_commit = rev_parse(&repo, "HEAD");
+        seed_commit(&repo, "second.txt", "second\n");
+        let branch_tip = rev_parse(&repo, "HEAD");
+        assert_ne!(
+            detached_commit, branch_tip,
+            "test setup should advance the named branch past the detached commit"
+        );
+
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["checkout", "--detach", &detached_commit])
+            .status()
+            .expect("git checkout --detach should run");
+        assert!(status.success(), "detaching mother HEAD failed");
+
+        let worker_path = unique_worktree_path(&repo, "detached-worker");
+        let worker =
+            create_worker_worktree(&repo, "detached-worker", &worker_path).expect("worktree");
+
+        assert!(
+            worker.target_branch.is_none(),
+            "a detached mother must not record a target_branch"
+        );
+        assert_eq!(
+            worker.target_head.as_deref(),
+            Some(detached_commit.as_str()),
+            "target_head must record the mother's detached commit"
+        );
+
+        let worker_head = rev_parse(&worker.path, "HEAD");
+        assert_eq!(
+            worker_head, detached_commit,
+            "the wip/<slug> branch must be created from the captured target_head, \
+             not the clone's default-branch tip"
+        );
+
+        let _ = remove_worker_worktree(&repo, &worker, false);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn merge_worker_branch_refuses_when_target_branch_has_moved_since_launch() {
+        let repo = init_test_repo("merge-target-branch-moved");
+        seed_commit(&repo, "file.txt", "base\n");
+        let base_branch = current_branch(&repo)
+            .expect("current branch")
+            .expect("mother repo should be on a branch");
+
+        // Worker launched against the mother's named branch.
+        let worker_path = unique_worktree_path(&repo, "worker");
+        let worker = create_worker_worktree(&repo, "worker", &worker_path).expect("worktree");
+        assert_eq!(worker.target_branch.as_deref(), Some(base_branch.as_str()));
+        std::fs::write(worker.path.join("worker-change.txt"), "from-worker\n").expect("write");
+        assert!(
+            commit_worker_changes(&worker, &[worker.path.join("worker-change.txt")], "worker")
+                .expect("commit worker")
+                .has_commit()
+        );
+
+        // Separate integration worktree, checked out to the same target branch
+        // first — matching the pattern used elsewhere in this file — then
+        // moved onto a different branch, simulating an operator `git checkout`
+        // in the integration worktree between launch and merge-back.
+        let int_path = unique_worktree_path(&repo, "int-target");
+        let integration =
+            create_worker_worktree(&repo, "int-target", &int_path).expect("integration worktree");
+        run_git_in(&integration.path, ["checkout", base_branch.as_str()])
+            .expect("checkout base branch in integration worktree");
+        run_git_in(&integration.path, ["checkout", "-b", "other-branch"])
+            .expect("checkout other-branch in integration worktree");
+
+        let head_before = head_commit(&integration.path).expect("head before merge attempt");
+
+        let err = merge_worker_branch(&integration.path, &worker)
+            .expect_err("merge must refuse when the integration worktree has moved branches");
+        let message = err.to_string();
+        assert!(
+            message.contains(&base_branch) && message.contains("other-branch"),
+            "error should name both branches: {message}"
+        );
+
+        // Nothing changed: still on the new branch, same commit, no merge in
+        // progress, and the worker's change never landed.
+        assert_eq!(
+            current_branch(&integration.path).expect("current branch"),
+            Some("other-branch".to_owned())
+        );
+        assert_eq!(
+            head_commit(&integration.path).expect("head after merge attempt"),
+            head_before
+        );
+        let merge_in_progress = Command::new("git")
+            .arg("-C")
+            .arg(&integration.path)
+            .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .output()
+            .expect("rev-parse MERGE_HEAD")
+            .status
+            .success();
+        assert!(!merge_in_progress, "refused merge must not start a merge");
+        assert!(
+            !integration.path.join("worker-change.txt").exists(),
+            "worker's change must not have merged"
+        );
+
+        for wt in [&worker, &integration] {
+            let _ = remove_worker_worktree(&repo, wt, false);
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn merge_worker_branch_refuses_when_launched_detached_and_integration_now_on_a_branch() {
+        let repo = init_test_repo("merge-detached-integration-moved");
+        seed_commit(&repo, "file.txt", "base\n");
+        let detached_head = head_commit(&repo).expect("head commit");
+        run_git_in(&repo, ["checkout", detached_head.as_str()]).expect("detach mother HEAD");
+
+        // Worker launched against a detached mother HEAD.
+        let worker_path = unique_worktree_path(&repo, "worker");
+        let worker = create_worker_worktree(&repo, "worker", &worker_path).expect("worktree");
+        assert_eq!(worker.target_branch, None);
+        assert_eq!(worker.target_head.as_deref(), Some(detached_head.as_str()));
+        std::fs::write(worker.path.join("worker-change.txt"), "from-worker\n").expect("write");
+        assert!(
+            commit_worker_changes(&worker, &[worker.path.join("worker-change.txt")], "worker")
+                .expect("commit worker")
+                .has_commit()
+        );
+
+        // Separate integration worktree, detached at that same commit first —
+        // matching the pattern used elsewhere in this file — then moved onto a
+        // named branch, simulating an operator `git checkout` in the
+        // integration worktree between launch and merge-back.
+        let int_path = unique_worktree_path(&repo, "int-target");
+        let integration =
+            create_worker_worktree(&repo, "int-target", &int_path).expect("integration worktree");
+        run_git_in(&integration.path, ["checkout", detached_head.as_str()])
+            .expect("detach integration worktree at the captured HEAD");
+        run_git_in(&integration.path, ["checkout", "-b", "new-branch"])
+            .expect("checkout new-branch in integration worktree");
+
+        let err = merge_worker_branch(&integration.path, &worker)
+            .expect_err("merge must refuse when the integration worktree moved to a branch");
+        let message = err.to_string();
+        assert!(
+            message.contains(&detached_head) && message.contains("new-branch"),
+            "error should name both the detached commit and the new branch: {message}"
+        );
+
+        // Nothing changed: still on the new branch, same commit, no merge in
+        // progress, and the worker's change never landed.
+        assert_eq!(
+            current_branch(&integration.path).expect("current branch"),
+            Some("new-branch".to_owned())
+        );
+        assert_eq!(
+            head_commit(&integration.path).expect("head after merge attempt"),
+            detached_head
+        );
+        let merge_in_progress = Command::new("git")
+            .arg("-C")
+            .arg(&integration.path)
+            .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .output()
+            .expect("rev-parse MERGE_HEAD")
+            .status
+            .success();
+        assert!(!merge_in_progress, "refused merge must not start a merge");
+        assert!(
+            !integration.path.join("worker-change.txt").exists(),
+            "worker's change must not have merged"
+        );
+
+        for wt in [&worker, &integration] {
+            let _ = remove_worker_worktree(&repo, wt, false);
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     #[test]
     fn integrate_worker_branches_merges_clean_flags_manifests_and_queues_conflicts() {
         let repo = init_test_repo("integrate-worker-branches");
@@ -1396,6 +1779,13 @@ mod tests {
         let int_path = unique_worktree_path(&repo, "int-target");
         let integration =
             create_worker_worktree(&repo, "int-target", &int_path).expect("integration worktree");
+        // Merge-back targets the mother's branch, not the integration clone's
+        // own `wip/int-target` branch (task #833) — check it out first.
+        let base_branch = current_branch(&repo)
+            .expect("current branch")
+            .expect("mother repo should be on a branch");
+        run_git_in(&integration.path, ["checkout", base_branch.as_str()])
+            .expect("checkout base branch in integration worktree");
         std::fs::write(integration.path.join("shared.txt"), "from-integration\n")
             .expect("write integration");
         assert!(commit_worker_changes(
@@ -1538,6 +1928,13 @@ mod tests {
         let int_path = unique_worktree_path(&repo, "int-target");
         let integration =
             create_worker_worktree(&repo, "int-target", &int_path).expect("integration worktree");
+        // Merge-back targets the mother's branch, not the integration clone's
+        // own `wip/int-target` branch (task #833) — check it out first.
+        let base_branch = current_branch(&repo)
+            .expect("current branch")
+            .expect("mother repo should be on a branch");
+        run_git_in(&integration.path, ["checkout", base_branch.as_str()])
+            .expect("checkout base branch in integration worktree");
         // Untracked local tooling files (e.g. `.claude/`, `.mcp.json`) that
         // AGENTS.md says do not belong in the repo — must never block
         // integration, unlike a modification to a tracked file.
