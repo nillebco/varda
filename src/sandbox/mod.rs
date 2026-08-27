@@ -2986,6 +2986,17 @@ pub fn provider_from_config(
              `egress = []`."
         );
     }
+    // The removed-primitive check must run before the egress-enforcement check below:
+    // `egress_is_enforced("clawk", ...)` now returns `false` like any other
+    // non-enforcing primitive, so without this early bail a `clawk` sandbox with
+    // non-empty strict/proxy egress would hit the generic "cannot enforce egress"
+    // message instead of the clear "clawk was removed" refusal (found in cross-review
+    // of #817).
+    if config.primitive == "clawk" {
+        bail!(
+            "sandbox '{name}' has primitive 'clawk', which was removed; use local, docker, or microsandbox"
+        );
+    }
     if !config.egress.is_empty()
         && config.egress_mode != EgressMode::DnsPin
         && !egress_is_enforced(&config.primitive, config.egress_mode)
@@ -3010,9 +3021,6 @@ pub fn provider_from_config(
             MicrosandboxProvider::from_config(name, config, mounts)?
                 .with_identity(identity.clone()),
         )),
-        "clawk" => bail!(
-            "sandbox '{name}' has primitive 'clawk', which was removed; use local, docker, or microsandbox"
-        ),
         other => bail!(
             "sandbox '{name}' has unknown primitive '{other}' (expected local, docker, or microsandbox)"
         ),
@@ -4381,6 +4389,42 @@ mod tests {
         assert!(
             message.contains("clawk"),
             "error must name the removed primitive; got: {message}"
+        );
+        assert!(
+            message.contains("local") && message.contains("docker") && message.contains("microsandbox"),
+            "error must name the valid primitives; got: {message}"
+        );
+    }
+
+    /// Cross-review of #817 found that `egress_is_enforced("clawk", ...)` now
+    /// returns `false` like any other non-enforcing primitive, so a `clawk`
+    /// sandbox paired with non-empty strict/proxy `egress` used to fall into the
+    /// generic "primitive cannot enforce egress" bail in `provider_from_config`
+    /// BEFORE ever reaching the dedicated removed-primitive refusal — giving a
+    /// confusing error that neither names `clawk` as removed nor lists the valid
+    /// primitives. The removed-primitive check must run first regardless of the
+    /// sandbox's egress configuration.
+    #[test]
+    fn clawk_primitive_is_refused_even_with_non_empty_strict_egress() {
+        let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
+        sandboxes.insert(
+            "legacy".to_owned(),
+            SandboxConfig {
+                image: Some("busybox".to_owned()),
+                primitive: "clawk".to_owned(),
+                egress: vec!["example.com".to_owned()],
+                egress_mode: EgressMode::Strict,
+                ..Default::default()
+            },
+        );
+        let message = match provider_for("legacy", &sandboxes, &[], &SandboxIdentity::default()) {
+            Ok(_) => panic!("a 'clawk' primitive must be refused, not silently accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains("clawk") && message.contains("removed"),
+            "a clawk sandbox with non-empty strict egress must still hit the clear \
+             removed-primitive refusal, not the generic egress-enforcement error; got: {message}"
         );
         assert!(
             message.contains("local") && message.contains("docker") && message.contains("microsandbox"),
