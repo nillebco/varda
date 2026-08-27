@@ -3196,6 +3196,20 @@ deny_sandboxes = ["local"]
                 .unwrap_or(2)
         ));
         let integration = git::create_worker_worktree(&repo, "integration", &int).unwrap();
+        // Merge-back targets the mother's branch, not the integration clone's
+        // own `wip/integration` branch (task #833) — check it out first.
+        let base_branch = git::current_branch(&repo)
+            .unwrap()
+            .expect("mother repo should be on a branch");
+        assert!(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&integration.path)
+                .args(["checkout", base_branch.as_str()])
+                .status()
+                .unwrap()
+                .success()
+        );
 
         // Registry: launcher recorded both isolated checkouts.
         let registry = WorkerRegistry::new();

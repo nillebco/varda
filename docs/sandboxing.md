@@ -62,6 +62,59 @@ Two knobs are deliberately separate. **`image`/`build`** decides *what tools are
 
 **`microsandbox`** shells to the `msb` CLI (install with the microsandbox project; expects `msb` on `PATH`) and runs the agent inside an **own-kernel microVM** — a stronger inward boundary than docker's shared kernel, plus Windows coverage. It mirrors the docker provider: the same `image`/`build` inputs (a `build` Dockerfile is built via docker into a tag `msb` runs), the same project-only + opt-in merged mounts (`msb --mount HOST:GUEST`, read-only by default), the same resume-capture model (the guest `HOME` lives in VM storage and is `msb cp`-ed out to `~/.varda/sessions/{session_id}` after the run, so the host `$HOME`/credentials are never exposed), and default-deny egress (fully offline with no `egress`; `egress` hosts become per-host `msb` net allow-rules — enforced in-guest, so hostnames/CIDRs are passed directly rather than pre-resolved to IPs as docker requires). Because msb 0.6.x has no env-file option, Varda stages `env`-target credential values in a private read-only file with `--copy-file` and imports them inside the guest; secret values never appear in the ps-visible `msb run` argv. Ordinary non-secret environment settings continue to use `--env`. The keys never enter the VM, and an OCI image can bake in the agent CLI (e.g. the copilot CLI for the Windows path). *The `msb` argv spellings are centralized in `MicrosandboxSession::wrap`/`extract_session_store`; confirm them against your installed `msb --help` — see the M4 task notes on live verification.*
 
+### Offline `cargo` builds in the worker sandbox (crates.io off the egress allowlist)
+
+A worker sandbox (`[sandboxes.worker]`, image `varda-agents:latest`, see `Dockerfile.agents`)
+builds and tests varda itself as part of ordinary task work. That build must not need
+`crates.io` / `static.crates.io` / `index.crates.io` on the egress allowlist — removing them is
+a net reduction in the box's network surface and makes the build reproducible for a given
+lockfile regardless of registry flakiness.
+
+**A read-only bind mount of the host's `~/.cargo/registry` does not work** and must not be
+re-proposed: cargo takes an in-directory `.package-cache` lock during resolution (fails
+immediately on a `ro` mount, before any build starts) and extracts crate sources into
+`registry/src/` (also a write). Both are writes cargo performs *into* the registry directory
+itself, so a read-only mount of that directory breaks before compilation even begins.
+
+**Mechanism chosen: bake a warm `CARGO_HOME` into the worker image** (`Dockerfile.agents`).
+Image build already runs `cargo fetch --locked` against this project's committed `Cargo.lock`
+into an agent-owned `$CARGO_HOME` (`/home/agent/.cargo`), caching every locked dependency's
+`.crate` archive and index data — no registry index fetch, no archive download, needed later.
+(Cargo may extract a `.crate`'s sources into `registry/src/` lazily, the first time something
+actually builds against it, rather than at fetch time — that's fine here specifically because
+`$CARGO_HOME` is baked into the image and stays writable, unlike a read-only host bind-mount of
+`~/.cargo/registry`, where that same lazy extraction would fail.) `CARGO_NET_OFFLINE=true` is
+baked in as an image `ENV`, so a worker's `cargo build`/`cargo test` never dials out even if the
+sandbox's egress config still happens to allow it; the guarantee lives in the image, not just in
+the egress allow-list. Rejected alternatives: `cargo vendor` + source replacement is fully reproducible but
+adds a vendor-tree refresh step and repo/image size for no benefit here, since the image is
+already rebuilt on every dependency change; `cargo local-registry` is lighter than vendoring but
+still needs its own generation step this project doesn't otherwise need. Baking `CARGO_HOME`
+reuses machinery (`cargo fetch --locked` at image build) that already existed for the "worker
+can build at all" case; going offline is a one-line addition (`CARGO_NET_OFFLINE=true`) on top
+of it.
+
+**Failure mode when a dependency is added is explicit, not a network hang.** Because
+`CARGO_NET_OFFLINE=true` is set, a `Cargo.lock` that gained a crate since the image was last
+built fails immediately with cargo's own offline-resolution error (`no matching package named
+`X` found ... you are using --offline`) instead of a confusing DNS/connect failure inside a box
+that has no route to `crates.io` at all. Remediation is a host action: rebuild and reload the
+image (`make agents-image`) so the new dependency is fetched into `$CARGO_HOME` with real
+network access on the host, then retry the worker task.
+
+**Trade-off, accepted.** The warmed cache goes stale the moment `Cargo.lock` changes and the
+image is not rebuilt — the image must be refreshed on every dependency change (`make
+agents-image`). This is a known, explicit cost of mechanism 3 versus `cargo vendor`/
+`cargo local-registry`, accepted because the image already had to be rebuilt for other reasons
+(new CLI versions, base image bumps) and staleness now fails loudly instead of silently.
+
+**Operator action required (outside this repo):** remove `crates.io`, `static.crates.io`, and
+`index.crates.io` from `[sandboxes.worker].egress` in the central `config.toml` — that egress
+list is host/operator config, not something this repo can commit on your behalf. The resident
+(`[sandboxes.orchestrate]`) is unaffected either way: it still does not build (its rw
+`/workspace` mount means a Linux-guest build would land in the macOS host's `target/`), so it
+never needed `crates.io` egress in the first place.
+
 ### Interactive sandbox (real agents): TTY, prompt staging, injected auth, and the docker lifecycle
 
 `--interactive` runs now put the **real coding agents** (`claude`, `codex`, `copilot`) — not just a bare shell — inside `docker` and `microsandbox`, not just `local`. Each default agent ships an `interactive_command`/`interactive_args` that launches the agent through a login shell reading the staged prompt (`sh -c '<agent> "$(cat $VARDA_PROMPT_FILE)" …'`); when the resolved sandbox is not `local`, Varda attaches **your terminal** to that agent *inside the box*. The project is mounted, but `~/.aws`/`~/.ssh`/`~/.claude`/etc. stay invisible (the same isolation as a batch run), and teardown removes the container/microVM and its volume on every exit path.
