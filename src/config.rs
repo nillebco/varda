@@ -2132,42 +2132,7 @@ fn resolve_includes(
             }
         }
 
-        reject_unknown_fragment_keys(&content, entry.path())?;
-        let mut fragment: ConfigFragment = toml::from_str(&content).with_context(|| {
-            format!("failed to parse included config fragment {}", entry.path())
-        })?;
-        if !fragment.include.is_empty() {
-            bail!(
-                "included config fragment {} declares its own `include`; \
-                 nested includes are not supported",
-                entry.path()
-            );
-        }
-
-        for route in &mut fragment.routes {
-            expand_route_mounts(route, Some(&bundle_dir))?;
-            // This route comes from a less-trusted included fragment, not the
-            // central config — `resolve_sandbox_for` unions its own `env` keys
-            // into `varda_env_keys` so a fnox binding in it is refused. See the
-            // field doc on `untrusted`.
-            route.untrusted = true;
-        }
-        for sandbox in fragment.sandboxes.values_mut() {
-            expand_sandbox_mounts(sandbox, Some(&bundle_dir))?;
-            // Same provenance flag as above, for fragment-sourced sandboxes. See
-            // the field doc on `SandboxConfig::untrusted`.
-            sandbox.untrusted = true;
-        }
-        for agent in fragment.agents.values_mut() {
-            agent.command = resolve_bundle_relative_command(&agent.command, &bundle_dir);
-            if let Some(working_dir) = &agent.working_dir {
-                agent.working_dir = Some(resolve_bundle_relative_command(working_dir, &bundle_dir));
-            }
-            // This agent comes from a less-trusted included fragment, not the
-            // central config — `resolve_agent_credentials` (main.rs) refuses to
-            // mint any host credential for it. See the field doc on `untrusted`.
-            agent.untrusted = true;
-        }
+        let mut fragment = parse_and_process_fragment(&content, entry.path(), &bundle_dir)?;
 
         config.routes.append(&mut fragment.routes);
         for (name, sandbox) in fragment.sandboxes {
@@ -2193,6 +2158,55 @@ fn resolve_includes(
     }
 
     Ok(unverified_warnings)
+}
+
+/// Parse a fragment's raw `content` and apply the per-fragment processing shared by
+/// [`resolve_includes`]'s merge loop and [`fragment_capability_summary`]: unknown-key
+/// rejection, nested-include rejection, mount expansion relative to `bundle_dir`, and
+/// flagging every route/sandbox/agent as `untrusted`. Extracting this into one
+/// function (rather than two hand-synced copies) is what makes the two call sites
+/// incapable of drifting — see #765 follow-up / cross-review #806.
+fn parse_and_process_fragment(
+    content: &str,
+    entry_path: &str,
+    bundle_dir: &Path,
+) -> Result<ConfigFragment> {
+    reject_unknown_fragment_keys(content, entry_path)?;
+    let mut fragment: ConfigFragment = toml::from_str(content)
+        .with_context(|| format!("failed to parse included config fragment {entry_path}"))?;
+    if !fragment.include.is_empty() {
+        bail!(
+            "included config fragment {entry_path} declares its own `include`; \
+             nested includes are not supported"
+        );
+    }
+
+    for route in &mut fragment.routes {
+        expand_route_mounts(route, Some(bundle_dir))?;
+        // This route comes from a less-trusted included fragment, not the
+        // central config — `resolve_sandbox_for` unions its own `env` keys
+        // into `varda_env_keys` so a fnox binding in it is refused. See the
+        // field doc on `untrusted`.
+        route.untrusted = true;
+    }
+    for sandbox in fragment.sandboxes.values_mut() {
+        expand_sandbox_mounts(sandbox, Some(bundle_dir))?;
+        // Same provenance flag as above, for fragment-sourced sandboxes. See
+        // the field doc on `SandboxConfig::untrusted`.
+        sandbox.untrusted = true;
+    }
+    for agent in fragment.agents.values_mut() {
+        agent.command = resolve_bundle_relative_command(&agent.command, bundle_dir);
+        if let Some(working_dir) = &agent.working_dir {
+            agent.working_dir = Some(resolve_bundle_relative_command(working_dir, bundle_dir));
+        }
+        // This agent comes from a less-trusted included fragment, not the
+        // central config — `resolve_agent_credentials` (main.rs) refuses to
+        // mint any host credential for it. See the field doc on `untrusted`.
+        agent.untrusted = true;
+    }
+
+    Ok(fragment)
 }
 
 /// Field names recognized by [`ConfigFragment`] / [`SandboxConfig`] / [`AgentConfig`]
@@ -2342,43 +2356,18 @@ fn detect_launch_context() -> LaunchContext {
 }
 
 /// Derive the [`config_approval::CapabilitySummary`] of a standalone fragment's
-/// content, applying the same per-fragment processing [`resolve_includes`] itself
-/// applies before merging (unknown-key rejection, mount expansion relative to
-/// `bundle_dir`, the `untrusted` provenance flag) so the summary reflects exactly
-/// what would be merged — without actually merging it into the caller's `Config`.
-/// Used to diff the previously-approved copy of a bundle against its new content;
-/// never the full merged config (approval is scoped per include file, matching
+/// content, via the same [`parse_and_process_fragment`] helper [`resolve_includes`]
+/// itself calls before merging, so the summary reflects exactly what would be
+/// merged — without actually merging it into the caller's `Config`. Used to diff the
+/// previously-approved copy of a bundle against its new content; never the full
+/// merged config (approval is scoped per include file, matching
 /// [`config_approval::ApprovalStore`]'s per-bundle-path keying).
 fn fragment_capability_summary(
     content: &str,
     entry_path: &str,
     bundle_dir: &Path,
 ) -> Result<config_approval::CapabilitySummary> {
-    reject_unknown_fragment_keys(content, entry_path)?;
-    let mut fragment: ConfigFragment = toml::from_str(content).with_context(|| {
-        format!("failed to parse content of {entry_path} for a capability-summary diff")
-    })?;
-    if !fragment.include.is_empty() {
-        bail!(
-            "included config fragment {entry_path} declares its own `include`; \
-             nested includes are not supported"
-        );
-    }
-    for route in &mut fragment.routes {
-        expand_route_mounts(route, Some(bundle_dir))?;
-        route.untrusted = true;
-    }
-    for sandbox in fragment.sandboxes.values_mut() {
-        expand_sandbox_mounts(sandbox, Some(bundle_dir))?;
-        sandbox.untrusted = true;
-    }
-    for agent in fragment.agents.values_mut() {
-        agent.command = resolve_bundle_relative_command(&agent.command, bundle_dir);
-        if let Some(working_dir) = &agent.working_dir {
-            agent.working_dir = Some(resolve_bundle_relative_command(working_dir, bundle_dir));
-        }
-        agent.untrusted = true;
-    }
+    let fragment = parse_and_process_fragment(content, entry_path, bundle_dir)?;
     let mut summary_config: Config =
         toml::from_str(DEFAULT_CONFIG).expect("DEFAULT_CONFIG template must parse");
     summary_config.routes = fragment.routes;
@@ -5263,6 +5252,137 @@ command = "codex"
         assert!(
             !central_route.untrusted,
             "a central-config route must never be flagged untrusted by resolve_includes"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// #765 follow-up (task #812): `resolve_includes` and `fragment_capability_summary`
+    /// must share the exact same per-fragment processing (unknown-key rejection,
+    /// mount expansion, `untrusted` flagging) rather than two hand-synced copies that
+    /// could drift. This exercises the extracted [`parse_and_process_fragment`]
+    /// helper directly, so a future change that reintroduces a hand-copied variant
+    /// at either call site (rather than calling this helper) is not covered by this
+    /// test — but a regression IN the helper itself is caught here.
+    #[test]
+    fn parse_and_process_fragment_expands_mounts_and_flags_untrusted() {
+        let root = temp_dir("parse-and-process-fragment");
+
+        let content = "[sandboxes.frag_sandbox]\nimage = \"frag-image\"\n\
+                        mounts = [\"./data:/data:rw\"]\n\n\
+                       [agents.frag_agent]\nkind = \"acp\"\ncommand = \"true\"\n\n\
+                       [[routes]]\nglob = \"frag/**\"\nagents = [\"codex\"]\n";
+
+        let fragment = parse_and_process_fragment(content, "frag.toml", &root)
+            .expect("well-formed fragment should parse and process");
+
+        let sandbox = &fragment.sandboxes["frag_sandbox"];
+        assert!(
+            sandbox.untrusted,
+            "fragment sandbox must be flagged untrusted"
+        );
+        assert_eq!(
+            sandbox.mounts,
+            vec![root.join("./data").to_string_lossy().into_owned() + ":/data:rw"],
+            "a relative mount source must expand relative to bundle_dir"
+        );
+        assert!(
+            fragment.agents["frag_agent"].untrusted,
+            "fragment agent must be flagged untrusted"
+        );
+        assert!(
+            fragment.routes[0].untrusted,
+            "fragment route must be flagged untrusted"
+        );
+
+        let unknown_key_err = parse_and_process_fragment(
+            "[sandboxes.x]\nnot_a_real_field = true\n",
+            "bad.toml",
+            &root,
+        )
+        .expect_err("an unrecognized key must be rejected");
+        assert!(
+            unknown_key_err.to_string().contains("not_a_real_field"),
+            "error must name the offending key: {unknown_key_err}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// #765 follow-up (task #812): guards against `resolve_includes`'s merge loop
+    /// and `fragment_capability_summary` drifting apart. Both now call the same
+    /// [`parse_and_process_fragment`] helper, so the capability surface a human
+    /// reviews before approving a bundle (`fragment_capability_summary`) must equal
+    /// the capability surface the SAME fragment content actually contributes once
+    /// merged (`resolve_includes` + `CapabilitySummary::from_config`). Central-only
+    /// entries are disjoint by name from fragment-sourced ones here, so the merged
+    /// summary must equal the union of the central-only summary and the
+    /// fragment-only summary; if a future edit makes the two code paths diverge
+    /// (e.g. mount expansion applied on one side only), this union equality breaks.
+    #[test]
+    fn fragment_capability_summary_matches_resolve_includes_merge() {
+        let root = temp_dir("capability-summary-parity");
+
+        let content = "[sandboxes.frag_sandbox]\nimage = \"frag-image\"\n\
+                        mounts = [\"./data:/data:rw\"]\n\n\
+                       [agents.frag_agent]\nkind = \"acp\"\ncommand = \"true\"\n\n\
+                       [[routes]]\nglob = \"frag/**\"\nagents = [\"codex\"]\n";
+        fs::write(root.join("frag.toml"), content).expect("frag should be written");
+
+        let central_config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        let central_summary = config_approval::CapabilitySummary::from_config(&central_config);
+
+        let mut merged_config = central_config.clone();
+        merged_config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+        resolve_includes(&root, &mut merged_config, VerifyMode::Strict)
+            .expect("includes should resolve");
+        let merged_summary = config_approval::CapabilitySummary::from_config(&merged_config);
+
+        let direct_summary = fragment_capability_summary(content, "frag.toml", &root)
+            .expect("capability summary should derive from fragment content");
+
+        assert_eq!(
+            merged_summary.sandboxes,
+            central_summary
+                .sandboxes
+                .union(&direct_summary.sandboxes)
+                .cloned()
+                .collect(),
+            "merged sandboxes must equal central ∪ fragment-derived"
+        );
+        assert_eq!(
+            merged_summary.agents,
+            central_summary
+                .agents
+                .union(&direct_summary.agents)
+                .cloned()
+                .collect(),
+            "merged agents must equal central ∪ fragment-derived"
+        );
+        assert_eq!(
+            merged_summary.route_globs,
+            central_summary
+                .route_globs
+                .union(&direct_summary.route_globs)
+                .cloned()
+                .collect(),
+            "merged route globs must equal central ∪ fragment-derived"
+        );
+        assert_eq!(
+            merged_summary.rw_mounts_outside_project,
+            central_summary
+                .rw_mounts_outside_project
+                .union(&direct_summary.rw_mounts_outside_project)
+                .cloned()
+                .collect(),
+            "merged rw-outside-project mounts (post-expansion) must equal central ∪ \
+             fragment-derived — this is the field that would catch mount-expansion drift"
+        );
+        assert!(
+            !direct_summary.rw_mounts_outside_project.is_empty(),
+            "sanity check: the fragment's relative mount must have expanded to an \
+             outside-project rw mount in the direct summary too, or this test proves nothing"
         );
 
         fs::remove_dir_all(&root).ok();
