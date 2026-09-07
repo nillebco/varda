@@ -745,6 +745,23 @@ pub struct SandboxConfig {
     /// run`'s integer `--cpus` core count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<String>,
+    /// Opt-in in-memory scratch filesystems, `msb run --tmpfs` grammar
+    /// (`PATH`, `PATH:SIZE`, or `PATH:SIZE:OPTIONS` — e.g. `"/tmp:4G"`). One
+    /// `--tmpfs` argv pair is emitted per entry; empty ⇒ argv unchanged, exactly
+    /// like `memory`/`cpus`.
+    ///
+    /// MICROSANDBOX ONLY. The guest mounts a fresh 512 MiB tmpfs over `/tmp` at
+    /// boot, and a build or a chatty tool then fills it: every scratch write dies
+    /// with ENOSPC while the agent itself stays alive, so the agent reports "my
+    /// shell is broken" rather than "the disk is full" (resident incident,
+    /// 2026-09-07). Docker's `--tmpfs` takes a DIFFERENT option grammar
+    /// (`/tmp:size=4g`), so the docker provider deliberately refuses to
+    /// reinterpret these specs and warns instead of silently mis-applying them.
+    ///
+    /// tmpfs is RAM-backed: a size here is a CEILING carved out of the sandbox's
+    /// memory, not a reservation. Keep it well under `memory`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmpfs: Vec<String>,
     /// Provenance, NOT a TOML field (never (de)serialized — set only by
     /// [`resolve_includes`] after merge). `true` when this sandbox was declared by
     /// an included, less-trusted fragment rather than the central config. Mirrors
@@ -1114,6 +1131,7 @@ impl Default for SandboxConfig {
             egress_proxy_image: None,
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             untrusted: false,
         }
     }
@@ -1299,11 +1317,25 @@ impl AgentCli {
 /// `mkdir -p "$HOME/.copilot"; exec copilot ...` resolves to `Copilot`, not `None`,
 /// and doesn't false-match on `.copilot` substrings inside the preamble either.
 pub fn agent_cli_kind(command: &str, args: &[String]) -> Option<AgentCli> {
-    if let Some(kind) = AgentCli::from_binary(command) {
+    // Match on the command's FILE NAME, never the literal string. An INCLUDED
+    // config fragment must spell `command` ABSOLUTELY (`/bin/sh`), because
+    // `resolve_bundle_relative_command` joins a bare `"sh"` to the fragment's own
+    // directory (task #873). The old literal `command == "sh"` test therefore
+    // missed every fragment-declared agent: `agent_cli_kind` returned `None`, so
+    // `record_external_session` spawned NO recorder, so no `external_session_log=`
+    // line reached the session log — and the interpreter pass, handed a log with
+    // nothing but the header and `status=`, could only report "no transcript, no
+    // recap" (observed on interactive `dpt-copilot` runs, 2026-09-07).
+    let binary = std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command);
+
+    if let Some(kind) = AgentCli::from_binary(binary) {
         return Some(kind);
     }
 
-    if command == "sh" && args.first().is_some_and(|arg| arg == "-c") {
+    if matches!(binary, "sh" | "bash" | "zsh") && args.first().is_some_and(|arg| arg == "-c") {
         if let Some(script) = args.get(1) {
             return shell_script_cli_kind(script);
         }
@@ -3196,6 +3228,31 @@ mod tests {
         // Unknown CLI wrapped in sh -c resolves to None, not a false positive.
         let unknown_wrapped = vec!["-c".to_owned(), "opencode run --auto".to_owned()];
         assert_eq!(agent_cli_kind("sh", &unknown_wrapped), None);
+    }
+
+    #[test]
+    fn agent_cli_kind_resolves_an_absolute_shell_command() {
+        // An INCLUDED fragment must spell the command absolutely (task #873), and
+        // that must not cost the agent its external-session capture (no recorder
+        // => transcript-less session log => the interpreter cannot produce a recap).
+        let wrapped = vec![
+            "-c".to_owned(),
+            "copilot -p \"$(cat)\" --allow-all-tools --add-dir /p -s".to_owned(),
+        ];
+        assert_eq!(
+            agent_cli_kind("/bin/sh", &wrapped),
+            Some(AgentCli::Copilot),
+            "an absolute /bin/sh wrapper must resolve like a bare sh one"
+        );
+        assert_eq!(
+            agent_cli_kind("/bin/bash", &wrapped),
+            Some(AgentCli::Copilot)
+        );
+        assert_eq!(
+            agent_cli_kind("/opt/homebrew/bin/claude", &[]),
+            Some(AgentCli::Claude),
+            "an absolute agent binary must resolve by its file name"
+        );
     }
 
     #[test]

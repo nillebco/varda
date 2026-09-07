@@ -1149,8 +1149,32 @@ fn find_copilot_process_log(session_root: &Path, started_at: SystemTime) -> Opti
     find_copilot_process_log_in(&logs_dir, started_at)
 }
 
+/// Epoch-ms START stamp encoded in a real copilot process-log NAME
+/// (`process-<epoch_ms>-<pid>.log`). `None` for any other shape, which keeps the
+/// mtime fallback below for logs whose name carries no stamp.
+fn copilot_process_log_started_ms(name: &str) -> Option<u128> {
+    let rest = name.strip_prefix("process-")?.strip_suffix(".log")?;
+    let (stamp, pid) = rest.split_once('-')?;
+    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    stamp.parse::<u128>().ok()
+}
+
 fn find_copilot_process_log_in(logs_dir: &Path, started_at: SystemTime) -> Option<PathBuf> {
-    let mut candidates: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(logs_dir)
+    // Order by the START stamp in the file NAME when it has one, NOT by mtime. A
+    // copilot session that is still running keeps appending to its own log, so
+    // EVERY concurrent session's mtime is >= started_at and the earliest-mtime
+    // pick could return a FOREIGN, hours-old session's log — and hence a foreign
+    // workspace id, feeding the interpreter someone else's transcript. The name
+    // stamp is fixed when the process starts, so ">= started_at" selects only a
+    // log born with this run. Logs whose name carries no stamp keep the old
+    // mtime behaviour.
+    let started_ms = started_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let mut candidates: Vec<(u128, PathBuf)> = std::fs::read_dir(logs_dir)
         .ok()?
         .flatten()
         .filter_map(|e| {
@@ -1159,15 +1183,25 @@ fn find_copilot_process_log_in(logs_dir: &Path, started_at: SystemTime) -> Optio
             if !name.starts_with("process-") || !name.ends_with(".log") {
                 return None;
             }
-            let mtime = e.metadata().ok()?.modified().ok()?;
-            if mtime < started_at {
+            let key = match copilot_process_log_started_ms(&name) {
+                Some(stamp) => stamp,
+                None => e
+                    .metadata()
+                    .ok()?
+                    .modified()
+                    .ok()?
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis(),
+            };
+            if key < started_ms {
                 return None;
             }
-            Some((mtime, path))
+            Some((key, path))
         })
         .collect();
-    // Pick the file whose mtime is closest to (and at or after) started_at.
-    candidates.sort_by_key(|(mtime, _)| *mtime);
+    // Pick the file that started closest to (and at or after) started_at.
+    candidates.sort_by_key(|(key, _)| *key);
     candidates.into_iter().map(|(_, p)| p).next()
 }
 
@@ -3420,6 +3454,40 @@ mod tests {
             .unwrap()
             .to_owned();
         assert_eq!(name, "process-22222.log");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn find_copilot_process_log_in_ignores_a_still_running_foreign_session() {
+        // Real copilot names are `process-<epoch_ms>-<pid>.log`. A long-running
+        // FOREIGN session keeps appending, so its mtime is newer than ours even
+        // though it started hours earlier — selecting on mtime handed the
+        // interpreter that session's workspace id.
+        let dir =
+            std::env::temp_dir().join(format!("varda-copilot-logs-foreign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let started_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        // Started an hour ago, still being written to right now.
+        let foreign = dir.join(format!("process-{}-84086.log", started_ms - 3_600_000));
+        std::fs::write(&foreign, b"foreign session, still appending").unwrap();
+        // Ours: started just after the run began.
+        let ours = dir.join(format!("process-{}-10241.log", started_ms + 5));
+        std::fs::write(&ours, b"our session").unwrap();
+        // Touch the foreign log LAST so it has the newest mtime.
+        std::fs::write(&foreign, b"foreign session, still appending more").unwrap();
+
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_millis(started_ms as u64);
+        let result = find_copilot_process_log_in(&dir, started_at).unwrap();
+        assert_eq!(
+            result, ours,
+            "picked the foreign still-running session's log"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }
