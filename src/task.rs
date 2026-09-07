@@ -140,6 +140,10 @@ impl TaskFrontmatter {
 /// falls back to the matching `defaults.*` config value.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskBounds {
+    /// Operator-supplied hosts added to the resolved sandbox allow-list for each
+    /// launch. Stored with other per-task launch overrides so resumes preserve it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress: Vec<String>,
     /// Override `defaults.idle_timeout_seconds` for this task (seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<u64>,
@@ -618,6 +622,26 @@ pub fn create_task(
     description: Option<&str>,
     sandbox: Option<&str>,
 ) -> Result<PathBuf> {
+    create_task_with_egress(
+        config,
+        taskname,
+        project_path,
+        assignee,
+        description,
+        sandbox,
+        &[],
+    )
+}
+
+pub fn create_task_with_egress(
+    config: &Config,
+    taskname: &str,
+    project_path: &Path,
+    assignee: Option<&str>,
+    description: Option<&str>,
+    sandbox: Option<&str>,
+    egress: &[String],
+) -> Result<PathBuf> {
     let task_root = Path::new(&config.defaults.operations_dir).join("tasks");
     let task_dir = task_root.join(project_task_folder(project_path)?);
     fs::create_dir_all(&task_dir)
@@ -643,7 +667,10 @@ pub fn create_task(
     let task = TaskDocument {
         path: path.clone(),
         frontmatter: TaskFrontmatter {
-            bounds: crate::task::TaskBounds::default(),
+            bounds: crate::task::TaskBounds {
+                egress: egress.to_vec(),
+                ..Default::default()
+            },
             id: Some(id),
             status: TaskStatus::Backlog,
             project: Some(project_path.display().to_string()),

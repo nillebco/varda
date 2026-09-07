@@ -120,6 +120,10 @@ enum TaskCommand {
         /// for the identity provider. Composes with `--exec --interactive`.
         #[arg(long, value_name = "NAME")]
         sandbox: Option<String>,
+        /// Add comma-delimited exact hosts to the sandbox egress allow-list for
+        /// this task's launches. Wildcards, URLs, and paths are rejected.
+        #[arg(long, value_delimiter = ',', value_name = "HOSTS")]
+        egress: Vec<String>,
         /// Treat the task name as a complete one-line task and run it immediately.
         #[arg(long)]
         exec: bool,
@@ -398,6 +402,7 @@ async fn run_cli() -> Result<()> {
                 project,
                 agent,
                 sandbox,
+                egress,
                 exec,
                 edit,
                 background,
@@ -447,6 +452,7 @@ async fn run_cli() -> Result<()> {
                 let config_path = config::config_file()?;
                 let config = config::resolve_config(&config_path)?;
                 let project_path = task::resolve_project_path(project.as_deref())?;
+                validate_egress_override(&egress)?;
                 // --reuse (with --exec): if this (project, name) task already exists,
                 // resume it instead of erroring on the collision. Lets the shell aliases
                 // (vadbdev, vadbinfra, ...) be launched repeatedly without a stuck
@@ -464,7 +470,19 @@ async fn run_cli() -> Result<()> {
                 if reuse && exec {
                     let existing = task::task_file_path(&config, &project_path, &taskname)?;
                     if existing.exists() {
-                        let existing_task = task::load_task(&existing)?;
+                        let mut existing_task = task::load_task(&existing)?;
+                        for host in &egress {
+                            if !existing_task
+                                .frontmatter
+                                .bounds
+                                .egress
+                                .iter()
+                                .any(|saved| saved.eq_ignore_ascii_case(host))
+                            {
+                                existing_task.frontmatter.bounds.egress.push(host.clone());
+                            }
+                        }
+                        task::write_task(&existing_task)?;
                         let fresh = existing_task.frontmatter.status == task::TaskStatus::Done;
                         if fresh {
                             println!(
@@ -504,13 +522,14 @@ async fn run_cli() -> Result<()> {
                     }
                     assignee
                 };
-                let task_path = task::create_task(
+                let task_path = task::create_task_with_egress(
                     &config,
                     &taskname,
                     &project_path,
                     assignee.as_deref(),
                     description.as_deref(),
                     sandbox.as_deref(),
+                    &egress,
                 )?;
                 let mut task_doc = task::load_task(&task_path)?;
                 if ready || exec {
@@ -1142,6 +1161,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         None,
         None,
         None,
+        &[],
     )?;
     let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
     let request = agent::AgentRunRequest {
@@ -2142,6 +2162,7 @@ fn build_client(
     project_path: Option<&Path>,
     policy_path: Option<&Path>,
     pinned_sandbox: Option<&str>,
+    egress_override: &[String],
 ) -> Result<acp::AcpSubprocessClient> {
     // M11 — resolve the three identity/auth channels (curated identity files,
     // SSH-agent + git identity, scoped auth token) once and inject them into
@@ -2166,8 +2187,9 @@ fn build_client(
             // `routing_root_for` would return the WORKTREE root, not the mother.
             let policy_path = policy_path.unwrap_or(project_path);
             let routing_root = routing_root_for(policy_path);
-            let resolved =
+            let mut resolved =
                 config.resolve_sandbox_for(policy_path, &routing_root, pinned_sandbox)?;
+            apply_egress_override(&mut resolved.config, egress_override)?;
             enforce_varda_env_credential_floor(agent_config, &resolved)?;
             if let Some(varda_file) = &resolved.varda_file {
                 eprintln!(
@@ -2200,7 +2222,26 @@ fn build_client(
             static_env.extend(route_env.clone());
             let route_untrusted_keys = config::untrusted_env_keys_if(route_env, route_untrusted);
             untrusted_env_keys = config::union_keys(sandbox_untrusted_keys, route_untrusted_keys);
-            sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?
+            if egress_override.is_empty() {
+                sandbox::provider_for(sandbox_name, &config.sandboxes, route_mounts, &identity)?
+            } else {
+                let mut sandbox_config = if sandbox_name == config::DEFAULT_SANDBOX_PROVIDER {
+                    config::SandboxConfig {
+                        primitive: "local".to_owned(),
+                        ..Default::default()
+                    }
+                } else {
+                    config
+                        .sandboxes
+                        .get(sandbox_name)
+                        .cloned()
+                        .with_context(|| format!("sandbox '{sandbox_name}' is not configured"))?
+                };
+                apply_egress_override(&mut sandbox_config, egress_override)?;
+                let mounts =
+                    sandbox::merge_mount_origins(&sandbox_config.mounts, route_mounts, &[]);
+                sandbox::provider_from_config(sandbox_name, &sandbox_config, mounts, &identity)?
+            }
         }
     };
     // Resolve `${fnox:NAME}` bindings on the HOST at prepare time, injecting only the
@@ -2217,6 +2258,56 @@ fn build_client(
         provider,
         static_env,
     ))
+}
+
+fn validate_egress_override(hosts: &[String]) -> Result<()> {
+    for entry in hosts {
+        let (host, port) = match entry.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            _ => (entry.as_str(), None),
+        };
+        let valid_port = port.is_none_or(|port| {
+            !port.is_empty() && port.parse::<u16>().is_ok_and(|port| port != 0)
+        });
+        // Docker's shared host/port splitter does not support IPv6 literals yet,
+        // so per-launch entries deliberately accept IPv4 only.
+        let valid_host = host.parse::<std::net::Ipv4Addr>().is_ok()
+            || (host.len() <= 253
+                && host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                        && label
+                            .as_bytes()
+                            .first()
+                            .is_some_and(u8::is_ascii_alphanumeric)
+                        && label
+                            .as_bytes()
+                            .last()
+                            .is_some_and(u8::is_ascii_alphanumeric)
+                }));
+        if !valid_host || !valid_port {
+            anyhow::bail!(
+                "invalid --egress host '{entry}': use an exact hostname or IPv4 address with an optional numeric port"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn apply_egress_override(config: &mut config::SandboxConfig, hosts: &[String]) -> Result<()> {
+    validate_egress_override(hosts)?;
+    let mut added = Vec::new();
+    for host in hosts {
+        if !config.egress.iter().any(|existing| existing.eq_ignore_ascii_case(host)) {
+            config.egress.push(host.clone());
+            added.push(host.as_str());
+        }
+    }
+    if !added.is_empty() {
+        eprintln!("sandbox: per-launch egress added: {}", added.join(","));
+    }
+    Ok(())
 }
 
 fn enforce_varda_env_credential_floor(
@@ -2565,6 +2656,7 @@ async fn run_task_path_for_parallel(
             .as_deref()
             .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
+        &task_document.frontmatter.bounds.egress,
     )?;
     // POLICY reads (orchestration policy + sandbox-primitive/transport selection)
     // key on the MOTHER repo root via `policy_project`; MOUNT/cwd (the socket dir,
@@ -4502,6 +4594,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
             .as_deref()
             .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
+        &task_document.frontmatter.bounds.egress,
     )?;
     // Wire the nested-orchestration broker onto the interactive resident: when
     // orchestration is enabled for this project, wrap the session in
@@ -4873,6 +4966,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
             .as_deref()
             .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
+        &task_document.frontmatter.bounds.egress,
     )?;
     let outcome = runner::plan_task(
         &config,
@@ -4979,6 +5073,7 @@ async fn run_captured_resume_command(
             .as_deref()
             .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
+        &task_document.frontmatter.bounds.egress,
     )?;
     if config.git.auto_commit {
         git::commit_task_file(
@@ -5541,6 +5636,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .map(|_| ())
         .expect_err(
@@ -5577,6 +5673,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .map(|_| ())
         .expect_err(
@@ -5624,10 +5721,38 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .expect(
             "central-config sandbox/route env must not be affected by the untrusted-fragment refusal",
         );
+    }
+
+    #[test]
+    fn build_client_none_project_applies_egress_override() {
+        let config = config_with_sandbox(
+            "central_sandbox",
+            config::SandboxConfig {
+                primitive: "local".to_owned(),
+                ..Default::default()
+            },
+        );
+        let error = build_client(
+            &config,
+            "agent",
+            &agent_for_credentials(vec![]),
+            "central_sandbox",
+            &[],
+            &std::collections::BTreeMap::new(),
+            false,
+            None,
+            None,
+            None,
+            &["example.com".to_owned()],
+        )
+        .map(|_| ())
+        .expect_err("local provider must see and reject the egress override");
+        assert!(error.to_string().contains("non-empty `egress`"));
     }
 
     #[test]
@@ -7937,5 +8062,33 @@ Do it.
         assert!(recap.contains("agent binary was not found"));
 
         fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn per_launch_egress_is_additive_deduplicated_and_validated() {
+        let mut sandbox = config::SandboxConfig {
+            egress: vec!["Crates.io".to_owned()],
+            ..Default::default()
+        };
+        apply_egress_override(
+            &mut sandbox,
+            &["crates.io".to_owned(), "index.crates.io".to_owned()],
+        )
+        .expect("exact hosts should be accepted");
+        assert_eq!(sandbox.egress, ["Crates.io", "index.crates.io"]);
+
+        for invalid in [
+            "*.example.com",
+            "https://example.com",
+            "example.com/path",
+            "safe|github.com",
+            "[a-z].example.com",
+            "example.com:0",
+            "::1",
+        ] {
+            let error = validate_egress_override(&[invalid.to_owned()])
+                .expect_err("non-exact egress must be rejected");
+            assert!(error.to_string().contains("invalid --egress host"));
+        }
     }
 }
