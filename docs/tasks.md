@@ -114,6 +114,21 @@ field in the task frontmatter. It composes with `--exec`, `--interactive`, and
 `--agent`. It does **not** relax the resident/orchestrate launch checks
 (`enforce_resident_launch` runs for `varda orchestrate`, not plain `task add`).
 
+### Per-launch egress (`--egress`)
+
+Add exact hosts to the selected sandbox's configured allow-list for one task:
+
+```sh
+varda task add --sandbox worker --egress crates.io,index.crates.io --exec "update dependencies"
+```
+
+The comma-delimited hosts are persisted in task frontmatter, applied to fresh
+launches and resumes, de-duplicated case-insensitively against configured
+egress, and logged when the sandbox is built. This is additive: it does not
+replace the sandbox's configured list. Values must be valid hostnames or IPv4
+addresses, optionally followed by a numeric port. The selected primitive still has to enforce the resulting list;
+in particular, `local` with non-empty egress remains an error.
+
 `taskname` and `description` are two separate positional arguments, so quote any multi-word values:
 
 ```sh
