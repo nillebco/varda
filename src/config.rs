@@ -2272,6 +2272,7 @@ pub(crate) const SANDBOX_CONFIG_FIELDS: &[&str] = &[
     "egress_proxy_image",
     "memory",
     "cpus",
+    "tmpfs",
 ];
 pub(crate) const AGENT_CONFIG_FIELDS: &[&str] = &[
     "kind",
@@ -5996,6 +5997,37 @@ command = "codex"
         assert!(
             message.contains("definitely-not-a-real-command-from-fragment"),
             "error must name the command required by the included fragment: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// #910: `tmpfs` must survive an INCLUDED fragment. Fragments reject unknown
+    /// `[sandboxes.*]` keys against `SANDBOX_CONFIG_FIELDS`, so a field added to
+    /// the struct but not to that list loads fine centrally and then fails only
+    /// in the one place the resident is actually configured from.
+    #[test]
+    fn a_fragment_may_declare_sandbox_tmpfs() {
+        let root = temp_dir("fragment-tmpfs");
+        fs::write(
+            root.join("frag.toml"),
+            "[sandboxes.orchestrate]\nprimitive = \"microsandbox\"\nimage = \"varda-agents:latest\"\ntmpfs = [\"/tmp:4G\"]\n",
+        )
+        .expect("fragment should be written");
+
+        let mut config: Config =
+            toml::from_str(&minimal_config_toml()).expect("base config should parse");
+        config.include = vec![IncludeEntry::Path("frag.toml".to_owned())];
+        resolve_includes(&root, &mut config, VerifyMode::Strict)
+            .expect("a fragment declaring `tmpfs` must load");
+
+        assert_eq!(
+            config
+                .sandboxes
+                .get("orchestrate")
+                .expect("fragment sandbox should be merged in")
+                .tmpfs,
+            vec!["/tmp:4G".to_owned()]
         );
 
         fs::remove_dir_all(&root).ok();

@@ -665,6 +665,9 @@ mod tests {
             "egress_proxy_image",
             "memory",
             "cpus",
+            // A guest-internal scratch-size ceiling (`msb run --tmpfs`): it grants
+            // no host path, no egress, and no identity — same class as memory/cpus.
+            "tmpfs",
         ];
 
         const AGENT_CAPABILITY_BEARING: &[&str] = &[

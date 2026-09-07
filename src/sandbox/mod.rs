@@ -952,6 +952,17 @@ impl DockerProvider {
                 "sandbox '{name}' needs an `image`, a `build` path, or `image_from` (required for the docker provider)"
             );
         }
+        // `tmpfs` is microsandbox-only. docker's own `--tmpfs` takes a DIFFERENT
+        // option grammar (`/tmp:size=4g` vs msb's `/tmp:4G`), so re-emitting the
+        // spec here would either error at run time or, worse, mount a
+        // default-sized tmpfs that looks like it honoured the ceiling. Warn and
+        // ignore rather than mis-apply.
+        if !config.tmpfs.is_empty() {
+            eprintln!(
+                "warning: sandbox '{name}' sets `tmpfs`, which only applies to the microsandbox \
+                 primitive; ignoring it for docker"
+            );
+        }
         Ok(Self {
             name: name.to_owned(),
             image,
@@ -2351,6 +2362,9 @@ pub struct MicrosandboxProvider {
     /// Opt-in CPU ceiling, docker `--cpus` grammar, rounded to `msb run`'s own
     /// integer `--cpus` core count at wrap time.
     cpus: Option<String>,
+    /// Opt-in `msb run --tmpfs` specs (`PATH[:SIZE[:OPTIONS]]`), emitted verbatim
+    /// one flag per entry at wrap time. Empty ⇒ argv unchanged.
+    tmpfs: Vec<String>,
     /// M11 identity/auth channels forwarded into the microVM. Empty ⇒ pre-M11 argv.
     identity: SandboxIdentity,
 }
@@ -2386,6 +2400,12 @@ impl MicrosandboxProvider {
             egress: config.egress.clone(),
             memory: config.memory.clone().filter(|m| !m.is_empty()),
             cpus: config.cpus.clone().filter(|c| !c.is_empty()),
+            tmpfs: config
+                .tmpfs
+                .iter()
+                .filter(|spec| !spec.trim().is_empty())
+                .cloned()
+                .collect(),
             identity: SandboxIdentity::default(),
         })
     }
@@ -2431,6 +2451,7 @@ impl SandboxProvider for MicrosandboxProvider {
             home: "/home/agent".to_owned(),
             memory: self.memory.clone(),
             cpus: self.cpus.clone(),
+            tmpfs: self.tmpfs.clone(),
             identity: self.identity.clone(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         }))
@@ -2456,6 +2477,9 @@ pub struct MicrosandboxSession {
     /// Opt-in CPU ceiling, docker `--cpus` grammar; rounded to `msb run`'s own
     /// integer `--cpus` core count at wrap time. `None` ⇒ unbounded.
     cpus: Option<String>,
+    /// Opt-in `msb run --tmpfs` specs (`PATH[:SIZE[:OPTIONS]]`), one flag per
+    /// entry at wrap time. Empty ⇒ argv unchanged.
+    tmpfs: Vec<String>,
     /// M11 identity/auth channels applied at wrap time.
     identity: SandboxIdentity,
     /// Interactive files staged via [`stage_file`], as `(host_temp, guest_path)`.
@@ -2718,6 +2742,16 @@ impl SandboxSession for MicrosandboxSession {
                      ignoring it for the microsandbox primitive"
                 ),
             }
+        }
+
+        // Scratch-space ceilings. The guest mounts its OWN 512 MiB tmpfs over
+        // /tmp, which a build or a chatty tool fills — and an out-of-space /tmp
+        // does not stop the agent, it just breaks every tool that needs a scratch
+        // file, so the agent reports a broken shell rather than a full disk.
+        // Emitted verbatim: `msb` owns the `PATH[:SIZE[:OPTIONS]]` grammar.
+        for spec in &self.tmpfs {
+            args.push("--tmpfs".to_owned());
+            args.push(spec.clone());
         }
 
         // Image is positional, then the command after `--` so its flags are not
@@ -3814,6 +3848,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity {
                 auth_files,
                 ..Default::default()
@@ -4447,6 +4482,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4545,6 +4581,75 @@ mod tests {
         assert_eq!(docker_cpus_to_msb_count("-inf"), None);
     }
 
+    /// #910: `tmpfs` specs reach `msb run --tmpfs` verbatim, one flag per entry.
+    /// The guest's own `/tmp` is a 512 MiB tmpfs, and filling it breaks every tool
+    /// that needs a scratch file while leaving the agent running — so this is the
+    /// only knob that keeps a resident's shell alive under a big build.
+    #[test]
+    fn microsandbox_wrap_emits_tmpfs_specs_verbatim() {
+        let session = MicrosandboxSession {
+            image: "busybox".to_owned(),
+            project_root: PathBuf::from("/proj"),
+            mounts: Vec::new(),
+            egress: Vec::new(),
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-abc".to_owned(),
+            home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
+            tmpfs: vec!["/tmp:4G".to_owned(), "/scratch:1G:mode=1777".to_owned()],
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+        let specs: Vec<&String> = wrapped
+            .args
+            .windows(2)
+            .filter(|w| w[0] == "--tmpfs")
+            .map(|w| &w[1])
+            .collect();
+        assert_eq!(specs, vec!["/tmp:4G", "/scratch:1G:mode=1777"]);
+    }
+
+    /// An unset `tmpfs` must leave argv BYTE-IDENTICAL — the same unbounded-default
+    /// contract `memory`/`cpus` already keep, so adding the knob cannot perturb any
+    /// existing sandbox.
+    #[test]
+    fn microsandbox_wrap_without_tmpfs_leaves_argv_unchanged() {
+        let build = |tmpfs: Vec<String>| {
+            let session = MicrosandboxSession {
+                image: "busybox".to_owned(),
+                project_root: PathBuf::from("/proj"),
+                mounts: Vec::new(),
+                egress: Vec::new(),
+                session_store: PathBuf::from("/host/store"),
+                sandbox: "varda-sbx-abc".to_owned(),
+                home: "/home/agent".to_owned(),
+                memory: None,
+                cpus: None,
+                tmpfs,
+                identity: SandboxIdentity::default(),
+                staged_files: std::sync::Mutex::new(Vec::new()),
+            };
+            let spec = CommandSpec {
+                program: "claude".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            };
+            session.wrap(spec, LaunchMode::Batch).unwrap().args
+        };
+        assert_eq!(build(Vec::new()), build(Vec::new()));
+        assert!(!build(Vec::new()).iter().any(|a| a == "--tmpfs"));
+        assert_ne!(build(Vec::new()), build(vec!["/tmp:4G".to_owned()]));
+    }
+
     /// task-limits: `memory`/`cpus` translate from the shared docker grammar onto
     /// `msb run`'s own MB-integer `--memory` and integer-core `--cpus`.
     #[test]
@@ -4559,6 +4664,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: Some("4g".to_owned()),
             cpus: Some("1.5".to_owned()),
+            tmpfs: Vec::new(),
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4604,6 +4710,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity {
                 auth_env,
                 ..Default::default()
@@ -4674,6 +4781,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity {
                 auth_env,
                 ..Default::default()
@@ -4720,6 +4828,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4813,6 +4922,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4863,6 +4973,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4900,6 +5011,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -4995,6 +5107,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -5222,6 +5335,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -5267,6 +5381,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         };
@@ -5740,6 +5855,7 @@ mod tests {
             home: "/home/agent".to_owned(),
             memory: None,
             cpus: None,
+            tmpfs: Vec::new(),
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
         });
