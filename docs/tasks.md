@@ -129,6 +129,26 @@ replace the sandbox's configured list. Values must be valid hostnames or IPv4
 addresses, optionally followed by a numeric port. The selected primitive still has to enforce the resulting list;
 in particular, `local` with non-empty egress remains an error.
 
+For an existing interactive task, combine `--reuse` with the widened list. This
+updates the task, relaunches its sandbox (so microsandbox receives new boot-time
+network rules), and automatically invokes the captured agent resume command:
+
+```sh
+varda task add --reuse --exec --interactive --egress new.example.com "dev-shell"
+```
+
+Only an invocation with an explicit `--egress` override skips the captured-session
+confirmation; plain `--reuse --exec` retains the confirmation prompt. If the task
+was waiting for user input, Varda still offers to open the editor before resuming.
+
+On Docker and microsandbox, the relaunched sandbox does not retain the previous
+sandbox's HOME or filesystem state. Here, “resume” means re-invoking the captured
+agent resume command in a fresh sandbox, not restoring full session continuity.
+
+The resumed run log records the task's exact `egress_override`. An empty value
+is recorded as `(sandbox default)`, since the configured sandbox allow-list is
+resolved separately at launch time.
+
 `taskname` and `description` are two separate positional arguments, so quote any multi-word values:
 
 ```sh

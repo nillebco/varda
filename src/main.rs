@@ -470,6 +470,7 @@ async fn run_cli() -> Result<()> {
                 if reuse && exec {
                     let existing = task::task_file_path(&config, &project_path, &taskname)?;
                     if existing.exists() {
+                        let confirmed_resume = !egress.is_empty();
                         let mut existing_task = task::load_task(&existing)?;
                         for host in &egress {
                             if !existing_task
@@ -495,7 +496,16 @@ async fn run_cli() -> Result<()> {
                                 existing.display()
                             );
                         }
-                        return resume_task_command(&existing, fresh, interactive).await;
+                        // An explicit egress relaunch is a one-command operation: skip
+                        // only the captured-session confirmation. A needs-user task's
+                        // editor offer remains independent and is never bypassed here.
+                        return resume_task_command(
+                            &existing,
+                            fresh,
+                            interactive,
+                            confirmed_resume,
+                        )
+                        .await;
                     }
                 }
                 // Validate the pinned sandbox up front so `--sandbox typo` fails at
@@ -584,7 +594,7 @@ async fn run_cli() -> Result<()> {
                 fresh,
                 interactive,
             } => {
-                resume_task_command(&task, fresh, interactive).await?;
+                resume_task_command(&task, fresh, interactive, false).await?;
             }
             TaskCommand::ResumeSession { task } => {
                 resume_task_session_command(&task)?;
@@ -4990,7 +5000,12 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn resume_task_command(task_path: &Path, fresh: bool, interactive: bool) -> Result<()> {
+async fn resume_task_command(
+    task_path: &Path,
+    fresh: bool,
+    interactive: bool,
+    confirmed_resume: bool,
+) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::resolve_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
@@ -5006,14 +5021,16 @@ async fn resume_task_command(task_path: &Path, fresh: bool, interactive: bool) -
     task_document.frontmatter.requires_user = false;
     task::write_task(&task_document)?;
 
-    if was_needs_user && prompt_yes_no("Open editor to complete the task update?", true)? {
+    let (offer_editor, confirm_session_resume) =
+        resume_prompt_policy(was_needs_user, confirmed_resume);
+    if offer_editor && prompt_yes_no("Open editor to complete the task update?", true)? {
         open_editor(&task_path)?;
     }
 
     if let Some(resume_command) = captured_resume_command {
         println!("Captured agent resume command found:");
         println!("  {resume_command}");
-        if prompt_yes_no("Resume the previous agent session?", true)? {
+        if !confirm_session_resume || prompt_yes_no("Resume the previous agent session?", true)? {
             match run_captured_resume_command(&config, &task_path, &task_document, resume_command)
                 .await
             {
@@ -5033,6 +5050,12 @@ async fn resume_task_command(task_path: &Path, fresh: bool, interactive: bool) -
     }
 
     run_task_command(&task_path, interactive, false).await
+}
+
+/// Keep the needs-user editor offer independent from the egress relaunch's
+/// captured-session confirmation bypass.
+fn resume_prompt_policy(was_needs_user: bool, confirmed_resume: bool) -> (bool, bool) {
+    (was_needs_user, !confirmed_resume)
 }
 
 fn latest_agent_resume_command(task_document: &task::TaskDocument) -> Option<String> {
@@ -5547,6 +5570,13 @@ fn skill_install_command(source: Option<&Path>, link: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_auto_resume_does_not_suppress_needs_user_editor_offer() {
+        assert_eq!(resume_prompt_policy(true, true), (true, false));
+        assert_eq!(resume_prompt_policy(true, false), (true, true));
+        assert_eq!(resume_prompt_policy(false, true), (false, false));
+    }
     use gray_matter::{Matter, engine::YAML};
     use serde::Deserialize;
 

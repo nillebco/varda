@@ -816,8 +816,9 @@ pub async fn resume_interactive_task(
     write_session_log(
         &session_log_path,
         &format!(
-            "session_id={session_id}\nagent={agent_name}\ntask={}\nresume_command={resume_command}\n[interactive_resume]\n",
-            task_path.display()
+            "session_id={session_id}\nagent={agent_name}\ntask={}\nresume_command={resume_command}\negress_override={}\n[interactive_resume]\n",
+            task_path.display(),
+            active_egress_label(&task.frontmatter.bounds.egress),
         ),
     )?;
 
@@ -916,6 +917,16 @@ pub async fn resume_interactive_task(
         blocked_commands,
         files_touched,
     })
+}
+
+/// Stable, human-readable task override evidence kept beside every resumed
+/// conversation. The configured sandbox allow-list is resolved separately.
+fn active_egress_label(egress: &[String]) -> String {
+    if egress.is_empty() {
+        "(sandbox default)".to_owned()
+    } else {
+        egress.join(",")
+    }
 }
 
 pub async fn plan_task(
@@ -2957,5 +2968,17 @@ Help interactively.
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
         }
+    }
+
+    #[test]
+    fn resumed_run_egress_label_distinguishes_default_from_task_override() {
+        assert_eq!(super::active_egress_label(&[]), "(sandbox default)");
+        assert_eq!(
+            super::active_egress_label(&[
+                "api.example.com".to_owned(),
+                "crates.io:443".to_owned()
+            ]),
+            "api.example.com,crates.io:443"
+        );
     }
 }
