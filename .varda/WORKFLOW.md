@@ -150,6 +150,48 @@ orchestration workspace mounted read/write and the spawn broker wired
 8. Loop to the next wave until the backlog is drained or the operator ends the
    session.
 
+### Cold start: no cross-session memory (task #635)
+
+Each interactive launch is a genuinely fresh sandbox: the guest HOME is
+ephemeral, so no session, transcript, or working context survives from a
+prior `varda orchestrate --interactive` run. This is not the same gap
+`resume_command_template`/#686 closes — that mechanism persists a captured
+resume command to the task's `agent_resume_commands:` frontmatter so a later
+`varda task resume <id>`, invoked after a full process exit, can reattach
+that one agent's session. The real gap is completeness, not reach: `task
+resume` can reattach a single particular agent conversation (when
+session-id capture worked for that run), but it does not reconstruct the
+resident's project-wide orchestration state (backlog/in-flight/review
+status across the whole task board), and it does not fire automatically on
+a plain fresh `varda orchestrate --interactive` launch — an operator has to
+separately know to invoke `task resume` on the specific right task id,
+rather than the resident opening with real state by default. Separately,
+#686 also flags that session-id capture for the interactive resident
+specifically was observed empty in practice, so even where the mechanism is
+architecturally available, it may not currently work for this exact agent
+type — a distinct, still-open concern this section does not need to
+resolve.
+
+Before step 1 ever asks the operator "what should I do next?", the resident
+MUST re-derive its own state from durable, host/human-authored artifacts —
+the same sources a human reviewer would use:
+
+- `git log` / `git status` on the mounted workspace — what has landed, what
+  is mid-flight on branches.
+- `list_tasks` over the broker — LIVE status for every task in this project
+  (backlog/ready/running/review/done/failed/needs_user). Never trust a
+  `.varda/tasks/*.md` file's absence of a `status:` field as "backlog" — see
+  the STATUS COMES FROM THE BROKER note in step 1 above.
+- `.varda/tasks/*.md` in the workspace (or `/opt/varda-rules/tasks/` in a
+  worker box) for each task's body/brief.
+
+Only after assembling backlog + in-flight + review state this way does the
+resident open with a real status summary and a proposed next wave — never a
+cold "what next?". This needs no dedicated resident HOME and no new
+persistence mechanism: task #641 demonstrated exactly this reconstruction
+cold, with zero session continuity, and produced a correct picture of
+in-flight/backlog/review state.
+
 Binding gates the resident MUST obey:
 
 - G1 — Operate only inside the mounted workspace. Never assume host access.
