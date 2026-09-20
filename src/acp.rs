@@ -550,12 +550,19 @@ impl AcpSubprocessClient {
         }
 
         if !status.success() {
-            let stderr = String::from_utf8_lossy(&stderr);
+            // Some agent CLIs (e.g. Claude Code's "Not logged in" failure) write
+            // their only diagnostic to stdout, not stderr. A sandboxed caller has
+            // no other path to that text (the host session log is outside any
+            // sandbox mount), so both streams must be surfaced here or the
+            // failure is undiagnosable from inside the sandbox (see #1017).
+            let stdout_tail = tail_for_failure_message(&stdout);
+            let stderr_tail = tail_for_failure_message(&stderr);
             bail!(
-                "agent '{}' exited with status {}; stderr: {}",
+                "agent '{}' exited with status {}; stdout: {}; stderr: {}",
                 self.agent_name,
                 status,
-                stderr.trim()
+                stdout_tail,
+                stderr_tail
             );
         }
 
@@ -1336,6 +1343,36 @@ async fn record_codex_external_session(
         time::sleep(Duration::from_millis(500)).await;
     }
     None
+}
+
+/// Bound on how much of a failed agent's stdout/stderr goes into the `bail!`
+/// message below — the full text is already written to the session log; the
+/// failure message only needs enough of the tail to diagnose the failure from
+/// a sandbox that has no other access to that log (see #1017).
+const MAX_FAILURE_OUTPUT_BYTES: usize = 4096;
+
+/// Tail-truncate captured stdout/stderr for inclusion in a failure message,
+/// trimming at a UTF-8 char boundary so `String::from_utf8_lossy` output isn't
+/// mangled mid-character.
+fn tail_for_failure_message(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    if text.len() <= MAX_FAILURE_OUTPUT_BYTES {
+        return text.to_owned();
+    }
+    let min_start = text.len() - MAX_FAILURE_OUTPUT_BYTES;
+    let start = (min_start..=text.len())
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(text.len());
+    format!(
+        "... (truncated, {} bytes total, showing last {}) ...\n{}",
+        text.len(),
+        MAX_FAILURE_OUTPUT_BYTES,
+        &text[start..]
+    )
 }
 
 async fn collect_stream<R>(
@@ -2994,6 +3031,81 @@ mod tests {
         assert!(log.contains("stdout:\nrecap line"));
         assert!(log.contains("stderr:\ndiagnostic line"));
         assert!(log.contains("status=exit status: 0"));
+    }
+
+    #[tokio::test]
+    async fn subprocess_client_failure_message_includes_stdout_when_stderr_is_empty() {
+        // Regression test for #1017: some agent CLIs (e.g. Claude Code's
+        // "Not logged in" failure) print their only diagnostic to stdout and
+        // exit non-zero with an empty stderr. The failure `bail!` must surface
+        // that stdout text, or a sandboxed caller has no way to see it.
+        let config = AgentConfig {
+            untrusted: false,
+            kind: crate::config::AgentKind::Acp,
+            command: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf 'Not logged in \\xc2\\xb7 Please run /login\\n'; exit 1".to_owned(),
+            ],
+            max_prompt_tokens: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            interactive_command: None,
+            interactive_args: None,
+            auth_token_env: None,
+            auth_token_target: None,
+            credentials: Vec::new(),
+            streams_output: None,
+            resume_command_template: None,
+            interpreter_agent: None,
+            skip_recap: false,
+        };
+        let client = AcpSubprocessClient::new("shell", &config);
+
+        let error = client
+            .run_task(AgentRunRequest {
+                agent_name: "shell".to_owned(),
+                role_instructions: None,
+                task_path: "task.md".to_owned(),
+                frontmatter: TaskFrontmatter {
+                    bounds: crate::task::TaskBounds::default(),
+                    id: None,
+                    status: TaskStatus::Ready,
+                    project: Some("/work/project".to_owned()),
+                    mother_project: None,
+                    assignee: Some("shell".to_owned()),
+                    sandbox: None,
+                    recap: None,
+                    recaps: vec![],
+                    plan: None,
+                    agent_session_id: None,
+                    agent_session_log: None,
+                    agent_session_ids: vec![],
+                    agent_session_logs: vec![],
+                    agent_resume_commands: vec![],
+                    allow_commands: vec![],
+                    requires_user: false,
+                },
+                body: "# Task\n\nDo it.".to_owned(),
+                timeout: Duration::from_secs(600),
+                session_id: "session-1".to_owned(),
+                session_log_path: None,
+                interactive: false,
+                interpret: false,
+                stream: false,
+                resume_command: None,
+                orchestration_socket_path: None,
+                orchestration_addr: None,
+            })
+            .await
+            .expect_err("non-zero exit with empty stderr should still fail");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Not logged in"),
+            "expected stdout diagnostic in failure message, got: {message}"
+        );
+        assert!(message.contains("stderr: "));
     }
 
     #[tokio::test]
