@@ -1625,6 +1625,14 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
             .with_context(|| format!("cannot run subtask: no task resolves to id '{task_id}'"))?;
         let mut task_doc = task::load_task(&task_path)?;
 
+        // Sync DEFINITION-owned fields (assignee, sandbox, allow_commands,
+        // bounds) from the repo-local `.varda/tasks/<id>-*.md` DEFINITION onto
+        // the operations copy BEFORE route/sandbox/agent resolution reads them
+        // below (#1024): otherwise an operator's edit to the repo-local file
+        // has zero effect on dispatch — the (possibly stale) operations copy
+        // always wins.
+        task::sync_definition_fields_from_repo(&mut task_doc)?;
+
         // Preflight route resolution BEFORE running, exactly like `launch`: this
         // re-validates the EXISTING task's own agent/sandbox against the route's
         // `agents` allowlist and isolating-sandbox requirement, so an unrunnable
@@ -2651,7 +2659,12 @@ async fn run_task_path_for_parallel(
     lineage: Option<SpawnLineage>,
 ) -> Result<ParallelRunReport> {
     let task_path = task::resolve_task_reference(&config, &task_path)?;
-    let task_document = task::load_task(&task_path)?;
+    let mut task_document = task::load_task(&task_path)?;
+    // Sync DEFINITION-owned fields (assignee, sandbox, allow_commands, bounds)
+    // from the repo-local DEFINITION before route/agent resolution reads them
+    // below (#1024) and persist to the operations copy.
+    task::sync_definition_fields_from_repo(&mut task_document)?;
+    task::write_task(&task_document)?;
     let route = routing::match_route_for_task(&config, &task_document, false)?;
     let id = task_document
         .frontmatter
@@ -4587,7 +4600,12 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     let config_path = config::config_file()?;
     let config = config::resolve_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
-    let task_document = task::load_task(&task_path)?;
+    let mut task_document = task::load_task(&task_path)?;
+    // Sync DEFINITION-owned fields (assignee, sandbox, allow_commands, bounds)
+    // from the repo-local DEFINITION before route/agent resolution reads them
+    // below (#1024) and persist to the operations copy.
+    task::sync_definition_fields_from_repo(&mut task_document)?;
+    task::write_task(&task_document)?;
     let id_str = task_document
         .frontmatter
         .id
@@ -5028,6 +5046,11 @@ async fn resume_task_command(
     let config = config::resolve_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
     let mut task_document = task::load_task(&task_path)?;
+    // Sync DEFINITION-owned fields (assignee, sandbox, allow_commands, bounds)
+    // from the repo-local DEFINITION before route/client resolution reads them
+    // in `run_captured_resume_command` below (#1024); persisted together with
+    // the status/requires_user write just below.
+    task::sync_definition_fields_from_repo(&mut task_document)?;
     let was_needs_user = task_document.frontmatter.status == task::TaskStatus::NeedsUser;
     let captured_resume_command = if fresh {
         None

@@ -304,25 +304,83 @@ fn parse_task_raw(path: &Path) -> Result<TaskDocument> {
 ///
 /// Returns `Err` if the store exists but can't be enumerated, a candidate
 /// definition file can't be parsed, or multiple definition files claim the
-/// same id (see [`find_definition_body`]) — never silently swallowed.
+/// same id (see [`find_definition_document`]) — never silently swallowed.
 fn overlay_repo_definition_body(task: &mut TaskDocument) -> Result<()> {
-    let Some(id) = task.frontmatter.id else {
+    let Some((store, id)) = definition_store_for(task) else {
         return Ok(());
     };
-    let Some(project) = task.frontmatter.policy_project().cloned() else {
-        return Ok(());
-    };
-    let Some(store) = repo_task_store(Path::new(&project)) else {
-        return Ok(());
-    };
-    if !store.exists() || path_is_within(&task.path, &store) {
-        return Ok(());
-    }
 
-    if let Some(body) = find_definition_body(&store, id)? {
-        task.body = body;
+    if let Some(doc) = find_definition_document(&store, id)? {
+        task.body = doc.body;
     }
     Ok(())
+}
+
+/// Re-read the repo-local DEFINITION for `task` (if one exists) and overwrite
+/// its DEFINITION-owned frontmatter fields — `assignee`, `sandbox`,
+/// `allow_commands`, the M10 bounds — with the committed values. This is a
+/// SUBSET of the field set [`write_definition`] commits to the repo
+/// (`TaskDefinition`): `id` is excluded (immutable post-creation), `project`
+/// is excluded (the operations copy's `project` may already carry a
+/// worker-worktree override — see `isolate_worker` in `main.rs` — that a stale
+/// repo-local `project` would incorrectly clobber), and `requires_user` is
+/// excluded even though `TaskDefinition` currently commits it to the repo —
+/// task #1024, which requested this sync, explicitly classifies
+/// `requires_user` as a STATE field ("stays operations-copy-owned exactly as
+/// today"), which conflicts with `TaskDefinition` treating it as committable.
+/// That conflict is flagged here rather than silently resolved: a human should
+/// confirm whether `write_definition` should stop committing `requires_user`
+/// at all, or whether it is in fact safe to sync.
+///
+/// Unlike [`overlay_repo_definition_body`], which runs on every [`load_task`]
+/// call, this is NOT wired into the universal read path: it exists to close
+/// #1024 (`run_subtask`/`run_task` dispatch resolving `assignee`/`sandbox` from
+/// a stale operations copy instead of the repo-local DEFINITION an operator
+/// just edited), so callers invoke it explicitly at the START of dispatch,
+/// before route/sandbox/agent resolution reads those fields. This function
+/// only mutates `task.frontmatter` in memory — callers must still
+/// [`write_task`] to persist the synced values to the operations copy on disk
+/// (dispatch call sites already do this as part of normalizing status to
+/// `Ready`).
+///
+/// No-ops (leaves `task.frontmatter` untouched) under the same conditions as
+/// `overlay_repo_definition_body`: no id, no project, no `.varda/` directory,
+/// no store yet, no definition with a matching id, or `task.path` is already
+/// inside the definition store.
+pub fn sync_definition_fields_from_repo(task: &mut TaskDocument) -> Result<()> {
+    let Some((store, id)) = definition_store_for(task) else {
+        return Ok(());
+    };
+
+    if let Some(doc) = find_definition_document(&store, id)? {
+        task.frontmatter.assignee = doc.frontmatter.assignee;
+        task.frontmatter.sandbox = doc.frontmatter.sandbox;
+        task.frontmatter.allow_commands = doc.frontmatter.allow_commands;
+        task.frontmatter.bounds = doc.frontmatter.bounds;
+    }
+    Ok(())
+}
+
+/// Resolve the repo-local DEFINITION store (and the id to look up within it)
+/// that `task` should overlay against, if any. Shared by
+/// [`overlay_repo_definition_body`] and [`sync_definition_fields_from_repo`].
+/// Uses `policy_project()` (mother project first) so a spawned worker running
+/// in an isolated worktree resolves against the ORCHESTRATOR's checkout — the
+/// place an operator's edit actually lands — not its own possibly-stale git
+/// clone.
+///
+/// Returns `None` when: there is no id, no project, the project has no
+/// `.varda/` directory, no definition store yet, or `task.path` is already
+/// inside the definition store (the doc being loaded IS the definition, so
+/// there's nothing to overlay it with).
+fn definition_store_for(task: &TaskDocument) -> Option<(PathBuf, u64)> {
+    let id = task.frontmatter.id?;
+    let project = task.frontmatter.policy_project()?;
+    let store = repo_task_store(Path::new(project))?;
+    if !store.exists() || path_is_within(&task.path, &store) {
+        return None;
+    }
+    Some((store, id))
 }
 
 /// Whether `path` lives inside `ancestor`, comparing canonicalized paths when
@@ -335,16 +393,16 @@ fn path_is_within(path: &Path, ancestor: &Path) -> bool {
 }
 
 /// Find the single DEFINITION under `store` (recursively) whose id is `id` and
-/// return its body. Filenames follow `<id>-<slug>.md` (see
-/// [`materialize_from_repo_definition`]), so candidates are first narrowed by
-/// filename prefix before the expensive parse — this keeps the common case to
-/// "parse the one matching file" rather than "parse every file in the store".
-/// The store is still walked and every id-prefixed candidate is still parsed
-/// on every call (no cache/index), so this remains O(matching files) per
-/// `load_task` call and the containing store is O(store size) to enumerate;
-/// callers on hot paths (`list_tasks`, `find_task_by_id`) pay that cost per
-/// task. Full elimination would need a cache or index and is out of scope
-/// here.
+/// return its parsed document (frontmatter + body). Filenames follow
+/// `<id>-<slug>.md` (see [`materialize_from_repo_definition`]), so candidates
+/// are first narrowed by filename prefix before the expensive parse — this
+/// keeps the common case to "parse the one matching file" rather than "parse
+/// every file in the store". The store is still walked and every id-prefixed
+/// candidate is still parsed on every call (no cache/index), so this remains
+/// O(matching files) per `load_task` call and the containing store is O(store
+/// size) to enumerate; callers on hot paths (`list_tasks`, `find_task_by_id`)
+/// pay that cost per task. Full elimination would need a cache or index and is
+/// out of scope here.
 ///
 /// Returns `Ok(None)` when no candidate matches. Returns `Err` if the
 /// directory walk fails, a candidate fails to parse, or more than one
@@ -352,7 +410,7 @@ fn path_is_within(path: &Path, ancestor: &Path) -> bool {
 /// `materialize_from_repo_definition` already applies at materialization
 /// time, so a duplicate is never resolved by nondeterministic filesystem
 /// iteration order.
-fn find_definition_body(store: &Path, id: u64) -> Result<Option<String>> {
+fn find_definition_document(store: &Path, id: u64) -> Result<Option<TaskDocument>> {
     let mut candidates = Vec::new();
     collect_definition_candidates(store, id, &mut candidates)?;
 
@@ -363,7 +421,7 @@ fn find_definition_body(store: &Path, id: u64) -> Result<Option<String>> {
             let doc = parse_task_raw(&path).with_context(|| {
                 format!("failed to parse task definition {}", path.display())
             })?;
-            Ok(Some(doc.body))
+            Ok(Some(doc))
         }
         _ => bail!(
             "multiple task definitions found with id {id} in {}",
@@ -374,7 +432,7 @@ fn find_definition_body(store: &Path, id: u64) -> Result<Option<String>> {
 
 /// Recursively collect paths under `path` whose filename plausibly names
 /// definition `id` (`<id>-<slug>.md`, or the bare `<id>.md`), without parsing
-/// them. Narrows the set of files [`find_definition_body`] has to parse.
+/// them. Narrows the set of files [`find_definition_document`] has to parse.
 fn collect_definition_candidates(
     path: &Path,
     id: u64,
@@ -2722,6 +2780,183 @@ requires_user: false
         let loaded = load_task(&state_path).expect("state should load");
         assert!(loaded.body.contains("Live mother body."));
         assert!(!loaded.body.contains("Stale worker-local body."));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn sync_definition_fields_prefers_repo_local_over_stale_operations_copy() {
+        let root = std::env::temp_dir().join(format!("varda-def-sync-fresh-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        fs::write(
+            store.join("60-sync-me.md"),
+            "---\nid: 60\nassignee: claude-worker\nsandbox: worker\nallow_commands:\n  - cargo\n---\n\n# Sync Me\n",
+        )
+        .expect("repo definition should write");
+
+        let task_dir = operations_dir
+            .join("tasks")
+            .join(project_task_folder(&project).expect("project should slugify"));
+        fs::create_dir_all(&task_dir).expect("home task dir should be created");
+        let state_path = task_dir.join("60-sync-me.md");
+        fs::write(
+            &state_path,
+            format!(
+                "---\nid: 60\nstatus: ready\nproject: {}\nassignee: claude\nsandbox: resident\n---\n\n# Sync Me\n",
+                project.display()
+            ),
+        )
+        .expect("stale operations copy should write");
+
+        let mut loaded = load_task(&state_path).expect("state should load");
+        assert_eq!(loaded.frontmatter.assignee.as_deref(), Some("claude"));
+        assert_eq!(loaded.frontmatter.sandbox.as_deref(), Some("resident"));
+
+        sync_definition_fields_from_repo(&mut loaded).expect("sync should not fail");
+
+        assert_eq!(loaded.frontmatter.assignee.as_deref(), Some("claude-worker"));
+        assert_eq!(loaded.frontmatter.sandbox.as_deref(), Some("worker"));
+        assert_eq!(loaded.frontmatter.allow_commands, vec!["cargo".to_owned()]);
+
+        write_task(&loaded).expect("sync should persist");
+        let reread = load_task(&state_path).expect("state should reload");
+        assert_eq!(reread.frontmatter.assignee.as_deref(), Some("claude-worker"));
+        assert_eq!(reread.frontmatter.sandbox.as_deref(), Some("worker"));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn sync_definition_fields_does_not_touch_state_fields() {
+        let root = std::env::temp_dir().join(format!("varda-def-sync-state-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        fs::write(
+            store.join("61-mid-run.md"),
+            "---\nid: 61\nassignee: claude-worker\nsandbox: worker\n---\n\n# Mid Run\n",
+        )
+        .expect("repo definition should write");
+
+        let task_dir = operations_dir
+            .join("tasks")
+            .join(project_task_folder(&project).expect("project should slugify"));
+        fs::create_dir_all(&task_dir).expect("home task dir should be created");
+        let state_path = task_dir.join("61-mid-run.md");
+        fs::write(
+            &state_path,
+            format!(
+                "---\nid: 61\nstatus: running\nproject: {}\nassignee: claude\nsandbox: resident\nrecaps:\n  - \"partial progress\"\nagent_session_ids:\n  - \"abc-123\"\nrequires_user: true\n---\n\n# Mid Run\n",
+                project.display()
+            ),
+        )
+        .expect("mid-run operations copy should write");
+
+        let mut loaded = load_task(&state_path).expect("state should load");
+        sync_definition_fields_from_repo(&mut loaded).expect("sync should not fail");
+
+        assert_eq!(loaded.frontmatter.assignee.as_deref(), Some("claude-worker"));
+        assert_eq!(loaded.frontmatter.sandbox.as_deref(), Some("worker"));
+        assert_eq!(loaded.frontmatter.status, TaskStatus::Running);
+        assert_eq!(loaded.frontmatter.recaps, vec!["partial progress".to_owned()]);
+        assert_eq!(loaded.frontmatter.agent_session_ids, vec!["abc-123".to_owned()]);
+        assert!(loaded.frontmatter.requires_user);
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn sync_definition_fields_noop_without_repo_definition() {
+        let root = std::env::temp_dir().join(format!("varda-def-sync-noop-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let project = root.join("repo");
+
+        let task_dir = operations_dir
+            .join("tasks")
+            .join(project_task_folder(&project).expect("project should slugify"));
+        fs::create_dir_all(&task_dir).expect("home task dir should be created");
+        let state_path = task_dir.join("62-adhoc.md");
+        fs::write(
+            &state_path,
+            format!(
+                "---\nid: 62\nstatus: ready\nproject: {}\nassignee: claude\nsandbox: resident\n---\n\n# Adhoc\n",
+                project.display()
+            ),
+        )
+        .expect("operations copy should write");
+
+        let mut loaded = load_task(&state_path).expect("state should load");
+        sync_definition_fields_from_repo(&mut loaded).expect("sync should not fail");
+
+        assert_eq!(loaded.frontmatter.assignee.as_deref(), Some("claude"));
+        assert_eq!(loaded.frontmatter.sandbox.as_deref(), Some("resident"));
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    /// `resume_task_command` in `main.rs` is a fourth dispatch site (#1024
+    /// follow-up): it loads the operations copy, must sync DEFINITION-owned
+    /// fields from the repo-local DEFINITION BEFORE `run_captured_resume_command`
+    /// resolves a route/client from `assignee`/`sandbox`, then persists via
+    /// `write_task` alongside the status/`requires_user` reset. This mirrors that
+    /// exact sequence (load -> sync -> set_status(Ready) -> write_task) for a
+    /// task stuck at `needs_user` with a stale operations-copy `assignee`/
+    /// `sandbox`, to prove the repo-local edit is what a resume dispatches
+    /// against. Without the sync call, `loaded.frontmatter.assignee`/`sandbox`
+    /// (and thus what `run_captured_resume_command` would route on) would still
+    /// read the stale "claude"/"resident" values after this sequence.
+    #[test]
+    fn resume_dispatch_sequence_picks_up_repo_local_assignee_and_sandbox() {
+        let root = std::env::temp_dir().join(format!("varda-def-sync-resume-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        fs::write(
+            store.join("63-resume-me.md"),
+            "---\nid: 63\nassignee: claude-worker\nsandbox: worker\n---\n\n# Resume Me\n",
+        )
+        .expect("repo definition should write");
+
+        let task_dir = operations_dir
+            .join("tasks")
+            .join(project_task_folder(&project).expect("project should slugify"));
+        fs::create_dir_all(&task_dir).expect("home task dir should be created");
+        let state_path = task_dir.join("63-resume-me.md");
+        fs::write(
+            &state_path,
+            format!(
+                "---\nid: 63\nstatus: needs_user\nproject: {}\nassignee: claude\nsandbox: resident\nrequires_user: true\n---\n\n# Resume Me\n",
+                project.display()
+            ),
+        )
+        .expect("stale operations copy should write");
+
+        // Mirrors `resume_task_command`: load, sync-before-route-resolution,
+        // then set_status(Ready)/requires_user=false and persist.
+        let mut task_document = load_task(&state_path).expect("state should load");
+        sync_definition_fields_from_repo(&mut task_document).expect("sync should not fail");
+        task_document.set_status(TaskStatus::Ready);
+        task_document.frontmatter.requires_user = false;
+        write_task(&task_document).expect("resume sync should persist");
+
+        // What `run_captured_resume_command`'s route/client resolution would
+        // read: the repo-local values, not the stale operations copy.
+        assert_eq!(
+            task_document.frontmatter.assignee.as_deref(),
+            Some("claude-worker")
+        );
+        assert_eq!(task_document.frontmatter.sandbox.as_deref(), Some("worker"));
+
+        let reread = load_task(&state_path).expect("state should reload");
+        assert_eq!(reread.frontmatter.assignee.as_deref(), Some("claude-worker"));
+        assert_eq!(reread.frontmatter.sandbox.as_deref(), Some("worker"));
+        assert_eq!(reread.frontmatter.status, TaskStatus::Ready);
+        assert!(!reread.frontmatter.requires_user);
 
         fs::remove_dir_all(root).expect("test directory should be removable");
     }
