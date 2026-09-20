@@ -20,11 +20,18 @@ worktree copy does not exist.
   (`id`, `project`, `assignee`, `allow_commands`, cooperative bounds,
   `requires_user`) plus the brief. Local-only (gitignored); agents see it at
   `/opt/varda-rules/tasks/` read-only.
-- EDITING A DEFINITION DOES NOT CHANGE A RUN. The runner reads the operations
-  record at `~/.varda/operations/tasks/<project-slug>/<id>-<slug>.md`, which is
-  the authority for `assignee`/`sandbox`/`status`. Changing frontmatter in
-  `.varda/tasks/` (or in `/opt/varda-rules/`) is silently ignored — ask the host
-  to run `varda task update <id> --set-agent <agent>` instead.
+- The runner reads the operations record at
+  `~/.varda/operations/tasks/<project-slug>/<id>-<slug>.md` for `status`. As of
+  #1024, `run_subtask`/`run_task` dispatch also re-syncs the DEFINITION-owned
+  fields — `assignee`, `sandbox`, `allow_commands`, the cooperative bounds —
+  from `.varda/tasks/` onto the operations record BEFORE route/sandbox
+  resolution runs, so an edit to the repo-local DEFINITION takes effect on the
+  NEXT dispatch with no separate sync step. The BODY was already live on every
+  read this way (#710). `requires_user` is NOT synced by this path — it stays
+  operations-copy-owned — even though it is still written into the DEFINITION
+  file by `varda task add`; that mismatch is unresolved (see
+  `sync_definition_fields_from_repo` in `src/task.rs`). A dispatch that has
+  already started (mid-run) is unaffected until its NEXT dispatch.
 - `~/.varda/operations/` — runtime STATE: status transitions, recaps
   (`operations/recaps`), session logs (`operations/runs`), notifications. NOT
   committed to the code repo.
