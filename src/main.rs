@@ -308,6 +308,21 @@ enum ConfigCommand {
         #[arg(long)]
         resolved: bool,
     },
+    /// Review a standalone bundle file's capability surface and re-pin it in the
+    /// launch-time approval store, outside of a `varda run` launch.
+    ///
+    /// Refused unconditionally when run from inside a sandbox — a sandboxed
+    /// worker or the resident must never be able to approve its own capability
+    /// escalation.
+    Approve {
+        /// Path to the bundle file to review and approve.
+        path: PathBuf,
+        /// Approve without an interactive prompt. Only takes effect for a
+        /// headless (non-TTY) run; has no effect inside a sandbox, which always
+        /// refuses.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -393,6 +408,23 @@ async fn run_cli() -> Result<()> {
                     println!("{content}");
                 }
             }
+            ConfigCommand::Approve { path, yes } => match config::approve_bundle(&path, yes)? {
+                config::ApprovalOutcome::NoChanges => {
+                    println!("{}: no capability changes; re-pinned.", path.display());
+                }
+                config::ApprovalOutcome::Approved { changes } => {
+                    println!("{}: approved and re-pinned.", path.display());
+                    for change in changes {
+                        println!("  - {}", change.sentence);
+                    }
+                }
+                config::ApprovalOutcome::Declined { changes } => {
+                    println!("{}: declined; nothing was stored.", path.display());
+                    for change in changes {
+                        println!("  - {}", change.sentence);
+                    }
+                }
+            },
         },
         Command::Task { command } => match command {
             TaskCommand::Add {
