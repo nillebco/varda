@@ -1,5 +1,7 @@
 /target
 .varda-mcp/
 fnox.toml
-.varda/
+# Rules travel with the code; runtime state and task definitions stay local.
+.varda/*
+!.varda/WORKFLOW.md
 target-resident/
