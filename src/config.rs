@@ -2718,7 +2718,7 @@ fn split_mount_segments(spec: &str) -> Vec<String> {
     segments
 }
 
-/// Expand `${env:NAME}` (and, for the `source` segment, a leading `~`) within
+/// Expand `${env:NAME}` and a leading `~` (in whichever segment it leads) within
 /// one mount segment. If a resolved `${env:NAME}` value itself contains `:`,
 /// error WITHOUT embedding the resolved value in the message (it may be
 /// credential-bearing) — name only the mount, segment role, and env var NAME.
@@ -2745,8 +2745,7 @@ fn expand_mount_segment(segment: &str, mount_desc: &str, segment_role: &str) -> 
     }
     result.push_str(rest);
 
-    if segment_role == "source"
-        && let Some(stripped) = result.strip_prefix('~')
+    if let Some(stripped) = result.strip_prefix('~')
         && (stripped.is_empty() || stripped.starts_with('/'))
     {
         let home = std::env::var("HOME").with_context(|| {
@@ -3028,9 +3027,25 @@ fn resolve_config_paths(path: &Path, config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+/// Match a `command` field by its FILE NAME, never the literal string.
+/// `resolve_bundle_relative_command` rewrites a bare, fragment-declared command
+/// (e.g. `"codex"`) to an absolute bundle path (task #873), so any load-time
+/// normalization that keys off the command must resolve the basename first —
+/// a literal `command == "codex"` check silently never fires for a
+/// fragment-sourced agent, letting it skip normalization passes that a
+/// centrally-defined agent always gets.
+fn command_basename(command: &str) -> &str {
+    std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+}
+
 fn remove_legacy_codex_exec_args(config: &mut Config) {
     for agent in config.agents.values_mut() {
-        if agent.command != "codex" || !agent.args.iter().any(|arg| arg == "exec") {
+        if command_basename(&agent.command) != "codex"
+            || !agent.args.iter().any(|arg| arg == "exec")
+        {
             continue;
         }
 
@@ -3056,7 +3071,7 @@ fn remove_legacy_codex_exec_args(config: &mut Config) {
 
 fn add_varda_project_dir_to_default_agents(config: &mut Config) {
     for agent in config.agents.values_mut() {
-        match agent.command.as_str() {
+        match command_basename(&agent.command) {
             "codex" => add_codex_varda_project_dir(agent),
             "claude" => add_varda_dirs_as_arg_pairs(&mut agent.args),
             "sh" if matches!(
@@ -5231,6 +5246,42 @@ command = "codex"
         fs::remove_dir_all(&root).ok();
     }
 
+    /// #741 cross-review: `resolve_includes` must run BEFORE
+    /// `remove_legacy_codex_exec_args` in the `resolve_config` pipeline, so an agent
+    /// merged in from an included fragment gets the same load-time normalization as
+    /// a centrally-defined agent. Exercised end-to-end via `resolve_config` (rather
+    /// than calling `resolve_includes` directly) because the ordering bug lives in
+    /// how `resolve_config_with_mode` sequences its passes, not in `resolve_includes`
+    /// itself.
+    #[test]
+    fn include_sourced_agent_gets_same_normalization_as_central_agent() {
+        let root = temp_dir("include-normalization-order");
+        let path = root.join("config.toml");
+
+        fs::write(
+            root.join("frag.toml"),
+            "[agents.frag_codex]\nkind = \"acp\"\ncommand = \"codex\"\n\
+             args = [\"exec\", \"--sandbox\", \"workspace-write\", \"--ask-for-approval\", \"never\", \"-\"]\n",
+        )
+        .expect("frag should be written");
+
+        let content = format!("include = [\"frag.toml\"]\n{}", minimal_config_toml());
+        fs::write(&path, content).expect("config should be written");
+
+        let config = resolve_config(&path).expect("config with include should resolve");
+
+        assert!(
+            !config.agents["frag_codex"]
+                .args
+                .contains(&"--ask-for-approval".to_owned()),
+            "an include-sourced codex agent must have legacy exec args stripped just like a \
+             central agent: {:?}",
+            config.agents["frag_codex"].args
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn resolve_includes_flags_fragment_sourced_agents_as_untrusted() {
         let root = temp_dir("agent-provenance");
@@ -5784,6 +5835,20 @@ command = "codex"
         }];
 
         validate_include_pin_formats(&config).expect("64 lowercase hex characters must be valid");
+    }
+
+    #[test]
+    fn tilde_expands_in_a_non_leading_mount_segment() {
+        let home = std::env::var("HOME").expect("HOME must be set for this test to run");
+
+        let expanded = expand_relocatable_mount("data:~/target:ro", None)
+            .expect("mount with '~' in the target segment should expand");
+
+        assert_eq!(
+            expanded,
+            format!("data:{home}/target:ro"),
+            "'~' must expand wherever it leads a segment, not only in the source segment"
+        );
     }
 
     #[test]
