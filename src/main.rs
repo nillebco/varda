@@ -408,23 +408,9 @@ async fn run_cli() -> Result<()> {
                     println!("{content}");
                 }
             }
-            ConfigCommand::Approve { path, yes } => match config::approve_bundle(&path, yes)? {
-                config::ApprovalOutcome::NoChanges => {
-                    println!("{}: no capability changes; re-pinned.", path.display());
-                }
-                config::ApprovalOutcome::Approved { changes } => {
-                    println!("{}: approved and re-pinned.", path.display());
-                    for change in changes {
-                        println!("  - {}", change.sentence);
-                    }
-                }
-                config::ApprovalOutcome::Declined { changes } => {
-                    println!("{}: declined; nothing was stored.", path.display());
-                    for change in changes {
-                        println!("  - {}", change.sentence);
-                    }
-                }
-            },
+            ConfigCommand::Approve { path, yes } => {
+                render_approval_outcome(&path, config::approve_bundle(&path, yes)?)?;
+            }
         },
         Command::Task { command } => match command {
             TaskCommand::Add {
@@ -5487,6 +5473,37 @@ fn prompt_assignee(default_assignee: &str) -> Result<Option<String>> {
     }
 }
 
+/// Render a `varda config approve` `ApprovalOutcome` and turn a decline into a
+/// non-zero exit. Without this, `Declined` fell through to a normal `Ok(())`
+/// return, so a script/CI check running `varda config approve <path>` could not
+/// tell "approved" from "operator said no" by exit code alone.
+fn render_approval_outcome(path: &Path, outcome: config::ApprovalOutcome) -> Result<()> {
+    match outcome {
+        config::ApprovalOutcome::NoChanges => {
+            println!("{}: no capability changes; re-pinned.", path.display());
+            Ok(())
+        }
+        config::ApprovalOutcome::Approved { changes } => {
+            println!("{}: approved and re-pinned.", path.display());
+            for change in changes {
+                println!("  - {}", change.sentence);
+            }
+            Ok(())
+        }
+        config::ApprovalOutcome::Declined { changes } => {
+            eprintln!("{}: declined; nothing was stored.", path.display());
+            for change in &changes {
+                eprintln!("  - {}", change.sentence);
+            }
+            anyhow::bail!(
+                "config approve: declined; {} capability change(s) for {} were NOT approved",
+                changes.len(),
+                path.display()
+            );
+        }
+    }
+}
+
 fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
     let suffix = if default { "Y/n" } else { "y/N" };
     print!("{prompt} [{suffix}]: ");
@@ -5608,6 +5625,41 @@ mod tests {
         assert_eq!(resume_prompt_policy(true, true), (true, false));
         assert_eq!(resume_prompt_policy(true, false), (true, true));
         assert_eq!(resume_prompt_policy(false, true), (false, false));
+    }
+
+    #[test]
+    fn render_approval_outcome_declined_is_err_with_context() {
+        let path = Path::new("/tmp/bundle.toml");
+        let changes = vec![config_approval::CapabilityChange {
+            critical: true,
+            sentence: "grants network egress".to_owned(),
+        }];
+        let err = render_approval_outcome(path, config::ApprovalOutcome::Declined { changes })
+            .expect_err("declined outcome must be an error");
+        let msg = err.to_string();
+        assert!(msg.contains("declined"), "error must mention decline: {msg}");
+        assert!(
+            msg.contains("/tmp/bundle.toml"),
+            "error must mention the path: {msg}"
+        );
+    }
+
+    #[test]
+    fn render_approval_outcome_approved_is_ok() {
+        let path = Path::new("/tmp/bundle.toml");
+        let changes = vec![config_approval::CapabilityChange {
+            critical: false,
+            sentence: "grants filesystem read".to_owned(),
+        }];
+        render_approval_outcome(path, config::ApprovalOutcome::Approved { changes })
+            .expect("approved outcome must be Ok");
+    }
+
+    #[test]
+    fn render_approval_outcome_no_changes_is_ok() {
+        let path = Path::new("/tmp/bundle.toml");
+        render_approval_outcome(path, config::ApprovalOutcome::NoChanges)
+            .expect("no-changes outcome must be Ok");
     }
     use gray_matter::{Matter, engine::YAML};
     use serde::Deserialize;
