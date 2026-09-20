@@ -2555,6 +2555,126 @@ fn resolve_pin_mismatch_with(
     }
 }
 
+/// Outcome of a standalone `varda config approve <path>` run (#765 follow-up
+/// #809) — the CLI-command counterpart to the launch-time
+/// [`resolve_pin_mismatch_with`] flow, for reviewing and re-pinning a bundle
+/// OUTSIDE of a `varda run` launch. Returned rather than printed directly so
+/// the caller (`main.rs`) controls the user-facing message and exit code for
+/// each case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// Nothing security-relevant changed since the last approval (or the
+    /// bundle grants nothing on first approval) — re-pinned silently,
+    /// matching Decision 3.
+    NoChanges,
+    /// The capability diff was approved (via `--yes` or the interactive
+    /// prompt) and the store was updated to the new content.
+    Approved {
+        changes: Vec<config_approval::CapabilityChange>,
+    },
+    /// The interactive prompt was shown and declined; the store was left
+    /// untouched.
+    Declined {
+        changes: Vec<config_approval::CapabilityChange>,
+    },
+}
+
+/// Review and re-pin a standalone bundle file at `path`, entry point for the
+/// `varda config approve <path>` CLI command (#765 follow-up #809). Thin
+/// wrapper around [`approve_bundle_with`] that supplies the real
+/// [`LaunchContext`], the real interactive-prompt function, and a real
+/// [`config_approval::ApprovalStore`]; see that function for the actual
+/// decision logic and its unit tests for the injectable seams this split
+/// exists for.
+pub fn approve_bundle(path: &Path, auto_yes: bool) -> Result<ApprovalOutcome> {
+    let store = config_approval::ApprovalStore::open()
+        .context("failed to open the launch-time bundle approval store")?;
+    approve_bundle_with(
+        path,
+        auto_yes,
+        detect_launch_context(),
+        prompt_capability_approval,
+        &store,
+    )
+}
+
+/// Core decision logic for [`approve_bundle`], with [`LaunchContext`], the
+/// approval prompt, AND the [`config_approval::ApprovalStore`] injected so
+/// it's testable without a real terminal or the real `VARDA_HOME` — same
+/// rationale as [`resolve_pin_mismatch_with`]'s injectable seams.
+///
+/// `LaunchContext::Sandboxed` is refused UNCONDITIONALLY, checked before
+/// `auto_yes` is ever consulted: a sandboxed worker or the resident must
+/// never be able to approve its own capability escalation, `--yes` or not —
+/// this is the same invariant [`resolve_pin_mismatch_with`] enforces for the
+/// launch-time flow, and this standalone command must not diverge from it.
+/// `auto_yes` only ever bypasses the prompt for `Headless`; `InteractiveTty`
+/// always prompts regardless of `auto_yes`.
+fn approve_bundle_with(
+    path: &Path,
+    auto_yes: bool,
+    launch_context: LaunchContext,
+    mut ask: impl FnMut() -> Result<bool>,
+    store: &config_approval::ApprovalStore,
+) -> Result<ApprovalOutcome> {
+    let entry_path = path.display().to_string();
+    let bundle_dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read bundle {entry_path}"))?;
+
+    let previously_approved = store
+        .load_approved_content(path)
+        .with_context(|| format!("failed to load a previously-approved copy of {entry_path}"))?;
+
+    let old_summary = match &previously_approved {
+        Some(prev) => fragment_capability_summary(prev, &entry_path, &bundle_dir)?,
+        None => config_approval::CapabilitySummary::default(),
+    };
+    let new_summary = fragment_capability_summary(&content, &entry_path, &bundle_dir)?;
+    let changes = config_approval::diff_capabilities(&old_summary, &new_summary);
+
+    if changes.is_empty() {
+        store
+            .store_approval(path, &content)
+            .with_context(|| format!("failed to record approval for {entry_path}"))?;
+        return Ok(ApprovalOutcome::NoChanges);
+    }
+
+    match launch_context {
+        LaunchContext::Sandboxed => anyhow::bail!(
+            "config approve REFUSED: cannot approve a capability change from inside a sandbox \
+             — a sandboxed worker must never be able to approve its own escalation; run \
+             `varda config approve` on an interactive host terminal instead"
+        ),
+        LaunchContext::Headless if !auto_yes => anyhow::bail!(
+            "config approve REFUSED: no TTY attached to review and confirm {entry_path}'s \
+             capability changes; re-run interactively, or pass --yes if it has already been \
+             reviewed by other means"
+        ),
+        LaunchContext::Headless => {
+            // auto_yes == true here
+            store
+                .store_approval(path, &content)
+                .with_context(|| format!("failed to record approval for {entry_path}"))?;
+            Ok(ApprovalOutcome::Approved { changes })
+        }
+        LaunchContext::InteractiveTty => {
+            print_capability_diff(&entry_path, &changes);
+            if ask()? {
+                store
+                    .store_approval(path, &content)
+                    .with_context(|| format!("failed to record approval for {entry_path}"))?;
+                Ok(ApprovalOutcome::Approved { changes })
+            } else {
+                Ok(ApprovalOutcome::Declined { changes })
+            }
+        }
+    }
+}
+
 /// Parse a fragment's raw TOML text a SECOND time as a generic [`toml::Value`] and
 /// reject any key the corresponding typed struct doesn't recognize.
 ///
@@ -6699,6 +6819,197 @@ agents = ["frag_agent"]
         assert_eq!(result, new);
         let stored = store
             .load_approved_content(&include_path)
+            .expect("store should be readable");
+        assert_eq!(stored.as_deref(), Some(new));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn approve_bundle_with_empty_diff_repins_without_prompting() {
+        let root = temp_dir("approve-empty-diff");
+        fs::create_dir_all(&root).expect("root dir should be creatable");
+        let bundle_path = root.join("bundle.toml");
+
+        let old = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        let new = "# a harmless comment\n[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&bundle_path, new).expect("bundle should be written");
+
+        let store = isolated_approval_store(&root);
+        store
+            .store_approval(&bundle_path, old)
+            .expect("prior approval should store");
+
+        let outcome = approve_bundle_with(
+            &bundle_path,
+            false,
+            // Context is irrelevant on an empty diff — Sandboxed proves it's
+            // never even consulted, since the closure below panics if called.
+            LaunchContext::Sandboxed,
+            || panic!("must never prompt when the capability diff is empty"),
+            &store,
+        )
+        .expect("an empty-diff approve must silently re-pin, not refuse");
+
+        assert_eq!(outcome, ApprovalOutcome::NoChanges);
+        let stored = store
+            .load_approved_content(&bundle_path)
+            .expect("store should be readable");
+        assert_eq!(
+            stored.as_deref(),
+            Some(new),
+            "the approval store must be updated to the new content"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn approve_bundle_with_sandboxed_refuses_even_with_auto_yes() {
+        let root = temp_dir("approve-sandboxed-yes");
+        fs::create_dir_all(&root).expect("root dir should be creatable");
+        let bundle_path = root.join("bundle.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&bundle_path, new).expect("bundle should be written");
+
+        let store = isolated_approval_store(&root);
+        let err = approve_bundle_with(
+            &bundle_path,
+            true,
+            LaunchContext::Sandboxed,
+            || panic!(
+                "a sandboxed worker/resident must never be offered the approval prompt, \
+                 even if it would answer yes"
+            ),
+            &store,
+        )
+        .expect_err("Sandboxed + --yes must still refuse — never self-approve");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("REFUSED"));
+        assert!(message.contains("sandbox"));
+        assert!(
+            store
+                .load_approved_content(&bundle_path)
+                .expect("store should be readable")
+                .is_none(),
+            "a refused approval must not be recorded"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn approve_bundle_with_headless_refuses_without_yes() {
+        let root = temp_dir("approve-headless-no-yes");
+        fs::create_dir_all(&root).expect("root dir should be creatable");
+        let bundle_path = root.join("bundle.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&bundle_path, new).expect("bundle should be written");
+
+        let store = isolated_approval_store(&root);
+        let err = approve_bundle_with(
+            &bundle_path,
+            false,
+            LaunchContext::Headless,
+            || panic!("a headless run must never block on a prompt"),
+            &store,
+        )
+        .expect_err("a headless run without --yes must refuse");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("REFUSED"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn approve_bundle_with_auto_yes_stores_without_prompting_even_when_headless() {
+        let root = temp_dir("approve-headless-yes");
+        fs::create_dir_all(&root).expect("root dir should be creatable");
+        let bundle_path = root.join("bundle.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&bundle_path, new).expect("bundle should be written");
+
+        let store = isolated_approval_store(&root);
+        let outcome = approve_bundle_with(
+            &bundle_path,
+            true,
+            LaunchContext::Headless,
+            || panic!("--yes must bypass the prompt, not merely default its answer"),
+            &store,
+        )
+        .expect("Headless + --yes must approve without prompting");
+
+        match outcome {
+            ApprovalOutcome::Approved { .. } => {}
+            other => panic!("expected Approved, got {other:?}"),
+        }
+        let stored = store
+            .load_approved_content(&bundle_path)
+            .expect("store should be readable");
+        assert_eq!(stored.as_deref(), Some(new));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn approve_bundle_with_interactive_decline_stores_nothing() {
+        let root = temp_dir("approve-interactive-decline");
+        fs::create_dir_all(&root).expect("root dir should be creatable");
+        let bundle_path = root.join("bundle.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&bundle_path, new).expect("bundle should be written");
+
+        let store = isolated_approval_store(&root);
+        let outcome = approve_bundle_with(
+            &bundle_path,
+            false,
+            LaunchContext::InteractiveTty,
+            || Ok(false),
+            &store,
+        )
+        .expect("declining is not an error for the standalone approve command");
+
+        match outcome {
+            ApprovalOutcome::Declined { .. } => {}
+            other => panic!("expected Declined, got {other:?}"),
+        }
+        assert!(
+            store
+                .load_approved_content(&bundle_path)
+                .expect("store should be readable")
+                .is_none(),
+            "declining must not store anything"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn approve_bundle_with_interactive_approval_stores_new_content() {
+        let root = temp_dir("approve-interactive-approve");
+        fs::create_dir_all(&root).expect("root dir should be creatable");
+        let bundle_path = root.join("bundle.toml");
+        let new = "[[routes]]\nglob = \"a/**\"\nagents = [\"codex\"]\n";
+        fs::write(&bundle_path, new).expect("bundle should be written");
+
+        let store = isolated_approval_store(&root);
+        let outcome = approve_bundle_with(
+            &bundle_path,
+            false,
+            LaunchContext::InteractiveTty,
+            || Ok(true),
+            &store,
+        )
+        .expect("approving at the prompt must succeed");
+
+        match outcome {
+            ApprovalOutcome::Approved { .. } => {}
+            other => panic!("expected Approved, got {other:?}"),
+        }
+        let stored = store
+            .load_approved_content(&bundle_path)
             .expect("store should be readable");
         assert_eq!(stored.as_deref(), Some(new));
 
