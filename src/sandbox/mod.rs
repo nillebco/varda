@@ -756,6 +756,19 @@ pub fn session_store_key(ctx: &SandboxContext<'_>) -> String {
 #[async_trait]
 pub trait SandboxProvider: Send + Sync {
     fn name(&self) -> &str;
+    /// Whether this provider can seed a PRIOR run's session store into a fresh
+    /// container/VM before the agent starts — i.e. whether resuming an
+    /// interactive session under this sandbox is possible at all. Docker's
+    /// `create` → `docker cp` → `start` lifecycle has a pre-boot window to
+    /// inject the store (see `DockerSession::inject_session_store`);
+    /// `microsandbox`'s `msb run` boots straight from the image with no such
+    /// window, so it cannot support this and must keep refusing an
+    /// interactive resume rather than attempt an unsupported mid-boot seed.
+    /// Default false; `local` doesn't need this path (resume runs directly on
+    /// the host, no sandbox involved).
+    fn supports_interactive_resume(&self) -> bool {
+        false
+    }
     async fn prepare(&self, ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>>;
 }
 
@@ -1351,6 +1364,10 @@ fn strip_jsonc(text: &str) -> String {
 impl SandboxProvider for DockerProvider {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn supports_interactive_resume(&self) -> bool {
+        true
     }
 
     async fn prepare(&self, ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
@@ -4669,6 +4686,46 @@ mod tests {
             },
         );
         assert!(provider_for("weird", &sandboxes, &[], &SandboxIdentity::default()).is_err());
+    }
+
+    /// Only docker can seed a prior run's session store into a fresh box before
+    /// it starts (a create-then-boot window), so only docker reports itself as
+    /// able to resume an interactive session under isolation. `local` doesn't
+    /// need this (resume runs directly on the host); `microsandbox` boots
+    /// straight from the image with no pre-start seed window and must keep
+    /// refusing an interactive resume rather than attempt an unsupported
+    /// mid-boot seed.
+    #[test]
+    fn only_docker_supports_interactive_resume() {
+        assert!(!LocalProvider.supports_interactive_resume());
+
+        let mut sandboxes: BTreeMap<String, SandboxConfig> = BTreeMap::new();
+        sandboxes.insert(
+            "docker".to_owned(),
+            SandboxConfig {
+                image: Some("varda:latest".to_owned()),
+                primitive: "docker".to_owned(),
+                ..Default::default()
+            },
+        );
+        sandboxes.insert(
+            "vm".to_owned(),
+            SandboxConfig {
+                image: Some("busybox".to_owned()),
+                primitive: "microsandbox".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            provider_for("docker", &sandboxes, &[], &SandboxIdentity::default())
+                .unwrap()
+                .supports_interactive_resume()
+        );
+        assert!(
+            !provider_for("vm", &sandboxes, &[], &SandboxIdentity::default())
+                .unwrap()
+                .supports_interactive_resume()
+        );
     }
 
     /// The `clawk` primitive was removed outright (no shim, no alias). A config

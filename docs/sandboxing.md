@@ -134,7 +134,7 @@ never needed `crates.io` egress in the first place.
 - **Ctrl-C** under `-it` propagates to the guest process; the `SessionTeardownGuard` still fires on the way out, so no `varda-sbx-*` container or volume leaks.
 - **The interpretation pass stays local.** After the interactive session ends, Varda's post-session interpretation pass only reads the host session log to produce the recap and the captured `resume_command` (no untrusted exec), so it runs **un-sandboxed** on the host. An optional `interpreter_agent` on the agent config selects which agent runs that pass; when unset it defaults to the same agent that drove the session (a real agent re-reads its own transcript; a bare `sh` shell that can't emit a Varda recap should point `interpreter_agent` at a real agent).
 
-> Resuming an interactive session under a sandbox is not yet supported (the fresh-shell launch is); resume runs remain `local`-only.
+> Resuming an interactive session under `docker` runs the resume invocation (`sh -c "<resume_command>"`) through the same create → inject-store → cp → start lifecycle as a fresh interactive launch, so the prior run's task-keyed store is seeded into the new container's HOME before the agent starts. `microsandbox` has no create-then-boot window to seed that store pre-start, so it still refuses an interactive resume outright rather than attempt an unsupported mid-boot seed — resume under `microsandbox` remains `local`-only. Either way a resume that cannot be satisfied inside the pinned sandbox refuses; it never silently falls back to running on the host.
 
 ### Per-folder `.varda` (untrusted origin) and the hardening floor
 
@@ -282,7 +282,7 @@ Files only (never a whole dotdir, never `projects/` transcripts); the credential
 
 Current limitations:
 
-- **Resume is `local`-only.** Fresh interactive sessions run under `docker`/`microsandbox` (the real `claude`/`codex`/`copilot` agents attach to your TTY inside the box — see [Interactive sandbox](#interactive-sandbox-real-agents-tty-prompt-staging-injected-auth-and-the-docker-lifecycle)). **Resuming** an interactive session under a non-`local` sandbox still returns a clear error and remains `local`-only.
+- **Resume under `microsandbox` is `local`-only.** Fresh interactive sessions run under `docker`/`microsandbox` (the real `claude`/`codex`/`copilot` agents attach to your TTY inside the box — see [Interactive sandbox](#interactive-sandbox-real-agents-tty-prompt-staging-injected-auth-and-the-docker-lifecycle)). **Resuming** an interactive session under `docker` re-seeds the task-keyed session store into a fresh container before the agent starts, same as a fresh `docker` interactive launch; resuming under any other non-`local` sandbox (`microsandbox` included) still returns a clear error rather than falling back to the host.
 
 ## Per-folder `.varda` overrides
 
