@@ -702,12 +702,55 @@ pub enum LaunchMode {
 /// `route_glob`, `agent_kind`, and `session_id` are threaded through for
 /// providers that will key on them in later milestones (image selection,
 /// per-session container names); the M1 providers don't read them yet.
+/// `task_path`, `task_id`, and `policy_project` identify the TASK (not the
+/// session/run) so [`session_store_key`] can key persistent session-store
+/// storage on task identity rather than the per-run `session_id`, letting a
+/// `--reuse` rerun of the same task find its predecessor's store.
 #[allow(dead_code)]
 pub struct SandboxContext<'a> {
     pub project_root: &'a Path,
     pub route_glob: &'a str,
     pub agent_kind: AgentKind,
     pub session_id: &'a str,
+    pub task_path: &'a str,
+    pub task_id: Option<u64>,
+    pub policy_project: &'a str,
+}
+
+/// Derive a stable, task-scoped key for the on-host session store directory.
+///
+/// Keyed on `(policy_project, task identity)` rather than `session_id` so that
+/// repeated runs of the SAME task (e.g. `--reuse`) resolve to the SAME store
+/// and can pick up a prior run's session/conversation state, while different
+/// tasks — or the same task path under a different project — never collide.
+/// Task identity prefers the numeric task id (`Some(id)` ⇒ `"id:{id}"`) since
+/// a task's file path can change (rename/move) while its id stays stable;
+/// falls back to the task path when no id is available (e.g. ad hoc `--task`
+/// invocations that never got registered).
+///
+/// Hashed (SHA-256) rather than used as a literal path so neither component
+/// needs filesystem-safe escaping, and length-prefixed (8-byte little-endian
+/// length before each field) so `("ab", "c")` and `("a", "bc")` cannot collide
+/// by concatenation.
+pub fn session_store_key(ctx: &SandboxContext<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, ctx.policy_project.as_bytes());
+    let identity = match ctx.task_id {
+        Some(id) => format!("id:{id}"),
+        None => format!("path:{}", ctx.task_path),
+    };
+    hash_len_prefixed(&mut hasher, identity.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 #[async_trait]
@@ -826,6 +869,14 @@ pub trait SandboxSession: Send + Sync {
     /// teardown (e.g. `docker cp` from a per-session volume into
     /// [`session_store_root`](Self::session_store_root)). No-op for live stores.
     async fn extract_session_store(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Seed the guest's HOME with a prior run's session store BEFORE the agent
+    /// starts, so a `--reuse` rerun (now resolving to the same task-keyed store
+    /// via [`session_store_key`]) sees its predecessor's conversation state.
+    /// Default no-op: `local`'s HOME already IS the persistent store; providers
+    /// with a create-then-boot window (docker) override this.
+    async fn inject_session_store(&self) -> Result<()> {
         Ok(())
     }
     /// Whether the guest reached the provider's agent relay. `None` means the
@@ -1351,7 +1402,10 @@ impl SandboxProvider for DockerProvider {
         // the agent's session store never reaches the host. After the run we
         // `docker cp` the store out of the container into `session_store` (a
         // host-side dir we create, never mounted), which resume-capture reads.
-        let session_store = varda_sessions_root().join(ctx.session_id);
+        // Keyed on task identity (not `session_id`) so a `--reuse` rerun of the
+        // SAME task resolves to the SAME store and can pick up its predecessor's
+        // conversation state (see `session_store_key`).
+        let session_store = varda_sessions_root().join(session_store_key(ctx));
         std::fs::create_dir_all(&session_store).with_context(|| {
             format!(
                 "failed to create sandbox session store {}",
@@ -1371,7 +1425,7 @@ impl SandboxProvider for DockerProvider {
                 &handle,
                 &egress_hosts,
                 &self.egress_proxy_image,
-                &session_store,
+                &egress_proxy_scratch_dir(&handle),
             )
             .await?;
         }
@@ -1389,6 +1443,7 @@ impl SandboxProvider for DockerProvider {
             cpus: self.cpus.clone(),
             identity: self.identity.clone(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         }))
     }
 }
@@ -1401,6 +1456,23 @@ fn egress_proxy_network(handle: &str) -> String {
 }
 fn egress_proxy_container(handle: &str) -> String {
     format!("varda-eproxy-{handle}")
+}
+
+/// Host dir the generated tinyproxy config/filter are written to before being
+/// `docker cp`-ed into the proxy sidecar.
+///
+/// Deliberately NOT under `session_store`: that directory is now keyed on TASK
+/// identity (via [`session_store_key`]) and persists across `--reuse` reruns,
+/// while this is per-RUN operational scratch for the proxy sidecar (rewritten
+/// every run, never conversation/session state). Mixing the two would (a) make
+/// [`DockerSession::has_stored_session`] see a non-empty store on a genuinely
+/// first-ever run of a task, since the config always exists, wrongly triggering
+/// [`SandboxSession::inject_session_store`]; and (b) race two concurrent runs of
+/// the SAME task over the SAME config path. Keyed on the (unique per run)
+/// sanitized session handle, under `sessions/scratch` — a sibling of the
+/// per-task session stores, not nested inside any of them.
+fn egress_proxy_scratch_dir(handle: &str) -> PathBuf {
+    varda_sessions_root().join("scratch").join(handle)
 }
 
 /// Expand `${env:NAME}` inside an egress entry from the HOST env at prepare time.
@@ -1511,7 +1583,7 @@ async fn setup_egress_proxy(
     handle: &str,
     hosts: &[String],
     image: &str,
-    session_store: &Path,
+    scratch_dir: &Path,
 ) -> Result<()> {
     let network = egress_proxy_network(handle);
     let container = egress_proxy_container(handle);
@@ -1528,8 +1600,9 @@ async fn setup_egress_proxy(
         }
     }
     // 2. Write the proxy config + filter into a host dir mounted read-only into the
-    //    proxy. Lives under the session store so it is cleaned with the session.
-    let cfg_dir = session_store.join("egress-proxy");
+    //    proxy. Lives under a per-run scratch dir (NOT the task-keyed, `--reuse`-
+    //    persistent session store — see `egress_proxy_scratch_dir`).
+    let cfg_dir = scratch_dir.join("egress-proxy");
     std::fs::create_dir_all(&cfg_dir)
         .with_context(|| format!("failed to create proxy config dir {}", cfg_dir.display()))?;
     std::fs::write(cfg_dir.join("tinyproxy.conf"), tinyproxy_conf(hosts))
@@ -1801,6 +1874,13 @@ pub struct DockerSession {
     /// `(host_temp, guest_path)`. `docker cp`-ed into the container between
     /// `create` and `start` by [`begin_interactive`] (M13a §2/§3). Empty for batch.
     staged_files: std::sync::Mutex<Vec<(PathBuf, String)>>,
+    /// Every guest path staged THIS run (prompt + credential files), for the
+    /// lifetime of the run — unlike `staged_files`, this is NOT drained by
+    /// [`create_cp_start`](Self::create_cp_start); it survives so
+    /// [`extract_session_store`](Self::extract_session_store) can scrub these
+    /// paths back out of the freshly extracted store (a staged credential must
+    /// not linger in the persistent, `--reuse`-visible session store).
+    staged_guest_paths: std::sync::Mutex<Vec<String>>,
 }
 
 impl DockerSession {
@@ -1823,7 +1903,81 @@ impl DockerSession {
             .lock()
             .expect("staged_files mutex poisoned")
             .push((tmp, guest_path.to_owned()));
+        self.staged_guest_paths
+            .lock()
+            .expect("staged_guest_paths mutex poisoned")
+            .push(guest_path.to_owned());
         Ok(guest_path.to_owned())
+    }
+
+    /// Whether `session_store` already holds a prior run's state — the signal
+    /// [`wrap`](SandboxSession::wrap)/[`begin_batch`](SandboxSession::begin_batch)
+    /// use to decide whether a populated store must be seeded into the guest
+    /// before the agent starts (forcing the create→cp→start lifecycle). Any
+    /// entry counts: the egress-proxy scratch config is written OUTSIDE
+    /// `session_store` (`egress_proxy_scratch_dir`), so a genuinely first-ever
+    /// run's store really is empty here.
+    fn has_stored_session(&self) -> bool {
+        self.session_store
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
+    }
+
+    /// Translate a guest-absolute path into a path relative to `self.home`,
+    /// suitable for joining onto `session_store`. Returns `None` (skip, don't
+    /// delete) when the guest path is not under `self.home`, resolves to the
+    /// store root itself (empty relative path — refuse to ever touch the store
+    /// root), or contains any non-[`Component::Normal`] component (`..`, `.`,
+    /// a root, or a prefix) — which would otherwise let a guest path escape
+    /// `session_store` lexically before a single syscall runs.
+    fn store_relative_path(&self, guest_path: &str) -> Option<PathBuf> {
+        use std::path::Component;
+        let relative = Path::new(guest_path)
+            .strip_prefix(Path::new(&self.home))
+            .ok()?;
+        if relative.as_os_str().is_empty() {
+            return None;
+        }
+        if relative
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            return None;
+        }
+        Some(relative.to_path_buf())
+    }
+
+    /// Second, independent containment check: verifies the target's PARENT
+    /// resolves (symlinks and all) to somewhere still inside `session_store`.
+    ///
+    /// [`store_relative_path`](Self::store_relative_path) only rejects a
+    /// lexical `..`/`.`/root component written directly in the ORIGINAL guest
+    /// path string. It cannot catch an intermediate path component that is
+    /// itself a SYMLINK planted in the store by a PRIOR run — e.g. if an
+    /// agent-authored symlink from an earlier extraction sits at
+    /// `session_store/.aws` pointing outside the store, `session_store.join(".aws/credentials")`
+    /// is a lexically clean relative path, yet resolving it on disk follows
+    /// that symlink and lands outside `session_store` entirely. Canonicalizing
+    /// the target's parent (not the target itself — the target may legitimately
+    /// BE a symlink Varda staged, e.g. a credential file, and `remove_file`
+    /// does not follow a symlink target, so that case is safe regardless) and
+    /// checking it is still prefixed by the canonicalized store catches that.
+    fn target_is_within_store(&self, relative: &Path) -> bool {
+        let Ok(store_real) = std::fs::canonicalize(&self.session_store) else {
+            // If the store itself can't be canonicalized, refuse rather than guess.
+            return false;
+        };
+        let target = self.session_store.join(relative);
+        let Some(parent) = target.parent() else {
+            return false;
+        };
+        let Ok(parent_real) = std::fs::canonicalize(parent) else {
+            // Parent doesn't exist / can't be resolved — nothing to delete,
+            // refuse rather than guess at a partial path.
+            return false;
+        };
+        parent_real.starts_with(&store_real)
     }
 
     /// Shared create → cp → start lifecycle for both launch modes. `wrapped` is a
@@ -1868,6 +2022,10 @@ impl DockerSession {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
+        // Seed any prior run's session store BEFORE the staged-file copies, so a
+        // staged credential/prompt file (below) is never shadowed by, or itself
+        // shadows, whatever the agent's own session state writes to the same path.
+        self.inject_session_store().await?;
         for (host_temp, guest_path) in &staged {
             let src = host_temp.display().to_string();
             let dst = format!("{}:{guest_path}", self.container);
@@ -1922,11 +2080,15 @@ impl SandboxSession for DockerSession {
         // credential must be `docker cp`-ed into the container BEFORE the agent
         // starts, which `run` cannot do — so when files are staged, batch also
         // takes the `create` → cp → `start -ai` lifecycle (still `-i`, no TTY).
+        // A populated session store (a prior run's state, to be seeded via
+        // `inject_session_store`) forces the same lifecycle for the same reason:
+        // `docker run` has no window to `docker cp` it in before the agent starts.
         let has_staged = !self
             .staged_files
             .lock()
             .expect("staged_files mutex poisoned")
-            .is_empty();
+            .is_empty()
+            || self.has_stored_session();
         let (verb, tty_flag) = match mode {
             LaunchMode::Batch if has_staged => ("create", "-i"),
             LaunchMode::Batch => ("run", "-i"),
@@ -2123,15 +2285,17 @@ impl SandboxSession for DockerSession {
     }
 
     async fn begin_batch(&self, wrapped: CommandSpec) -> Result<CommandSpec> {
-        // No staged files ⇒ `wrapped` is a plain `docker run -i …`; spawn it as-is.
-        // Otherwise `wrap` produced `docker create -i …` so a file-target
-        // credential can be `docker cp`-ed in BEFORE the agent starts; run the same
+        // No staged files and no prior session store to seed ⇒ `wrapped` is a
+        // plain `docker run -i …`; spawn it as-is. Otherwise `wrap` produced
+        // `docker create -i …` so a file-target credential / the stored session
+        // can be `docker cp`-ed in BEFORE the agent starts; run the same
         // create → cp → `start -ai` lifecycle as interactive (no TTY, stdin piped).
         if self
             .staged_files
             .lock()
             .expect("staged_files mutex poisoned")
             .is_empty()
+            && !self.has_stored_session()
         {
             return Ok(wrapped);
         }
@@ -2200,6 +2364,39 @@ impl SandboxSession for DockerSession {
         ))
     }
 
+    async fn inject_session_store(&self) -> Result<()> {
+        // Nothing stored yet (genuinely first-ever run of this task) ⇒ nothing
+        // to seed; leave the fresh container HOME as the image provides it.
+        if !self.has_stored_session() {
+            return Ok(());
+        }
+        // Copy the store's contents INTO the (already-created, not-yet-started)
+        // container's HOME. The trailing `/.` copies what is inside
+        // `session_store` into the (already-existing, volume-backed) guest HOME
+        // rather than nesting it — mirrors the trailing `/.` in
+        // `extract_session_store`'s copy the other direction.
+        let src = format!("{}/.", self.session_store.display());
+        let dst = format!("{}:{}", self.container, self.home);
+        let output = tokio::process::Command::new("docker")
+            .args(["cp", &src, &dst])
+            .output()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to spawn `docker cp` of the stored session into '{}'",
+                    self.container
+                )
+            })?;
+        if !output.status.success() {
+            bail!(
+                "`docker cp {src} {dst}` failed with status {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     async fn extract_session_store(&self) -> Result<()> {
         // Copy the container HOME *contents* into the host session-store dir. The
         // trailing `/.` copies what is inside `home` into the (existing) host dir
@@ -2222,6 +2419,54 @@ impl SandboxSession for DockerSession {
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
             );
+        }
+        // Scrub every path Varda itself staged THIS run (the prompt, any
+        // file-target credential) back out of the freshly extracted store: it
+        // was staged fresh for this run, not written by the agent, and must not
+        // linger in the persistent, `--reuse`-visible session store where a
+        // LATER run's `inject_session_store` would copy a stale credential value
+        // back into a guest that never asked for it. Best-effort per entry — a
+        // failure to scrub one path must not abort extraction of the rest — but
+        // NEVER silent: `docs/sandboxing.md` documents this as a guarantee, so a
+        // failure is logged rather than swallowed (see AGENTS.md "fail loud").
+        for guest_path in std::mem::take(
+            &mut *self
+                .staged_guest_paths
+                .lock()
+                .expect("staged_guest_paths mutex poisoned"),
+        ) {
+            let Some(relative) = self.store_relative_path(&guest_path) else {
+                continue;
+            };
+            // Both checks must pass: the lexical check above catches a literal
+            // `..`/`.`/root in the guest path string; this one additionally
+            // resolves symlinks on the real filesystem (see
+            // `target_is_within_store`'s doc comment) — a prior run's extraction
+            // may have captured an agent-planted symlink under HOME that the
+            // scrub itself does not clean (it only removes paths VARDA staged).
+            if !self.target_is_within_store(&relative) {
+                eprintln!(
+                    "sandbox: refusing to scrub staged path '{guest_path}' from session store \
+                     {} — its target resolves outside the store (possible symlink); leaving it \
+                     in place",
+                    self.session_store.display()
+                );
+                continue;
+            }
+            let target = self.session_store.join(&relative);
+            let result = if target.is_dir() {
+                std::fs::remove_dir_all(&target)
+            } else {
+                std::fs::remove_file(&target)
+            };
+            if let Err(err) = result {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "sandbox: failed to scrub staged path '{}' from session store: {err}",
+                        target.display()
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -2432,7 +2677,9 @@ impl SandboxProvider for MicrosandboxProvider {
     async fn prepare(&self, ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
         // Host-side dir the guest session store is `msb cp`-ed into after the run
         // (never a bind mount — the microVM guest HOME lives in VM storage).
-        let session_store = varda_sessions_root().join(ctx.session_id);
+        // Keyed on task identity (not `session_id`), same as `DockerProvider` —
+        // see `session_store_key`.
+        let session_store = varda_sessions_root().join(session_store_key(ctx));
         std::fs::create_dir_all(&session_store).with_context(|| {
             format!(
                 "failed to create sandbox session store {}",
@@ -2531,6 +2778,17 @@ impl MicrosandboxSession {
     }
 }
 
+// NOTE: intentionally no `inject_session_store` override here (stays the
+// trait's no-op default). Unlike docker, `msb run` has no create-then-boot
+// window to `docker cp`-equivalent a prior store INTO the guest before the
+// microVM starts: it boots straight from `msb run [OPTS] <IMAGE> -- <CMD>`,
+// so there is nowhere to splice a seed copy between "sandbox exists" and
+// "process running". `session_store` is still keyed on task identity (see
+// `session_store_key`) and still round-trips OUT via `msb cp` in
+// `extract_session_store`, so a `--reuse` rerun's EXTRACTED store keeps
+// accumulating correctly — it just cannot be fed back IN pre-boot the way
+// docker's does, so a microsandbox `--reuse` rerun starts from a fresh guest
+// HOME each time regardless of what a prior run wrote to the host-side store.
 #[async_trait]
 impl SandboxSession for MicrosandboxSession {
     fn wrap(&self, spec: CommandSpec, mode: LaunchMode) -> Result<CommandSpec> {
@@ -3087,6 +3345,7 @@ impl DockerSession {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -3175,6 +3434,14 @@ mod tests {
             route_glob: "**",
             agent_kind: AgentKind::Acp,
             session_id,
+            // `session_store_key` hashes `(policy_project, task_path/task_id)`, NOT
+            // `session_id` — reuse `session_id` as `task_path` here (with no
+            // `task_id`) so tests that pass a UNIQUE `session_id` (the existing
+            // convention for docker integration tests, see the doc comment above)
+            // keep getting a unique, non-colliding on-disk session store per test.
+            task_path: session_id,
+            task_id: None,
+            policy_project: project_root.to_str().unwrap_or("."),
         }
     }
 
@@ -3367,6 +3634,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         assert_eq!(
             session.session_store_root(),
@@ -3460,6 +3728,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(
@@ -3503,6 +3772,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(
@@ -4079,6 +4349,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(
@@ -4118,6 +4389,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(
@@ -4170,6 +4442,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(
@@ -6239,6 +6512,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(
@@ -6286,6 +6560,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         let targets = session.mount_targets().expect("docker session restricts");
         assert!(targets.contains(&PathBuf::from("/srv/app")));
@@ -6321,6 +6596,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(
@@ -6362,6 +6638,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(
@@ -6414,6 +6691,7 @@ mod tests {
             cpus: None,
             identity: SandboxIdentity::default(),
             staged_files: std::sync::Mutex::new(Vec::new()),
+            staged_guest_paths: std::sync::Mutex::new(Vec::new()),
         };
         let wrapped = session
             .wrap(
@@ -6909,5 +7187,272 @@ mod tests {
         // Multiple declared hosts produce one exact-anchored line each.
         let multi = tinyproxy_filter(&["a.example.com".to_owned(), "b.example.com".to_owned()]);
         assert_eq!(multi, "^a\\.example\\.com$\n^b\\.example\\.com$\n");
+    }
+
+    fn ctx_for_task<'a>(
+        project_root: &'a Path,
+        session_id: &'a str,
+        task_path: &'a str,
+        task_id: Option<u64>,
+        policy_project: &'a str,
+    ) -> SandboxContext<'a> {
+        SandboxContext {
+            project_root,
+            route_glob: "**",
+            agent_kind: AgentKind::Acp,
+            session_id,
+            task_path,
+            task_id,
+            policy_project,
+        }
+    }
+
+    #[test]
+    fn session_store_key_is_stable_across_session_ids_for_same_project_and_task() {
+        let root = Path::new("/proj");
+        let a = ctx_for_task(root, "session-a", "task.md", Some(42), "/proj");
+        let b = ctx_for_task(root, "session-b", "task.md", Some(42), "/proj");
+        assert_eq!(
+            session_store_key(&a),
+            session_store_key(&b),
+            "the store key must be stable across DIFFERENT session ids for the SAME \
+             (policy_project, task) so a `--reuse` rerun (a new session id) resolves to \
+             the SAME on-disk store as its predecessor"
+        );
+    }
+
+    #[test]
+    fn session_store_key_is_isolated_by_task_and_by_project() {
+        let root = Path::new("/proj");
+        let base = ctx_for_task(root, "s1", "task.md", Some(1), "/proj");
+        let different_task_id = ctx_for_task(root, "s1", "task.md", Some(2), "/proj");
+        // `task_path` differing has NO effect when `task_id` is `Some` in both —
+        // the id takes priority and the path is not part of the identity, so this
+        // must equal `base`, not differ from it (a task can be renamed/moved
+        // without losing its store).
+        let same_id_different_path = ctx_for_task(root, "s1", "other.md", Some(1), "/proj");
+        let different_project = ctx_for_task(root, "s1", "task.md", Some(1), "/other");
+        let no_task_id_a = ctx_for_task(root, "s1", "task.md", None, "/proj");
+        let no_task_id_b = ctx_for_task(root, "s1", "other.md", None, "/proj");
+
+        let base_key = session_store_key(&base);
+        assert_ne!(base_key, session_store_key(&different_task_id));
+        assert_eq!(base_key, session_store_key(&same_id_different_path));
+        assert_ne!(base_key, session_store_key(&different_project));
+        // With no task id, identity falls back to task_path, so two DIFFERENT
+        // task paths must still resolve to different keys.
+        assert_ne!(
+            session_store_key(&no_task_id_a),
+            session_store_key(&no_task_id_b)
+        );
+        // A length-prefix guard: without the 8-byte length prefix, these two
+        // DIFFERENT (policy_project, task_path) pairs concatenate to the exact
+        // same byte string — `policy_project + "path:" + task_path` — because
+        // the split lands squarely on the literal "path:" separator:
+        //   A: "a" + "path:" + "path:b" == "apath:path:b"
+        //   B: "apath:" + "path:" + "b" == "apath:path:b"
+        // The length prefix on each field must keep them apart.
+        let concat_a = ctx_for_task(Path::new("/x"), "s1", "path:b", None, "a");
+        let concat_b = ctx_for_task(Path::new("/x"), "s1", "b", None, "apath:");
+        assert_ne!(
+            session_store_key(&concat_a),
+            session_store_key(&concat_b),
+            "length-prefixing must prevent a naive-concatenation collision across the \
+             (policy_project, task identity) boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_prepare_called_twice_resolves_the_same_store() {
+        let provider = DockerProvider::new_for_test("docker", "varda:latest", &[], &[]);
+        let root = Path::new("/proj/prepare-twice");
+        let ctx = ctx_for_task(
+            root,
+            "run-1",
+            "task-780.md",
+            Some(780),
+            "/proj/prepare-twice",
+        );
+        let session_a = provider.prepare(&ctx).await.unwrap();
+        let store_a = session_a.session_store_root().expect("store root");
+
+        let ctx2 = ctx_for_task(
+            root,
+            "run-2",
+            "task-780.md",
+            Some(780),
+            "/proj/prepare-twice",
+        );
+        let session_b = provider.prepare(&ctx2).await.unwrap();
+        let store_b = session_b.session_store_root().expect("store root");
+
+        assert_eq!(
+            store_a, store_b,
+            "two `prepare()` calls for the same task (different session ids, e.g. a \
+             `--reuse` rerun) must resolve to the SAME session store directory"
+        );
+        let _ = std::fs::remove_dir_all(&store_a);
+    }
+
+    #[test]
+    fn wrap_forces_create_lifecycle_when_store_populated() {
+        let store = std::env::temp_dir().join(format!(
+            "varda-store-populated-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&store).unwrap();
+
+        // Empty store: batch stays the plain streaming `docker run` form.
+        let empty_session = DockerSession::for_test(
+            "varda:latest",
+            "/proj",
+            vec![],
+            vec![],
+            store.to_str().unwrap(),
+        );
+        let wrapped = empty_session.wrap(empty_spec(), LaunchMode::Batch).unwrap();
+        assert_eq!(wrapped.args.first().map(String::as_str), Some("run"));
+
+        // Populate the store with a prior run's state.
+        std::fs::write(store.join("transcript.jsonl"), "hi").unwrap();
+        let populated_session = DockerSession::for_test(
+            "varda:latest",
+            "/proj",
+            vec![],
+            vec![],
+            store.to_str().unwrap(),
+        );
+        let wrapped = populated_session
+            .wrap(empty_spec(), LaunchMode::Batch)
+            .unwrap();
+        assert_eq!(
+            wrapped.args.first().map(String::as_str),
+            Some("create"),
+            "a populated session store must force the create→cp→start lifecycle, the same \
+             as a staged file, so `inject_session_store` gets a window to seed it pre-boot"
+        );
+
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// Fix 1 regression test: a symlink PLANTED IN THE STORE by a prior run (the
+    /// scrub only ever removes paths Varda itself staged, so an agent-authored
+    /// symlink from an earlier extraction can persist) must not let the scrub in
+    /// `extract_session_store` delete a file OUTSIDE the store. Uses a REAL
+    /// filesystem symlink so this actually exercises OS-level path resolution,
+    /// not just string manipulation on `store_relative_path`'s lexical check.
+    #[cfg(unix)]
+    #[test]
+    fn scrub_refuses_to_follow_a_symlink_out_of_the_store() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "varda-scrub-symlink-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let store = root.join("store");
+        let sibling = root.join("sibling");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        // A canary file OUTSIDE the store, in a sibling directory.
+        let canary = sibling.join("canary.txt");
+        std::fs::write(&canary, "do not delete me").unwrap();
+
+        // Simulate a PRIOR run's extraction having captured an agent-planted
+        // symlink at `<store>/.aws` pointing at the sibling dir.
+        symlink(&sibling, store.join(".aws")).unwrap();
+
+        let session = DockerSession::for_test(
+            "varda:latest",
+            "/proj",
+            vec![],
+            vec![],
+            store.to_str().unwrap(),
+        );
+
+        // Varda staged a credential THIS run at a guest path that, once joined
+        // onto the store, lands THROUGH the symlink: `.aws/credentials`.
+        let guest_path = format!("{}/.aws/credentials", session.home);
+        session
+            .staged_guest_paths
+            .lock()
+            .unwrap()
+            .push(guest_path.clone());
+
+        // Exercise the same relative-path + containment checks the scrub loop
+        // in `extract_session_store` applies, directly (no docker daemon needed
+        // for this — it's pure filesystem logic).
+        let relative = session
+            .store_relative_path(&guest_path)
+            .expect("guest path under HOME must translate to a relative path");
+        assert!(
+            !session.target_is_within_store(&relative),
+            "a target reached through a symlinked intermediate component must be \
+             refused, not treated as within the store"
+        );
+
+        // The canary must survive even if a caller (incorrectly) attempted the
+        // removal without checking `target_is_within_store` first — assert the
+        // ACTUAL scrub-loop behavior by running the same logic extract_session_store
+        // uses: skip when the containment check fails.
+        if session.target_is_within_store(&relative) {
+            let target = store.join(&relative);
+            let _ = std::fs::remove_file(&target);
+            let _ = std::fs::remove_dir_all(&target);
+        }
+        assert!(
+            canary.exists(),
+            "the symlink-traversal scrub must never delete a file outside the store"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Companion to the above: WITHOUT the `target_is_within_store` guard (i.e.
+    /// relying on the lexical `store_relative_path` check alone, which is what a
+    /// naive implementation would do), the same relative path WOULD be considered
+    /// safe to delete — demonstrating the lexical check alone is insufficient and
+    /// the symlink-resolving check is the one actually carrying the guarantee.
+    #[cfg(unix)]
+    #[test]
+    fn lexical_check_alone_is_insufficient_without_the_symlink_guard() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "varda-scrub-symlink-lexical-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let store = root.join("store");
+        let sibling = root.join("sibling");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        symlink(&sibling, store.join(".aws")).unwrap();
+
+        let session = DockerSession::for_test(
+            "varda:latest",
+            "/proj",
+            vec![],
+            vec![],
+            store.to_str().unwrap(),
+        );
+        let guest_path = format!("{}/.aws/credentials", session.home);
+        let relative = session
+            .store_relative_path(&guest_path)
+            .expect("lexically clean relative path");
+        // The lexical check alone (no `..`, no root component) passes...
+        assert!(
+            relative
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        );
+        // ...which is exactly why a second, symlink-resolving check is required:
+        // demonstrated above by `target_is_within_store` correctly refusing it.
+        assert!(!session.target_is_within_store(&relative));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

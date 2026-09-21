@@ -358,6 +358,13 @@ impl AcpSubprocessClient {
             route_glob: "",
             agent_kind: crate::config::AgentKind::Acp,
             session_id: &request.session_id,
+            policy_project: request
+                .frontmatter
+                .policy_project()
+                .map(String::as_str)
+                .unwrap_or_else(|| working_dir.as_deref().unwrap_or(".")),
+            task_path: &request.task_path,
+            task_id: request.frontmatter.id,
         };
         let session = self
             .sandbox
@@ -906,6 +913,13 @@ impl AcpSubprocessClient {
             route_glob: "",
             agent_kind: crate::config::AgentKind::Acp,
             session_id: &request.session_id,
+            policy_project: request
+                .frontmatter
+                .policy_project()
+                .map(String::as_str)
+                .unwrap_or_else(|| working_dir.as_deref().unwrap_or(".")),
+            task_path: &request.task_path,
+            task_id: request.frontmatter.id,
         };
         let session = self
             .sandbox
