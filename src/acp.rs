@@ -625,15 +625,29 @@ impl AcpSubprocessClient {
         }
 
         if let Some(resume_command) = request.resume_command.as_deref() {
-            // Resuming an interactive session under a non-identity sandbox is not
-            // part of M13a (the fresh-shell launch is); fail clearly rather than
-            // silently resuming on the host.
+            // Resuming under a non-identity sandbox must NEVER fall back to
+            // running on the host — that would be a sandbox escape. Docker can
+            // seed a prior run's session store into a fresh container before it
+            // starts (see `supports_interactive_resume`), so it gets a real
+            // sandboxed resume path; any other non-local sandbox (e.g.
+            // microsandbox, which boots straight from the image with no
+            // pre-start seed window) still refuses clearly.
             if self.sandbox.name() != "local" {
-                bail!(
-                    "resuming an interactive session under the '{}' sandbox is not supported yet; \
-                     use sandbox=\"local\"",
-                    self.sandbox.name()
-                );
+                if !self.sandbox.supports_interactive_resume() {
+                    bail!(
+                        "resuming an interactive session under the '{}' sandbox is not supported; \
+                         use sandbox=\"local\", or a sandbox backed by docker",
+                        self.sandbox.name()
+                    );
+                }
+                return self
+                    .execute_interactive_resume_sandboxed(
+                        request,
+                        resume_command,
+                        working_dir,
+                        env,
+                    )
+                    .await;
             }
             let interactive_cmd = self
                 .interactive_command
@@ -1057,6 +1071,187 @@ impl AcpSubprocessClient {
 
         let result = AgentRunResult {
             recap: "Interactive sandboxed session completed.\n\nrequires_user: false".to_owned(),
+            requires_user: false,
+            suggested_agent: None,
+            resume_command,
+        };
+        guard.detach_teardown();
+        Ok(result)
+    }
+
+    /// Interactive resume under a sandbox that supports it (docker; gated by
+    /// `supports_interactive_resume` at the call site).
+    ///
+    /// Mirrors [`execute_interactive_sandboxed`](Self::execute_interactive_sandboxed)
+    /// but wraps the resume invocation (`sh -c "<resume_command>"`, matching the
+    /// `local` resume path) instead of a fresh agent launch, and skips prompt
+    /// staging — a resume command is already fully formed. The prior run's
+    /// session store is seeded into the fresh container's HOME before the agent
+    /// starts by `wrap`/`begin_interactive` (docker detects the stored session
+    /// and forces the create→inject→cp→start lifecycle — see
+    /// `DockerSession::inject_session_store`), so the resumed process finds its
+    /// predecessor's conversation state without this function doing anything
+    /// store-specific itself.
+    async fn execute_interactive_resume_sandboxed(
+        &self,
+        request: &AgentRunRequest,
+        resume_command: &str,
+        working_dir: Option<String>,
+        env: BTreeMap<String, String>,
+    ) -> Result<AgentRunResult> {
+        use std::io::IsTerminal as _;
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "an interactive sandboxed resume needs a terminal on stdin; \
+                 `{}` interactive requires a TTY (are you piping input or running headless?)",
+                self.sandbox.name()
+            );
+        }
+
+        let interactive_cmd = self
+            .interactive_command
+            .as_deref()
+            .map(|cmd| expand_request_value(cmd, request))
+            .unwrap_or_else(|| "sh".to_owned());
+        let interactive_args = resume_args_for_command(&interactive_cmd, resume_command);
+
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let _ = append_session_log(
+                log_path,
+                &format!(
+                    "[interactive-resume-sandboxed]\nsandbox={}\nresume_invocation={} {:?}\n",
+                    self.sandbox.name(),
+                    interactive_cmd,
+                    interactive_args
+                ),
+            );
+        }
+
+        let mut spec = CommandSpec {
+            program: interactive_cmd,
+            args: interactive_args,
+            env,
+            cwd: working_dir.as_deref().map(PathBuf::from),
+        };
+        let sandbox_ctx = SandboxContext {
+            project_root: Path::new(
+                request
+                    .frontmatter
+                    .project
+                    .as_deref()
+                    .unwrap_or_else(|| working_dir.as_deref().unwrap_or(".")),
+            ),
+            route_glob: "",
+            agent_kind: crate::config::AgentKind::Acp,
+            session_id: &request.session_id,
+            policy_project: request
+                .frontmatter
+                .policy_project()
+                .map(String::as_str)
+                .unwrap_or_else(|| working_dir.as_deref().unwrap_or(".")),
+            task_path: &request.task_path,
+            task_id: request.frontmatter.id,
+        };
+        let session = self
+            .sandbox
+            .prepare(&sandbox_ctx)
+            .await
+            .with_context(|| format!("failed to prepare '{}' sandbox", self.sandbox.name()))?;
+        let guard = SessionTeardownGuard::new(session);
+        let session = guard.session();
+        session
+            .validate_mounts()
+            .with_context(|| format!("unusable mount for '{}' sandbox", self.sandbox.name()))?;
+
+        // M11-ext — stage file-target credentials (env targets fold in via env above).
+        stage_identity_files(session, self.sandbox.name())?;
+        if let Some(mount_targets) = session.mount_targets() {
+            let dropped = drop_unreachable_varda_add_dirs(&mut spec, &mount_targets);
+            log_dropped_add_dirs(
+                &dropped,
+                self.sandbox.name(),
+                request.session_log_path.as_deref(),
+            );
+        }
+
+        let started_at = SystemTime::now();
+        let session_store_root = session.session_store_root();
+        let store_is_live = session.store_is_live();
+
+        mark_sandboxed(&mut spec, self.sandbox.name());
+        let wrapped = session
+            .wrap(spec, LaunchMode::Interactive)
+            .with_context(|| {
+                format!(
+                    "failed to wrap interactive resume command for '{}' sandbox",
+                    self.sandbox.name()
+                )
+            })?;
+        let launch = session.begin_interactive(wrapped).await.with_context(|| {
+            format!(
+                "failed to begin interactive resume session for '{}' sandbox",
+                self.sandbox.name()
+            )
+        })?;
+
+        let mut record_handle = None;
+        if store_is_live && let Some(session_root) = session_store_root.as_deref() {
+            record_handle = self.record_external_session(request, started_at, session_root);
+        }
+
+        let mut command_builder = Command::new(&launch.program);
+        command_builder
+            .args(&launch.args)
+            .envs(&launch.env)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if let Some(cwd) = launch.cwd.as_deref() {
+            command_builder.current_dir(cwd);
+        }
+
+        set_terminal_title_for_agent(&self.agent_name);
+
+        let mut child = command_builder.spawn().with_context(|| {
+            format!(
+                "failed to resume interactive sandboxed agent '{}' with command '{}'",
+                self.agent_name, launch.program
+            )
+        })?;
+        let status = child
+            .wait()
+            .await
+            .context("failed to wait for resumed interactive sandboxed agent subprocess")?;
+
+        if !store_is_live {
+            match session.extract_session_store().await {
+                Ok(()) => {
+                    if let Some(session_root) = session_store_root.as_deref() {
+                        record_handle =
+                            self.record_external_session(request, started_at, session_root);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("warning: failed to extract sandbox session store: {error:#}");
+                }
+            }
+        }
+
+        if let Some(log_path) = request.session_log_path.as_deref() {
+            let _ = append_session_log(log_path, &format!("\nstatus={status}\n"));
+        }
+        if !status.success() {
+            bail!("agent '{}' exited with status {}", self.agent_name, status);
+        }
+
+        let external_session_id = match record_handle {
+            Some(handle) => handle.await.ok().flatten(),
+            None => None,
+        };
+        let resume_command = self.build_resume_command(request, external_session_id.as_deref());
+
+        let result = AgentRunResult {
+            recap: "Resumed interactive sandboxed session.\n\nrequires_user: false".to_owned(),
             requires_user: false,
             suggested_agent: None,
             resume_command,
@@ -3721,6 +3916,71 @@ mod tests {
         let request = sample_request("sh", "/work/project");
         let err = client
             .execute_interactive_sandboxed(&request, "sh", "prompt text", None, BTreeMap::new())
+            .await
+            .expect_err("must refuse to launch without a TTY");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("needs a terminal on stdin"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// A resume-capable stub (`supports_interactive_resume` = true, mirroring
+    /// `docker`) so tests can exercise the sandboxed resume dispatch path
+    /// rather than the outright-refusal path.
+    struct FakeResumableSandboxProvider;
+    #[async_trait]
+    impl SandboxProvider for FakeResumableSandboxProvider {
+        fn name(&self) -> &str {
+            "docker"
+        }
+        fn supports_interactive_resume(&self) -> bool {
+            true
+        }
+        async fn prepare(&self, _ctx: &SandboxContext<'_>) -> Result<Box<dyn SandboxSession>> {
+            bail!("prepare should not be reached in the TTY-guard test")
+        }
+    }
+
+    /// Resuming under a non-`local` sandbox that cannot seed a prior session
+    /// store into a fresh box (the default `supports_interactive_resume` =
+    /// false, mirroring `microsandbox`) must refuse outright. Critically, it
+    /// must NEVER fall back to running the resume command on the host — that
+    /// would silently defeat the sandbox boundary the original `bail!` existed
+    /// to protect.
+    #[tokio::test]
+    async fn interactive_resume_under_non_resumable_sandbox_refuses_without_touching_host() {
+        let config = interactive_shell_config();
+        let client = AcpSubprocessClient::with_sandbox("sh", &config, Arc::new(FakeSandboxProvider));
+        let mut request = sample_request("sh", "/work/project");
+        request.interactive = true;
+        request.resume_command = Some("echo should-never-run-on-the-host".to_owned());
+        let err = client
+            .execute_interactive(String::new(), vec![], &request)
+            .await
+            .expect_err("must refuse rather than fall back to a host resume");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("is not supported") && msg.contains("docker"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// A resume-capable sandbox (docker) still needs a real TTY before it
+    /// prepares the box — same guard as a fresh sandboxed interactive launch.
+    #[tokio::test]
+    async fn interactive_resume_sandboxed_requires_a_tty() {
+        let config = interactive_shell_config();
+        let client = AcpSubprocessClient::with_sandbox(
+            "sh",
+            &config,
+            Arc::new(FakeResumableSandboxProvider),
+        );
+        let mut request = sample_request("sh", "/work/project");
+        request.interactive = true;
+        request.resume_command = Some("echo resume".to_owned());
+        let err = client
+            .execute_interactive(String::new(), vec![], &request)
             .await
             .expect_err("must refuse to launch without a TTY");
         let msg = format!("{err:#}");
