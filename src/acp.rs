@@ -1421,15 +1421,26 @@ fn find_copilot_process_log_in(logs_dir: &Path, started_at: SystemTime) -> Optio
     candidates.into_iter().map(|(_, p)| p).next()
 }
 
+/// The session id to replay with `copilot --resume=<id>`: the LAST foreground
+/// session the process registered. On `--resume=<X>` copilot first initializes
+/// (and registers) a throwaway placeholder workspace, then switches the
+/// foreground to X ~2s later; the placeholder never gets an `events.jsonl`, so
+/// replaying it fails with "No session, task, or name matched" (#1076). Taking
+/// the FIRST "Workspace initialized" line recorded exactly that placeholder.
+/// Falls back to the last "Workspace initialized" id for logs with no
+/// foreground registration.
 fn extract_copilot_workspace_id(log_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(log_path).ok()?;
-    for line in content.lines() {
-        if let Some(rest) = line.split("Workspace initialized: ").nth(1) {
-            let id = rest.split_whitespace().next()?;
-            return Some(id.to_owned());
-        }
-    }
-    None
+    let last_id_after = |marker: &str| {
+        content
+            .lines()
+            .filter(|line| !line.contains("Unregistering"))
+            .filter_map(|line| line.split(marker).nth(1)?.split_whitespace().next())
+            .last()
+            .map(str::to_owned)
+    };
+    last_id_after("Registering foreground session: ")
+        .or_else(|| last_id_after("Workspace initialized: "))
 }
 
 async fn record_copilot_external_session(
@@ -1437,26 +1448,39 @@ async fn record_copilot_external_session(
     log_path: String,
     started_at: SystemTime,
 ) -> Option<String> {
+    // Keep polling while the best candidate has no events.jsonl yet: that is the
+    // resume placeholder window (see extract_copilot_workspace_id). If the budget
+    // runs out (e.g. a fresh interactive session with no message yet), record the
+    // last candidate seen — a fresh session has only the one id anyway.
+    let mut candidate = None;
     for _ in 0..20 {
         if let Some(process_log) = find_copilot_process_log(&session_root, started_at)
             && let Some(workspace_id) = extract_copilot_workspace_id(&process_log)
         {
-            let events_path = session_root
-                .join(".copilot/session-state")
-                .join(&workspace_id)
-                .join("events.jsonl");
-            let _ = append_session_log(
-                &log_path,
-                &format!(
-                    "external_session_id={workspace_id}\nexternal_session_log={}\n",
-                    events_path.display()
-                ),
-            );
-            return Some(workspace_id);
+            let has_events = copilot_events_path(&session_root, &workspace_id).exists();
+            candidate = Some(workspace_id);
+            if has_events {
+                break;
+            }
         }
         time::sleep(Duration::from_millis(500)).await;
     }
-    None
+    let workspace_id = candidate?;
+    let _ = append_session_log(
+        &log_path,
+        &format!(
+            "external_session_id={workspace_id}\nexternal_session_log={}\n",
+            copilot_events_path(&session_root, &workspace_id).display()
+        ),
+    );
+    Some(workspace_id)
+}
+
+fn copilot_events_path(session_root: &Path, workspace_id: &str) -> PathBuf {
+    session_root
+        .join(".copilot/session-state")
+        .join(workspace_id)
+        .join("events.jsonl")
 }
 
 fn find_codex_session(
@@ -3809,6 +3833,44 @@ mod tests {
             result, ours,
             "picked the foreign still-running session's log"
         );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn extract_copilot_workspace_id_skips_the_resume_placeholder() {
+        // Shape of a real copilot 1.0.x `--resume=2631…` process log (#1076):
+        // a placeholder workspace is initialized and registered first, then the
+        // resumed session takes over the foreground.
+        let dir =
+            std::env::temp_dir().join(format!("varda-copilot-extract-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("process-1790072262184-7.log");
+        std::fs::write(
+            &log,
+            "\
+2026-09-22T10:17:42.203Z [INFO] Workspace initialized: 9bf4e0c9-357d-4562-9157-cba9433cb709 (checkpoints: 0)
+2026-09-22T10:17:42.209Z [INFO] Registering foreground session: 9bf4e0c9-357d-4562-9157-cba9433cb709
+2026-09-22T10:17:42.442Z [INFO] Workspace initialized: 26314700-f440-4337-8b44-1bf0a324386a (checkpoints: 0)
+2026-09-22T10:17:44.397Z [INFO] Unregistering foreground session: 9bf4e0c9-357d-4562-9157-cba9433cb709
+2026-09-22T10:17:44.400Z [INFO] Registering foreground session: 26314700-f440-4337-8b44-1bf0a324386a
+2026-09-23T05:20:22.241Z [INFO] Unregistering foreground session: 26314700-f440-4337-8b44-1bf0a324386a
+",
+        )
+        .unwrap();
+        assert_eq!(
+            extract_copilot_workspace_id(&log).as_deref(),
+            Some("26314700-f440-4337-8b44-1bf0a324386a")
+        );
+
+        // No foreground registration: fall back to the last initialized workspace.
+        std::fs::write(
+            &log,
+            "[INFO] Workspace initialized: aaaa (checkpoints: 0)\n\
+             [INFO] Workspace initialized: bbbb (checkpoints: 0)\n",
+        )
+        .unwrap();
+        assert_eq!(extract_copilot_workspace_id(&log).as_deref(), Some("bbbb"));
 
         std::fs::remove_dir_all(dir).unwrap();
     }
