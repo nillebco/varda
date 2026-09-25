@@ -92,7 +92,9 @@ enum Command {
         #[arg(long)]
         interactive: bool,
         /// Dedicated workspace directory mounted rw into the resident sandbox.
-        /// Defaults to `<varda_home>/orchestrate/workspace`. Never `$HOME`/`~/dev`.
+        /// Defaults to the current git repo's root when an orchestration-enabled
+        /// route covers it, else `<varda_home>/orchestrate/workspace`. Never
+        /// `$HOME`/`~/dev`.
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
@@ -4425,14 +4427,36 @@ fn resolve_or_scaffold_resident_task(
     Ok(task_path)
 }
 
+/// Workspace `varda orchestrate` uses when `--workspace` is omitted: the git
+/// repo root containing `cwd` if a route matches it AND that route's
+/// orchestration policy is enabled — so running from a checkout orchestrates
+/// that checkout — else the dedicated `<varda_home>/orchestrate/workspace`.
+/// The chosen path still goes through `resolve_resident_launch`'s gates, which
+/// refuse `$HOME`/`~/dev` and any non-isolating placement.
+fn default_orchestrate_workspace(
+    config: &config::Config,
+    cwd: Option<&Path>,
+    varda_home: &Path,
+) -> PathBuf {
+    cwd.and_then(|cwd| git::repo_root_for_path(cwd).ok())
+        .filter(|root| {
+            routing::find_route_public(config, root).is_ok()
+                && config.resolve_orchestration_for(root).enabled
+        })
+        .unwrap_or_else(|| varda_home.join("orchestrate").join("workspace"))
+}
+
 async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Result<()> {
     let config_path = config::config_file()?;
     let config = config::resolve_config(&config_path)?;
 
-    // Default to a dedicated workspace under the Varda home — never $HOME/~/dev.
     let workspace = match workspace {
         Some(dir) => dir.to_path_buf(),
-        None => config::varda_home()?.join("orchestrate").join("workspace"),
+        None => default_orchestrate_workspace(
+            &config,
+            std::env::current_dir().ok().as_deref(),
+            &config::varda_home()?,
+        ),
     };
     fs::create_dir_all(&workspace).with_context(|| {
         format!(
@@ -6874,6 +6898,54 @@ deny_sandboxes = ["local"]
             ws = ws.display(),
         );
         toml::from_str(&toml).expect("resident test config should parse")
+    }
+
+    fn git_init_quiet(dir: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn default_orchestrate_workspace_uses_the_covered_git_repo_root() {
+        let ws = resident_tmp("default-ws-repo").canonicalize().unwrap();
+        git_init_quiet(&ws);
+        let sub = ws.join("src");
+        fs::create_dir_all(&sub).unwrap();
+        let config = resident_config(&ws, "docker", "");
+        let home = Path::new("/varda-home");
+        // From the repo root and from a subdirectory alike.
+        assert_eq!(default_orchestrate_workspace(&config, Some(&ws), home), ws);
+        assert_eq!(default_orchestrate_workspace(&config, Some(&sub), home), ws);
+    }
+
+    #[test]
+    fn default_orchestrate_workspace_falls_back_outside_an_orchestrated_repo() {
+        let home = Path::new("/varda-home");
+        let fallback = home.join("orchestrate").join("workspace");
+
+        // Not a git repo (even though a route covers it).
+        let plain = resident_tmp("default-ws-plain").canonicalize().unwrap();
+        let config = resident_config(&plain, "docker", "");
+        assert_eq!(default_orchestrate_workspace(&config, Some(&plain), home), fallback);
+
+        // A git repo no route covers.
+        let other = resident_tmp("default-ws-uncovered").canonicalize().unwrap();
+        git_init_quiet(&other);
+        assert_eq!(default_orchestrate_workspace(&config, Some(&other), home), fallback);
+
+        // A covered git repo whose orchestration is disabled.
+        let off = resident_tmp("default-ws-off").canonicalize().unwrap();
+        git_init_quiet(&off);
+        let mut disabled = resident_config(&off, "docker", "");
+        disabled.orchestration.enabled = false;
+        assert_eq!(default_orchestrate_workspace(&disabled, Some(&off), home), fallback);
+
+        // No cwd at all.
+        assert_eq!(default_orchestrate_workspace(&config, None, home), fallback);
     }
 
     #[test]
