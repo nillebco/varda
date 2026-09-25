@@ -491,10 +491,47 @@ pub fn render_task_document(task: &TaskDocument) -> Result<String> {
 pub fn write_task(task: &TaskDocument) -> Result<()> {
     let content = render_task_document(task)?;
 
-    fs::write(&task.path, content)
-        .with_context(|| format!("failed to write task at {}", task.path.display()))?;
+    let parent = task.path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        task.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("task"),
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
 
-    Ok(())
+    let result = (|| -> Result<()> {
+        fs::write(&tmp_path, content)
+            .with_context(|| format!("failed to write task tmp file at {}", tmp_path.display()))?;
+
+        if let Ok(metadata) = fs::metadata(&task.path) {
+            fs::set_permissions(&tmp_path, metadata.permissions()).with_context(|| {
+                format!(
+                    "failed to apply permissions from {} to tmp file {}",
+                    task.path.display(),
+                    tmp_path.display()
+                )
+            })?;
+        }
+
+        fs::rename(&tmp_path, &task.path).with_context(|| {
+            format!(
+                "failed to atomically replace task at {} (tmp file: {})",
+                task.path.display(),
+                tmp_path.display()
+            )
+        })?;
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    result
 }
 
 /// Outcome of [`fold_project`].
@@ -1782,6 +1819,206 @@ Body.
         assert!(written.starts_with("---\n"));
         assert!(written.contains("status: review"));
         assert!(written.contains("# Task"));
+    }
+
+    fn sample_task_document(path: PathBuf, body: &str) -> TaskDocument {
+        TaskDocument {
+            path,
+            frontmatter: TaskFrontmatter {
+                bounds: crate::task::TaskBounds::default(),
+                id: Some(7),
+                status: TaskStatus::Review,
+                project: None,
+                mother_project: None,
+                assignee: Some("codex".to_owned()),
+                sandbox: None,
+                recap: None,
+                recaps: vec![],
+                plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
+                agent_resume_commands: vec![],
+                allow_commands: vec![],
+                requires_user: false,
+            },
+            body: body.to_owned(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_task_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "varda-task-write-perms-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        // Seed the file with unusual, non-default permissions before the first
+        // write_task call, so we can prove they survive the tmp-write + rename.
+        fs::write(&path, "seed\n").expect("seed file should write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+            .expect("seed permissions should apply");
+
+        let task = sample_task_document(path.clone(), "# Task\n\nDo the work.\n");
+        write_task(&task).expect("task should write");
+
+        let mode = fs::metadata(&path)
+            .expect("task file should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        fs::remove_file(&path).expect("task file should be removable");
+
+        assert_eq!(
+            mode, 0o640,
+            "write_task must preserve the pre-existing file's permissions across the atomic replace"
+        );
+    }
+
+    #[test]
+    fn write_task_removes_temp_file_when_write_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-task-write-fail-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("root dir should be created");
+        // Make the task's destination path a directory instead of a file. The
+        // tmp-file write succeeds, but the final `fs::rename` onto a directory
+        // must fail — exercising the cleanup path.
+        let task_path = root.join("task.md");
+        fs::create_dir_all(&task_path).expect("directory at task path should be created");
+
+        let task = sample_task_document(task_path.clone(), "# Task\n\nDo the work.\n");
+        write_task(&task).expect_err("renaming a tmp file onto a directory must fail");
+
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .expect("root dir should be readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "task.md")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "write_task must clean up its tmp file on failure, found: {leftovers:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn concurrent_writes_to_distinct_task_files_do_not_interfere() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-task-write-concurrent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("root dir should be created");
+
+        const THREAD_COUNT: usize = 8;
+        const WRITES_PER_THREAD: usize = 25;
+
+        let handles: Vec<_> = (0..THREAD_COUNT)
+            .map(|thread_index| {
+                let path = root.join(format!("task-{thread_index}.md"));
+                std::thread::spawn(move || {
+                    for write_index in 0..WRITES_PER_THREAD {
+                        let body = format!("# Task {thread_index}\n\nwrite {write_index}\n");
+                        let task = sample_task_document(path.clone(), &body);
+                        write_task(&task).expect("concurrent write should succeed");
+                    }
+                    path
+                })
+            })
+            .collect();
+
+        for (thread_index, handle) in handles.into_iter().enumerate() {
+            let path = handle.join().expect("writer thread should not panic");
+            let loaded = load_task(&path).expect("task should load after concurrent writes");
+            let expected_body = format!("# Task {thread_index}\n\nwrite {}", WRITES_PER_THREAD - 1);
+            assert_eq!(
+                loaded.body, expected_body,
+                "each task file must only ever contain content its own writer thread produced"
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn concurrent_load_task_never_observes_a_torn_write() {
+        let path = std::env::temp_dir().join(format!(
+            "varda-task-torn-write-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+
+        const ITERATIONS: usize = 100;
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            // The first write (i == 0) is the seed: readers may start polling
+            // before it lands, which is the only legitimate source of NotFound.
+            for i in 0..ITERATIONS {
+                // A growing body makes a torn (non-atomic) write more likely to
+                // produce content load_task can't parse, if the rename weren't atomic.
+                let body = format!("# Task\n\n{}\n", "x".repeat(i % 50) + &i.to_string());
+                write_task(&sample_task_document(writer_path.clone(), &body))
+                    .expect("writer should succeed");
+            }
+        });
+
+        let reader_paths: Vec<_> = (0..4).map(|_| path.clone()).collect();
+        let readers: Vec<_> = reader_paths
+            .into_iter()
+            .map(|reader_path| {
+                std::thread::spawn(move || {
+                    // Tracks whether THIS reader has observed at least one successful
+                    // read yet. `fs::rename` is atomic, so once the destination file
+                    // has been created by the first successful write, it should never
+                    // go missing again — a `NotFound` AFTER a prior success is a real
+                    // bug (e.g. something removing the file outside the normal write
+                    // path), not legitimate startup timing, and must fail the test.
+                    let mut observed_success = false;
+                    for _ in 0..2000 {
+                        match load_task(&reader_path) {
+                            Ok(task) => {
+                                observed_success = true;
+                                assert!(
+                                    task.body.starts_with("# Task\n\n"),
+                                    "reader must never observe a torn/partial write, got: {:?}",
+                                    task.body
+                                );
+                            }
+                            Err(err) => {
+                                let is_not_found = err
+                                    .chain()
+                                    .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                                    .is_some_and(|io_err| {
+                                        io_err.kind() == std::io::ErrorKind::NotFound
+                                    });
+                                assert!(
+                                    is_not_found && !observed_success,
+                                    "load_task failed with a non-NotFound error, or failed after \
+                                     already having observed a successful read once (which the \
+                                     atomic rename guarantees should never happen again): {err}"
+                                );
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        writer.join().expect("writer thread should not panic");
+        for reader in readers {
+            reader.join().expect("reader thread should not panic");
+        }
+
+        fs::remove_file(&path).ok();
     }
 
     #[test]
