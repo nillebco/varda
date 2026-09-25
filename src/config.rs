@@ -1726,9 +1726,26 @@ fn inspect_git_config_tree(dir: &Path, workspace: &Path, depth: usize) -> Result
     Ok(())
 }
 
+/// Maximum `[include]`/`[includeIf]` chain depth to follow, mirroring git's own
+/// built-in include-depth limit — bounds recursion against a cyclic or
+/// pathologically deep include chain.
+const MAX_GIT_CONFIG_INCLUDE_DEPTH: usize = 10;
+
 /// Read one git config file and reject an embedded-credential remote or a configured
-/// credential helper. Missing/unreadable file ⇒ clean.
+/// credential helper, THEN recurse into any `[include]`/`[includeIf "…"]` `path =`
+/// directives it carries. Missing/unreadable file ⇒ clean.
 fn inspect_git_config_file(path: &Path, workspace: &Path) -> Result<()> {
+    inspect_git_config_file_at_depth(path, workspace, 0)
+}
+
+/// `includeIf` condition predicates (`gitdir:`, `onbranch:`, …) are NOT evaluated —
+/// every include is followed unconditionally, so this scan is conservative: it may
+/// inspect a config that a real `git` invocation would not have included, but it
+/// never misses one that could seed a push credential.
+fn inspect_git_config_file_at_depth(path: &Path, workspace: &Path, depth: usize) -> Result<()> {
+    if depth > MAX_GIT_CONFIG_INCLUDE_DEPTH {
+        return Ok(());
+    }
     let Ok(text) = fs::read_to_string(path) else {
         return Ok(());
     };
@@ -1740,7 +1757,198 @@ fn inspect_git_config_file(path: &Path, workspace: &Path) -> Result<()> {
             workspace.display()
         );
     }
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    for included in included_config_paths(&text, base_dir) {
+        inspect_git_config_file_at_depth(&included, workspace, depth + 1)?;
+    }
     Ok(())
+}
+
+/// Strip a trailing `#`/`;` comment from a git-config line, mirroring git's own
+/// quote-aware comment rule: `#`/`;` outside a double-quoted value starts a
+/// comment; inside one (or escaped with `\`) it's literal. Returns the slice up to
+/// (not including) the comment, or the whole line when there is none.
+fn strip_unquoted_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '#' | ';' if !in_quotes => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Join backslash-continued physical lines of a git-config file into logical
+/// lines, mirroring git's own line-continuation rule: a line ending in an ODD
+/// number of trailing backslashes continues onto the next physical line, with the
+/// trailing `\` and the newline removed and the two lines concatenated directly
+/// (no whitespace inserted) — this is legal INSIDE a double-quoted value and is how
+/// git lets a `path = "…"` value span multiple physical lines. An EVEN number of
+/// trailing backslashes means the last one is itself escaped, so the line does NOT
+/// continue. Must run on the RAW text before comment-stripping / quote-tracking,
+/// since those operate within a single line and don't see across a continuation.
+fn join_git_config_continuations(text: &str) -> Vec<String> {
+    let mut logical = Vec::new();
+    let mut current = String::new();
+    for raw in text.lines() {
+        let trailing_backslashes = raw.chars().rev().take_while(|&c| c == '\\').count();
+        if trailing_backslashes % 2 == 1 {
+            current.push_str(&raw[..raw.len() - 1]);
+        } else {
+            current.push_str(raw);
+            logical.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        logical.push(current);
+    }
+    logical
+}
+
+/// Collect resolved `path` values from `[include]` / `[includeIf "…"]` sections in
+/// `text`. Relative paths resolve against `base_dir` (the directory containing the
+/// including file, per git's own semantics); a leading `~/` (or bare `~`) resolves
+/// against `$HOME`.
+fn included_config_paths(text: &str, base_dir: &Path) -> Vec<PathBuf> {
+    let mut section = String::new();
+    let mut paths = Vec::new();
+    for logical in join_git_config_continuations(text) {
+        let line = logical.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let line = strip_unquoted_comment(line).trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            section = line
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim()
+                .to_ascii_lowercase();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if key != "path" || !(section == "include" || section.starts_with("includeif")) {
+            continue;
+        }
+        if let Some(resolved) = resolve_git_config_include_path(value.trim(), base_dir) {
+            paths.push(resolved);
+        }
+    }
+    paths
+}
+
+/// Unescape a double-quoted git-config value's inner content: `\"` → `"`, `\\` →
+/// `\`, `\n`/`\t`/`\b` → their control characters, per git's config value quoting
+/// rules. Any other `\`-escape is passed through literally (matching git's leniency
+/// rather than erroring). `value` must already have its surrounding quotes removed.
+fn unescape_git_config_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Decode a git-config value that may freely mix quoted and unquoted segments
+/// which concatenate directly, e.g. `"creds".inc` → `creds.inc`, or
+/// `"a"b"c"` → `abc` — a value is NOT required to be entirely quoted or entirely
+/// bare. A `"` toggles the in-quotes state and is itself a delimiter, never
+/// content. Each quoted segment's escapes are decoded via
+/// [`unescape_git_config_value`] (`\"` → `"`, `\\` → `\`, `\n`/`\t`/`\b` → control
+/// chars, …); outside quotes every character — including `\` — is literal, since
+/// git config value syntax has no unquoted escaping.
+///
+/// This subsumes the simpler "fully quoted" case (`"foo"` tokenizes to `foo`)
+/// without a separate special-case check, and closes the bypass where a
+/// partially-quoted value like `"creds".inc` would previously fall through
+/// untouched — keeping its literal quote characters — and resolve to a
+/// nonexistent/wrong path, letting a crafted include dodge the scanner.
+fn tokenize_git_config_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut segment_start = 0;
+    for (idx, ch) in value.char_indices() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => {
+                    out.push_str(&unescape_git_config_value(&value[segment_start..idx]));
+                    in_quotes = false;
+                    segment_start = idx + 1;
+                }
+                _ => {}
+            }
+        } else if ch == '"' {
+            out.push_str(&value[segment_start..idx]);
+            in_quotes = true;
+            segment_start = idx + 1;
+        }
+    }
+    if in_quotes {
+        out.push_str(&unescape_git_config_value(&value[segment_start..]));
+    } else {
+        out.push_str(&value[segment_start..]);
+    }
+    out
+}
+
+/// Resolve one `include(If).path` value to an absolute path: `~/…` (or bare `~`)
+/// against `$HOME`, a relative path against `base_dir`, an absolute path as-is.
+/// Returns `None` for an empty value or a `~`-prefixed value with no `$HOME` set.
+///
+/// The value is first decoded with [`tokenize_git_config_value`], which handles
+/// arbitrary quoted/unquoted segment interleaving — a naive
+/// `trim_matches('"')`-style check would resolve a crafted
+/// `path = "..\\/evil\"dir"` (or a partially-quoted `"creds".inc`) to a DIFFERENT
+/// literal path than real git does, letting an attacker point real git's include
+/// at a credential-seeding file while this scanner looks elsewhere and reports
+/// clean.
+fn resolve_git_config_include_path(value: &str, base_dir: &Path) -> Option<PathBuf> {
+    let value = tokenize_git_config_value(value);
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")?;
+        return Some(PathBuf::from(home).join(rest));
+    }
+    if value == "~" {
+        return std::env::var_os("HOME").map(PathBuf::from);
+    }
+    let p = PathBuf::from(&value);
+    Some(if p.is_absolute() { p } else { base_dir.join(p) })
 }
 
 /// Classify git-config TEXT (INI-like) for a push credential. Returns a redacted
@@ -4646,6 +4854,13 @@ mod resident_tests {
         fs::write(git_dir.join("config"), contents).unwrap();
     }
 
+    /// Write an arbitrary file (e.g. an `[include]`d config), creating its parent
+    /// directory first.
+    fn write_file(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
     #[test]
     fn credential_enables_push_flags_push_channels_only() {
         assert!(credential_enables_push(&env_cred("GITHUB_TOKEN")));
@@ -5267,6 +5482,191 @@ mod resident_tests {
             err.to_string().contains("pre-seeded push credential"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn rejects_workspace_git_config_with_include() {
+        let ws = tmp("git-include");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        seed_git_config(&ws, "[include]\n\tpath = included.gitconfig\n");
+        write_file(
+            &ws.join(".git").join("included.gitconfig"),
+            "[remote \"origin\"]\n\turl = https://x-access-token:ghp_secret@github.com/foo/bar.git\n",
+        );
+        let err = enforce_resident_launch(
+            "claude",
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("pre-seeded push credential"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_workspace_git_config_with_includeif() {
+        // The `gitdir:` predicate is never evaluated — every includeIf is followed
+        // unconditionally, so this must still be rejected even though the
+        // condition plainly does not match this workspace.
+        let ws = tmp("git-includeif");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        seed_git_config(
+            &ws,
+            "[includeIf \"gitdir:/nonexistent/path/\"]\n\tpath = included.gitconfig\n",
+        );
+        write_file(
+            &ws.join(".git").join("included.gitconfig"),
+            "[credential]\n\thelper = store\n",
+        );
+        let err = enforce_resident_launch(
+            "claude",
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("pre-seeded push credential"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_workspace_git_config_with_continued_and_commented_include() {
+        // The `path` value is split across a backslash line-continuation, and the
+        // logical line carries a trailing `;` comment — both must be handled
+        // before the include is followed.
+        let ws = tmp("git-continuation");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        seed_git_config(
+            &ws,
+            "[include]\n\tpath = include\\\nd.gitconfig ; trailing comment\n",
+        );
+        write_file(
+            &ws.join(".git").join("included.gitconfig"),
+            "[credential]\n\thelper = store\n",
+        );
+        let err = enforce_resident_launch(
+            "claude",
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("pre-seeded push credential"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_workspace_git_config_with_partially_quoted_include_path() {
+        // Round-5 regression: `"creds".inc` mixes a quoted and an unquoted
+        // segment that concatenate to `creds.inc` — the old all-or-nothing
+        // "fully wrapped in quotes" check left the literal quote characters in
+        // place and resolved to a nonexistent path, letting this include dodge
+        // the scanner.
+        let ws = tmp("git-partial-quote");
+        let mounts = vec![format!("{}:/workspace:rw", ws.display())];
+        seed_git_config(&ws, "[include]\n\tpath = \"creds\".inc\n");
+        write_file(
+            &ws.join(".git").join("creds.inc"),
+            "[credential]\n\thelper = store\n",
+        );
+        let err = enforce_resident_launch(
+            "claude",
+            "orchestration",
+            &isolating_sandbox(),
+            &mounts,
+            &ws,
+            &[],
+            &no_env(),
+            false,
+            &resident_policy(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("pre-seeded push credential"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unescape_git_config_value_handles_quote_and_backslash() {
+        assert_eq!(unescape_git_config_value("a\\\"b"), "a\"b");
+        assert_eq!(unescape_git_config_value("a\\\\b"), "a\\b");
+        assert_eq!(unescape_git_config_value("a\\nb"), "a\nb");
+        assert_eq!(unescape_git_config_value("a\\tb"), "a\tb");
+        assert_eq!(unescape_git_config_value("a\\bb"), "a\u{8}b");
+        // Unknown escape: passed through literally rather than erroring.
+        assert_eq!(unescape_git_config_value("a\\zb"), "azb");
+        // Trailing lone backslash: passed through literally.
+        assert_eq!(unescape_git_config_value("a\\"), "a\\");
+    }
+
+    #[test]
+    fn tokenize_git_config_value_handles_fully_quoted() {
+        assert_eq!(tokenize_git_config_value("\"foo\""), "foo");
+    }
+
+    #[test]
+    fn tokenize_git_config_value_handles_fully_unquoted() {
+        assert_eq!(tokenize_git_config_value("foo/bar.inc"), "foo/bar.inc");
+    }
+
+    #[test]
+    fn tokenize_git_config_value_handles_mixed_segments() {
+        assert_eq!(tokenize_git_config_value("\"a\"b\"c\""), "abc");
+        assert_eq!(tokenize_git_config_value("a\"b\"c"), "abc");
+        assert_eq!(tokenize_git_config_value("\"creds\".inc"), "creds.inc");
+    }
+
+    #[test]
+    fn tokenize_git_config_value_handles_quote_and_backslash_escapes() {
+        // Same cases as `unescape_git_config_value_handles_quote_and_backslash`,
+        // routed through the whole-value tokenizer.
+        assert_eq!(tokenize_git_config_value("\"a\\\"b\""), "a\"b");
+        assert_eq!(tokenize_git_config_value("\"a\\\\b\""), "a\\b");
+        assert_eq!(tokenize_git_config_value("\"a\\nb\""), "a\nb");
+    }
+
+    #[test]
+    fn join_git_config_continuations_no_continuation() {
+        let logical = join_git_config_continuations("a\nb\nc\n");
+        assert_eq!(
+            logical,
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+    }
+
+    #[test]
+    fn join_git_config_continuations_odd_backslash_joins_next_line() {
+        let logical = join_git_config_continuations("foo\\\nbar\n");
+        assert_eq!(logical, vec!["foobar".to_owned()]);
+    }
+
+    #[test]
+    fn join_git_config_continuations_even_backslash_does_not_join() {
+        let logical = join_git_config_continuations("foo\\\\\nbar\n");
+        assert_eq!(logical, vec!["foo\\\\".to_owned(), "bar".to_owned()]);
     }
 
     #[test]
