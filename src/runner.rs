@@ -839,12 +839,25 @@ pub async fn resume_interactive_task(
         orchestration_addr: None,
     };
 
-    let session_result = client.run_task(request).await.with_context(|| {
-        format!(
-            "failed to resume interactive agent session for {}",
-            task_path.display()
-        )
-    })?;
+    let session_result = match client.run_task(request).await {
+        Ok(result) => result,
+        Err(error) => {
+            // The Running status written above must not outlive a failed resume
+            // attempt: callers (e.g. `resume_task_command`'s fresh-session
+            // fallback) reload the task from disk and require TaskStatus::Ready
+            // to proceed. Leaving it at Running here strands the task — the
+            // fallback's own `run_task` bails with "not ready" instead of
+            // starting the fresh session it was meant to fall back to.
+            task.set_status(TaskStatus::Ready);
+            write_task(&task)?;
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to resume interactive agent session for {}",
+                    task_path.display()
+                )
+            });
+        }
+    };
 
     let _interactive_finalization_guard = InteractiveFinalizationGuard::activate()?;
 
