@@ -25,6 +25,9 @@ use crate::config::{
 /// with a `Varda` (untrusted `.varda`) origin plus a hardening floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountOrigin {
+    /// Varda-provided read-only view of the current policy project's `.varda`
+    /// directory. This is distinct from the shared `$HOME/.varda` control plane.
+    ProjectVarda,
     /// Image-intrinsic `[sandboxes.X].mounts` — same for every project using
     /// the image.
     Sandbox,
@@ -36,6 +39,49 @@ pub enum MountOrigin {
     /// at run time by [`crate::config::Config::resolve_sandbox_for`] and merged in
     /// via [`merge_mount_origins`].
     Varda,
+}
+
+/// Fixed in-guest path for the current policy project's task definitions and
+/// workflow instructions.
+pub const PROJECT_VARDA_GUEST_PATH: &str = "/opt/varda-rules";
+
+/// Return the automatic, read-only project-local `.varda` mount when present.
+/// `policy_project` is deliberately used instead of the worker worktree root:
+/// it is the stable task/project identity and cannot point at another project's
+/// rules through a fresh worker checkout.
+fn project_varda_mount(policy_project: &Path) -> Option<(MountOrigin, String)> {
+    let source = policy_project.join(".varda");
+    (source.is_dir() && check_control_plane_denylist(&source).is_ok()).then(|| {
+        (
+            MountOrigin::ProjectVarda,
+            format!("{}:{PROJECT_VARDA_GUEST_PATH}:ro", source.display()),
+        )
+    })
+}
+
+fn mounts_with_project_varda(
+    configured: &[(MountOrigin, String)],
+    policy_project: &Path,
+    project_root: &Path,
+) -> Vec<(MountOrigin, String)> {
+    let automatic = project_varda_mount(policy_project);
+    let source = policy_project.join(".varda");
+    let writable_alias_mask = automatic.as_ref().and_then(|_| {
+        let resolved_source = resolve_symlinks(&source);
+        let resolved_project = resolve_symlinks(project_root);
+        resolved_source.strip_prefix(&resolved_project).ok().map(|suffix| {
+            let guest_target = project_root.join(suffix);
+            (
+                MountOrigin::ProjectVarda,
+                format!("{}:{}:ro", source.display(), guest_target.display()),
+            )
+        })
+    });
+    writable_alias_mask
+        .into_iter()
+        .chain(automatic)
+        .chain(configured.iter().cloned())
+        .collect()
 }
 
 /// Compose the three mount origins into a single origin-tagged list for a
@@ -1449,7 +1495,11 @@ impl SandboxProvider for DockerProvider {
         Ok(Box::new(DockerSession {
             image,
             project_root: ctx.project_root.to_path_buf(),
-            mounts: self.mounts.clone(),
+            mounts: mounts_with_project_varda(
+                &self.mounts,
+                Path::new(ctx.policy_project),
+                ctx.project_root,
+            ),
             egress_pins,
             egress_hosts,
             session_store,
@@ -2710,7 +2760,11 @@ impl SandboxProvider for MicrosandboxProvider {
         Ok(Box::new(MicrosandboxSession {
             image,
             project_root: ctx.project_root.to_path_buf(),
-            mounts: self.mounts.clone(),
+            mounts: mounts_with_project_varda(
+                &self.mounts,
+                Path::new(ctx.policy_project),
+                ctx.project_root,
+            ),
             egress: self.egress.clone(),
             session_store,
             sandbox: format!("varda-sbx-{handle}"),
@@ -3403,6 +3457,57 @@ mod tests {
     }
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn project_varda_mount_is_present_read_only_and_project_scoped() {
+        let nonce = format!(
+            "varda-project-rules-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(nonce);
+        let project_a = root.join("a");
+        let project_b = root.join("b");
+        std::fs::create_dir_all(project_a.join(".varda/tasks")).unwrap();
+        std::fs::create_dir_all(project_b.join(".varda/tasks")).unwrap();
+
+        let mounts = mounts_with_project_varda(
+            &[(
+                MountOrigin::Sandbox,
+                "/tmp/override:/opt/varda-rules:rw".to_owned(),
+            )],
+            &project_a,
+            &root.join("worker-checkout"),
+        );
+        assert_eq!(mounts[0].0, MountOrigin::ProjectVarda);
+        let spec = parse_mount(&mounts[0].1).unwrap();
+        assert_eq!(spec.source, project_a.join(".varda"));
+        assert_eq!(spec.target, Path::new(PROJECT_VARDA_GUEST_PATH));
+        assert!(
+            !spec.writable,
+            "the automatic rules mount must always be read-only"
+        );
+        assert!(!mounts[0].1.contains(&project_b.display().to_string()));
+
+        let same_project = mounts_with_project_varda(&[], &project_a, &project_a);
+        let mask = parse_mount(&same_project[0].1).unwrap();
+        assert_eq!(mask.source, project_a.join(".varda"));
+        assert_eq!(mask.target, project_a.join(".varda"));
+        assert!(!mask.writable);
+        assert_eq!(
+            parse_mount(&same_project[1].1).unwrap().target,
+            Path::new(PROJECT_VARDA_GUEST_PATH)
+        );
+
+        let absent = root.join("plain-project");
+        std::fs::create_dir_all(&absent).unwrap();
+        assert!(project_varda_mount(&absent).is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn empty_spec() -> CommandSpec {
         CommandSpec {
