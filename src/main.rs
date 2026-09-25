@@ -4100,11 +4100,21 @@ fn spawn_task_in_background(task_path: &Path) -> Result<()> {
     // has it open — the child keeps writing until it closes its stderr or exits.
     let _ = fs::remove_file(&stderr_capture_path);
     result?;
-    println!(
-        "task running in background: {} (pid: {})",
-        resolved.display(),
-        child.id()
-    );
+    // The success branch of `wait_for_background_launch` can be reached after the
+    // child has already exited (a very fast agent can record its session and finish
+    // before this poll notices) — printing `pid: N` then would name an already-reaped
+    // process as if it were still running. Only advertise the pid while it's live.
+    match child.try_wait() {
+        Ok(None) => println!(
+            "task running in background: {} (pid: {})",
+            resolved.display(),
+            child.id()
+        ),
+        _ => println!(
+            "task running in background: {} (already finished)",
+            resolved.display()
+        ),
+    }
     Ok(())
 }
 
@@ -4151,6 +4161,11 @@ fn captured_stderr_suffix(stderr_capture_path: &Path) -> String {
     }
 }
 
+/// Default budget for [`wait_for_background_launch`] to see the child record a
+/// running session. Tests pass a much shorter timeout so the timeout/never-records
+/// branch doesn't cost real wall-clock seconds per run.
+const BACKGROUND_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn wait_for_background_launch(
     config: &config::Config,
     task_path: &Path,
@@ -4158,18 +4173,52 @@ fn wait_for_background_launch(
     child: &mut std::process::Child,
     stderr_capture_path: &Path,
 ) -> Result<()> {
-    const BACKGROUND_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+    wait_for_background_launch_with_timeout(
+        config,
+        task_path,
+        initial_session_count,
+        child,
+        stderr_capture_path,
+        BACKGROUND_LAUNCH_TIMEOUT,
+    )
+}
+
+fn wait_for_background_launch_with_timeout(
+    config: &config::Config,
+    task_path: &Path,
+    initial_session_count: usize,
+    child: &mut std::process::Child,
+    stderr_capture_path: &Path,
+    timeout: Duration,
+) -> Result<()> {
     const BACKGROUND_LAUNCH_POLL: Duration = Duration::from_millis(100);
 
     let started = Instant::now();
+    // Tracks whether `load_task` EVER succeeded during this wait, not just on the
+    // most recent poll. A transient parse blip that later resolves is a very
+    // different diagnostic signal from a task file that never once parsed — so
+    // this must only ever flip false -> true, never back.
+    let mut ever_parsed_ok = false;
+    let mut last_load_error: Option<anyhow::Error>;
     loop {
-        let task = task::load_task(task_path)?;
-        let recorded_launch = task.frontmatter.agent_session_ids.len() > initial_session_count
-            && task.frontmatter.agent_session_logs.len() > initial_session_count
-            && Path::new(&task.frontmatter.agent_session_logs[initial_session_count]).exists();
-        if recorded_launch && task.frontmatter.status != task::TaskStatus::Ready {
-            return Ok(());
-        }
+        let recorded_launch = match task::load_task(task_path) {
+            Ok(task) => {
+                ever_parsed_ok = true;
+                last_load_error = None;
+                let recorded = task.frontmatter.agent_session_ids.len() > initial_session_count
+                    && task.frontmatter.agent_session_logs.len() > initial_session_count
+                    && Path::new(&task.frontmatter.agent_session_logs[initial_session_count])
+                        .exists();
+                if recorded && task.frontmatter.status != task::TaskStatus::Ready {
+                    return Ok(());
+                }
+                recorded
+            }
+            Err(err) => {
+                last_load_error = Some(err);
+                false
+            }
+        };
 
         if let Some(status) = child
             .try_wait()
@@ -4193,23 +4242,37 @@ fn wait_for_background_launch(
             );
         }
 
-        if started.elapsed() >= BACKGROUND_LAUNCH_TIMEOUT {
+        if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
             let stderr_suffix = captured_stderr_suffix(stderr_capture_path);
-            record_background_launch_failure(
+            // Only diagnose "persistent parse failure" when the file NEVER once
+            // parsed successfully during the wait — if it parsed fine at some
+            // point but the last poll before timeout happened to fail, that's
+            // most likely a transient blip (e.g. a torn read racing a concurrent
+            // writer), not corruption, so we omit the diagnostic rather than
+            // misattribute it.
+            let load_error_suffix = if !ever_parsed_ok {
+                last_load_error
+                    .as_ref()
+                    .map(|err| format!(" (task file never parsed successfully: {err})"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let _ = record_background_launch_failure(
                 config,
                 task_path,
                 &format!(
-                    "background child pid {} did not record a running session within {} seconds{stderr_suffix}",
+                    "background child pid {} did not record a running session within {} seconds{stderr_suffix}{load_error_suffix}",
                     child.id(),
-                    BACKGROUND_LAUNCH_TIMEOUT.as_secs()
+                    timeout.as_secs_f64()
                 ),
-            )?;
+            );
             anyhow::bail!(
-                "background agent for {} did not record a session within {} seconds{stderr_suffix}",
+                "background agent for {} did not record a session within {} seconds{stderr_suffix}{load_error_suffix}",
                 task_path.display(),
-                BACKGROUND_LAUNCH_TIMEOUT.as_secs()
+                timeout.as_secs_f64()
             );
         }
 
@@ -8158,6 +8221,114 @@ Do it.
         assert!(recap.contains("agent binary was not found"));
 
         fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn wait_for_background_launch_timeout_surfaces_persistent_parse_error() {
+        // The task file never parses successfully for the entire wait — the
+        // timeout error must name that as the likely cause.
+        let root = std::env::temp_dir().join(format!(
+            "varda-wait-launch-parse-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let operations_dir = root.join("operations");
+        fs::create_dir_all(&operations_dir).expect("operations dir should be created");
+        let task_path = root.join("task.md");
+        fs::write(&task_path, "---\nstatus: [unterminated\n---\n\nbroken.\n")
+            .expect("broken task file should be written");
+        let config = launcher_test_config(&root);
+
+        let mut child = ProcessCommand::new("sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn test child");
+        let stderr_capture_path = root.join("stderr-capture.log");
+
+        let result = wait_for_background_launch_with_timeout(
+            &config,
+            &task_path,
+            0,
+            &mut child,
+            &stderr_capture_path,
+            Duration::from_millis(250),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let error = result.expect_err("a task file that never parses must time out as an error");
+        let message = error.to_string();
+        assert!(
+            message.contains("task file never parsed successfully"),
+            "expected the persistent-parse-failure diagnostic, got: {message}"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn wait_for_background_launch_timeout_does_not_blame_parsing_after_a_later_success() {
+        // The task file parses fine at least once during the wait, but a writer
+        // clobbers it with invalid YAML right before the timeout fires. That's a
+        // transient blip, not a persistently broken file, so the timeout error
+        // must NOT carry the parse-failure diagnostic.
+        let root = std::env::temp_dir().join(format!(
+            "varda-wait-launch-parse-recovers-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let operations_dir = root.join("operations");
+        fs::create_dir_all(&operations_dir).expect("operations dir should be created");
+        let task_path = root.join("task.md");
+        fs::write(
+            &task_path,
+            "---\nstatus: ready\nrequires_user: false\n---\n\nvalid.\n",
+        )
+        .expect("valid task file should be written");
+        let config = launcher_test_config(&root);
+
+        let mut child = ProcessCommand::new("sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn test child");
+        let stderr_capture_path = root.join("stderr-capture.log");
+
+        let writer_task_path = task_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            fs::write(
+                &writer_task_path,
+                "---\nstatus: [unterminated\n---\n\nbroken.\n",
+            )
+            .expect("clobbering write should succeed");
+        });
+
+        let result = wait_for_background_launch_with_timeout(
+            &config,
+            &task_path,
+            0,
+            &mut child,
+            &stderr_capture_path,
+            Duration::from_millis(450),
+        );
+        writer.join().expect("writer thread should not panic");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let error = result.expect_err("the task never records a session, so this must time out");
+        let message = error.to_string();
+        assert!(
+            !message.contains("task file never parsed successfully"),
+            "a file that parsed successfully at least once must not be blamed as unparseable, got: {message}"
+        );
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
