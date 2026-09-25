@@ -1538,16 +1538,18 @@ fn split_egress_host(entry: &str) -> (&str, Option<&str>) {
 /// Build the tinyproxy config that default-denies and allow-lists exactly `hosts`.
 /// `FilterDefaultDeny Yes` + a per-host anchored regex means a non-allow-listed
 /// CONNECT/GET is refused at the proxy — real enforcement, not just DNS breakage.
-/// The regex is exact-host only (`^host$`): declaring `api.anthropic.com` allows
-/// ONLY that host, never a subdomain (`evil.api.anthropic.com`) or a suffix-match
-/// impostor (`api.anthropic.com.evil.com`).
+/// A plain host is exact-match only (`^host$`). A leading `*.` allows exactly one
+/// subdomain label, e.g. `*.blob.core.windows.net` matches a storage account host.
 fn tinyproxy_filter(hosts: &[String]) -> String {
     let mut seen = std::collections::BTreeSet::new();
     hosts
         .iter()
         .map(|h| split_egress_host(h).0)
         .filter(|h| seen.insert(h.to_owned()))
-        .map(|h| format!("^{}$", h.replace('.', "\\.")))
+        .map(|h| match h.strip_prefix("*.") {
+            Some(suffix) => format!("^[^.]+\\.{}$", suffix.replace('.', "\\.")),
+            None => format!("^{}$", h.replace('.', "\\.")),
+        })
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
@@ -7244,6 +7246,12 @@ mod tests {
         // Multiple declared hosts produce one exact-anchored line each.
         let multi = tinyproxy_filter(&["a.example.com".to_owned(), "b.example.com".to_owned()]);
         assert_eq!(multi, "^a\\.example\\.com$\n^b\\.example\\.com$\n");
+    }
+
+    #[test]
+    fn tinyproxy_filter_wildcard_matches_one_subdomain_label() {
+        let filter = tinyproxy_filter(&["*.blob.core.windows.net".to_owned()]);
+        assert_eq!(filter, "^[^.]+\\.blob\\.core\\.windows\\.net$\n");
     }
 
     fn ctx_for_task<'a>(
