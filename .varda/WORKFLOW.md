@@ -108,8 +108,8 @@ worktree copy does not exist.
 
 The resident orchestrator is a sandboxed interactive agent with the dedicated
 orchestration workspace mounted read/write and the spawn broker wired
-(`spawn_subtask`, `await_subtask`, `await_subtasks`, `subtask_result`,
-`list_tasks`, `get_task`, `set_task_status`). Its control loop is:
+(`create_task`, `run_subtask`, `await_subtask`, `await_subtasks`,
+`subtask_result`, `list_tasks`, `get_task`, `set_task_status`). Its control loop is:
 
 1. Prioritize the backlog into the next wave, selecting tasks whose expected
    file footprints are disjoint enough to parallelize. Discover work via the
@@ -125,19 +125,22 @@ orchestration workspace mounted read/write and the spawn broker wired
    on 2026-08-24: a resident reported #661 as `backlog` and #667 as stuck at `ready`
    while the state store had both `done`, then reasoned confidently from it. Use
    `get_task`, which merges home STATE over repo definitions and gives live status.
-2. Fan out one sandboxed worker per task with `spawn_subtask`. Each worker runs
-   on its own worktree/branch. Respect the depth-1, fanout, and budget caps.
-   Pin `agent="claude-worker"` and `sandbox="worker"` explicitly on every
-   `spawn_subtask` call — this is the documented default placement for a
-   worker, and it removes any ambiguity about which route/agent/sandbox the
-   task lands in. Policy DOES now carry a `default_worker_sandbox` fallback
+2. Fan out one sandboxed worker per task with `run_subtask(task_id)`. Work that
+   has no task yet is filed first with `create_task` and then run by the returned
+   id — there is no create-and-run tool. Each worker runs on its own
+   worktree/branch. Respect the depth-1, fanout, and budget caps (charged by
+   `run_subtask`; `create_task` is free). Pin `assignee="claude-worker"` and
+   `sandbox="worker"` explicitly on every `create_task` call — this is the
+   documented default placement for a worker, and it removes any ambiguity
+   about which route/agent/sandbox the task lands in. Policy DOES now carry a `default_worker_sandbox` fallback
    (see "Implementation status" below) that a launcher falls back to when
    `sandbox` is omitted, but that fallback exists to keep older or
    less-careful callers safe — it is not a substitute for the explicit pin,
    which stays the resident's documented default.
 3. Await the wave with `await_subtasks`, then read each terminal result via
    `subtask_result` (`status`, `files_touched`, `blocked_commands`, `recap`).
-4. For each finished worker, spawn a cross-reviewer using the OTHER agent.
+4. For each finished worker, run a cross-reviewer (`create_task` + `run_subtask`)
+   using the OTHER agent.
    Await the review and inspect its verdict against the actual diff.
 5. On APPROVE, the resident merges locally in-box against the mounted
    workspace — this step is resident-driven and does NOT require operator
@@ -226,9 +229,9 @@ The control loop above is the TARGET contract. As of task #598 the isolation +
 merge-back wiring is LIVE; this note tracks what ships where.
 
 - Steps 1-3 (prioritize → fan out → await → read results) are live via the
-  `spawn_subtask` / `await_subtasks` / `subtask_result` broker.
+  `create_task` / `run_subtask` / `await_subtasks` / `subtask_result` broker.
 - Step 2's "own worktree/branch" isolation is now wired into the launcher: before
-  a worker runs, `VardaSubtaskLauncher::launch` creates a
+  a worker runs, `VardaSubtaskLauncher::run_existing` creates a
   `git worktree add -b wip/<slug>` off the mother's HEAD at an out-of-tree host
   path (`<varda_home>/worktrees/wip-<slug>/`) and mounts THAT into the worker (its
   `project` points at the worktree). Two workers editing the same file are now two
@@ -356,17 +359,14 @@ Creating a wrapper task to "execute" another one splits one investigation across
 makes the board lie about what is untouched (#669/#670). Put the extra instructions in the
 task itself.
 
-**Mechanically: for an EXISTING backlog/ready task id, call `run_subtask(task_id: "<id>")`,
-never `spawn_subtask`.** `spawn_subtask` ALWAYS mints a brand-new task from a free-text brief
-— it has no id parameter, so pasting an existing task's body into it does not run that task,
-it clones it under a new id and leaves the original sitting untouched in `backlog` forever
-(there is no tool to close a `backlog` task after the fact — `set_task_status` only closes
-out of `running`). This is an easy slip because `spawn_subtask` is the familiar/first-listed
-verb; it happened live on 2026-08-25 (task #710 wrapped into a new #727). Reach for
-`spawn_subtask` ONLY when the work has no task id yet (ad-hoc, discovered mid-run). If you
-already have an id in hand, it's `run_subtask`, full stop. (#645 tracks removing
-`spawn_subtask` entirely in favor of `create_task` + `run_subtask` so this class of mistake
-becomes structurally impossible rather than a discipline reminder.)
+**Mechanically: for an EXISTING backlog/ready task id, call `run_subtask(task_id: "<id>")`.**
+Never `create_task` a copy of it: pasting an existing task's body into a new task does not run
+that task, it clones it under a new id and leaves the original sitting untouched in `backlog`
+forever (there is no tool to close a `backlog` task after the fact — `set_task_status` only
+closes out of `running`). It happened live on 2026-08-25 (task #710 wrapped into a new #727)
+via the old combined `spawn_subtask` tool, which #645 removed: creation (`create_task`) and
+launch (`run_subtask`) are now separate, so `create_task` is ONLY for work that has no task id
+yet.
 
 ### Write briefs that name the trap
 

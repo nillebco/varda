@@ -127,7 +127,7 @@ where
 ///    inside it for up to `max_wait` (30 minutes by default). Calling it inline
 ///    meant the next request was not even READ until the current one returned, so
 ///    a parent blocked in `await_subtask` could not issue `get_task`,
-///    `set_task_status`, `subtask_result` or `spawn_subtask` — it went deaf for
+///    `set_task_status`, `subtask_result` or `run_subtask` — it went deaf for
 ///    the whole await and could not supervise its own workers.
 /// 2. `std::thread::sleep` inside an async task PARKS a runtime worker thread
 ///    instead of yielding it. Enough concurrent awaits and the runtime starves,
@@ -212,20 +212,12 @@ mod tests {
 
     use super::*;
     use crate::orchestration::{
-        OrchestrationPolicy, SPAWN_SUBTASK_TOOL, SpawnGrant, SpawnRequest, SubtaskId,
-        SubtaskLauncher,
+        OrchestrationPolicy, RUN_SUBTASK_TOOL, SpawnGrant, SubtaskId, SubtaskLauncher,
     };
 
     struct MockLauncher;
 
     impl SubtaskLauncher for MockLauncher {
-        fn launch(
-            &mut self,
-            _req: &SpawnRequest,
-            _grant: &SpawnGrant,
-        ) -> anyhow::Result<SubtaskId> {
-            Ok("child-1".to_owned())
-        }
         fn run_existing(
             &mut self,
             task_id: &str,
@@ -236,7 +228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unix_socket_round_trips_spawn_subtask_rpc() {
+    async fn unix_socket_round_trips_run_subtask_rpc() {
         let root = Path::new("/tmp").join(format!(
             "vmcp-{}-{}",
             std::process::id(),
@@ -269,8 +261,8 @@ mod tests {
         write
             .write_all(
                 format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{}\",\"arguments\":{{\"brief\":\"do it\"}}}}}}\n",
-                    SPAWN_SUBTASK_TOOL
+                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{}\",\"arguments\":{{\"task_id\":\"child-1\"}}}}}}\n",
+                    RUN_SUBTASK_TOOL
                 )
                 .as_bytes(),
             )
@@ -292,7 +284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_round_trips_spawn_subtask_rpc() {
+    async fn tcp_round_trips_run_subtask_rpc() {
         let policy = OrchestrationPolicy {
             enabled: true,
             ..Default::default()
@@ -316,8 +308,8 @@ mod tests {
         write
             .write_all(
                 format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{}\",\"arguments\":{{\"brief\":\"do it\"}}}}}}\n",
-                    SPAWN_SUBTASK_TOOL
+                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{}\",\"arguments\":{{\"task_id\":\"child-1\"}}}}}}\n",
+                    RUN_SUBTASK_TOOL
                 )
                 .as_bytes(),
             )

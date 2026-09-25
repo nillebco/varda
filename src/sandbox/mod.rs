@@ -6146,7 +6146,7 @@ mod tests {
     /// `--net-default-egress deny` with `--net-rule allow@host` (added by `wrap`
     /// because the guest env carries `VARDA_MCP_HOST`/`VARDA_MCP_PORT`) — dials
     /// `socat TCP:host.microsandbox.internal:$VARDA_MCP_PORT` and completes an MCP
-    /// `tools/list`, whose reply advertises `spawn_subtask`. Proves the guest's own
+    /// `tools/list`, whose reply advertises `run_subtask`. Proves the guest's own
     /// loopback is NOT the host, that `host.microsandbox.internal` bridges to the
     /// host loopback service, and that the `host` net-rule is what unblocks it.
     /// Needs the msb runtime AND a guest image with `socat` + `sh` (override via
@@ -6159,13 +6159,6 @@ mod tests {
         // A live broker on HOST loopback, exactly as the run path binds it.
         struct NoopLauncher;
         impl crate::orchestration::SubtaskLauncher for NoopLauncher {
-            fn launch(
-                &mut self,
-                _req: &crate::orchestration::SpawnRequest,
-                _grant: &crate::orchestration::SpawnGrant,
-            ) -> anyhow::Result<crate::orchestration::SubtaskId> {
-                Ok("child-1".to_owned())
-            }
             fn run_existing(
                 &mut self,
                 task_id: &str,
@@ -6231,7 +6224,7 @@ mod tests {
                     args: vec![
                         "-c".to_owned(),
                         // One-line MCP `tools/list`; the broker replies with a line
-                        // advertising the four tools including spawn_subtask.
+                        // advertising the broker tools including run_subtask.
                         "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\\n' \
                          | socat - TCP:${VARDA_MCP_HOST:-host.microsandbox.internal}:$VARDA_MCP_PORT"
                             .to_owned(),
@@ -6266,7 +6259,7 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
-            stdout.contains("spawn_subtask"),
+            stdout.contains("run_subtask"),
             "guest must reach the host broker via host.microsandbox.internal and see \
              tools/list; got: {stdout}"
         );

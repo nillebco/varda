@@ -1494,119 +1494,6 @@ impl VardaSubtaskLauncher {
 }
 
 impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
-    fn launch(
-        &mut self,
-        req: &orchestration::SpawnRequest,
-        grant: &orchestration::SpawnGrant,
-    ) -> anyhow::Result<orchestration::SubtaskId> {
-        let handle = tokio::runtime::Handle::try_current()
-            .context("spawn_subtask launch requires a Tokio runtime")?;
-        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-            anyhow::bail!("detached spawn_subtask launch requires Tokio's multi-thread runtime");
-        }
-        let project = req
-            .route
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.project_path.clone());
-        let assignee = req.agent.as_deref().unwrap_or(&self.fallback_agent);
-
-        // Preflight route resolution BEFORE creating/spawning the subtask. A
-        // spawned worker is run through normal route resolution, which enforces
-        // the route's `agents` allowlist and sandbox. If the requested agent
-        // isn't runnable at the target path, fail the spawn LOUDLY here so the
-        // master's `spawn_subtask` call returns an error it can react to —
-        // otherwise the subtask sits at `ready` forever and an `await_subtasks`
-        // on it deadlocks (the resident route listing only `claude-resident`
-        // while the broker spawns `claude` workers did exactly this).
-        routing::match_route(&self.config, &project, Some(assignee)).with_context(|| {
-            format!(
-                "cannot spawn subtask: agent '{assignee}' is not runnable at '{}'. \
-                 Add it to that route's `agents`, or request a permitted agent.",
-                project.display()
-            )
-        })?;
-
-        // Resolve + preflight the worker sandbox BEFORE creating anything, so a
-        // misconfigured sandbox fails the spawn LOUDLY (like the agent check above)
-        // instead of stranding a task/worktree. An explicit `sandbox=` request wins;
-        // else the route's `default_worker_sandbox`; else `None` (route resolution).
-        // Pinning it onto the subtask's frontmatter (below) takes highest precedence
-        // in `resolve_sandbox_for`, so the worker lands in a box that can actually
-        // build/reach its model API rather than the route's LLM-only resident box —
-        // the failure that stranded #642/#649/#636.
-        let spawn_sandbox =
-            self.worker_sandbox_override(&project, req.sandbox.as_deref(), assignee, "spawn")?;
-
-        let short = uuid::Uuid::new_v4().to_string();
-        let task_name = format!("spawned-subtask-{}", &short[..8]);
-        // `create_task` is ALWAYS called with the MOTHER path (`project`): it uses
-        // this both for the home-store folder and to locate the repo DEFINITION
-        // store. If it were called with the worktree, every subtask would write
-        // its definition INTO the worktree, where it would be committed onto that
-        // worker's own `wip/` branch and self-replicate through merge-back. So we
-        // create against the mother, then (below) point the LOADED doc's `project`
-        // at the isolated worktree while recording the mother in `mother_project`.
-        let task_path = task::create_task(
-            &self.config,
-            &task_name,
-            &project,
-            Some(assignee),
-            Some(&req.brief),
-            None,
-        )
-        .context("failed to create spawned subtask")?;
-        let mut task_doc = task::load_task(&task_path)?;
-
-        // Pin the resolved sandbox onto the subtask (highest precedence in
-        // `resolve_sandbox_for`) so it overrides the route's sandbox. Preflighted
-        // above, so this name is known to resolve. See #636.
-        if let Some(sandbox) = spawn_sandbox {
-            task_doc.frontmatter.sandbox = Some(sandbox);
-        }
-
-        // §2 — per-worker isolation. Create a `git worktree add -b wip/<slug>` off
-        // the mother's HEAD at a distinct out-of-tree host path, mount THAT into
-        // the worker (via its `project`), and record the mother in `mother_project`
-        // so POLICY (route/sandbox/orchestration) still keys on the mother while
-        // the worker edits files in its own worktree/branch. DEGRADE gracefully:
-        // `create_worker_worktree` fails outside a git repo, so a non-git mother
-        // falls back to today's shared-mount behaviour (no worktree, no override).
-        let worktree_slug = format!("{}-{}", task_name, &short[..8]);
-        let worker_checkout = self.isolate_worker(&mut task_doc, &project, &worktree_slug);
-
-        task_doc.set_status(task::TaskStatus::Ready);
-        task::write_task(&task_doc)?;
-        let subtask_id = task_doc
-            .frontmatter
-            .id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| task_path.display().to_string());
-
-        // Record the isolated checkout so the resident's `integrate_subtasks` tool
-        // can harvest and merge this worker's branch back later. Keyed by the same
-        // subtask id the broker returns and the master `await`s on.
-        if let Some(checkout) = worker_checkout {
-            self.worker_registry.record(subtask_id.clone(), checkout);
-        }
-
-        let lineage = SpawnLineage {
-            root_id: subtask_id.clone(),
-            root_depth: grant.child_depth,
-            state: self.spawn_state.clone(),
-        };
-        let config = self.config.clone();
-        let path = task_path.clone();
-        let child_id = subtask_id.clone();
-        let child_handle = tokio::spawn(run_spawned_subtask_settling(
-            config, path, lineage, child_id, "spawned",
-        ));
-        self.spawn_state
-            .insert_handle(subtask_id.clone(), child_handle);
-
-        Ok(subtask_id)
-    }
-
     fn run_existing(
         &mut self,
         task_id: &str,
@@ -1633,8 +1520,7 @@ impl orchestration::SubtaskLauncher for VardaSubtaskLauncher {
         // always wins.
         task::sync_definition_fields_from_repo(&mut task_doc)?;
 
-        // Preflight route resolution BEFORE running, exactly like `launch`: this
-        // re-validates the EXISTING task's own agent/sandbox against the route's
+        // Preflight route resolution BEFORE running: this re-validates the EXISTING task's own agent/sandbox against the route's
         // `agents` allowlist and isolating-sandbox requirement, so an unrunnable
         // placement surfaces as an error the master can react to instead of a
         // subtask wedged at `ready`. The id is caller-supplied — its stored
@@ -4479,7 +4365,8 @@ egress is restricted to your LLM provider API ONLY (no `github.com`, no general 
 with this workspace mounted read-write. Your contract — the dev loop you execute — is \
 defined in `.varda/WORKFLOW.md` in this workspace. Read it and follow it.
 
-Spawn workers through the Varda spawn broker (`spawn_subtask`); merge their branches \
+Launch workers through the Varda spawn broker: file new work with `create_task`, then \
+start it with `run_subtask` (an existing task runs directly by id); merge their branches \
 in-box against the mounted workspace. You can reach ONLY your LLM API and have NO push \
 credential and NO route to a remote: pushing back out is a separate, human-gated step \
 performed on the host. \
@@ -4570,7 +4457,7 @@ async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Res
     println!(
         "  broker:     {}",
         if launch.broker_wired {
-            "wired (spawn_subtask available to the resident)"
+            "wired (create_task + run_subtask available to the resident)"
         } else {
             "off"
         }
@@ -4590,7 +4477,7 @@ async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Res
     println!();
 
     // Delegate to the standard run path, which (for an orchestration-enabled route)
-    // wraps the session in the 461d interactive broker so `spawn_subtask` is served
+    // wraps the session in the 461d interactive broker so `run_subtask` is served
     // for the whole session. `--interactive` attaches the TTY (M13b); headless runs
     // the resident autonomously until it terminates or signals needs_user.
     run_task_command(&task_path, interactive, false).await
@@ -7161,7 +7048,7 @@ deny_sandboxes = ["local"]
     ///
     /// Scenario (driven manually / by the WORKFLOW.md resident contract):
     ///   1. A resident boots in a docker box with `ws` mounted rw and `--network none`.
-    ///   2. It spawns ONE worker (via `spawn_subtask`) that edits a file on a branch.
+    ///   2. It runs ONE worker (`create_task` + `run_subtask`) that edits a file on a branch.
     ///   3. The resident merges that branch IN-BOX against the mounted workspace.
     /// Assertions:
     ///   - the merged change is visible on the HOST through the `ws` mount;

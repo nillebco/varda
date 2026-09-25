@@ -993,7 +993,7 @@ impl Config {
     /// Resolve the effective nested-orchestration policy for a task at
     /// `project_path`: the glob-matched route's `orchestration` override when it
     /// sets one, otherwise the top-level `[orchestration]` defaults. Consulted by
-    /// the run path when standing up the `spawn_subtask` broker for a sandboxed
+    /// the run path when standing up the spawn broker for a sandboxed
     /// master, so every live spawn is gated by exactly the policy that governs the
     /// code being worked on.
     ///
