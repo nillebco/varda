@@ -332,10 +332,35 @@ was learned by getting it wrong first.
 
 ### Trust nothing a worker reports about its own work
 
-- **Re-run the build and tests on the HOST, every time.** Workers repeatedly self-reported
-  "9 failed" that were purely in-box environment restrictions (denied socket binding, a
-  read-only `/home/agent/.varda`). The host run was clean every time. Cheap to check,
-  and it is the difference between a verified change and a hopeful one.
+- **Re-run the build and tests on the HOST, every time — but don't jump to "fabrication"
+  when a report repeats.** Workers have repeatedly self-reported failures attributed to
+  the same two in-box causes — a read-only `/home/agent/.varda` and a blocked socket
+  create (`Operation not permitted`) — while an independent sandbox running the identical
+  diff came back clean: "9 failed" in one incident, "19 failed" recurring identically
+  across three unrelated diffs in another (#920, 2026-09-07), and "20 failed" in three more
+  independent 2026-09-25 samples — one cross-reviewing an unrelated fix (#1087); one
+  re-checking #920's own claim twice in a row (533 passed/20 failed both runs); one
+  independently reproducing it a fourth time (534 passed/20 failed) with exact failing
+  tests clustered in socket/listener and sandbox/docker fixture modules (e.g.
+  `mcp_transport::tests::tcp_round_trips_run_subtask_rpc`,
+  `sandbox::tests::docker_wrap_produces_exact_argv`), all failing with either
+  `Read-only file system (os error 30)` under `/home/agent/.varda` or
+  `Operation not permitted (os error 1)` on socket/listener creation. #920 concluded from
+  its single clean sample that the restriction was "not real" and that a recurring
+  identical count is a fabrication signal — that conclusion is wrong: later samples
+  reproduced the same restriction for real, so a lone clean run cannot generalize to
+  "never happens." The honest read is **per-spawn variance**: some `sandbox: worker`
+  instances land with this restriction — specifically affecting socket/listener creation
+  and writes under `/home/agent` — and others don't. This is not explained by
+  implementer/reviewer role selection: `resolve_sandbox_for` in `src/config.rs` takes no
+  role parameter. That check only rules out role selection as the cause, not any other
+  code or provisioning path — the actual root cause (host resource contention, a flaky
+  provisioning step, a setup race, or something else) is still OPEN and worth its own
+  investigation. What IS actionable today: always get the LITERAL failing test names and
+  error output, never accept a rounded-off "N failed, environment-restricted" summary — a
+  report lacking that literal detail is lower-trust because it can't be checked, not
+  because it's assumed fabricated. Re-running on the HOST (or an independent sandbox)
+  stays cheap, and it is the difference between a verified change and a hopeful one.
 - **A worker change its author could not verify is NOT safe.** `ef64e83` broke
   `make agents-image` outright and reached the branch anyway, because the worker was inside
   the sandbox that could not build. Varda commits `files_touched` regardless.
