@@ -318,7 +318,15 @@ fn overlay_repo_definition_body(task: &mut TaskDocument) -> Result<()> {
 
 /// Re-read the repo-local DEFINITION for `task` (if one exists) and overwrite
 /// its DEFINITION-owned frontmatter fields — `assignee`, `sandbox`,
-/// `allow_commands`, the M10 bounds — with the committed values. This is a
+/// `allow_commands`, the M10 bounds — with the committed values.
+/// `assignee`/`sandbox` are synced only when the DEFINITION sets them: an old
+/// DEFINITION that predates the worker-pinning convention and omits them
+/// entirely leaves the operations copy's existing value alone instead of
+/// clobbering it to `None` (task #1087 — this previously mis-routed dispatch
+/// to `claude-resident` or the legacy `claude` agent on every re-run of such a
+/// task, with no in-box recovery). `allow_commands`/the bounds have no such
+/// gap: an empty/default value in the DEFINITION is itself a meaningful,
+/// intentional "no overrides" and always wins. This is a
 /// SUBSET of the field set [`write_definition`] commits to the repo
 /// (`TaskDefinition`): `id` is excluded (immutable post-creation), `project`
 /// is excluded (the operations copy's `project` may already carry a
@@ -353,8 +361,25 @@ pub fn sync_definition_fields_from_repo(task: &mut TaskDocument) -> Result<()> {
     };
 
     if let Some(doc) = find_definition_document(&store, id)? {
-        task.frontmatter.assignee = doc.frontmatter.assignee;
-        task.frontmatter.sandbox = doc.frontmatter.sandbox;
+        // `assignee`/`sandbox` have no safe "absent" meaning for dispatch: a
+        // repo-local DEFINITION written before the worker-pinning convention
+        // (task #1087) may omit either field entirely, and an absent field
+        // must read as "this DEFINITION has no opinion", NOT as "clear
+        // whatever pin the operations copy already carries". Without this
+        // guard, every re-dispatch of such a stale DEFINITION permanently
+        // wiped a correct operations-copy pin back to `None`, which then
+        // mis-routed to `claude-resident` (no `.mcp.json` in a worker
+        // worktree) or the legacy `claude` agent ("Not logged in"). A
+        // DEFINITION that DOES set the field — even to a wrong legacy value
+        // like `assignee: claude` — still wins unconditionally, matching
+        // #1024's intent that an explicit repo-local edit always takes effect
+        // on the next dispatch.
+        if doc.frontmatter.assignee.is_some() {
+            task.frontmatter.assignee = doc.frontmatter.assignee;
+        }
+        if doc.frontmatter.sandbox.is_some() {
+            task.frontmatter.sandbox = doc.frontmatter.sandbox;
+        }
         task.frontmatter.allow_commands = doc.frontmatter.allow_commands;
         task.frontmatter.bounds = doc.frontmatter.bounds;
     }
@@ -3102,6 +3127,46 @@ requires_user: false
         assert_eq!(loaded.frontmatter.recaps, vec!["partial progress".to_owned()]);
         assert_eq!(loaded.frontmatter.agent_session_ids, vec!["abc-123".to_owned()]);
         assert!(loaded.frontmatter.requires_user);
+
+        fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn sync_definition_fields_preserves_operations_pin_when_repo_definition_omits_it() {
+        // Regression test for #1087: an old repo-local DEFINITION written
+        // before the worker-pinning convention (only `id`/`project`, no
+        // `assignee`/`sandbox`) must NOT clobber an already-correct
+        // operations-copy pin back to `None` on every re-dispatch.
+        let root = std::env::temp_dir().join(format!("varda-def-sync-absent-{}", std::process::id()));
+        let operations_dir = root.join("operations");
+        let project = root.join("repo");
+        let store = project.join(".varda/tasks");
+        fs::create_dir_all(&store).expect("repo store should be created");
+        fs::write(
+            store.join("70-no-opinion.md"),
+            "---\nid: 70\n---\n\n# No Opinion\n",
+        )
+        .expect("repo definition should write");
+
+        let task_dir = operations_dir
+            .join("tasks")
+            .join(project_task_folder(&project).expect("project should slugify"));
+        fs::create_dir_all(&task_dir).expect("home task dir should be created");
+        let state_path = task_dir.join("70-no-opinion.md");
+        fs::write(
+            &state_path,
+            format!(
+                "---\nid: 70\nstatus: ready\nproject: {}\nassignee: claude-worker\nsandbox: worker\n---\n\n# No Opinion\n",
+                project.display()
+            ),
+        )
+        .expect("operations copy should write");
+
+        let mut loaded = load_task(&state_path).expect("state should load");
+        sync_definition_fields_from_repo(&mut loaded).expect("sync should not fail");
+
+        assert_eq!(loaded.frontmatter.assignee.as_deref(), Some("claude-worker"));
+        assert_eq!(loaded.frontmatter.sandbox.as_deref(), Some("worker"));
 
         fs::remove_dir_all(root).expect("test directory should be removable");
     }
