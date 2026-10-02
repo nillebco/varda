@@ -32,6 +32,15 @@ worktree copy does not exist.
   file by `varda task add`; that mismatch is unresolved (see
   `sync_definition_fields_from_repo` in `src/task.rs`). A dispatch that has
   already started (mid-run) is unaffected until its NEXT dispatch.
+- `assignee`/`sandbox` sync as "no opinion wins, not the absence" (#1087): if
+  the repo-local DEFINITION omits one of these fields entirely (e.g. an old
+  file predating the worker-pinning convention below), the operations
+  record's existing value is left alone rather than clobbered to empty — an
+  absent field is never treated as "clear the pin". A DEFINITION that DOES
+  set the field, even to a wrong legacy value like `assignee: claude`, still
+  wins outright. `allow_commands`/the cooperative bounds have no such gap and
+  always sync as-is, since an empty/default value is itself a meaningful
+  "no overrides" in the DEFINITION.
 - `~/.varda/operations/` — runtime STATE: status transitions, recaps
   (`operations/recaps`), session logs (`operations/runs`), notifications. NOT
   committed to the code repo.
