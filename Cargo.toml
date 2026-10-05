@@ -2,6 +2,10 @@
 name = "varda"
 version = "0.3.0"
 edition = "2024"
+description = "Routes markdown tasks to AI agents (Claude, Codex, Copilot) and tracks their lifecycle"
+license = "MIT"
+repository = "https://github.com/nillebco/varda"
+homepage = "https://github.com/nillebco/varda"
 
 [dependencies]
 anyhow = "1.0"
@@ -19,3 +23,8 @@ sha2 = "0.11.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
