@@ -13,7 +13,7 @@ varda task add "Fix the flaky auth test" --exec
 ## Quickstart
 
 ```sh
-brew install nillebco/tap/varda   # or, from a checkout: make install (→ ~/.local/bin)
+brew tap nillebco/tap && brew install varda   # or, from a checkout: make install (→ ~/.local/bin)
 varda init            # creates the control plane at ~/.varda
 ```
 
