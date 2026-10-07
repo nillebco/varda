@@ -1,6 +1,6 @@
 [package]
 name = "varda"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Routes markdown tasks to AI agents (Claude, Codex, Copilot) and tracks their lifecycle"
 license = "MIT"
