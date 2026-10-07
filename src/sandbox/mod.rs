@@ -1857,6 +1857,8 @@ fn write_stage_temp(content: &str, read_only: bool) -> Result<PathBuf> {
             .with_context(|| format!("failed to set perms on {}", tmp.display()))?;
         return Ok(tmp);
     }
+    #[cfg(not(unix))]
+    let _ = read_only;
     // Prompt / non-credential: default (umask) perms so a non-root guest agent can
     // still read the file after `docker cp`/`--copy-file` preserves the source mode.
     std::fs::write(&tmp, content)
@@ -3445,6 +3447,7 @@ mod tests {
     /// privacy on the HOST therefore comes from the containing directory, which must
     /// be `0o700` — no other local user can traverse in. Assert the property that
     /// actually protects the secret, not a proxy for it.
+    #[cfg(unix)]
     fn assert_credential_dir_is_private(host_temp: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = host_temp.parent().expect("staged credential has a parent dir");
@@ -4142,6 +4145,7 @@ mod tests {
     /// temp and, because a copy must precede the agent, batch `wrap` switches to the
     /// `docker create` (not `run`) lifecycle so `begin_batch` can `docker cp` it in.
     /// Teardown removes the host temp — no credential value is left behind.
+    #[cfg(unix)]
     #[tokio::test]
     async fn m11ext_batch_file_target_delivered_and_cleaned_docker() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -4224,6 +4228,7 @@ mod tests {
     /// M11-ext Finding 2 (msb): a BATCH run with a `file`-target credential reaches
     /// the guest via a pre-boot `--copy-file` (emitted in EITHER mode now), the host
     /// temp is read-only, and teardown removes it.
+    #[cfg(unix)]
     #[tokio::test]
     async fn m11ext_batch_file_target_delivered_and_cleaned_msb() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5130,6 +5135,7 @@ mod tests {
 
     /// Credential env values cross the microsandbox boundary in a private staged
     /// file, never in the ps-visible `msb run` argv. Ordinary env stays on argv.
+    #[cfg(unix)]
     #[test]
     fn microsandbox_credential_env_is_not_exposed_on_argv() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5661,6 +5667,7 @@ mod tests {
     /// `stage_credential_file` returns. The value is never reachable by another
     /// local user at any point: the containing directory is created `0o700` before
     /// the file exists, so there is no create-time window regardless of umask.
+    #[cfg(unix)]
     #[test]
     fn m11ext_docker_staged_credential_private_at_creation() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -6272,6 +6279,7 @@ mod tests {
     /// the `create`/`cp`-failure guard). This was previously covered only via
     /// the now-removed clawk provider; ported to microsandbox, the surviving
     /// own-kernel microVM primitive, to keep that normal-path guarantee tested.
+    #[cfg(unix)]
     #[tokio::test]
     async fn microsandbox_staged_credential_is_private_and_cleaned() {
         use std::os::unix::fs::PermissionsExt as _;

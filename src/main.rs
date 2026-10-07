@@ -1757,14 +1757,20 @@ fn subtask_worktree_diff(project: &str, mother: Option<&str>) -> Option<String> 
         .and_then(|m| git_out(m, &["rev-parse", "HEAD"]))
         .and_then(|head| git_out(project, &["merge-base", "HEAD", &head]))
         .unwrap_or_else(|| "HEAD".to_owned());
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "git add -A -N >/dev/null 2>&1; git diff {base}; git reset -q >/dev/null 2>&1"
-        ))
-        .current_dir(project)
-        .output()
-        .ok()?;
+    // Plain git invocations (no `sh -c`) so this works on Windows too.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+    };
+    let _ = git(&["add", "-A", "-N"]);
+    let diff = git(&["diff", &base]);
+    let _ = git(&["reset", "-q"]);
+    let output = diff.ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2012,7 +2018,9 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
         // not its AF_UNIX endpoint, so an in-guest connect() is refused; those guests
         // reach the host over TCP instead. `local`/`docker` see the real socket
         // through the bind mount and keep the Unix transport.
-        let use_tcp = config::primitive_needs_tcp_broker(&self.sandbox_primitive);
+        // Windows has no tokio Unix-socket listener, so it always uses the TCP transport.
+        let use_tcp =
+            cfg!(not(unix)) || config::primitive_needs_tcp_broker(&self.sandbox_primitive);
         let server = if use_tcp {
             let (addr, listener) = match mcp_transport::bind_tcp(broker_bind_ip()).await {
                 Ok(bound) => bound,
@@ -2028,15 +2036,22 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
                 }
             })
         } else {
-            let server_path = socket_path.clone();
-            request.orchestration_socket_path = Some(socket_path.display().to_string());
-            tokio::spawn(async move {
-                if let Err(error) =
-                    mcp_transport::serve_unix_socket(&server_path, root_id, broker).await
-                {
-                    eprintln!("warning: MCP broker transport exited: {error:#}");
-                }
-            })
+            #[cfg(unix)]
+            {
+                let server_path = socket_path.clone();
+                request.orchestration_socket_path = Some(socket_path.display().to_string());
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        mcp_transport::serve_unix_socket(&server_path, root_id, broker).await
+                    {
+                        eprintln!("warning: MCP broker transport exited: {error:#}");
+                    }
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                unreachable!("`use_tcp` is always true on non-unix targets")
+            }
         };
 
         let is_root_run = self.lineage.is_none();
@@ -2996,8 +3011,28 @@ fn spawn_dashboard_daemon(project: Option<&Path>, all_projects: bool, port: u16)
         "dashboard daemon started on http://127.0.0.1:{port}/ (pid: {})",
         child.id()
     );
-    println!("stop it with: kill {}", child.id());
+    if cfg!(windows) {
+        println!("stop it with: taskkill /PID {} /F", child.id());
+    } else {
+        println!("stop it with: kill {}", child.id());
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(source: &Path, dest: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(source, dest)
+}
+
+/// Windows symlinks need Developer Mode or elevation; this is a per-user tool, so
+/// the failure is surfaced rather than silently elevated (`--copy` always works).
+#[cfg(windows)]
+fn create_symlink(source: &Path, dest: &Path) -> io::Result<()> {
+    if source.is_dir() {
+        std::os::windows::fs::symlink_dir(source, dest)
+    } else {
+        std::os::windows::fs::symlink_file(source, dest)
+    }
 }
 
 #[cfg(unix)]
@@ -3013,7 +3048,15 @@ fn detach_command(command: &mut ProcessCommand) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn detach_command(command: &mut ProcessCommand) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(any(unix, windows)))]
 fn detach_command(_command: &mut ProcessCommand) {}
 
 fn serve_task_dashboard(
@@ -5595,7 +5638,7 @@ fn skill_install_command(source: Option<&Path>, link: bool) -> Result<()> {
         let source = source
             .canonicalize()
             .with_context(|| format!("failed to resolve {}", source.display()))?;
-        std::os::unix::fs::symlink(&source, &dest).with_context(|| {
+        create_symlink(&source, &dest).with_context(|| {
             format!(
                 "failed to create symlink {} -> {}",
                 dest.display(),

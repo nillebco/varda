@@ -22,12 +22,15 @@
 //!   a reachable port grants no capability the unix socket did not.
 
 use std::net::{IpAddr, SocketAddr};
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 use crate::orchestration::{SpawnBroker, SubtaskLauncher};
 
@@ -75,6 +78,7 @@ where
     }
 }
 
+#[cfg(unix)]
 pub async fn serve_unix_socket<L>(
     socket_path: &Path,
     parent_id: String,
@@ -228,6 +232,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn unix_socket_round_trips_run_subtask_rpc() {
         let root = Path::new("/tmp").join(format!(
             "vmcp-{}-{}",

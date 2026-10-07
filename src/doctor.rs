@@ -264,7 +264,19 @@ pub fn doctor_task_command(task_ref: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::ExitStatusExt;
+
+    fn ok_status() -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        }
+    }
 
     struct Fake(Option<(&'static str, &'static str)>);
 
@@ -283,7 +295,7 @@ mod tests {
                 None => "NAME IMAGE STATUS CREATED\n".to_owned(),
             };
             Ok(Output {
-                status: std::process::ExitStatus::from_raw(0),
+                status: ok_status(),
                 stdout: listing.into_bytes(),
                 stderr: vec![],
             })
@@ -299,7 +311,7 @@ mod tests {
                 ));
             };
             Ok(Output {
-                status: std::process::ExitStatus::from_raw(0),
+                status: ok_status(),
                 stdout: if wanted == source {
                     text.as_bytes().to_vec()
                 } else {

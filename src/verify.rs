@@ -34,17 +34,27 @@ impl VerificationOutcome {
     }
 }
 
+/// A command that runs `line` through the platform shell: `sh -c` on Unix,
+/// `cmd /C` on Windows.
+fn shell_command(line: &str) -> Command {
+    #[cfg(windows)]
+    let (shell, flag) = ("cmd", "/C");
+    #[cfg(not(windows))]
+    let (shell, flag) = ("sh", "-c");
+    let mut command = Command::new(shell);
+    command.arg(flag).arg(line);
+    command
+}
+
 /// Run `commands` in order inside `project_path`, stopping at the first
-/// failure. Each entry is a full shell line executed via `sh -c`, so config
+/// failure. Each entry is a full shell line executed via the platform shell (`sh -c` / `cmd /C`), so config
 /// can use pipelines/flags freely (e.g. `cargo check --all-targets`).
 pub fn run_verification(project_path: &Path, commands: &[String]) -> Result<VerificationOutcome> {
     if commands.is_empty() {
         return Ok(VerificationOutcome::Skipped);
     }
     for command in commands {
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
+        let output = shell_command(command)
             .current_dir(project_path)
             .output()
             .with_context(|| {
