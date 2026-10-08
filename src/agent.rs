@@ -117,6 +117,22 @@ If you need user input, stop and use the true marker."#
     )
 }
 
+/// Instructions for a `bare_result` headless run (scripted callers): no Varda
+/// recap contract, so the agent's final message is exactly the answer.
+pub fn build_bare_result_instructions(timeout: Duration) -> String {
+    let minutes = timeout.as_secs() / 60;
+
+    format!(
+        r#"You are processing a task managed by Varda in a headless one-shot run.
+
+You have at most {minutes} minutes. There is no human to approve commands interactively.
+
+Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder, when present.
+
+Your final message is consumed verbatim by a script. Make it contain ONLY the answer to the task: no recap, no preamble, no file list, no status markers."#
+    )
+}
+
 pub fn build_interactive_instructions() -> String {
     r#"You are running an interactive task session managed by Varda.
 
@@ -339,6 +355,14 @@ mod tests {
 
     use super::fake::FakeAgentClient;
     use super::*;
+
+    #[test]
+    fn bare_result_instructions_omit_recap_contract() {
+        let text = build_bare_result_instructions(Duration::from_secs(600));
+        assert!(text.contains("10 minutes"));
+        assert!(!text.contains("Files touched"));
+        assert!(!text.contains("requires_user"));
+    }
 
     #[test]
     fn builds_time_limited_agent_instructions() {

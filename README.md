@@ -29,6 +29,15 @@ varda task run <task>                       # or: varda run  (runs everything re
 varda task show <task>                      # the recap
 ```
 
+For scripts (cron/launchd jobs, bots) that need only the agent's answer:
+
+```sh
+echo "say hi" | varda task add t --agent brain-eod --exec --print-result   # answer on stdout, chatter on stderr
+varda task run <task> --result-file /tmp/answer.txt                        # answer written to a file
+```
+
+`--print-result` / `--result-file` mark the task `bare_result` (the agent prompt omits Varda's recap/`Files touched`/`requires_user` contract), send all Varda output to stderr (or stdout for `--result-file`), skip live streaming, and exit non-zero if the agent run fails. Interactive and background runs are unchanged (the flags conflict with `--interactive`/`--background`).
+
 `varda init` also runs `git init` on `~/.varda`, because every task update, recap and notification is committed there.
 
 ## The loop

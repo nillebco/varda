@@ -1,3 +1,14 @@
+/// `println!` to stdout, or to stderr when stdout is reserved for `--print-result`.
+macro_rules! say {
+    ($to_stderr:expr, $($arg:tt)*) => {
+        if $to_stderr {
+            eprintln!($($arg)*)
+        } else {
+            println!($($arg)*)
+        }
+    };
+}
+
 mod acp;
 mod agent;
 mod capability;
@@ -152,6 +163,15 @@ enum TaskCommand {
         /// repeated launches reuse one task per (project, name) rather than colliding.
         #[arg(long)]
         reuse: bool,
+        /// Scripted-caller mode (only meaningful with --exec): print ONLY the agent's final
+        /// answer on stdout (all Varda chatter goes to stderr), omit Varda's recap
+        /// boilerplate from the agent prompt, and exit non-zero if the agent run fails.
+        #[arg(long, conflicts_with_all = ["background", "interactive"])]
+        print_result: bool,
+        /// Like --print-result, but write the agent's final answer to this file instead of
+        /// stdout (chatter stays on stdout).
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["background", "interactive"])]
+        result_file: Option<PathBuf>,
     },
     /// List markdown tasks for a project.
     List {
@@ -176,6 +196,15 @@ enum TaskCommand {
         /// written to the session log and the recap is printed after the run).
         #[arg(long)]
         quiet: bool,
+        /// Scripted-caller mode (only meaningful with --exec): print ONLY the agent's final
+        /// answer on stdout (all Varda chatter goes to stderr), omit Varda's recap
+        /// boilerplate from the agent prompt, and exit non-zero if the agent run fails.
+        #[arg(long, conflicts_with_all = ["background", "interactive"])]
+        print_result: bool,
+        /// Like --print-result, but write the agent's final answer to this file instead of
+        /// stdout (chatter stays on stdout).
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["background", "interactive"])]
+        result_file: Option<PathBuf>,
     },
     /// Generate an agent-driven plan for a task and open it in $EDITOR.
     Plan {
@@ -430,8 +459,17 @@ async fn run_cli() -> Result<()> {
                 quiet,
                 ready,
                 reuse,
+                print_result,
+                result_file,
             } => {
                 use std::io::IsTerminal as _;
+                let result_output = ResultOutput {
+                    print: print_result,
+                    file: result_file,
+                };
+                if result_output.requested() && !exec {
+                    anyhow::bail!("--print-result/--result-file require --exec");
+                }
                 let (taskname, description) = if let Some(file_path) = file {
                     let stem = file_path
                         .file_stem()
@@ -567,9 +605,13 @@ async fn run_cli() -> Result<()> {
                     task::write_task(&task_doc)?;
                 }
                 if let Some(task_id) = task_doc.frontmatter.id {
-                    println!("created task #{task_id} {}", task_path.display());
+                    say!(
+                        result_output.print,
+                        "created task #{task_id} {}",
+                        task_path.display()
+                    );
                 } else {
-                    println!("created task {}", task_path.display());
+                    say!(result_output.print, "created task {}", task_path.display());
                 }
                 if exec {
                     if edit {
@@ -578,7 +620,8 @@ async fn run_cli() -> Result<()> {
                     if background {
                         spawn_task_in_background(&task_path)?;
                     } else {
-                        run_task_command(&task_path, interactive, quiet).await?;
+                        run_task_command_with(&task_path, interactive, quiet, &result_output)
+                            .await?;
                     }
                 } else if edit {
                     open_editor(&task_path)?;
@@ -599,11 +642,17 @@ async fn run_cli() -> Result<()> {
                 background,
                 interactive,
                 quiet,
+                print_result,
+                result_file,
             } => {
+                let result_output = ResultOutput {
+                    print: print_result,
+                    file: result_file,
+                };
                 if background {
                     spawn_task_in_background(&task)?;
                 } else {
-                    run_task_command(&task, interactive, quiet).await?;
+                    run_task_command_with(&task, interactive, quiet, &result_output).await?;
                 }
             }
             TaskCommand::Plan { task } => {
@@ -1383,6 +1432,7 @@ async fn run_task_paths_in_parallel(
                             &report.task_path,
                             project,
                             &report.outcome.files_touched,
+                            false,
                         );
                     }
                     git::commit_task_update(
@@ -4613,7 +4663,42 @@ async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Res
     run_task_command(&task_path, interactive, false).await
 }
 
+/// Where a scripted caller wants the agent's final answer (`--print-result` /
+/// `--result-file`). Default (neither set) leaves the run output unchanged.
+#[derive(Debug, Default, Clone)]
+struct ResultOutput {
+    /// Print only the agent's answer on stdout; all Varda chatter goes to stderr.
+    print: bool,
+    /// Write the agent's answer to this file.
+    file: Option<PathBuf>,
+}
+
+impl ResultOutput {
+    fn requested(&self) -> bool {
+        self.print || self.file.is_some()
+    }
+}
+
+/// Strips the `---\ntask: …\n---\n\n` header `write_recap` prepends, leaving the
+/// agent's own final message.
+fn recap_body(recap_file: &str) -> &str {
+    recap_file
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map_or(recap_file, |(_, body)| body.trim_start_matches('\n'))
+}
+
 async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> Result<()> {
+    run_task_command_with(task_path, interactive, quiet, &ResultOutput::default()).await
+}
+
+async fn run_task_command_with(
+    task_path: &Path,
+    interactive: bool,
+    quiet: bool,
+    result_output: &ResultOutput,
+) -> Result<()> {
+    let to_stderr = result_output.print;
     let config_path = config::config_file()?;
     let config = config::resolve_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
@@ -4622,21 +4707,32 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     // from the repo-local DEFINITION before route/agent resolution reads them
     // below (#1024) and persist to the operations copy.
     task::sync_definition_fields_from_repo(&mut task_document)?;
+    if result_output.requested() {
+        task_document.frontmatter.bounds.bare_result = true;
+    }
     task::write_task(&task_document)?;
     let id_str = task_document
         .frontmatter
         .id
         .map(|id| format!(" #{id}"))
         .unwrap_or_default();
-    println!("Running task{}: {}", id_str, task_document.title());
-    println!();
-    print!("{}", task_document.body.trim());
-    println!();
-    println!();
-    println!("---");
-    println!();
+    say!(
+        to_stderr,
+        "Running task{}: {}",
+        id_str,
+        task_document.title()
+    );
+    say!(to_stderr,);
+    say!(to_stderr, "{}", task_document.body.trim());
+    say!(to_stderr,);
+    say!(to_stderr, "---");
+    say!(to_stderr,);
     let route = routing::match_route_for_task(&config, &task_document, false)?;
-    println!("estimated_prompt_tokens: {}", route.estimated_prompt_tokens);
+    say!(
+        to_stderr,
+        "estimated_prompt_tokens: {}",
+        route.estimated_prompt_tokens
+    );
     let agent_config = config
         .agents
         .get(&route.agent)
@@ -4696,7 +4792,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
             &task_path,
             &format!("Snapshot task {} before run", task_path.display()),
         )?;
-        println!("committed task snapshot");
+        say!(to_stderr, "committed task snapshot");
     }
     // Pre-run dirty-set snapshot of the project repo (#816): taken before the
     // agent runs so the post-run completeness check can tell "the run changed
@@ -4722,7 +4818,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     } else {
         Some(Vec::new())
     };
-    let stream = !quiet && !interactive;
+    let stream = !quiet && !interactive && !result_output.requested();
     let mut outcome = runner::run_task(
         &config,
         &display_name,
@@ -4735,7 +4831,8 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         stream,
     )
     .await?;
-    println!(
+    say!(
+        to_stderr,
         "processed task={} agent={} glob={} status={:?} recap={}",
         task_path.display(),
         display_name,
@@ -4745,12 +4842,27 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     );
 
     if !outcome.blocked_commands.is_empty() {
-        println!();
-        println!("blocked_commands: {}", outcome.blocked_commands.join(", "));
-        println!(
+        say!(to_stderr,);
+        say!(
+            to_stderr,
+            "blocked_commands: {}",
+            outcome.blocked_commands.join(", ")
+        );
+        say!(
+            to_stderr,
             "hint: add these to the task's `allow_commands` frontmatter and re-run to authorize them headlessly"
         );
     }
+
+    // Capture the agent's own final message now: the verification gate below
+    // appends sections to the recap file.
+    let agent_answer = if result_output.requested() {
+        let recap_file = fs::read_to_string(&outcome.recap_path)
+            .with_context(|| format!("failed to read recap at {}", outcome.recap_path.display()))?;
+        Some(recap_body(&recap_file).trim().to_owned())
+    } else {
+        None
+    };
 
     let mut may_commit_files = true;
     if config.git.auto_commit && let Some(project) = task_document.frontmatter.project.clone() {
@@ -4769,18 +4881,16 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
 
     let recap_content = fs::read_to_string(&outcome.recap_path)
         .with_context(|| format!("failed to read recap at {}", outcome.recap_path.display()))?;
-    println!();
-    println!("---");
-    println!();
-    print!("{recap_content}");
-    if !recap_content.ends_with('\n') {
-        println!();
-    }
+    say!(to_stderr,);
+    say!(to_stderr, "---");
+    say!(to_stderr,);
+    say!(to_stderr, "{}", recap_content.trim_end_matches('\n'));
 
     let notification = if outcome.status == task::TaskStatus::NeedsUser {
         let notification =
             notify::notify_user_interaction(&config, &task_path, &outcome.recap_path)?;
-        println!(
+        say!(
+            to_stderr,
             "user interaction required; notification={}",
             notification.display()
         );
@@ -4790,7 +4900,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     };
     if config.git.auto_commit {
         if may_commit_files && let Some(project) = task_document.frontmatter.project.as_deref() {
-            commit_agent_files_for_task(&task_path, project, &outcome.files_touched);
+            commit_agent_files_for_task(&task_path, project, &outcome.files_touched, to_stderr);
         }
         git::commit_task_update(
             &task_path,
@@ -4798,13 +4908,35 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
             &outcome.session_log_path,
             notification.as_deref(),
         )?;
-        println!("committed task update");
+        say!(to_stderr, "committed task update");
+    }
+
+    if let Some(answer) = agent_answer {
+        if outcome.status == task::TaskStatus::Failed {
+            anyhow::bail!(
+                "agent run failed for task {}; see recap {}",
+                task_path.display(),
+                outcome.recap_path.display()
+            );
+        }
+        if let Some(path) = &result_output.file {
+            fs::write(path, format!("{answer}\n"))
+                .with_context(|| format!("failed to write result to {}", path.display()))?;
+        }
+        if result_output.print {
+            println!("{answer}");
+        }
     }
 
     Ok(())
 }
 
-fn commit_agent_files_for_task(task_path: &Path, project: &str, files_touched: &[PathBuf]) {
+fn commit_agent_files_for_task(
+    task_path: &Path,
+    project: &str,
+    files_touched: &[PathBuf],
+    to_stderr: bool,
+) {
     if files_touched.is_empty() {
         return;
     }
@@ -4820,7 +4952,8 @@ fn commit_agent_files_for_task(task_path: &Path, project: &str, files_touched: &
             task_path.display()
         );
     } else {
-        println!(
+        say!(
+            to_stderr,
             "committed {} agent file(s) in {}",
             files_touched.len(),
             project_path.display()
@@ -5659,6 +5792,32 @@ fn skill_install_command(source: Option<&Path>, link: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recap_body_strips_write_recap_header() {
+        let file = "---\ntask: /t/x.md\n---\n\nhi there\n";
+        assert_eq!(recap_body(file), "hi there\n");
+        assert_eq!(recap_body("no header"), "no header");
+    }
+
+    #[test]
+    fn result_output_requested_only_when_a_flag_is_set() {
+        assert!(!ResultOutput::default().requested());
+        assert!(
+            ResultOutput {
+                print: true,
+                file: None
+            }
+            .requested()
+        );
+        assert!(
+            ResultOutput {
+                print: false,
+                file: Some(PathBuf::from("/tmp/r"))
+            }
+            .requested()
+        );
+    }
 
     #[test]
     fn egress_auto_resume_does_not_suppress_needs_user_editor_offer() {

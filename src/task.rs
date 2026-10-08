@@ -156,6 +156,11 @@ pub struct TaskBounds {
     /// Override `defaults.max_tool_calls` (tool-call budget) for this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_calls: Option<u64>,
+    /// Headless one-shot mode for scripted callers (`--print-result`): the agent
+    /// prompt omits Varda's recap boilerplate (Files touched / requires_user
+    /// marker / ...) so the agent's final message is just the answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bare_result: bool,
 }
 
 /// Default status for a task whose frontmatter omits `status` — namely a

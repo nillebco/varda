@@ -15,7 +15,8 @@ use tokio::time;
 
 use crate::agent::{
     AgentClient, AgentRunRequest, AgentRunResult, build_agent_instructions,
-    build_interactive_instructions, build_interpretation_instructions, build_planning_instructions,
+    build_bare_result_instructions, build_interactive_instructions,
+    build_interpretation_instructions, build_planning_instructions,
     recap_requires_user_interaction,
 };
 use crate::config::AgentConfig;
@@ -1750,6 +1751,8 @@ Task markdown:
             build_interactive_instructions()
         } else if request.interpret {
             build_interpretation_instructions()
+        } else if request.frontmatter.bounds.bare_result {
+            build_bare_result_instructions(request.timeout)
         } else {
             build_agent_instructions(request.timeout)
         },
