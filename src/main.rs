@@ -109,6 +109,26 @@ enum Command {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Internal: run a `processcontainer` relay request (Windows MXC). Written
+    /// by the provider's `wrap()`; not meant to be typed by hand.
+    #[command(name = "sandbox-exec", hide = true)]
+    SandboxExec {
+        /// Relay request file.
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Internal: inside a `processcontainer`, run the agent under a
+    /// pseudo-console fed by stdin/stdout (MXC cannot attach one itself).
+    #[command(name = "pty-host", hide = true)]
+    PtyHost {
+        #[arg(long)]
+        rows: u16,
+        #[arg(long)]
+        cols: u16,
+        /// Agent command line, passed verbatim to CreateProcessW.
+        #[arg(long)]
+        command_line: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -797,6 +817,21 @@ async fn run_cli() -> Result<()> {
             workspace,
         } => {
             orchestrate_command(interactive, workspace.as_deref()).await?;
+        }
+        Command::SandboxExec { request } => {
+            let code = sandbox::processcontainer::run_relay(&request).await?;
+            std::process::exit(code);
+        }
+        Command::PtyHost {
+            rows,
+            cols,
+            command_line,
+        } => {
+            let code = tokio::task::spawn_blocking(move || {
+                sandbox::pty_host::run(rows, cols, &command_line)
+            })
+            .await??;
+            std::process::exit(code);
         }
     }
 

@@ -24,6 +24,13 @@ sha2 = "0.11.0"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `processcontainer` primitive (Windows MXC). Pinned to MXC main for
+# microsoft/mxc#1490 (identity-less loopback proxy on PSEC 1.0 hosts); move to
+# crates.io `mxc-sdk = "1.0.1"` once it is published.
+[target.'cfg(windows)'.dependencies]
+mxc-sdk = { git = "https://github.com/microsoft/mxc", rev = "fda29ac6", default-features = false }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

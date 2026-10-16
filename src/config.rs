@@ -655,12 +655,14 @@ pub enum EgressMode {
 ///   internal network whose only route out is the proxy. `Strict` maps to the proxy
 ///   sidecar so a docker strict allow-list is enforced rather than refused.
 /// - `DnsPin` is name-pin only (direct-IP bypassable) and never counts as enforced.
+/// - `processcontainer` (Windows MXC) confines the container to one loopback
+///   endpoint, the relay's allow-listing proxy, under `Strict` or `Proxy`.
 /// - `local` has no network isolation at all.
 pub fn egress_is_enforced(primitive: &str, mode: EgressMode) -> bool {
     match mode {
         EgressMode::DnsPin => false,
         EgressMode::Strict | EgressMode::Proxy => {
-            matches!(primitive, "microsandbox" | "docker")
+            matches!(primitive, "microsandbox" | "docker" | "processcontainer")
         }
     }
 }
@@ -710,7 +712,8 @@ pub struct SandboxConfig {
     /// `image`/`build` when both are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_from: Option<String>,
-    /// Isolation primitive: `"docker"` | `"microsandbox"` | `"local"`.
+    /// Isolation primitive: `"docker"` | `"microsandbox"` | `"processcontainer"`
+    /// (Windows MXC, no admin) | `"local"`.
     /// Orthogonal to the image/rootfs: the same OCI image can run under docker
     /// (shared kernel) or an own-kernel microVM.
     #[serde(default = "default_primitive")]

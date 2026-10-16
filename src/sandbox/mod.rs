@@ -19,6 +19,10 @@ use crate::config::{
     AgentKind, EgressMode, SandboxConfig, docker_uses_egress_proxy, egress_is_enforced,
 };
 
+pub mod egress_proxy;
+pub mod processcontainer;
+pub mod pty_host;
+
 /// Where a mount declaration came from. Mounts compose across origins (effective
 /// set = their union). In M6a both origins are the trusted central
 /// `config.toml`, so no clamping is applied; this enum is the seam M6b extends
@@ -1780,6 +1784,7 @@ fn varda_sessions_root() -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".varda")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|home| Path::new(&home).join(".varda")))
         .unwrap_or_else(|| PathBuf::from(".varda"));
     base.join("sessions")
 }
@@ -3361,7 +3366,7 @@ pub fn provider_from_config(
     // of #817).
     if config.primitive == "clawk" {
         bail!(
-            "sandbox '{name}' has primitive 'clawk', which was removed; use local, docker, or microsandbox"
+            "sandbox '{name}' has primitive 'clawk', which was removed; use local, docker, microsandbox, or processcontainer"
         );
     }
     if !config.egress.is_empty()
@@ -3388,8 +3393,12 @@ pub fn provider_from_config(
             MicrosandboxProvider::from_config(name, config, mounts)?
                 .with_identity(identity.clone()),
         )),
+        "processcontainer" => Ok(std::sync::Arc::new(
+            processcontainer::ProcessContainerProvider::from_config(name, config, mounts)?
+                .with_identity(identity.clone()),
+        )),
         other => bail!(
-            "sandbox '{name}' has unknown primitive '{other}' (expected local, docker, or microsandbox)"
+            "sandbox '{name}' has unknown primitive '{other}' (expected local, docker, microsandbox, or processcontainer)"
         ),
     }
 }
