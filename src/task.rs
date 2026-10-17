@@ -101,6 +101,29 @@ pub struct TaskFrontmatter {
     pub bounds: TaskBounds,
     #[serde(default)]
     pub requires_user: bool,
+    /// Link to the issue-tracker work item this task mirrors. Absent ⇒ a plain
+    /// local task, behaviour unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalRef>,
+}
+
+/// Tracker-side handle of a task (`[[trackers]]` entry `backend`, native `id`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalRef {
+    /// Name of the `[[trackers]]` entry.
+    pub backend: String,
+    /// Tracker-native id (a string: GH `owner/repo#12`, Jira `ABC-12`).
+    pub id: String,
+    pub url: String,
+    /// Last revision seen (optimistic concurrency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<u64>,
+    /// Last status successfully pushed to the tracker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_status: Option<TaskStatus>,
+    /// Last push failure, retried on the next sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_error: Option<String>,
 }
 
 impl TaskFrontmatter {
@@ -132,6 +155,12 @@ impl TaskFrontmatter {
         fm.agent_session_ids.clear();
         fm.agent_session_logs.clear();
         fm.agent_resume_commands.clear();
+        // Keep backend/id/url; rev and sync bookkeeping are host-only.
+        if let Some(external) = fm.external.as_mut() {
+            external.rev = None;
+            external.synced_status = None;
+            external.sync_error = None;
+        }
         fm
     }
 }
@@ -812,6 +841,7 @@ pub fn create_task_with_egress(
             agent_resume_commands: vec![],
             allow_commands: vec![],
             requires_user: false,
+            external: None,
         },
         body: if let Some(desc) = description {
             format!("# {taskname}\n\n{desc}\n")
@@ -896,6 +926,14 @@ pub fn resolve_task_reference(config: &Config, task_ref: &Path) -> Result<PathBu
     let Some(task_ref) = task_ref.to_str() else {
         bail!("task reference is not valid UTF-8: {}", task_ref.display());
     };
+    // `<tracker>:<id>` (e.g. `azdo-adb:12345`): only when the prefix names a
+    // configured tracker, so other colon-bearing strings keep their old errors.
+    if let Some((backend, external_id)) = task_ref.split_once(':')
+        && config.trackers.iter().any(|t| t.name == backend)
+    {
+        return find_task_by_external(config, backend, external_id)?
+            .with_context(|| format!("no task found for tracker reference '{task_ref}'"));
+    }
     let id = task_ref.parse::<u64>().with_context(|| {
         format!("task reference '{task_ref}' is neither an existing path nor a numeric id")
     })?;
@@ -1218,6 +1256,66 @@ pub fn find_task_by_id(config: &Config, id: u64) -> Result<Option<PathBuf>> {
         Some(TaskIndexEntry::Duplicate) => bail!("multiple tasks found with id {id}"),
         None => Ok(None),
     }
+}
+
+/// Resolve a tracker-native id to its home task file via `external.{backend,id}`.
+/// The persistent id→path index is keyed by the local `u64` id only, so this is a
+/// full recursive scan of the task store (cost ∝ number of task files); it is
+/// meant for `varda task run <tracker>:<id>` and pull/import, not hot loops.
+/// Two tasks claiming the same external id is an error, never a silent pick.
+pub fn find_task_by_external(
+    config: &Config,
+    backend: &str,
+    id: &str,
+) -> Result<Option<PathBuf>> {
+    let task_dir = Path::new(&config.defaults.operations_dir).join("tasks");
+    if !task_dir.exists() {
+        return Ok(None);
+    }
+    let mut matches = Vec::new();
+    collect_external_matches(&task_dir, backend, id, &mut matches)?;
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => bail!("multiple tasks found for external id {backend}:{id}"),
+    }
+}
+
+fn collect_external_matches(
+    dir: &Path,
+    backend: &str,
+    id: &str,
+    matches: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("failed to read task directory {}", dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read task directory {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if file_type.is_dir() {
+            collect_external_matches(&path, backend, id, matches)?;
+            continue;
+        }
+        if path.extension().is_none_or(|extension| extension != "md") {
+            continue;
+        }
+        let Ok(task) = load_task(&path) else {
+            continue;
+        };
+        if task
+            .frontmatter
+            .external
+            .as_ref()
+            .is_some_and(|e| e.backend == backend && e.id == id)
+        {
+            matches.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// One id's resolution as discovered by a full-tree scan: either it maps to
@@ -1791,6 +1889,7 @@ Body.
                 agent_resume_commands: vec![],
                 allow_commands: vec![],
                 requires_user: false,
+                external: None,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
         };
@@ -1838,6 +1937,7 @@ Body.
                 agent_resume_commands: vec![],
                 allow_commands: vec![],
                 requires_user: false,
+                external: None,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
         };
@@ -1872,6 +1972,7 @@ Body.
                 agent_resume_commands: vec![],
                 allow_commands: vec![],
                 requires_user: false,
+                external: None,
             },
             body: body.to_owned(),
         }
@@ -2080,6 +2181,7 @@ Body.
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let project_path = Path::new("/work/project");
@@ -2140,6 +2242,7 @@ requires_user: false
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let path = create_task(&config, "Next Task", Path::new("/work/project"), None, None, None)
@@ -2178,6 +2281,7 @@ requires_user: false
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let first = create_task(&config, "Project Task", &first_project, None, None, None)
@@ -2209,6 +2313,7 @@ requires_user: false
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
@@ -2719,6 +2824,7 @@ requires_user: false
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let tasks = list_tasks(&config, &project_path).expect("tasks should list");
@@ -2768,6 +2874,7 @@ requires_user: false
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let resolved =
@@ -3266,5 +3373,93 @@ requires_user: false
         assert!(!reread.frontmatter.requires_user);
 
         fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    const EXTERNAL_TASK: &str = r#"---
+id: 9
+status: ready
+external:
+  backend: azdo-test
+  id: "12345"
+  url: https://dev.azure.com/o/p/_workitems/edit/12345
+  rev: 7
+  synced_status: review
+  sync_error: boom
+---
+
+# Ext
+"#;
+
+    #[test]
+    fn external_frontmatter_round_trips_and_is_skipped_when_absent() {
+        let task = parse_task(Path::new("t/ext.md"), EXTERNAL_TASK).expect("parse");
+        let ext = task.frontmatter.external.clone().expect("external");
+        assert_eq!(ext.id, "12345");
+        assert_eq!(ext.rev, Some(7));
+        assert_eq!(ext.synced_status, Some(TaskStatus::Review));
+        let yaml = serde_yaml::to_string(&task.frontmatter).expect("serialize");
+        let back: TaskFrontmatter = serde_yaml::from_str(&yaml).expect("reparse");
+        assert_eq!(back.external, Some(ext));
+
+        let plain = parse_task(Path::new("t/p.md"), "---\nid: 1\nstatus: ready\n---\n\n# P\n")
+            .expect("parse");
+        assert!(plain.frontmatter.external.is_none());
+        let yaml = serde_yaml::to_string(&plain.frontmatter).expect("serialize");
+        assert!(!yaml.contains("external"), "yaml: {yaml}");
+    }
+
+    #[test]
+    fn sanitized_for_prompt_keeps_external_identity_drops_sync_bookkeeping() {
+        let task = parse_task(Path::new("t/ext.md"), EXTERNAL_TASK).expect("parse");
+        let ext = task.frontmatter.sanitized_for_prompt().external.expect("kept");
+        assert_eq!(ext.backend, "azdo-test");
+        assert_eq!(ext.id, "12345");
+        assert!(ext.url.contains("12345"));
+        assert_eq!(ext.rev, None);
+        assert_eq!(ext.synced_status, None);
+        assert_eq!(ext.sync_error, None);
+    }
+
+    #[test]
+    fn resolves_tracker_colon_id_reference_via_external_id() {
+        let root = std::env::temp_dir().join(format!("varda-task-ext-{}", std::process::id()));
+        let task_dir = root.join("operations/tasks/proj");
+        fs::create_dir_all(&task_dir).expect("dir");
+        let path = task_dir.join("9-ext.md");
+        fs::write(&path, EXTERNAL_TASK).expect("write");
+        fs::write(
+            task_dir.join("10-other.md"),
+            EXTERNAL_TASK.replace("id: 9", "id: 10").replace("12345", "999"),
+        )
+        .expect("write");
+
+        let mut config = test_config(&root.join("operations"));
+        config.trackers.push(crate::config::TrackerConfig {
+            name: "azdo-test".to_owned(),
+            kind: crate::config::TrackerKind::Azdo,
+            project_path: "/p".to_owned(),
+            credential: crate::config::CredentialConfig {
+                from_env: Some("PAT".to_owned()),
+                ..Default::default()
+            },
+            filter: Default::default(),
+            status_map: Default::default(),
+            acknowledged: None,
+            extra: Default::default(),
+        });
+
+        let resolved = resolve_task_reference(&config, Path::new("azdo-test:12345")).expect("resolve");
+        assert_eq!(resolved, path);
+        assert_eq!(
+            find_task_by_external(&config, "azdo-test", "nope").expect("scan"),
+            None
+        );
+        let err = resolve_task_reference(&config, Path::new("azdo-test:nope")).unwrap_err();
+        assert!(format!("{err:#}").contains("no task found for tracker reference"));
+        // An unconfigured prefix keeps the old numeric-id error.
+        let err = resolve_task_reference(&config, Path::new("other:12345")).unwrap_err();
+        assert!(format!("{err:#}").contains("neither an existing path nor a numeric id"));
+
+        fs::remove_dir_all(root).ok();
     }
 }

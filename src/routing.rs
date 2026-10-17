@@ -447,6 +447,7 @@ mod tests {
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let route = match_route(&config, Path::new("/work/special/project"), None)
@@ -558,6 +559,7 @@ mod tests {
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let adb_route = match_route(
@@ -620,6 +622,7 @@ mod tests {
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let error = match_route(&config, Path::new("/work/project"), Some("claude"))
@@ -698,6 +701,7 @@ mod tests {
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),
@@ -719,6 +723,7 @@ mod tests {
                 agent_resume_commands: vec![],
                 allow_commands: vec![],
                 requires_user: false,
+                external: None,
             },
             body: "# Task\n\nDo it.".to_owned(),
         };
@@ -800,6 +805,7 @@ mod tests {
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
         let task = TaskDocument {
             path: Path::new("/tmp/task.md").to_path_buf(),
@@ -821,6 +827,7 @@ mod tests {
                 agent_resume_commands: vec![],
                 allow_commands: vec![],
                 requires_user: false,
+                external: None,
             },
             body: "# Task\n\nDo it.".to_owned(),
         };
