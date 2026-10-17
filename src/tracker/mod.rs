@@ -39,6 +39,9 @@ pub struct IssueDraft {
     pub body_markdown: String,
     pub tags: Vec<String>,
     pub assignee: Option<String>,
+    /// Backend work-item type (Azure DevOps: `Task`, `Bug`, ...); `None` ⇒ the
+    /// tracker's configured default.
+    pub work_item_type: Option<String>,
 }
 
 /// Tracker failures. A revision conflict is distinguished from every other
