@@ -7683,6 +7683,44 @@ agents = ["frag_agent"]
         }
     }
 
+    /// Regression: unescaped `k=v` concatenation made these two distinct
+    /// configurations fingerprint identically, so a pinned fragment could be
+    /// silently re-pinned.
+    #[test]
+    fn pinned_fragment_tracker_delimiter_collision_requires_approval() {
+        let frag = |project_path: &str, org: &str| {
+            format!(
+                "[[trackers]]\nname = \"t\"\nkind = \"azdo\"\nproject_path = {project_path:?}\n\
+                 organization = {org:?}\ncredential = {{ from_env = \"TOK\" }}\n"
+            )
+        };
+        let old = frag("/r organization=evil", "good");
+        let new = frag("/r", "evil organization=good");
+        let root = temp_dir("mismatch-tracker-collision");
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        let include_path = bundle_dir.join("frag.toml");
+        fs::write(&include_path, &new).unwrap();
+        let store = isolated_approval_store(&root);
+        store.store_approval(&include_path, &old).unwrap();
+        for context in [LaunchContext::Headless, LaunchContext::Sandboxed] {
+            let err = resolve_pin_mismatch_with(
+                &include_path,
+                "frag.toml",
+                &bundle_dir,
+                &new,
+                "deadbeef",
+                "cafef00d",
+                context,
+                || panic!("must not prompt"),
+                &store,
+            )
+            .expect_err("colliding tracker change must refuse, not re-pin");
+            assert!(format!("{err:#}").contains("REFUSED"));
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn tracker_capability_summary_reports_destination_and_credential() {
         let root = temp_dir("tracker-summary");
