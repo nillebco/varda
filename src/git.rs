@@ -421,7 +421,7 @@ fn tracked_paths(repo: &Path, rel_paths: &[String]) -> Result<Vec<String>> {
 // with the resident-side commit+merge step so the live orchestrate path never
 // regresses (isolated worktrees with no merge-back would strand worker changes).
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerCheckout {
     /// Host path of the clone (mount this rw into the worker's sandbox).
     pub path: PathBuf,
@@ -897,6 +897,52 @@ pub fn remove_worker_worktree(
     repo_root_for_path(mother_repo)?;
     std::fs::remove_dir_all(&checkout.path)
         .with_context(|| format!("failed to remove worker clone {}", checkout.path.display()))
+}
+
+/// Whether a worker clone holds nothing that would be lost by deleting it
+/// (#1239): its tree is clean (no tracked edits AND no untracked files — a
+/// worker's new files are untracked until the host commits them) and its
+/// `HEAD` commit is already contained in the mother's merge-back target (the
+/// recorded `target_branch`, else `target_head`, else the mother's `HEAD`).
+/// A no-op worker whose `HEAD` is still the base it was cloned from counts as
+/// integrated: nothing it produced is outstanding. A commit the mother has
+/// never fetched (the branch was never merged) is not an ancestor, so the
+/// clone is reported as NOT integrated. Root-run teardown deletes only clones
+/// for which this returns `Ok(true)`.
+pub fn worker_checkout_is_integrated(mother_repo: &Path, checkout: &WorkerCheckout) -> Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&checkout.path)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .context("failed to check worker clone status")?;
+    if !status.status.success() {
+        bail!(
+            "git status failed in worker clone {}; stderr: {}",
+            checkout.path.display(),
+            String::from_utf8_lossy(&status.stderr).trim()
+        );
+    }
+    if !String::from_utf8_lossy(&status.stdout).trim().is_empty() {
+        return Ok(false);
+    }
+
+    let worker_head = head_commit(&checkout.path)?;
+    let repo = repo_root_for_path(mother_repo)?;
+    let target = checkout
+        .target_branch
+        .clone()
+        .or_else(|| checkout.target_head.clone())
+        .unwrap_or_else(|| "HEAD".to_owned());
+    let ancestor = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["merge-base", "--is-ancestor", worker_head.as_str(), target.as_str()])
+        .output()
+        .context("failed to check whether the worker branch is integrated")?;
+    // Exit 0 = ancestor; 1 = not an ancestor; anything else (e.g. 128 for an
+    // object the mother never fetched) also means the work is not in the mother.
+    Ok(ancestor.status.success())
 }
 
 /// Dependency-manifest files among `files`, for the G5 gate: manifest and

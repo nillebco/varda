@@ -1750,12 +1750,40 @@ async fn finish_spawned_subtasks(
         // paths this launcher registered and makes repeated teardown harmless.
         // Only reclaimed on a SUCCESSFUL root run — on failure the checkouts are
         // left in place for a human to inspect/recover un-integrated work.
-        for checkout in worker_registry.drain() {
-            if let Err(error) = git::remove_worker_worktree(mother, &checkout, true) {
-                eprintln!(
-                    "warning: failed to remove worker checkout '{}' after root run: {error:#}",
-                    checkout.path.display()
-                );
+        //
+        // "Successful" includes a resident that settled at `needs_user` before
+        // integrating its workers, so a checkout is removed only when it is
+        // provably integrated (clean and its HEAD contained in the mother's
+        // target); anything else is kept and re-recorded so a relaunched resident
+        // can still integrate it (#1239 — this used to delete un-merged work).
+        for (id, checkout) in worker_registry.drain() {
+            match git::worker_checkout_is_integrated(mother, &checkout) {
+                Ok(true) => match git::remove_worker_worktree(mother, &checkout, true) {
+                    Ok(()) => worker_registry.forget(&id),
+                    Err(error) => {
+                        eprintln!(
+                            "warning: failed to remove worker checkout '{}' after root run: {error:#}",
+                            checkout.path.display()
+                        );
+                        worker_registry.record(id, checkout);
+                    }
+                },
+                Ok(false) => {
+                    eprintln!(
+                        "keeping un-integrated worker checkout for subtask {id}: {} (branch {})",
+                        checkout.path.display(),
+                        checkout.branch
+                    );
+                    worker_registry.record(id, checkout);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: keeping worker checkout for subtask {id} at '{}': could not \
+                         prove it is integrated: {error:#}",
+                        checkout.path.display()
+                    );
+                    worker_registry.record(id, checkout);
+                }
             }
         }
     } else {
@@ -2076,8 +2104,15 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
         // Shared worker registry: the launcher records each isolated worktree it
         // creates, and the broker's `integrate_subtasks` tool harvests them back
         // for the host-side merge. One instance threaded through both halves so
-        // they observe the same map.
-        let worker_registry = orchestration::WorkerRegistry::new();
+        // they observe the same map. Persisted under `<varda_home>/worktrees/` so
+        // a relaunched resident still sees a prior run's un-integrated workers
+        // (#1239).
+        let worker_registry = match config::varda_home() {
+            Ok(home) => {
+                orchestration::WorkerRegistry::persistent(home.join("worktrees").join("registry"))
+            }
+            Err(_) => orchestration::WorkerRegistry::new(),
+        };
         let launcher = VardaSubtaskLauncher {
             config: self.config.clone(),
             project_path: self.project_path.clone(),
@@ -7634,6 +7669,142 @@ deny_sandboxes = ["local"]
             registry.get("worker-1").is_some(),
             "registry must not be drained on a failed root run"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // #1239: a resident that settles `needs_user` before integrating counts as a
+    // successful root run; teardown must still keep every un-integrated worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_root_run_keeps_unintegrated_worker_checkouts() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-root-worker-keep-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        seed_git_repo(&mother);
+
+        // Uncommitted output (a new, untracked file) — the #1227 loss scenario.
+        let dirty = git::create_worker_worktree(&mother, "dirty", &root.join("dirty"))
+            .expect("dirty worker checkout should be created");
+        fs::write(dirty.path.join("new_module.rs"), "pub fn f() {}\n").unwrap();
+
+        // Committed on its wip branch but never merged into the mother.
+        let unmerged = git::create_worker_worktree(&mother, "unmerged", &root.join("unmerged"))
+            .expect("unmerged worker checkout should be created");
+        fs::write(unmerged.path.join("feature.txt"), "work\n").unwrap();
+        for args in [
+            vec!["add", "feature.txt"],
+            vec!["commit", "-q", "-m", "worker change"],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&unmerged.path)
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed in worker clone");
+        }
+
+        // No-op worker: clean and still at its base — safe to reclaim.
+        let noop = git::create_worker_worktree(&mother, "noop", &root.join("noop"))
+            .expect("noop worker checkout should be created");
+
+        let registry = orchestration::WorkerRegistry::new();
+        registry.record("dirty".to_owned(), dirty.clone());
+        registry.record("unmerged".to_owned(), unmerged.clone());
+        registry.record("noop".to_owned(), noop.clone());
+
+        finish_spawned_subtasks(
+            &orchestration::SharedSpawnState::new(),
+            &registry,
+            &mother,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(dirty.path.exists(), "uncommitted worker output must survive teardown");
+        assert!(unmerged.path.exists(), "unmerged worker branch must survive teardown");
+        assert!(!noop.path.exists(), "a no-op worker clone is reclaimed");
+        assert!(registry.get("dirty").is_some(), "kept checkout stays registered");
+        assert!(registry.get("unmerged").is_some(), "kept checkout stays registered");
+        assert!(registry.get("noop").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persistent_worker_registry_survives_a_new_instance() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-worker-registry-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        seed_git_repo(&mother);
+        let checkout = git::create_worker_worktree(&mother, "persisted", &root.join("w"))
+            .expect("worker checkout should be created");
+        let store = root.join("registry");
+
+        orchestration::WorkerRegistry::persistent(store.clone())
+            .record("1227".to_owned(), checkout.clone());
+
+        let reloaded = orchestration::WorkerRegistry::persistent(store.clone());
+        let found = reloaded.get("1227").expect("entry survives a relaunch");
+        assert_eq!(found.path, checkout.path);
+        assert_eq!(found.branch, checkout.branch);
+
+        // Entries whose clone vanished are dropped on load.
+        fs::remove_dir_all(&checkout.path).unwrap();
+        assert!(orchestration::WorkerRegistry::persistent(store).get("1227").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // A registry instance never tears down an entry it only LOADED from disk
+    // (possibly a concurrent resident's live worker), even one that looks
+    // reclaimable; and the kept entry's file survives teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_ignores_entries_another_run_owns() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-worker-registry-owner-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        seed_git_repo(&mother);
+        let store = root.join("registry");
+        let foreign = git::create_worker_worktree(&mother, "foreign", &root.join("foreign"))
+            .expect("worker checkout should be created");
+        let other_run = orchestration::WorkerRegistry::persistent(store.clone());
+        other_run.record("other".to_owned(), foreign.clone());
+
+        let this_run = orchestration::WorkerRegistry::persistent(store.clone());
+        finish_spawned_subtasks(
+            &orchestration::SharedSpawnState::new(),
+            &this_run,
+            &mother,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(foreign.path.exists(), "another run's clean worker must not be reclaimed");
+        assert!(store.join("other.json").exists(), "its registry entry must survive");
+
+        // The owning run reclaims it and drops the entry file.
+        finish_spawned_subtasks(
+            &orchestration::SharedSpawnState::new(),
+            &other_run,
+            &mother,
+            true,
+            true,
+        )
+        .await;
+        assert!(!foreign.path.exists());
+        assert!(!store.join("other.json").exists());
 
         let _ = fs::remove_dir_all(root);
     }
