@@ -24,6 +24,7 @@ mod routing;
 mod runner;
 mod sandbox;
 mod task;
+mod tracker;
 mod verify;
 
 use std::fs;
@@ -1307,6 +1308,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
             agent_resume_commands: vec![],
             allow_commands: vec![],
             requires_user: false,
+            external: None,
         },
         body: format!(
             "# Transform Execution Plan To JSON\n\nReturn only JSON using schema `varda.execution_plan.v1`.\n\nThe JSON shape is:\n\n```json\n{{\"schema\":\"varda.execution_plan.v1\",\"source_plan\":\"{}\",\"tasks\":[{{\"path\":\"/absolute/or/resolvable/task.md\",\"id\":1,\"title\":\"Task title\",\"agent\":\"codex\",\"project\":\"/project\",\"stage\":\"Stage 1\",\"parallel_group\":\"group-1\"}}]}}\n```\n\nInclude every task that should be executed from this plan. Omit optional fields when unknown.\n\nPlan markdown:\n\n{}",
@@ -5989,6 +5991,7 @@ mod tests {
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
@@ -6798,6 +6801,7 @@ planner_agent: codex
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
@@ -7904,6 +7908,7 @@ deny_sandboxes = ["local"]
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
@@ -8519,6 +8524,7 @@ deny_sandboxes = ["local"]
                 agent_resume_commands: vec![],
                 allow_commands: vec![],
                 requires_user: false,
+                external: None,
             },
             body: "# Task\n".to_owned(),
         }
@@ -8564,6 +8570,7 @@ deny_sandboxes = ["local"]
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let sessions = task_sessions(&config, &task_path).expect("sessions should be found");
@@ -8616,6 +8623,7 @@ Do it.
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         record_background_launch_failure(&config, &task_path, "agent binary was not found")

@@ -510,6 +510,7 @@ mod tests {
                     agent_resume_commands: vec![],
                     allow_commands: vec![],
                     requires_user: false,
+                    external: None,
                 },
                 body: "# Task".to_owned(),
                 timeout: Duration::from_secs(600),

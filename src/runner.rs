@@ -2928,6 +2928,7 @@ Help interactively.
             allow_commands: vec![],
             bounds: crate::task::TaskBounds::default(),
             requires_user: false,
+            external: None,
         }
     }
 
@@ -2980,6 +2981,7 @@ Help interactively.
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
