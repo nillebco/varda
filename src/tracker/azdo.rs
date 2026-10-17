@@ -16,12 +16,17 @@ use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{IssueDraft, IssueTracker, RemoteIssue, Result, TrackerError};
+use super::{IssueDraft, IssueTracker, RemoteIssue, Result, TrackerError, map_status};
 use crate::config::{TrackerConfig, TrackerFilter};
 use crate::task::TaskStatus;
 
 const API_VERSION: &str = "7.1";
 const BATCH_SIZE: usize = 200;
+const COMMENT_API_VERSION: &str = "7.1-preview.4";
+const PATCH_CONTENT_TYPE: &str = "application/json-patch+json";
+const DEFAULT_WORK_ITEM_TYPE: &str = "Task";
+/// Comments longer than this are truncated (with a note) before posting.
+const MAX_COMMENT_BYTES: usize = 100 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on the whole raw response (headers + body) read from the socket.
@@ -286,6 +291,9 @@ pub struct AzdoTracker {
     project: String,
     pat: String,
     transport: Arc<dyn Transport>,
+    /// Central tracker entry (status map, default work-item type); `None` for
+    /// trackers built with [`AzdoTracker::new`] alone, which cannot transition.
+    config: Option<TrackerConfig>,
 }
 
 impl AzdoTracker {
@@ -315,7 +323,14 @@ impl AzdoTracker {
             project,
             pat,
             Arc::new(StdHttpTransport),
-        ))
+        )
+        .with_config(config.clone()))
+    }
+
+    /// Attach the tracker entry that drives `transition` (status map) and `create`.
+    pub fn with_config(mut self, config: TrackerConfig) -> Self {
+        self.config = Some(config);
+        self
     }
 
     pub fn new(
@@ -331,6 +346,7 @@ impl AzdoTracker {
             project,
             pat,
             transport,
+            config: None,
         }
     }
 
@@ -345,6 +361,16 @@ impl AzdoTracker {
     }
 
     fn request(&self, method: &'static str, url: String, body: Option<Value>) -> HttpRequest {
+        self.request_as(method, url, body, "application/json")
+    }
+
+    fn request_as(
+        &self,
+        method: &'static str,
+        url: String,
+        body: Option<Value>,
+        content_type: &str,
+    ) -> HttpRequest {
         let mut headers = vec![
             (
                 "Authorization".to_owned(),
@@ -353,7 +379,7 @@ impl AzdoTracker {
             ("Accept".to_owned(), "application/json".to_owned()),
         ];
         if body.is_some() {
-            headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+            headers.push(("Content-Type".to_owned(), content_type.to_owned()));
         }
         HttpRequest {
             method,
@@ -408,6 +434,85 @@ impl AzdoTracker {
             }
         }
         Ok(issues)
+    }
+
+    fn work_item_url(&self, id: &str, suffix: &str) -> String {
+        format!(
+            "{}/{}/_apis/wit/workitems/{id}{suffix}",
+            self.base_url,
+            url_encode(&self.project)
+        )
+    }
+
+    /// JSON Patch against one work item. 409/412 (or a failed `test` op, which
+    /// Azure DevOps reports as 400) become [`TrackerError::Conflict`].
+    async fn patch_item(
+        &self,
+        id: &str,
+        ops: Vec<Value>,
+        expected_rev: Option<u64>,
+    ) -> Result<RemoteIssue> {
+        let url = format!("{}?api-version={API_VERSION}", self.work_item_url(id, ""));
+        let request = self.request_as("PATCH", url, Some(Value::Array(ops)), PATCH_CONTENT_TYPE);
+        let response = self.call(request).await?;
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        let lower = body.to_ascii_lowercase();
+        let test_failed = response.status == 400
+            && (lower.contains("testoperation") || lower.contains("jsonpatchtest"));
+        if matches!(response.status, 409 | 412) || test_failed {
+            return Err(TrackerError::Conflict {
+                id: id.to_owned(),
+                expected: expected_rev,
+                actual: None,
+            });
+        }
+        self.parse_item_response(response, &format!("work item {id}"))
+    }
+
+    fn parse_item_response(&self, response: HttpResponse, what: &str) -> Result<RemoteIssue> {
+        if response.status == 404 {
+            return Err(TrackerError::NotFound(what.to_owned()));
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(self.http_error(what, &response));
+        }
+        let value: Value = serde_json::from_slice(&response.body)
+            .with_context(|| format!("azdo {what}: response is not JSON"))?;
+        Ok(self.map_item(&value)?)
+    }
+
+    fn http_error(&self, what: &str, response: &HttpResponse) -> TrackerError {
+        let snippet: String = String::from_utf8_lossy(&response.body)
+            .chars()
+            .take(300)
+            .collect();
+        TrackerError::Other(anyhow!(redact(
+            &format!("azdo {what}: HTTP {}: {snippet}", response.status),
+            &self.pat
+        )))
+    }
+
+    /// State names of a work-item type, for `doctor`/`setup` validation of a
+    /// `status_map`.
+    pub async fn work_item_states(&self, work_item_type: &str) -> Result<Vec<String>> {
+        let url = self.api(
+            &format!("workitemtypes/{}/states", url_encode(work_item_type)),
+            "",
+        );
+        let value = self
+            .call_json(
+                self.request("GET", url, None),
+                &format!("work item type {work_item_type}"),
+            )
+            .await?;
+        let states = value
+            .get("value")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("azdo workitemtypes states: missing `value` array"))?;
+        Ok(states
+            .iter()
+            .filter_map(|s| s.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect())
     }
 
     fn map_item(&self, item: &Value) -> anyhow::Result<RemoteIssue> {
@@ -474,10 +579,6 @@ impl AzdoTracker {
     }
 }
 
-fn not_implemented(what: &str) -> TrackerError {
-    TrackerError::Other(anyhow!("azdo {what}: not implemented yet"))
-}
-
 #[async_trait]
 impl IssueTracker for AzdoTracker {
     fn name(&self) -> &str {
@@ -514,26 +615,197 @@ impl IssueTracker for AzdoTracker {
         Ok(self.map_item(&value)?)
     }
 
-    async fn create(&self, _draft: &IssueDraft) -> Result<RemoteIssue> {
-        Err(not_implemented("create"))
+    async fn create(&self, draft: &IssueDraft) -> Result<RemoteIssue> {
+        let work_item_type = draft
+            .work_item_type
+            .as_deref()
+            .or_else(|| {
+                self.config
+                    .as_ref()
+                    .and_then(|c| c.extra_str("work_item_type"))
+            })
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or(DEFAULT_WORK_ITEM_TYPE);
+        let mut ops = vec![
+            json!({"op": "add", "path": "/fields/System.Title", "value": draft.title}),
+            json!({"op": "add", "path": "/fields/System.Description",
+                   "value": markdown_to_html(&cap_markdown(&draft.body_markdown))}),
+        ];
+        if !draft.tags.is_empty() {
+            ops.push(json!({"op": "add", "path": "/fields/System.Tags",
+                            "value": draft.tags.join("; ")}));
+        }
+        if let Some(who) = draft.assignee.as_deref().filter(|w| !w.is_empty()) {
+            ops.push(json!({"op": "add", "path": "/fields/System.AssignedTo", "value": who}));
+        }
+        // `$` is the literal path marker before the type name.
+        let url = format!(
+            "{}/{}/_apis/wit/workitems/${}?api-version={API_VERSION}",
+            self.base_url,
+            url_encode(&self.project),
+            url_encode(work_item_type)
+        );
+        let request = self.request_as("POST", url, Some(Value::Array(ops)), PATCH_CONTENT_TYPE);
+        let response = self.call(request).await?;
+        self.parse_item_response(response, "create work item")
     }
 
     async fn transition(
         &self,
-        _id: &str,
-        _to: TaskStatus,
-        _expected_rev: Option<u64>,
+        id: &str,
+        to: TaskStatus,
+        expected_rev: Option<u64>,
     ) -> Result<RemoteIssue> {
-        Err(not_implemented("transition"))
+        let config = self.config.as_ref().ok_or_else(|| {
+            TrackerError::Other(anyhow!("azdo tracker '{}' has no config for transition", self.name))
+        })?;
+        let mapped = map_status(config, to);
+        let current = self.get(id).await?;
+        if let Some(expected) = expected_rev
+            && current.rev != expected
+        {
+            return Err(TrackerError::Conflict {
+                id: id.to_owned(),
+                expected: Some(expected),
+                actual: Some(current.rev),
+            });
+        }
+        // Only `varda:*` helper tags are touched; user tags keep their order.
+        let mut tags: Vec<String> = current
+            .tags
+            .iter()
+            .filter(|t| !mapped.remove_tags.iter().any(|r| r.eq_ignore_ascii_case(t)))
+            .cloned()
+            .collect();
+        for tag in &mapped.add_tags {
+            if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                tags.push(tag.clone());
+            }
+        }
+        let mut ops = Vec::new();
+        if let Some(rev) = expected_rev {
+            ops.push(json!({"op": "test", "path": "/rev", "value": rev}));
+        }
+        if let Some(state) = &mapped.state {
+            ops.push(json!({"op": "add", "path": "/fields/System.State", "value": state}));
+        }
+        if tags != current.tags {
+            ops.push(json!({"op": "add", "path": "/fields/System.Tags", "value": tags.join("; ")}));
+        }
+        if ops.iter().all(|op| op["op"] == "test") {
+            return Ok(current);
+        }
+        self.patch_item(id, ops, expected_rev).await
     }
 
-    async fn comment(&self, _id: &str, _markdown: &str) -> Result<()> {
-        Err(not_implemented("comment"))
+    async fn comment(&self, id: &str, markdown: &str) -> Result<()> {
+        check_id(id)?;
+        let markdown = cap_markdown(markdown);
+        let base = format!(
+            "{}/{}/_apis/wit/workItems/{id}/comments",
+            self.base_url,
+            url_encode(&self.project)
+        );
+        let md_url = format!("{base}?format=markdown&api-version={COMMENT_API_VERSION}");
+        let body = json!({ "text": markdown });
+        let response = self.call(self.request("POST", md_url, Some(body))).await?;
+        let response = if response.status == 400 {
+            // Org rejects `format=markdown`: post HTML (the default format).
+            let url = format!("{base}?api-version={COMMENT_API_VERSION}");
+            let body = json!({ "text": markdown_to_html(&markdown) });
+            self.call(self.request("POST", url, Some(body))).await?
+        } else {
+            response
+        };
+        if response.status == 404 {
+            return Err(TrackerError::NotFound(id.to_owned()));
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(self.http_error(&format!("comment on {id}"), &response));
+        }
+        Ok(())
     }
 
-    async fn assign(&self, _id: &str, _who: Option<&str>) -> Result<()> {
-        Err(not_implemented("assign"))
+    async fn assign(&self, id: &str, who: Option<&str>) -> Result<()> {
+        check_id(id)?;
+        let op = match who {
+            Some(who) => json!({"op": "add", "path": "/fields/System.AssignedTo", "value": who}),
+            None => json!({"op": "remove", "path": "/fields/System.AssignedTo"}),
+        };
+        self.patch_item(id, vec![op], None).await.map(|_| ())
     }
+}
+
+fn check_id(id: &str) -> Result<()> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(TrackerError::NotFound(id.to_owned()));
+    }
+    Ok(())
+}
+
+/// Truncate to [`MAX_COMMENT_BYTES`] on a char boundary, appending a note.
+fn cap_markdown(markdown: &str) -> String {
+    if markdown.len() <= MAX_COMMENT_BYTES {
+        return markdown.to_owned();
+    }
+    let mut end = MAX_COMMENT_BYTES;
+    while !markdown.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n\n_[truncated by Varda: comment exceeded 100 KB]_", &markdown[..end])
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Minimal markdown → HTML for the no-`format=markdown` fallback: everything
+/// is escaped; fenced blocks become `<pre><code>`, blank-line separated runs
+/// become `<p>` with `<br>` between lines. Inline markup is left as text.
+fn markdown_to_html(markdown: &str) -> String {
+    let mut out = String::new();
+    let mut para: Vec<String> = Vec::new();
+    let mut code: Option<Vec<&str>> = None;
+    fn flush(out: &mut String, para: &mut Vec<String>) {
+        if !para.is_empty() {
+            out.push_str("<p>");
+            out.push_str(&para.join("<br>"));
+            out.push_str("</p>");
+            para.clear();
+        }
+    }
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            match code.take() {
+                Some(lines) => {
+                    out.push_str("<pre><code>");
+                    out.push_str(&html_escape(&lines.join("\n")));
+                    out.push_str("</code></pre>");
+                }
+                None => {
+                    flush(&mut out, &mut para);
+                    code = Some(Vec::new());
+                }
+            }
+        } else if let Some(lines) = code.as_mut() {
+            lines.push(line);
+        } else if line.trim().is_empty() {
+            flush(&mut out, &mut para);
+        } else {
+            para.push(html_escape(line));
+        }
+    }
+    if let Some(lines) = code {
+        // Unterminated fence: still render what we have.
+        out.push_str("<pre><code>");
+        out.push_str(&html_escape(&lines.join("\n")));
+        out.push_str("</code></pre>");
+    }
+    flush(&mut out, &mut para);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,13 +1394,205 @@ mod tests {
         assert!(!text.contains("s3cret-pat"), "{text}");
     }
 
+    fn agile_tracker(base: &str) -> AzdoTracker {
+        let mut config = TrackerConfig {
+            name: "azdo".to_owned(),
+            kind: crate::config::TrackerKind::Azdo,
+            project_path: "/tmp/p".to_owned(),
+            credential: Default::default(),
+            filter: TrackerFilter::default(),
+            status_map: super::super::status_map_from(super::super::AZDO_AGILE_STATUS_MAP),
+            acknowledged: None,
+            extra: BTreeMap::new(),
+        };
+        config.extra.insert("project".to_owned(), "My Project".to_owned());
+        tracker(base).with_config(config)
+    }
+
+    fn item_json(index: usize) -> String {
+        serde_json::from_str::<Value>(BATCH_FIXTURE).unwrap()["value"][index].to_string()
+    }
+
+    fn body_of(raw: &str) -> Value {
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
     #[tokio::test]
-    async fn write_methods_are_not_implemented() {
-        let t = tracker("http://127.0.0.1:1");
-        assert_eq!(t.name(), "azdo");
-        let err = t.comment("1", "x").await.unwrap_err();
-        assert!(err.to_string().contains("not implemented yet"));
-        assert!(t.create(&IssueDraft::default()).await.is_err());
+    async fn transition_patches_state_and_recomputed_tags_with_rev_test() {
+        // Item 101 (rev 7): tags "varda; backend; varda:ready".
+        let (base, seen) = fake_server(vec![
+            (200, vec![], item_json(0)),
+            (200, vec![], item_json(0)),
+        ]);
+        let t = agile_tracker(&base);
+        let updated = t.transition("101", TaskStatus::NeedsUser, Some(7)).await.unwrap();
+        assert_eq!(updated.id, "101");
+        let requests = seen.lock().unwrap();
+        assert!(requests[0].starts_with("GET /My%20Project/_apis/wit/workitems/101?"));
+        assert!(requests[1].starts_with("PATCH /My%20Project/_apis/wit/workitems/101?api-version=7.1 "));
+        assert!(requests[1].contains("Content-Type: application/json-patch+json"), "{}", requests[1]);
+        let ops = body_of(&requests[1]);
+        assert_eq!(ops[0], json!({"op": "test", "path": "/rev", "value": 7}));
+        assert_eq!(ops[1], json!({"op": "add", "path": "/fields/System.State", "value": "Active"}));
+        // user tags kept, stale varda:ready dropped, new helper added
+        assert_eq!(
+            ops[2],
+            json!({"op": "add", "path": "/fields/System.Tags", "value": "varda; backend; varda:needs-user"})
+        );
+    }
+
+    #[tokio::test]
+    async fn transition_without_expected_rev_has_no_test_op() {
+        let (base, seen) = fake_server(vec![(200, vec![], item_json(0)), (200, vec![], item_json(0))]);
+        agile_tracker(&base).transition("101", TaskStatus::Done, None).await.unwrap();
+        let ops = body_of(&seen.lock().unwrap()[1]);
+        assert_eq!(ops[0]["path"], "/fields/System.State");
+        assert_eq!(ops[0]["value"], "Closed");
+        assert!(ops.as_array().unwrap().iter().all(|o| o["op"] != "test"));
+    }
+
+    #[tokio::test]
+    async fn transition_conflict_paths() {
+        // stale rev detected on the pre-read: no PATCH is sent
+        let (base, seen) = fake_server(vec![(200, vec![], item_json(0))]);
+        let err = agile_tracker(&base)
+            .transition("101", TaskStatus::Done, Some(3))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrackerError::Conflict { expected: Some(3), actual: Some(7), .. }), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // 412 and 409 and 400-with-failed-test on the PATCH
+        for (status, body) in [
+            (412, "{}"),
+            (409, "{}"),
+            (400, r#"{"typeKey":"JsonPatchTestOperationFailedException"}"#),
+        ] {
+            let (base, _) = fake_server(vec![
+                (200, vec![], item_json(0)),
+                (status, vec![], body.to_owned()),
+            ]);
+            let err = agile_tracker(&base)
+                .transition("101", TaskStatus::Done, Some(7))
+                .await
+                .unwrap_err();
+            assert!(err.is_conflict(), "{status}: {err}");
+        }
+
+        // other failures are not conflicts
+        let (base, _) = fake_server(vec![(200, vec![], item_json(0)), (500, vec![], "boom".to_owned())]);
+        let err = agile_tracker(&base).transition("101", TaskStatus::Done, None).await.unwrap_err();
+        assert!(!err.is_conflict() && err.to_string().contains("HTTP 500"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn transition_requires_config() {
+        let err = tracker("http://127.0.0.1:1")
+            .transition("1", TaskStatus::Done, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no config"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn comment_posts_markdown() {
+        let (base, seen) = fake_server(vec![(200, vec![], "{}".to_owned())]);
+        tracker(&base).comment("101", "hello **x**").await.unwrap();
+        let requests = seen.lock().unwrap();
+        assert!(requests[0].starts_with(
+            "POST /My%20Project/_apis/wit/workItems/101/comments?format=markdown&api-version=7.1-preview.4 "
+        ), "{}", requests[0]);
+        assert_eq!(body_of(&requests[0]), json!({"text": "hello **x**"}));
+    }
+
+    #[tokio::test]
+    async fn comment_falls_back_to_html_on_400() {
+        let (base, seen) = fake_server(vec![
+            (400, vec![], "no markdown".to_owned()),
+            (200, vec![], "{}".to_owned()),
+        ]);
+        tracker(&base)
+            .comment("101", "a <b> & c\nline2\n\n```\nlet x = 1 < 2;\n```")
+            .await
+            .unwrap();
+        let requests = seen.lock().unwrap();
+        assert!(requests[1].starts_with("POST /My%20Project/_apis/wit/workItems/101/comments?api-version=7.1-preview.4 "), "{}", requests[1]);
+        assert_eq!(
+            body_of(&requests[1])["text"],
+            "<p>a &lt;b&gt; &amp; c<br>line2</p><pre><code>let x = 1 &lt; 2;</code></pre>"
+        );
+
+        // a second 400 is an error, and 404 is NotFound
+        let (base, _) = fake_server(vec![(400, vec![], "x".to_owned()), (400, vec![], "y".to_owned())]);
+        assert!(tracker(&base).comment("1", "m").await.is_err());
+        let (base, _) = fake_server(vec![(404, vec![], "{}".to_owned())]);
+        assert!(matches!(tracker(&base).comment("1", "m").await, Err(TrackerError::NotFound(_))));
+    }
+
+    #[test]
+    fn long_comments_are_truncated_on_a_char_boundary() {
+        let long = "é".repeat(MAX_COMMENT_BYTES); // 2 bytes each
+        let capped = cap_markdown(&long);
+        assert!(capped.len() < MAX_COMMENT_BYTES + 100);
+        assert!(capped.contains("truncated by Varda"));
+        assert_eq!(cap_markdown("short"), "short");
+    }
+
+    #[tokio::test]
+    async fn assign_sets_and_removes() {
+        let (base, seen) = fake_server(vec![(200, vec![], item_json(0)), (200, vec![], item_json(0))]);
+        let t = tracker(&base);
+        t.assign("101", Some("ada@acme.example")).await.unwrap();
+        t.assign("101", None).await.unwrap();
+        let requests = seen.lock().unwrap();
+        assert_eq!(
+            body_of(&requests[0]),
+            json!([{"op": "add", "path": "/fields/System.AssignedTo", "value": "ada@acme.example"}])
+        );
+        assert_eq!(
+            body_of(&requests[1]),
+            json!([{"op": "remove", "path": "/fields/System.AssignedTo"}])
+        );
+        assert!(requests[0].contains("application/json-patch+json"));
+        assert!(matches!(t.assign("../x", None).await, Err(TrackerError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn create_posts_typed_patch_with_html_description_and_tags() {
+        let (base, seen) = fake_server(vec![(200, vec![], item_json(0)), (200, vec![], item_json(0))]);
+        let t = agile_tracker(&base);
+        let draft = IssueDraft {
+            title: "T".to_owned(),
+            body_markdown: "x < y".to_owned(),
+            tags: vec!["varda".to_owned(), "a".to_owned()],
+            assignee: Some("me".to_owned()),
+            work_item_type: None,
+        };
+        let created = t.create(&draft).await.unwrap();
+        assert_eq!(created.id, "101");
+        t.create(&IssueDraft { work_item_type: Some("User Story".to_owned()), ..draft })
+            .await
+            .unwrap();
+        let requests = seen.lock().unwrap();
+        assert!(requests[0].starts_with("POST /My%20Project/_apis/wit/workitems/$Task?api-version=7.1 "), "{}", requests[0]);
+        assert!(requests[1].starts_with("POST /My%20Project/_apis/wit/workitems/$User%20Story?"), "{}", requests[1]);
+        assert!(requests[0].contains("application/json-patch+json"));
+        let ops = body_of(&requests[0]);
+        assert_eq!(ops[0]["value"], "T");
+        assert_eq!(ops[1]["value"], "<p>x &lt; y</p>");
+        assert_eq!(ops[2]["value"], "varda; a");
+        assert_eq!(ops[3]["path"], "/fields/System.AssignedTo");
+    }
+
+    #[tokio::test]
+    async fn work_item_states_lists_names() {
+        let body = r#"{"count":2,"value":[{"name":"New","category":"Proposed"},{"name":"Active"}]}"#;
+        let (base, seen) = fake_server(vec![(200, vec![], body.to_owned())]);
+        let states = tracker(&base).work_item_states("User Story").await.unwrap();
+        assert_eq!(states, vec!["New", "Active"]);
+        assert!(seen.lock().unwrap()[0].starts_with(
+            "GET /My%20Project/_apis/wit/workitemtypes/User%20Story/states?api-version=7.1 "
+        ));
     }
 
     #[test]
