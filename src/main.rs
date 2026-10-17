@@ -96,6 +96,11 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    /// Issue-tracker integration: list trackers, pull work items as tasks.
+    Tracker {
+        #[command(subcommand)]
+        command: TrackerCommand,
+    },
     /// Launch the self-hosting orchestrator: run the RESIDENT as a sandboxed
     /// interactive agent with the spawn broker wired, so Varda can drive its own
     /// dev loop. The loop logic lives in the workspace's `.varda/WORKFLOW.md`; this
@@ -404,6 +409,21 @@ enum ProjectCommand {
         #[arg(long)]
         into: PathBuf,
         /// Preview what would move without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TrackerCommand {
+    /// List configured trackers with an authentication check for each.
+    List,
+    /// Import tracker work items as tasks (idempotent).
+    Pull {
+        /// Only pull this tracker.
+        #[arg(long, value_name = "NAME")]
+        tracker: Option<String>,
+        /// Print what would happen and write nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -815,6 +835,16 @@ async fn run_cli() -> Result<()> {
                 }
             }
         },
+        Command::Tracker { command } => {
+            let config_path = config::config_file()?;
+            let config = config::load_config(&config_path)?;
+            match command {
+                TrackerCommand::List => tracker::sync::list_command(&config).await?,
+                TrackerCommand::Pull { tracker, dry_run } => {
+                    tracker::sync::pull_command(&config, tracker.as_deref(), dry_run).await?
+                }
+            }
+        }
         Command::Skill { command } => match command {
             SkillCommand::Install { source, link } => {
                 skill_install_command(source.as_deref(), link)?;

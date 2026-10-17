@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod azdo;
+pub mod sync;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -104,6 +105,11 @@ pub trait IssueTracker: Send + Sync {
     ) -> Result<RemoteIssue>;
     async fn comment(&self, id: &str, markdown: &str) -> Result<()>;
     async fn assign(&self, id: &str, who: Option<&str>) -> Result<()>;
+    /// Cheap authenticated call proving the credential works (`tracker list`).
+    /// Backends without a dedicated endpoint accept by default.
+    async fn check_auth(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Build the backend for a (central-config) `[[trackers]]` entry, resolving its

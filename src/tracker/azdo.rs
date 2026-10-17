@@ -534,6 +534,12 @@ impl IssueTracker for AzdoTracker {
     async fn assign(&self, _id: &str, _who: Option<&str>) -> Result<()> {
         Err(not_implemented("assign"))
     }
+
+    async fn check_auth(&self) -> Result<()> {
+        let url = format!("{}/_apis/connectionData?api-version={API_VERSION}-preview", self.base_url);
+        let request = self.request("GET", url, None);
+        self.call_json(request, "connectionData").await.map(|_| ())
+    }
 }
 
 // ---------------------------------------------------------------------------
