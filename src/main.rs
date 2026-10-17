@@ -15,6 +15,7 @@ mod capability;
 mod config;
 mod config_approval;
 mod doctor;
+mod host_doctor;
 mod git;
 mod mcp_transport;
 mod notify;
@@ -71,6 +72,9 @@ enum Command {
     },
     /// Create a reviewable execution plan for ready tasks.
     Plan,
+    /// Check which isolation backends (docker, podman, microsandbox,
+    /// processcontainer) work on this host, and whether every configured sandbox can run.
+    Doctor,
     /// Manage Varda configuration.
     Config {
         #[command(subcommand)]
@@ -439,6 +443,9 @@ async fn run_cli() -> Result<()> {
         }
         Command::Plan => {
             plan_command()?;
+        }
+        Command::Doctor => {
+            host_doctor::doctor_host_command().await?;
         }
         Command::Config { command } => match command {
             ConfigCommand::Edit => {
