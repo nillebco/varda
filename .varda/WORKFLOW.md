@@ -349,14 +349,15 @@ was learned by getting it wrong first.
   its single clean sample that the restriction was "not real" and that a recurring
   identical count is a fabrication signal — that conclusion is wrong: later samples
   reproduced the same restriction for real, so a lone clean run cannot generalize to
-  "never happens." The honest read is **per-spawn variance**: some `sandbox: worker`
-  instances land with this restriction — specifically affecting socket/listener creation
-  and writes under `/home/agent` — and others don't. This is not explained by
-  implementer/reviewer role selection: `resolve_sandbox_for` in `src/config.rs` takes no
-  role parameter. That check only rules out role selection as the cause, not any other
-  code or provisioning path — the actual root cause (host resource contention, a flaky
-  provisioning step, a setup race, or something else) is still OPEN and worth its own
-  investigation. What IS actionable today: always get the LITERAL failing test names and
+  "never happens." It looked like per-spawn variance, but the root cause is the
+  **agent** (#1132): every restricted run was `assignee: codex`, every clean run
+  `claude-worker`. `[agents.codex]` launches `codex exec --sandbox workspace-write`
+  INSIDE the msb box, and codex's own sandbox writes only to the workdir, `/tmp` and
+  `$TMPDIR` and blocks sockets via seccomp — exactly the read-only `/home/agent/.varda`
+  and `Operation not permitted` pair. Worktree vs mother checkout is irrelevant (the
+  clean post-merge checks also ran in `wip-task-*` worktrees). Until codex's nested
+  sandbox is relaxed inside msb, do not trust codex's `cargo test` counts; route test
+  verification to `claude-worker` or the host. Still: always get the LITERAL failing test names and
   error output, never accept a rounded-off "N failed, environment-restricted" summary — a
   report lacking that literal detail is lower-trust because it can't be checked, not
   because it's assumed fabricated. Re-running on the HOST (or an independent sandbox)
