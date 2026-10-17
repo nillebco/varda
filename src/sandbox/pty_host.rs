@@ -13,6 +13,9 @@
 //! [`resize_sequence`] into the container's stdin and `pty-host` strips it out
 //! ([`ResizeFilter`]) and calls `ResizePseudoConsole`.
 
+// The pure helpers are exercised by tests on every OS but only wired in on Windows.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 /// In-band resize request: `ESC ] 9999 ; varda-resize ; ROWS ; COLS BEL`.
 /// An OSC with a private number, so a stray copy reaching a terminal is ignored.
 const RESIZE_PREFIX: &[u8] = b"\x1b]9999;varda-resize;";

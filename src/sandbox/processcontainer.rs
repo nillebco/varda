@@ -616,12 +616,14 @@ impl SandboxSession for ProcessContainerSession {
 }
 
 /// Hidden CLI subcommand run INSIDE the container for interactive launches.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const PTY_HOST_SUBCOMMAND: &str = "pty-host";
 
 /// Rewrite an interactive request so the container runs
 /// `varda pty-host --rows R --cols C --command-line <original>` (the same
 /// varda executable, made readable inside the container) instead of the agent
 /// directly. See [`super::pty_host`].
+#[cfg_attr(not(windows), allow(dead_code))]
 fn wrap_for_pty_host(
     mxc: &mut serde_json::Value,
     exe: &Path,
