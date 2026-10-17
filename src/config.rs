@@ -718,6 +718,11 @@ pub struct SandboxConfig {
     /// (shared kernel) or an own-kernel microVM.
     #[serde(default = "default_primitive")]
     pub primitive: String,
+    /// Container engine CLI for the `docker` primitive: `"docker"` (default) or
+    /// `"podman"`. Podman's CLI is docker-compatible for everything varda runs
+    /// (create/cp/start/network/volume); ignored for other primitives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<String>,
     /// Trusted image-intrinsic static, non-secret environment variables.
@@ -1127,6 +1132,7 @@ impl Default for SandboxConfig {
             build: None,
             image_from: None,
             primitive: default_primitive(),
+            engine: None,
             mounts: Vec::new(),
             env: BTreeMap::new(),
             egress: Vec::new(),
@@ -2476,6 +2482,7 @@ pub(crate) const SANDBOX_CONFIG_FIELDS: &[&str] = &[
     "build",
     "image_from",
     "primitive",
+    "engine",
     "mounts",
     "env",
     "egress",

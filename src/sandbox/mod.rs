@@ -990,6 +990,8 @@ impl SandboxSession for LocalSession {
 /// only reachable network hosts are an explicit egress allow-list.
 pub struct DockerProvider {
     name: String,
+    /// Container engine CLI (`docker` or `podman`), see [`SandboxConfig::engine`].
+    engine: String,
     /// A pre-existing image tag/reference. `None` when `build` is set.
     image: Option<String>,
     /// Path to a Dockerfile to build at `prepare()`. Takes precedence over
@@ -1030,6 +1032,28 @@ pub struct DockerProvider {
 /// default-denies and allow-lists exactly the declared egress hosts. Override per
 /// sandbox with `egress_proxy_image`.
 pub const DEFAULT_EGRESS_PROXY_IMAGE: &str = "vimagick/tinyproxy";
+
+/// Container engine CLI used by the `docker` primitive when `engine` is unset.
+pub const DEFAULT_DOCKER_ENGINE: &str = "docker";
+
+/// Docker-compatible engine CLIs the `docker` primitive can drive.
+pub const DOCKER_ENGINES: &[&str] = &["docker", "podman"];
+
+/// Resolve and validate a docker-primitive sandbox's `engine`.
+pub fn docker_engine(name: &str, config: &SandboxConfig) -> Result<String> {
+    let engine = config
+        .engine
+        .as_deref()
+        .filter(|engine| !engine.is_empty())
+        .unwrap_or(DEFAULT_DOCKER_ENGINE);
+    if !DOCKER_ENGINES.contains(&engine) {
+        bail!(
+            "sandbox '{name}' has unknown engine '{engine}' (expected {})",
+            DOCKER_ENGINES.join(" or ")
+        );
+    }
+    Ok(engine.to_owned())
+}
 
 /// In-container port the forward proxy listens on, and its network alias on the
 /// internal docker network. The sandbox reaches it via `http://<alias>:<port>`.
@@ -1077,8 +1101,10 @@ impl DockerProvider {
                  primitive; ignoring it for docker"
             );
         }
+        let engine = docker_engine(name, config)?;
         Ok(Self {
             name: name.to_owned(),
+            engine,
             image,
             build,
             image_from,
@@ -1106,7 +1132,9 @@ impl DockerProvider {
     async fn resolve_image(&self, project_root: &Path) -> Result<String> {
         if let Some(source) = &self.image_from {
             return match source.as_str() {
-                "devcontainer" => resolve_devcontainer_image(&self.name, project_root).await,
+                "devcontainer" => {
+                    resolve_devcontainer_image(&self.engine, &self.name, project_root).await
+                }
                 other => bail!(
                     "sandbox '{}' has unknown `image_from = \"{other}\"` (expected \"devcontainer\")",
                     self.name
@@ -1114,7 +1142,7 @@ impl DockerProvider {
             };
         }
         if let Some(build) = &self.build {
-            return build_image(&self.name, build).await;
+            return build_image(&self.engine, &self.name, build).await;
         }
         self.image
             .clone()
@@ -1125,6 +1153,7 @@ impl DockerProvider {
     fn new_for_test(name: &str, image: &str, mounts: &[&str], egress: &[&str]) -> Self {
         Self {
             name: name.to_owned(),
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: Some(image.to_owned()),
             build: None,
             image_from: None,
@@ -1147,13 +1176,13 @@ impl DockerProvider {
 /// The tag encodes a hash of the Dockerfile's contents, so an unchanged
 /// Dockerfile reuses the cached image (we skip the build when the tag already
 /// exists locally). The build context is the Dockerfile's parent directory.
-async fn build_image(name: &str, dockerfile: &str) -> Result<String> {
+async fn build_image(engine: &str, name: &str, dockerfile: &str) -> Result<String> {
     let context_dir = Path::new(dockerfile)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    build_image_with_context(name, Path::new(dockerfile), &context_dir).await
+    build_image_with_context(engine, name, Path::new(dockerfile), &context_dir).await
 }
 
 /// Build `dockerfile` with an explicit build `context_dir` and return a
@@ -1162,6 +1191,7 @@ async fn build_image(name: &str, dockerfile: &str) -> Result<String> {
 /// (context taken from `build.context`, which may differ from the Dockerfile's
 /// directory).
 async fn build_image_with_context(
+    engine: &str,
     name: &str,
     dockerfile: &Path,
     context_dir: &Path,
@@ -1180,7 +1210,7 @@ async fn build_image_with_context(
     let dockerfile = dockerfile_str.clone();
 
     // Skip the build when an image with this content-addressed tag already exists.
-    let exists = tokio::process::Command::new("docker")
+    let exists = tokio::process::Command::new(engine)
         .args(["image", "inspect", &tag])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1192,7 +1222,7 @@ async fn build_image_with_context(
         return Ok(tag);
     }
 
-    let output = tokio::process::Command::new("docker")
+    let output = tokio::process::Command::new(engine)
         .arg("build")
         .arg("-q")
         .arg("-t")
@@ -1249,7 +1279,11 @@ struct DevcontainerBuild {
 /// devcontainer.json are ignored — varda retains sole control over mounts,
 /// egress, and credentials (M2/M3 hardening). The resulting image feeds the
 /// SAME DockerProvider run path as a plain `image`/`build` sandbox.
-async fn resolve_devcontainer_image(name: &str, project_root: &Path) -> Result<String> {
+async fn resolve_devcontainer_image(
+    engine: &str,
+    name: &str,
+    project_root: &Path,
+) -> Result<String> {
     let (json_path, base_dir) = discover_devcontainer(project_root).with_context(|| {
         format!(
             "sandbox '{name}' uses `image_from = \"devcontainer\"` but no devcontainer.json was found under {}",
@@ -1284,7 +1318,7 @@ async fn resolve_devcontainer_image(name: &str, project_root: &Path) -> Result<S
         }
         let dockerfile_path = base_dir.join(&dockerfile);
         let context_dir = base_dir.join(build.context.as_deref().unwrap_or("."));
-        return build_image_with_context(name, &dockerfile_path, &context_dir).await;
+        return build_image_with_context(engine, name, &dockerfile_path, &context_dir).await;
     }
     bail!(
         "devcontainer.json at {} declares neither an `image` nor a `build.dockerfile` \
@@ -1489,6 +1523,7 @@ impl SandboxProvider for DockerProvider {
         // exists. Teardown removes both (best-effort, idempotent by name).
         if !egress_hosts.is_empty() {
             setup_egress_proxy(
+                &self.engine,
                 &handle,
                 &egress_hosts,
                 &self.egress_proxy_image,
@@ -1497,6 +1532,7 @@ impl SandboxProvider for DockerProvider {
             .await?;
         }
         Ok(Box::new(DockerSession {
+            engine: self.engine.clone(),
             image,
             project_root: ctx.project_root.to_path_buf(),
             mounts: mounts_with_project_varda(
@@ -1653,6 +1689,7 @@ fn tinyproxy_conf(hosts: &[String]) -> String {
 /// Idempotent by name: re-running `network create`/`run` for an existing resource
 /// is tolerated. Best-effort mirror in [`DockerSession::teardown`].
 async fn setup_egress_proxy(
+    engine: &str,
     handle: &str,
     hosts: &[String],
     image: &str,
@@ -1661,7 +1698,7 @@ async fn setup_egress_proxy(
     let network = egress_proxy_network(handle);
     let container = egress_proxy_container(handle);
     // 1. Internal network: containers on it have NO default route to the internet.
-    let out = tokio::process::Command::new("docker")
+    let out = tokio::process::Command::new(engine)
         .args(["network", "create", "--internal", &network])
         .output()
         .await
@@ -1683,7 +1720,7 @@ async fn setup_egress_proxy(
     std::fs::write(cfg_dir.join("filter"), tinyproxy_filter(hosts))
         .with_context(|| "failed to write proxy filter".to_string())?;
     // 2a. CREATE (not run) the proxy so the config can be copied in before it starts.
-    let out = tokio::process::Command::new("docker")
+    let out = tokio::process::Command::new(engine)
         .args([
             "create",
             "--rm",
@@ -1711,7 +1748,7 @@ async fn setup_egress_proxy(
     // 2b. Copy the config+filter INTO the created container (daemon API stream — works
     //     on a VM-backed daemon that does not share `~/.varda`; a bind mount does not).
     let cp_dest = format!("{container}:/etc/varda-proxy");
-    let out = tokio::process::Command::new("docker")
+    let out = tokio::process::Command::new(engine)
         .args(["cp", &cfg_dir.display().to_string(), &cp_dest])
         .output()
         .await
@@ -1723,7 +1760,7 @@ async fn setup_egress_proxy(
         );
     }
     // 3. Give the proxy — and only the proxy — a route to the internet.
-    let out = tokio::process::Command::new("docker")
+    let out = tokio::process::Command::new(engine)
         .args(["network", "connect", "bridge", &container])
         .output()
         .await
@@ -1735,7 +1772,7 @@ async fn setup_egress_proxy(
         );
     }
     // 4. Start it now that the config is in place and both networks are attached.
-    let out = tokio::process::Command::new("docker")
+    let out = tokio::process::Command::new(engine)
         .args(["start", &container])
         .output()
         .await
@@ -1749,13 +1786,13 @@ async fn setup_egress_proxy(
     // The sandbox's ONLY route out is this proxy, so a proxy that exits immediately
     // (bad config, missing filter) would surface as an opaque "network fetch failed"
     // inside the box. Assert it is actually running before handing the box its route.
-    let out = tokio::process::Command::new("docker")
+    let out = tokio::process::Command::new(engine)
         .args(["inspect", "-f", "{{.State.Running}}", &container])
         .output()
         .await
         .with_context(|| format!("failed to inspect proxy container `{container}`"))?;
     if String::from_utf8_lossy(&out.stdout).trim() != "true" {
-        let logs = tokio::process::Command::new("docker")
+        let logs = tokio::process::Command::new(engine)
             .args(["logs", "--tail", "20", &container])
             .output()
             .await
@@ -1914,6 +1951,8 @@ async fn resolve_host(host: &str) -> Result<String> {
 }
 
 pub struct DockerSession {
+    /// Container engine CLI (`docker` or `podman`) every command runs through.
+    engine: String,
     image: String,
     project_root: PathBuf,
     /// Extra host mounts (origin-tagged, `source[:target][:mode]` grammar),
@@ -2105,7 +2144,7 @@ impl DockerSession {
         for (host_temp, guest_path) in &staged {
             let src = host_temp.display().to_string();
             let dst = format!("{}:{guest_path}", self.container);
-            let output = tokio::process::Command::new("docker")
+            let output = tokio::process::Command::new(&self.engine)
                 .args(["cp", &src, &dst])
                 .output()
                 .await
@@ -2124,7 +2163,7 @@ impl DockerSession {
         }
         drop(guard);
         Ok(CommandSpec {
-            program: "docker".to_owned(),
+            program: self.engine.clone(),
             args: vec!["start".to_owned(), "-ai".to_owned(), self.container.clone()],
             env: BTreeMap::new(),
             cwd: None,
@@ -2330,7 +2369,7 @@ impl SandboxSession for DockerSession {
         args.extend(spec.args);
 
         Ok(CommandSpec {
-            program: "docker".to_owned(),
+            program: self.engine.clone(),
             args,
             // The docker CLI itself inherits the host env (needs PATH, DOCKER_HOST…);
             // the container env is fully specified by the `-e` flags above.
@@ -2453,7 +2492,7 @@ impl SandboxSession for DockerSession {
         // `extract_session_store`'s copy the other direction.
         let src = format!("{}/.", self.session_store.display());
         let dst = format!("{}:{}", self.container, self.home);
-        let output = tokio::process::Command::new("docker")
+        let output = tokio::process::Command::new(&self.engine)
             .args(["cp", &src, &dst])
             .output()
             .await
@@ -2479,7 +2518,7 @@ impl SandboxSession for DockerSession {
         // rather than nesting it. Runs after the agent exits and before teardown.
         let src = format!("{}:{}/.", self.container, self.home);
         let dst = self.session_store.display().to_string();
-        let output = tokio::process::Command::new("docker")
+        let output = tokio::process::Command::new(&self.engine)
             .args(["cp", &src, &dst])
             .output()
             .await
@@ -2560,13 +2599,13 @@ impl SandboxSession for DockerSession {
         }
         // Without `--rm` the container and its per-session volume persist; remove
         // both here. Best-effort: a cleanup failure must not fail the run.
-        let _ = tokio::process::Command::new("docker")
+        let _ = tokio::process::Command::new(&self.engine)
             .args(["rm", "-f", &self.container])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .await;
-        let _ = tokio::process::Command::new("docker")
+        let _ = tokio::process::Command::new(&self.engine)
             .args(["volume", "rm", "-f", &self.volume])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -2576,13 +2615,13 @@ impl SandboxSession for DockerSession {
         // are best-effort and no-ops when this session did not use proxy mode.
         if !self.egress_hosts.is_empty() {
             let handle = self.session_handle().to_owned();
-            let _ = tokio::process::Command::new("docker")
+            let _ = tokio::process::Command::new(&self.engine)
                 .args(["rm", "-f", &egress_proxy_container(&handle)])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .await;
-            let _ = tokio::process::Command::new("docker")
+            let _ = tokio::process::Command::new(&self.engine)
                 .args(["network", "rm", &egress_proxy_network(&handle)])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -2736,7 +2775,7 @@ impl MicrosandboxProvider {
     /// otherwise the configured OCI reference is used verbatim.
     async fn resolve_image(&self) -> Result<String> {
         if let Some(build) = &self.build {
-            return build_image(&self.name, build).await;
+            return build_image(DEFAULT_DOCKER_ENGINE, &self.name, build).await;
         }
         self.image
             .clone()
@@ -3416,6 +3455,7 @@ impl DockerSession {
         session_store: &str,
     ) -> Self {
         Self {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: image.to_owned(),
             project_root: PathBuf::from(project_root),
             mounts,
@@ -3757,6 +3797,7 @@ mod tests {
     #[test]
     fn docker_session_store_root_is_the_session_mount() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/proj"),
             mounts: vec![],
@@ -3851,6 +3892,7 @@ mod tests {
     #[test]
     fn docker_wrap_mounts_only_project_root_by_default() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![],
@@ -3895,6 +3937,7 @@ mod tests {
     #[test]
     fn docker_wrap_adds_extra_mounts_read_only() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![(MountOrigin::Sandbox, "/opt/cache".to_owned())],
@@ -4474,6 +4517,7 @@ mod tests {
     #[test]
     fn docker_wrap_no_egress_is_network_none() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![],
@@ -4511,6 +4555,7 @@ mod tests {
     #[test]
     fn docker_wrap_egress_pins_allow_listed_hosts() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![],
@@ -4567,6 +4612,7 @@ mod tests {
     #[test]
     fn docker_wrap_proxy_mode_confines_to_internal_net_and_sets_proxy_env() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![],
@@ -6370,7 +6416,7 @@ mod tests {
         )
         .unwrap();
 
-        let image = resolve_devcontainer_image("dc", &root).await.unwrap();
+        let image = resolve_devcontainer_image("docker", "dc", &root).await.unwrap();
         assert_eq!(image, "busybox:1.36");
     }
 
@@ -6384,7 +6430,7 @@ mod tests {
         )
         .unwrap();
 
-        let image = resolve_devcontainer_image("dc", &root).await.unwrap();
+        let image = resolve_devcontainer_image("docker", "dc", &root).await.unwrap();
         assert_eq!(image, "alpine:3.20");
     }
 
@@ -6419,7 +6465,7 @@ mod tests {
         .unwrap();
         assert_eq!(source.image.as_deref(), Some("busybox"));
 
-        let image = resolve_devcontainer_image("dc", &root).await.unwrap();
+        let image = resolve_devcontainer_image("docker", "dc", &root).await.unwrap();
         assert_eq!(image, "busybox");
     }
 
@@ -6465,7 +6511,7 @@ mod tests {
     #[tokio::test]
     async fn devcontainer_missing_file_errors_clearly() {
         let root = devc_root("missing");
-        let err = resolve_devcontainer_image("dc", &root).await.unwrap_err();
+        let err = resolve_devcontainer_image("docker", "dc", &root).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("devcontainer.json"),
@@ -6673,6 +6719,7 @@ mod tests {
     #[test]
     fn route_mount_reaches_argv_same_path_ro() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![(MountOrigin::Route, "/ctx/adb:ro".to_owned())],
@@ -6715,6 +6762,7 @@ mod tests {
     #[test]
     fn docker_mount_targets_includes_project_root_and_mount_targets() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![
@@ -6757,6 +6805,7 @@ mod tests {
     #[test]
     fn route_mount_explicit_target_reaches_argv() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![(MountOrigin::Route, "/host/adb:/context/adb".to_owned())],
@@ -6796,6 +6845,7 @@ mod tests {
     #[test]
     fn route_mount_expands_project_and_relative() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![
@@ -6848,6 +6898,7 @@ mod tests {
     #[test]
     fn effective_mounts_union_dedups_by_target() {
         let session = DockerSession {
+            engine: DEFAULT_DOCKER_ENGINE.to_owned(),
             image: "img".to_owned(),
             project_root: PathBuf::from("/srv/app"),
             mounts: vec![

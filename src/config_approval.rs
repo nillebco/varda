@@ -662,6 +662,9 @@ mod tests {
             "image",
             "build",
             "image_from",
+            // Which docker-compatible CLI runs the box (docker | podman); the
+            // mounts/egress/env it is handed are classified separately.
+            "engine",
             "egress_proxy_image",
             "memory",
             "cpus",
