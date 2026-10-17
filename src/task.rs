@@ -3408,6 +3408,16 @@ external:
         assert!(!yaml.contains("external"), "yaml: {yaml}");
     }
 
+    /// Documents current behaviour: `external.id` must be a quoted string; an
+    /// unquoted YAML number is rejected by the real frontmatter path.
+    #[test]
+    fn unquoted_numeric_external_id_is_rejected_quoted_is_accepted() {
+        let unquoted = EXTERNAL_TASK.replace("id: \"12345\"", "id: 12345");
+        assert_ne!(unquoted, EXTERNAL_TASK);
+        assert!(parse_task(Path::new("t/ext.md"), &unquoted).is_err());
+        assert!(parse_task(Path::new("t/ext.md"), EXTERNAL_TASK).is_ok());
+    }
+
     #[test]
     fn sanitized_for_prompt_keeps_external_identity_drops_sync_bookkeeping() {
         let task = parse_task(Path::new("t/ext.md"), EXTERNAL_TASK).expect("parse");

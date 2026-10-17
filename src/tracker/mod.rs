@@ -360,9 +360,15 @@ pub mod fake {
             if let Some(state) = mapped.state {
                 issue.remote_state = state;
             }
-            issue.tags.retain(|t| !mapped.remove_tags.contains(t));
+            // Helper tags match case-insensitively, like `status_from_remote`.
+            issue.tags.retain(|t| {
+                !mapped
+                    .remove_tags
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(t))
+            });
             for tag in mapped.add_tags {
-                if !issue.tags.contains(&tag) {
+                if !issue.tags.iter().any(|t| t.eq_ignore_ascii_case(&tag)) {
                     issue.tags.push(tag);
                 }
             }
@@ -460,8 +466,9 @@ mod tests {
                 let m = map_status(&t, status);
                 let back = status_from_remote(&t, m.state.as_deref().unwrap(), &m.add_tags);
                 match status {
-                    // Helper-tagged statuses always round-trip.
-                    TaskStatus::NeedsUser | TaskStatus::Failed => {
+                    // Helper-tagged statuses always round-trip exactly (Ready
+                    // shares a state with Backlog on Agile/Basic; its tag wins).
+                    TaskStatus::Ready | TaskStatus::NeedsUser | TaskStatus::Failed => {
                         assert_eq!(back, Some(status), "{map:?}")
                     }
                     // Untagged: the first candidate sharing the state wins, so
@@ -559,6 +566,34 @@ mod tests {
 
         t.comment(&item.id, "recap").await.unwrap();
         assert_eq!(t.comments(), vec![(item.id.clone(), "recap".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn fake_tracker_removes_helper_tags_case_insensitively() {
+        let t = FakeTracker::new(tracker_with(AZDO_AGILE_STATUS_MAP));
+        let item = t.insert("Active", "x", &["VARDA:NEEDS-USER"]);
+        assert_eq!(
+            status_from_remote(&tracker_with(AZDO_AGILE_STATUS_MAP), "Active", &item.tags),
+            Some(TaskStatus::NeedsUser)
+        );
+        let moved = t
+            .transition(&item.id, TaskStatus::Running, None)
+            .await
+            .unwrap();
+        assert!(moved.tags.is_empty(), "{:?}", moved.tags);
+        assert_ne!(
+            status_from_remote(
+                &tracker_with(AZDO_AGILE_STATUS_MAP),
+                &moved.remote_state,
+                &moved.tags
+            ),
+            Some(TaskStatus::NeedsUser)
+        );
+
+        // Dedup is case-insensitive too.
+        let item = t.insert("New", "y", &["VARDA:READY"]);
+        let moved = t.transition(&item.id, TaskStatus::Ready, None).await.unwrap();
+        assert_eq!(moved.tags.len(), 1, "{:?}", moved.tags);
     }
 
     #[tokio::test]

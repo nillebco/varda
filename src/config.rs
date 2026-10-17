@@ -2750,6 +2750,7 @@ fn fragment_capability_summary(
     summary_config.routes = fragment.routes;
     summary_config.sandboxes = fragment.sandboxes;
     summary_config.agents = fragment.agents;
+    summary_config.trackers = fragment.trackers;
     Ok(config_approval::CapabilitySummary::from_config(
         &summary_config,
     ))
@@ -7626,6 +7627,80 @@ agents = ["frag_agent"]
         .unwrap();
         let config = resolve_config(&path).expect("fragment tracker accepted");
         assert_eq!(config.trackers[0].name, "frag-t");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn tracker_fragment(org: &str, credential: &str) -> String {
+        format!(
+            "[[trackers]]\nname = \"t\"\nkind = \"azdo\"\nproject_path = \"/r\"\n\
+             organization = \"{org}\"\ncredential = {{ {credential} }}\n"
+        )
+    }
+
+    /// A pinned fragment that adds a tracker, or changes a tracker's destination
+    /// or credential source, must not pass a pin mismatch silently.
+    #[test]
+    fn pinned_fragment_tracker_changes_require_approval_not_silent_repin() {
+        let base = tracker_fragment("org-a", "from_env = \"TOK\"");
+        let cases = [
+            ("addition", String::new(), base.clone()),
+            (
+                "destination",
+                base.clone(),
+                tracker_fragment("org-evil", "from_env = \"TOK\""),
+            ),
+            (
+                "credential",
+                base.clone(),
+                tracker_fragment("org-a", "command = \"mint-token\""),
+            ),
+        ];
+        for (label, old, new) in cases {
+            let root = temp_dir(&format!("mismatch-tracker-{label}"));
+            let bundle_dir = root.join("bundle");
+            fs::create_dir_all(&bundle_dir).unwrap();
+            let include_path = bundle_dir.join("frag.toml");
+            fs::write(&include_path, &new).unwrap();
+            let store = isolated_approval_store(&root);
+            store.store_approval(&include_path, &old).unwrap();
+
+            for context in [LaunchContext::Headless, LaunchContext::Sandboxed] {
+                let err = resolve_pin_mismatch_with(
+                    &include_path,
+                    "frag.toml",
+                    &bundle_dir,
+                    &new,
+                    "deadbeef",
+                    "cafef00d",
+                    context,
+                    || panic!("must not prompt"),
+                    &store,
+                )
+                .expect_err(&format!("tracker {label} change must refuse, not re-pin"));
+                assert!(format!("{err:#}").contains("REFUSED"), "{label}");
+            }
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn tracker_capability_summary_reports_destination_and_credential() {
+        let root = temp_dir("tracker-summary");
+        let old = fragment_capability_summary(
+            &tracker_fragment("org-a", "from_env = \"TOK\""),
+            "f.toml",
+            &root,
+        )
+        .unwrap();
+        let new = fragment_capability_summary(
+            &tracker_fragment("org-b", "command = \"mint\""),
+            "f.toml",
+            &root,
+        )
+        .unwrap();
+        let changes = config_approval::diff_capabilities(&old, &new);
+        assert!(changes.iter().any(|c| c.critical && c.sentence.contains("mint")));
+        assert!(changes.iter().any(|c| c.sentence.contains("org-b")));
         fs::remove_dir_all(&root).ok();
     }
 
