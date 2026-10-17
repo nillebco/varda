@@ -6,12 +6,15 @@
 // Nothing outside tests consumes this seam yet (T1 wires the first backend).
 #![allow(dead_code)]
 
+pub mod azdo;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 
-use crate::config::{TrackerConfig, TrackerFilter};
+use crate::config::{Config, TrackerConfig, TrackerFilter, TrackerKind};
 use crate::task::TaskStatus;
 
 /// A work item as read from a tracker.
@@ -101,6 +104,29 @@ pub trait IssueTracker: Send + Sync {
     ) -> Result<RemoteIssue>;
     async fn comment(&self, id: &str, markdown: &str) -> Result<()>;
     async fn assign(&self, id: &str, who: Option<&str>) -> Result<()>;
+}
+
+/// Build the backend for a (central-config) `[[trackers]]` entry, resolving its
+/// credential on the HOST. The token never leaves this process.
+pub fn build_tracker(
+    tracker: &TrackerConfig,
+    _config: &Config,
+) -> anyhow::Result<Box<dyn IssueTracker>> {
+    match tracker.kind {
+        TrackerKind::Azdo => {
+            let source = tracker.credential.source()?;
+            let pat = crate::resolve_credential_value(&source, tracker.credential.optional)
+                .with_context(|| format!("resolving credential for tracker '{}'", tracker.name))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "credential for tracker '{}' resolved to nothing (unset/empty)",
+                        tracker.name
+                    )
+                })?;
+            Ok(Box::new(azdo::AzdoTracker::from_config(tracker, pat)?))
+        }
+        other => anyhow::bail!("tracker kind {other:?} is not implemented yet"),
+    }
 }
 
 // ---------------------------------------------------------------------------
