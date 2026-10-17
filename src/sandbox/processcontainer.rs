@@ -451,11 +451,10 @@ impl ProcessContainerSession {
         for (k, v) in spec_env {
             env.insert(k.clone(), v.clone());
         }
-        let mut path: Vec<String> = extra_path.iter().map(|p| p.display().to_string()).collect();
-        path.push(format!(r"{system_root}\System32"));
-        path.push(system_root.clone());
-        path.push(format!(r"{system_root}\System32\WindowsPowerShell\v1.0"));
-        env.insert("PATH".to_owned(), path.join(";"));
+        env.insert(
+            "PATH".to_owned(),
+            container_path(self.env.get("PATH").map(String::as_str), extra_path, &system_root),
+        );
         let home = self.home.display().to_string();
         let tmp = self.home.join("tmp").display().to_string();
         env.insert("USERPROFILE".to_owned(), home.clone());
@@ -509,12 +508,18 @@ impl SandboxSession for ProcessContainerSession {
             cwd: spec.cwd.as_deref().map(plain_path),
             ..spec
         };
+        // The sandbox's own PATH (e.g. a provisioned toolchain) is searched first, so
+        // its binaries win over whatever the host happens to have installed.
         let host_path = spec
             .env
             .get("PATH")
             .cloned()
             .or_else(|| Self::host_env("PATH"))
             .unwrap_or_default();
+        let host_path = match self.env.get("PATH").filter(|p| !p.is_empty()) {
+            Some(sandbox_path) => format!("{sandbox_path};{host_path}"),
+            None => host_path,
+        };
         let pathext: Vec<String> = Self::host_env("PATHEXT")
             .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_owned())
             .split(';')
@@ -911,6 +916,24 @@ mod relay {
     }
 }
 
+/// The container PATH: the sandbox's static `PATH` entries (a toolchain the operator
+/// grants read-only), then the resolved program's and node's dirs, then the Windows
+/// system dirs. The host PATH never leaks in. The sandbox entries must also be
+/// readable in the container, i.e. listed under the sandbox `mounts`.
+fn container_path(sandbox_path: Option<&str>, extra_path: &[PathBuf], system_root: &str) -> String {
+    let mut path: Vec<String> = sandbox_path
+        .unwrap_or_default()
+        .split(';')
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    path.extend(extra_path.iter().map(|p| p.display().to_string()));
+    path.push(format!(r"{system_root}\System32"));
+    path.push(system_root.to_owned());
+    path.push(format!(r"{system_root}\System32\WindowsPowerShell\v1.0"));
+    path.join(";")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,6 +970,19 @@ mod tests {
         assert_eq!(quote_windows_arg(""), "\"\"");
         assert_eq!(quote_windows_arg(r#"say "hi""#), r#""say \"hi\"""#);
         assert_eq!(quote_windows_arg(r"C:\dir with space\"), r#""C:\dir with space\\""#);
+    }
+
+    #[test]
+    fn sandbox_path_entries_come_first_and_host_path_never_leaks() {
+        let extra = [PathBuf::from(r"C:\npm")];
+        assert_eq!(
+            container_path(Some(r"C:\tc\bin;;C:\tc\git\cmd"), &extra, r"C:\Windows"),
+            r"C:\tc\bin;C:\tc\git\cmd;C:\npm;C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+        );
+        assert_eq!(
+            container_path(None, &[], r"C:\Windows"),
+            r"C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+        );
     }
 
     #[test]
