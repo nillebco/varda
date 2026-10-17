@@ -72,6 +72,15 @@ pub struct CapabilitySummary {
     /// `dns-pin`) changes no `egress_hosts` entry, so without this it would be a
     /// silent downgrade — exactly what Decision 3 exists to prevent.
     pub egress_modes: BTreeMap<String, EgressMode>,
+    /// Tracker names introduced (`[[trackers]]`).
+    pub trackers: BTreeSet<String>,
+    /// `(tracker_name, destination)` — where a tracker syncs work items to/from
+    /// (`kind`, `project_path`, and every kind-specific `extra` setting such as
+    /// the azdo organization). A changed destination is a NEW tuple, so it
+    /// diffs as an addition. Tracker credential sources land in
+    /// `host_env_reads` / `secrets_bound` / `host_commands` under the label
+    /// `tracker:<name>`.
+    pub tracker_destinations: BTreeSet<(String, String)>,
 }
 
 fn mount_is_rw_outside_project(raw: &str) -> Option<PathBuf> {
@@ -174,6 +183,33 @@ impl CapabilitySummary {
             }
         }
 
+        for tracker in &config.trackers {
+            summary.trackers.insert(tracker.name.clone());
+            let mut destination = format!(
+                "kind={:?} project_path={}",
+                tracker.kind, tracker.project_path
+            );
+            for (key, value) in &tracker.extra {
+                destination.push_str(&format!(" {key}={value}"));
+            }
+            summary
+                .tracker_destinations
+                .insert((tracker.name.clone(), destination));
+            let label = format!("tracker:{}", tracker.name);
+            match tracker.credential.source() {
+                Ok(CredentialSource::Env(env_name)) => {
+                    summary.host_env_reads.insert((label, env_name.to_owned()));
+                }
+                Ok(CredentialSource::Secret(secret_name)) => {
+                    summary.secrets_bound.insert((label, secret_name.to_owned()));
+                }
+                Ok(CredentialSource::Command(cmd)) => {
+                    summary.host_commands.insert((label, cmd.to_owned()));
+                }
+                Err(_) => {}
+            }
+        }
+
         summary
     }
 }
@@ -255,6 +291,21 @@ pub fn diff_capabilities(
         changes.push(CapabilityChange {
             critical: false,
             sentence: format!("introduces sandbox '{name}'"),
+        });
+    }
+    for name in new.trackers.difference(&old.trackers) {
+        changes.push(CapabilityChange {
+            critical: false,
+            sentence: format!("introduces tracker '{name}'"),
+        });
+    }
+    for (name, destination) in new
+        .tracker_destinations
+        .difference(&old.tracker_destinations)
+    {
+        changes.push(CapabilityChange {
+            critical: false,
+            sentence: format!("tracker '{name}' syncs with {destination}"),
         });
     }
     for glob in new.route_globs.difference(&old.route_globs) {
