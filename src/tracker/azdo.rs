@@ -114,6 +114,8 @@ fn resolve(addr_str: &str, authority: &str, budget: Duration) -> anyhow::Result<
     }
     let (tx, rx) = std::sync::mpsc::channel();
     let target = addr_str.to_owned();
+    // The resolver thread is detached and may outlive the timeout; acceptable
+    // for this stopgap transport, which `ureq` is expected to replace.
     std::thread::spawn(move || {
         let _ = tx.send(target.to_socket_addrs().map(|mut it| it.next()));
     });
@@ -129,6 +131,26 @@ impl Transport for StdHttpTransport {
     fn send(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
         send_limited(request, DEFAULT_LIMITS)
     }
+}
+
+/// Write all of `data`, re-arming the write timeout from the overall
+/// `deadline` before every partial write.
+fn write_with_deadline(
+    stream: &mut TcpStream,
+    mut data: &[u8],
+    deadline: Instant,
+    limits: &Limits,
+) -> anyhow::Result<()> {
+    while !data.is_empty() {
+        stream.set_write_timeout(Some(time_left(deadline, limits)?))?;
+        match stream.write(data) {
+            Ok(0) => bail!("write failed: connection accepted zero bytes"),
+            Ok(n) => data = &data[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(anyhow!("write failed: {e}")),
+        }
+    }
+    Ok(())
 }
 
 fn send_limited(request: &HttpRequest, limits: Limits) -> anyhow::Result<HttpResponse> {
@@ -148,7 +170,6 @@ fn send_limited(request: &HttpRequest, limits: Limits) -> anyhow::Result<HttpRes
     let addr = resolve(&addr_str, authority, time_left(deadline, &limits)?)?;
     let mut stream =
         TcpStream::connect_timeout(&addr, limits.connect.min(time_left(deadline, &limits)?))?;
-    stream.set_write_timeout(Some(time_left(deadline, &limits)?))?;
 
     let mut head = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
@@ -162,9 +183,8 @@ fn send_limited(request: &HttpRequest, limits: Limits) -> anyhow::Result<HttpRes
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes())?;
-    stream.set_write_timeout(Some(time_left(deadline, &limits)?))?;
-    stream.write_all(body)?;
+    write_with_deadline(&mut stream, head.as_bytes(), deadline, &limits)?;
+    write_with_deadline(&mut stream, body, deadline, &limits)?;
 
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
@@ -179,10 +199,14 @@ fn send_limited(request: &HttpRequest, limits: Limits) -> anyhow::Result<HttpRes
                 }
                 raw.extend_from_slice(&buf[..n]);
                 if !headers_done {
-                    headers_done = raw.windows(4).any(|w| w == b"\r\n\r\n");
-                    if !headers_done && raw.len() > limits.max_headers {
+                    let header_end = raw
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|i| i + 4);
+                    if header_end.unwrap_or(raw.len()) > limits.max_headers {
                         bail!("response headers exceed {} bytes", limits.max_headers);
                     }
+                    headers_done = header_end.is_some();
                 }
             }
             Err(e) => return Err(anyhow!("read failed: {e}")),
@@ -966,6 +990,16 @@ mod tests {
         let limits = Limits { max_response: 1000, ..DEFAULT_LIMITS };
         let err = send_limited(&req, limits).unwrap_err();
         assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn over_cap_headers_in_single_read_are_rejected() {
+        const LONG: &str = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy";
+        let (base, _) = fake_server(vec![(200, vec![("X-Long", LONG)], "ok".to_owned())]);
+        let req = HttpRequest { method: "GET", url: format!("{base}/"), headers: vec![], body: None };
+        let limits = Limits { max_headers: 128, ..DEFAULT_LIMITS };
+        let err = send_limited(&req, limits).unwrap_err();
+        assert!(err.to_string().contains("headers exceed"), "{err}");
     }
 
     #[test]
