@@ -22,6 +22,9 @@ pub enum PullAction {
     SkippedRunning,
     /// New remote item already in a `done` state: not worth importing.
     SkippedClosed,
+    /// New remote item in a state that must not be imported (in-flight
+    /// statuses, or a remote state the `status_map` does not know).
+    SkippedState,
 }
 
 impl PullAction {
@@ -33,6 +36,7 @@ impl PullAction {
             Self::Unchanged => "unchanged",
             Self::SkippedRunning => "skip (local task running)",
             Self::SkippedClosed => "skip (already closed remotely)",
+            Self::SkippedState => "skip (remote state not importable)",
         }
     }
 }
@@ -42,7 +46,17 @@ pub struct PullItem {
     pub id: String,
     pub title: String,
     pub action: PullAction,
-    pub path: Option<PathBuf>,
+    /// Every file written for this item (home task, plus the repo definition).
+    pub paths: Vec<PathBuf>,
+}
+
+/// Result of pulling one tracker: the items that succeeded (with the paths they
+/// wrote) and the per-item errors, so a late failure never discards bookkeeping
+/// for earlier writes.
+#[derive(Debug, Default)]
+pub struct PullOutcome {
+    pub items: Vec<PullItem>,
+    pub errors: Vec<String>,
 }
 
 /// One-line summary of a tracker's filter for `tracker list`.
@@ -118,24 +132,27 @@ pub async fn pull_tracker(
     tracker: &TrackerConfig,
     source: &dyn IssueTracker,
     dry_run: bool,
-) -> Result<Vec<PullItem>> {
+) -> Result<PullOutcome> {
     check_acknowledged(config, tracker)?;
     let issues = source
         .query(&tracker.filter)
         .await
         .map_err(|e| anyhow::anyhow!("tracker '{}': {e}", tracker.name))?;
-    let mut items = Vec::new();
+    let mut outcome = PullOutcome::default();
     for issue in issues {
-        let (action, path) = apply_issue(config, tracker, &issue, dry_run)
-            .with_context(|| format!("tracker '{}' item {}", tracker.name, issue.id))?;
-        items.push(PullItem {
-            id: issue.id,
-            title: issue.title,
-            action,
-            path,
-        });
+        match apply_issue(config, tracker, &issue, dry_run) {
+            Ok((action, paths)) => outcome.items.push(PullItem {
+                id: issue.id,
+                title: issue.title,
+                action,
+                paths,
+            }),
+            Err(e) => outcome
+                .errors
+                .push(format!("tracker '{}' item {}: {e:#}", tracker.name, issue.id)),
+        }
     }
-    Ok(items)
+    Ok(outcome)
 }
 
 fn apply_issue(
@@ -143,21 +160,23 @@ fn apply_issue(
     tracker: &TrackerConfig,
     issue: &RemoteIssue,
     dry_run: bool,
-) -> Result<(PullAction, Option<PathBuf>)> {
+) -> Result<(PullAction, Vec<PathBuf>)> {
     match task::find_task_by_external(config, &tracker.name, &issue.id)? {
         None => {
             if is_done(tracker, issue) {
-                return Ok((PullAction::SkippedClosed, None));
-            }
-            if dry_run {
-                return Ok((PullAction::Created, None));
+                return Ok((PullAction::SkippedClosed, Vec::new()));
             }
             let status = match status_from_remote(tracker, &issue.remote_state, &issue.tags) {
-                Some(TaskStatus::Backlog) => TaskStatus::Backlog,
-                _ => TaskStatus::Ready,
+                Some(s @ (TaskStatus::Backlog | TaskStatus::Ready)) => s,
+                _ => return Ok((PullAction::SkippedState, Vec::new())),
             };
+            if dry_run {
+                return Ok((PullAction::Created, Vec::new()));
+            }
             let project = Path::new(&tracker.project_path);
-            let name = format!("{} {}", issue.title, issue.id);
+            // The tracker name keeps two trackers that return the same title and
+            // native id for one project from colliding on the task filename.
+            let name = format!("{} {}-{}", issue.title, tracker.name, issue.id);
             let path = task::create_task(config, &name, project, None, None, None)?;
             let mut doc = task::load_task(&path)?;
             doc.frontmatter.status = status;
@@ -170,19 +189,20 @@ fn apply_issue(
                 sync_error: None,
             });
             doc.body = task_body(issue);
-            task::write_task(&doc)?;
-            Ok((PullAction::Created, Some(path)))
+            let paths = task::write_task_and_definition_body(&doc)?;
+            Ok((PullAction::Created, paths))
         }
         Some(path) => {
             let mut doc = task::load_task(&path)?;
             if doc.frontmatter.status == TaskStatus::Running {
-                return Ok((PullAction::SkippedRunning, None));
+                return Ok((PullAction::SkippedRunning, Vec::new()));
             }
             let seen_rev = doc.frontmatter.external.as_ref().and_then(|e| e.rev);
             if seen_rev == Some(issue.rev) {
-                return Ok((PullAction::Unchanged, None));
+                return Ok((PullAction::Unchanged, Vec::new()));
             }
             let close = is_done(tracker, issue) && doc.frontmatter.status != TaskStatus::Done;
+            let mut paths = Vec::new();
             if !dry_run {
                 if let Some(ext) = doc.frontmatter.external.as_mut() {
                     ext.rev = Some(issue.rev);
@@ -192,14 +212,14 @@ fn apply_issue(
                 if close {
                     doc.frontmatter.status = TaskStatus::Done;
                 }
-                task::write_task(&doc)?;
+                paths = task::write_task_and_definition_body(&doc)?;
             }
             let action = if close {
                 PullAction::MarkedDone
             } else {
                 PullAction::Updated
             };
-            Ok((action, Some(path)))
+            Ok((action, paths))
         }
     }
 }
@@ -262,11 +282,17 @@ pub async fn pull_command(config: &Config, only: Option<&str>, dry_run: bool) ->
             Err(e) => Err(e),
         };
         match result {
-            Ok(items) => {
-                for item in &items {
+            Ok(outcome) => {
+                for item in &outcome.items {
                     let prefix = if dry_run { "would " } else { "" };
                     println!("{}: {prefix}{} {} {}", t.name, item.action.label(), item.id, item.title);
-                    written.extend(item.path.clone());
+                    written.extend(item.paths.iter().cloned());
+                }
+                if !outcome.errors.is_empty() {
+                    failed += 1;
+                    for e in &outcome.errors {
+                        eprintln!("{e}");
+                    }
                 }
             }
             Err(e) => {
@@ -276,9 +302,20 @@ pub async fn pull_command(config: &Config, only: Option<&str>, dry_run: bool) ->
         }
     }
     if !dry_run && config.git.auto_commit && !written.is_empty() {
-        let refs: Vec<&Path> = written.iter().map(PathBuf::as_path).collect();
-        crate::git::commit_task_files(&refs, "Pull tracker work items")?;
-        println!("committed {} task file(s)", refs.len());
+        // The home task files and the project's repo definitions live in
+        // different git repositories: commit each group separately.
+        let mut groups: Vec<(PathBuf, Vec<&Path>)> = Vec::new();
+        for path in &written {
+            let root = crate::git::repo_root_for_path(path)?;
+            match groups.iter_mut().find(|(r, _)| *r == root) {
+                Some((_, paths)) => paths.push(path),
+                None => groups.push((root, vec![path])),
+            }
+        }
+        for (_, refs) in &groups {
+            crate::git::commit_task_files(refs, "Pull tracker work items")?;
+        }
+        println!("committed {} task file(s)", written.len());
     }
     if failed > 0 {
         bail!("{failed} tracker(s) failed");
@@ -368,18 +405,18 @@ mod tests {
         let fake = FakeTracker::new(t.clone());
         fake.insert("New", "alpha", &["varda:ready"]);
         fake.insert("New", "beta", &[]);
-        let items = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|i| i.action == PullAction::Created));
         assert_eq!(count_tasks(&root), 2);
-        let alpha = task::load_task(items[0].path.as_ref().unwrap()).unwrap();
+        let alpha = task::load_task(&items[0].paths[0]).unwrap();
         assert_eq!(alpha.frontmatter.status, TaskStatus::Ready);
         assert_eq!(alpha.frontmatter.project.as_deref(), Some(t.project_path.as_str()));
         assert!(alpha.body.contains("https://fake.example/items/1"));
-        let beta = task::load_task(items[1].path.as_ref().unwrap()).unwrap();
+        let beta = task::load_task(&items[1].paths[0]).unwrap();
         assert_eq!(beta.frontmatter.status, TaskStatus::Backlog);
 
-        let again = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        let again = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
         assert!(again.iter().all(|i| i.action == PullAction::Unchanged));
         assert_eq!(count_tasks(&root), 2);
         std::fs::remove_dir_all(root).ok();
@@ -391,18 +428,18 @@ mod tests {
         let fake = FakeTracker::new(t.clone());
         let a = fake.insert("New", "alpha", &[]);
         let b = fake.insert("New", "beta", &[]);
-        let items = pull_tracker(&config, &t, &fake, false).await.unwrap();
-        let mut running = task::load_task(items[1].path.as_ref().unwrap()).unwrap();
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
+        let mut running = task::load_task(&items[1].paths[0]).unwrap();
         running.frontmatter.status = TaskStatus::Running;
         task::write_task(&running).unwrap();
         let before = std::fs::read_to_string(&running.path).unwrap();
 
         fake.human_edit(&a.id);
         fake.human_edit(&b.id);
-        let items = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
         assert_eq!(items[0].action, PullAction::Updated);
         assert_eq!(items[1].action, PullAction::SkippedRunning);
-        let refreshed = task::load_task(items[0].path.as_ref().unwrap()).unwrap();
+        let refreshed = task::load_task(&items[0].paths[0]).unwrap();
         assert_eq!(refreshed.frontmatter.external.unwrap().rev, Some(2));
         assert_eq!(std::fs::read_to_string(&running.path).unwrap(), before);
         std::fs::remove_dir_all(root).ok();
@@ -413,11 +450,11 @@ mod tests {
         let (root, config, t) = setup("closed");
         let fake = FakeTracker::new(t.clone());
         let a = fake.insert("New", "alpha", &[]);
-        let items = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
         fake.transition(&a.id, TaskStatus::Done, None).await.unwrap();
-        let items2 = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        let items2 = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
         assert_eq!(items2[0].action, PullAction::MarkedDone);
-        let doc = task::load_task(items[0].path.as_ref().unwrap()).unwrap();
+        let doc = task::load_task(&items[0].paths[0]).unwrap();
         assert_eq!(doc.frontmatter.status, TaskStatus::Done);
         std::fs::remove_dir_all(root).ok();
     }
@@ -447,9 +484,129 @@ mod tests {
         let (root, config, t) = setup("dry");
         let fake = FakeTracker::new(t.clone());
         fake.insert("New", "alpha", &[]);
-        let items = pull_tracker(&config, &t, &fake, true).await.unwrap();
+        let items = pull_tracker(&config, &t, &fake, true).await.unwrap().items;
         assert_eq!(items[0].action, PullAction::Created);
         assert_eq!(count_tasks(&root), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn make_varda_dir(root: &Path) {
+        std::fs::create_dir_all(root.join("proj/.varda")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pulled_body_is_visible_via_load_task_with_repo_definition() {
+        let (root, config, t) = setup("defbody");
+        make_varda_dir(&root);
+        let fake = FakeTracker::new(t.clone());
+        let a = fake.insert("New", "alpha", &["varda:ready"]);
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
+        assert_eq!(items[0].paths.len(), 2, "{:?}", items[0].paths);
+        assert!(items[0].paths.iter().any(|p| p.starts_with(root.join("proj/.varda"))));
+        let doc = task::load_task(&items[0].paths[0]).unwrap();
+        assert!(doc.body.contains("https://fake.example/items/1"), "{}", doc.body);
+        assert!(doc.body.starts_with("# alpha"), "{}", doc.body);
+
+        fake.human_edit(&a.id);
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
+        assert_eq!(items[0].action, PullAction::Updated);
+        assert_eq!(items[0].paths.len(), 2);
+        let doc = task::load_task(&items[0].paths[0]).unwrap();
+        let raw = std::fs::read_to_string(&items[0].paths[0]).unwrap();
+        assert!(raw.contains("rev: 2"), "{raw}");
+        let def = std::fs::read_to_string(&items[0].paths[1]).unwrap();
+        assert!(def.trim_end().ends_with(doc.body.trim()), "{def}");
+        assert!(def.starts_with("---\n"), "{def}");
+        assert!(!def.contains("external"), "{def}");
+        let fresh = RemoteIssue {
+            body_markdown: "changed text".to_owned(),
+            rev: 3,
+            ..fake.get(&a.id).await.unwrap()
+        };
+        let (action, _) = apply_issue(&config, &t, &fresh, false).unwrap();
+        assert_eq!(action, PullAction::Updated);
+        let doc = task::load_task(&items[0].paths[0]).unwrap();
+        assert_eq!(doc.body.trim(), task_body(&fresh).trim());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn new_items_import_only_backlog_or_ready() {
+        let (root, config, mut t) = setup("states");
+        t.status_map.insert("running".to_owned(), "Active".to_owned());
+        t.status_map.insert("review".to_owned(), "Resolved".to_owned());
+        let fake = FakeTracker::new(t.clone());
+        fake.insert("New", "backlogged", &[]);
+        fake.insert("New", "readied", &["varda:ready"]);
+        fake.insert("Active", "running", &[]);
+        fake.insert("Resolved", "reviewing", &[]);
+        fake.insert("Weird", "unmapped", &[]);
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
+        let actions: Vec<_> = items.iter().map(|i| i.action.clone()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                PullAction::Created,
+                PullAction::Created,
+                PullAction::SkippedState,
+                PullAction::SkippedState,
+                PullAction::SkippedState,
+            ]
+        );
+        assert_eq!(count_tasks(&root), 2);
+        let b = task::load_task(&items[0].paths[0]).unwrap();
+        let r = task::load_task(&items[1].paths[0]).unwrap();
+        assert_eq!(b.frontmatter.status, TaskStatus::Backlog);
+        assert_eq!(r.frontmatter.status, TaskStatus::Ready);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn partial_failure_keeps_earlier_paths() {
+        let (root, config, t) = setup("partial");
+        let fake = FakeTracker::new(t.clone());
+        fake.insert("New", "alpha", &[]);
+        fake.insert("New", "beta", &[]);
+        // Squat on beta's filename so creating it fails after alpha succeeded.
+        task::create_task(&config, "beta azdo-test-2", Path::new(&t.project_path), None, None, None)
+            .unwrap();
+        let outcome = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        assert_eq!(outcome.items.len(), 1);
+        assert_eq!(outcome.items[0].action, PullAction::Created);
+        assert_eq!(outcome.items[0].paths.len(), 1);
+        assert!(outcome.items[0].paths[0].exists());
+        assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+        assert!(outcome.errors[0].contains("item 2"), "{:?}", outcome.errors);
+
+        // A retry sees alpha as unchanged: only the first run could report its path.
+        let again = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        assert_eq!(again.items[0].action, PullAction::Unchanged);
+        assert!(again.items[0].paths.is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn two_trackers_same_title_and_id_both_import() {
+        let (root, mut config, t1) = setup("twotrackers");
+        let mut t2 = t1.clone();
+        t2.name = "azdo-other".to_owned();
+        config.trackers.push(t2.clone());
+        let f1 = FakeTracker::new(t1.clone());
+        let f2 = FakeTracker::new(t2.clone());
+        f1.insert("New", "same", &[]);
+        f2.insert("New", "same", &[]);
+        let a = pull_tracker(&config, &t1, &f1, false).await.unwrap();
+        let b = pull_tracker(&config, &t2, &f2, false).await.unwrap();
+        assert!(a.errors.is_empty() && b.errors.is_empty(), "{:?} {:?}", a.errors, b.errors);
+        assert_eq!(a.items[0].action, PullAction::Created);
+        assert_eq!(b.items[0].action, PullAction::Created);
+        assert_ne!(a.items[0].paths[0], b.items[0].paths[0]);
+        assert_eq!(count_tasks(&root), 2);
+        let a2 = pull_tracker(&config, &t1, &f1, false).await.unwrap();
+        let b2 = pull_tracker(&config, &t2, &f2, false).await.unwrap();
+        assert_eq!(a2.items[0].action, PullAction::Unchanged);
+        assert_eq!(b2.items[0].action, PullAction::Unchanged);
+        assert_eq!(count_tasks(&root), 2);
         std::fs::remove_dir_all(root).ok();
     }
 }

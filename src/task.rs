@@ -865,6 +865,40 @@ pub fn create_task_with_egress(
     Ok(path)
 }
 
+/// Write `task` to its home STATE file AND, when the project carries a live
+/// repo DEFINITION for the same id, replace that definition's body with
+/// `task.body` (frontmatter untouched). [`load_task`] overlays the definition
+/// body onto the home task, so a body written only to the home file would be
+/// invisible on the next read. Returns every path written (home file first).
+pub fn write_task_and_definition_body(task: &TaskDocument) -> Result<Vec<PathBuf>> {
+    write_task(task)?;
+    let mut written = vec![task.path.clone()];
+    if let Some((store, id)) = definition_store_for(task)
+        && let Some(definition) = find_definition_document(&store, id)?
+    {
+        let content = fs::read_to_string(&definition.path).with_context(|| {
+            format!("failed to read task definition {}", definition.path.display())
+        })?;
+        let rest = content
+            .strip_prefix("---\n")
+            .with_context(|| format!("definition {} has no frontmatter", definition.path.display()))?;
+        let end = if rest.starts_with("---\n") {
+            0
+        } else {
+            rest.find("\n---\n").map(|i| i + 1).with_context(|| {
+                format!("definition {} has unterminated frontmatter", definition.path.display())
+            })?
+        };
+        let head = &content[..4 + end + 4];
+        let updated = format!("{head}\n{}", task.body.trim_start());
+        fs::write(&definition.path, updated).with_context(|| {
+            format!("failed to write task definition {}", definition.path.display())
+        })?;
+        written.push(definition.path);
+    }
+    Ok(written)
+}
+
 pub fn list_tasks(config: &Config, project_path: &Path) -> Result<Vec<TaskSummary>> {
     let normalized = normalize_project_path(project_path)?;
     let task_dir = Path::new(&config.defaults.operations_dir).join("tasks");
