@@ -1,0 +1,10 @@
+{
+  "queryType": "flat",
+  "queryResultType": "workItem",
+  "asOf": "2026-10-01T09:00:00.000Z",
+  "columns": [{"referenceName": "System.Id", "name": "ID", "url": "https://dev.azure.com/acme/_apis/wit/fields/System.Id"}],
+  "workItems": [
+    {"id": 101, "url": "https://dev.azure.com/acme/_apis/wit/workItems/101"},
+    {"id": 102, "url": "https://dev.azure.com/acme/_apis/wit/workItems/102"}
+  ]
+}
