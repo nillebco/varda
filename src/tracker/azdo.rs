@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,9 @@ const API_VERSION: &str = "7.1";
 const BATCH_SIZE: usize = 200;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cap on the whole raw response (headers + body) read from the socket.
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_RETRIES: usize = 2;
 /// Total time spent waiting on `Retry-After` across all retries of one request.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
@@ -80,62 +83,115 @@ pub trait Transport: Send + Sync {
 /// this transport for a `ureq`-backed one — nothing else changes.
 pub struct StdHttpTransport;
 
-impl Transport for StdHttpTransport {
-    fn send(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
-        let rest = request.url.strip_prefix("http://").ok_or_else(|| {
-            anyhow!("only http:// is supported by the built-in transport (TLS transport pending)")
-        })?;
-        let (authority, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
-        };
-        let addr_str = if authority.contains(':') {
-            authority.to_owned()
-        } else {
-            format!("{authority}:80")
-        };
-        let addr = addr_str
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| anyhow!("cannot resolve {authority}"))?;
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
-        let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
-        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+/// Timeouts and size caps for one [`StdHttpTransport`] request.
+#[derive(Clone, Copy)]
+struct Limits {
+    connect: Duration,
+    request: Duration,
+    max_response: usize,
+    max_headers: usize,
+}
 
-        let mut head = format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
-            request.method, path, authority
-        );
-        for (k, v) in &request.headers {
-            head.push_str(&format!("{k}: {v}\r\n"));
-        }
-        let body = request.body.as_deref().unwrap_or(&[]);
-        if request.body.is_some() {
-            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
-        }
-        head.push_str("\r\n");
-        stream.write_all(head.as_bytes())?;
-        stream.write_all(body)?;
+const DEFAULT_LIMITS: Limits = Limits {
+    connect: CONNECT_TIMEOUT,
+    request: REQUEST_TIMEOUT,
+    max_response: MAX_RESPONSE_BYTES,
+    max_headers: MAX_HEADER_BYTES,
+};
 
-        let mut raw = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let left = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|d| !d.is_zero())
-                .ok_or_else(|| anyhow!("request timed out after {}s", REQUEST_TIMEOUT.as_secs()))?;
-            stream.set_read_timeout(Some(left))?;
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => raw.extend_from_slice(&buf[..n]),
-                Err(e) => return Err(anyhow!("read failed: {e}")),
-            }
-        }
-        parse_response(&raw)
+/// Time left before `deadline`, or a timeout error.
+fn time_left(deadline: Instant, limits: &Limits) -> anyhow::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| anyhow!("request timed out after {:?}", limits.request))
+}
+
+/// Resolve `addr_str`, waiting at most `budget`. Literal IPs skip DNS.
+fn resolve(addr_str: &str, authority: &str, budget: Duration) -> anyhow::Result<SocketAddr> {
+    if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target = addr_str.to_owned();
+    std::thread::spawn(move || {
+        let _ = tx.send(target.to_socket_addrs().map(|mut it| it.next()));
+    });
+    match rx.recv_timeout(budget) {
+        Ok(Ok(Some(addr))) => Ok(addr),
+        Ok(Ok(None)) => Err(anyhow!("cannot resolve {authority}")),
+        Ok(Err(e)) => Err(anyhow!("cannot resolve {authority}: {e}")),
+        Err(_) => Err(anyhow!("timed out resolving {authority}")),
     }
 }
 
-fn parse_response(raw: &[u8]) -> anyhow::Result<HttpResponse> {
+impl Transport for StdHttpTransport {
+    fn send(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+        send_limited(request, DEFAULT_LIMITS)
+    }
+}
+
+fn send_limited(request: &HttpRequest, limits: Limits) -> anyhow::Result<HttpResponse> {
+    let deadline = Instant::now() + limits.request;
+    let rest = request.url.strip_prefix("http://").ok_or_else(|| {
+        anyhow!("only http:// is supported by the built-in transport (TLS transport pending)")
+    })?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let addr_str = if authority.contains(':') {
+        authority.to_owned()
+    } else {
+        format!("{authority}:80")
+    };
+    let addr = resolve(&addr_str, authority, time_left(deadline, &limits)?)?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, limits.connect.min(time_left(deadline, &limits)?))?;
+    stream.set_write_timeout(Some(time_left(deadline, &limits)?))?;
+
+    let mut head = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        request.method, path, authority
+    );
+    for (k, v) in &request.headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    let body = request.body.as_deref().unwrap_or(&[]);
+    if request.body.is_some() {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes())?;
+    stream.set_write_timeout(Some(time_left(deadline, &limits)?))?;
+    stream.write_all(body)?;
+
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut headers_done = false;
+    loop {
+        stream.set_read_timeout(Some(time_left(deadline, &limits)?))?;
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if raw.len() + n > limits.max_response {
+                    bail!("response exceeds {} bytes", limits.max_response);
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if !headers_done {
+                    headers_done = raw.windows(4).any(|w| w == b"\r\n\r\n");
+                    if !headers_done && raw.len() > limits.max_headers {
+                        bail!("response headers exceed {} bytes", limits.max_headers);
+                    }
+                }
+            }
+            Err(e) => return Err(anyhow!("read failed: {e}")),
+        }
+    }
+    parse_response(&raw, limits.max_response)
+}
+
+fn parse_response(raw: &[u8], max_body: usize) -> anyhow::Result<HttpResponse> {
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -156,7 +212,7 @@ fn parse_response(raw: &[u8]) -> anyhow::Result<HttpResponse> {
         .iter()
         .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
     let body = if chunked {
-        dechunk(body)?
+        dechunk(body, max_body)?
     } else {
         body.to_vec()
     };
@@ -167,7 +223,7 @@ fn parse_response(raw: &[u8]) -> anyhow::Result<HttpResponse> {
     })
 }
 
-fn dechunk(mut data: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn dechunk(mut data: &[u8], max_out: usize) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
     loop {
         let eol = data
@@ -181,11 +237,17 @@ fn dechunk(mut data: &[u8]) -> anyhow::Result<Vec<u8>> {
         if size == 0 {
             return Ok(out);
         }
-        if data.len() < size + 2 {
+        let framed = size
+            .checked_add(2)
+            .ok_or_else(|| anyhow!("chunk size overflows"))?;
+        if out.len().saturating_add(size) > max_out {
+            bail!("response exceeds {max_out} bytes");
+        }
+        if data.len() < framed {
             bail!("truncated chunked body");
         }
         out.extend_from_slice(&data[..size]);
-        data = &data[size + 2..];
+        data = &data[framed..];
     }
 }
 
@@ -886,6 +948,41 @@ mod tests {
             "s3cret-pat".to_owned(),
             Arc::new(StdHttpTransport),
         )
+    }
+
+    #[test]
+    fn dechunk_huge_chunk_size_errors_without_panic() {
+        let err = dechunk(b"FFFFFFFFFFFFFFFF\r\nabc\r\n0\r\n\r\n", 1024).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
+        let err = dechunk(b"7FFFFFFFFFFFFFFF\r\nabc", 1024).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert_eq!(dechunk(b"3\r\nabc\r\n0\r\n\r\n", 1024).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn over_cap_response_is_rejected() {
+        let (base, _) = fake_server(vec![(200, vec![], "x".repeat(5000))]);
+        let req = HttpRequest { method: "GET", url: format!("{base}/"), headers: vec![], body: None };
+        let limits = Limits { max_response: 1000, ..DEFAULT_LIMITS };
+        let err = send_limited(&req, limits).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn silent_server_hits_overall_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let req = HttpRequest {
+            method: "GET",
+            url: format!("http://{}/", listener.local_addr().unwrap()),
+            headers: vec![],
+            body: None,
+        };
+        let limits = Limits { request: Duration::from_millis(300), ..DEFAULT_LIMITS };
+        let start = Instant::now();
+        let err = send_limited(&req, limits).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(err.to_string().contains("timed out") || err.to_string().contains("read failed"), "{err}");
+        drop(listener);
     }
 
     #[tokio::test]
