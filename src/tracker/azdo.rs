@@ -629,7 +629,7 @@ impl IssueTracker for AzdoTracker {
         let mut ops = vec![
             json!({"op": "add", "path": "/fields/System.Title", "value": draft.title}),
             json!({"op": "add", "path": "/fields/System.Description",
-                   "value": markdown_to_html(&cap_markdown(&draft.body_markdown))}),
+                   "value": markdown_to_html(&draft.body_markdown)}),
         ];
         if !draft.tags.is_empty() {
             ops.push(json!({"op": "add", "path": "/fields/System.Tags",
@@ -660,42 +660,52 @@ impl IssueTracker for AzdoTracker {
             TrackerError::Other(anyhow!("azdo tracker '{}' has no config for transition", self.name))
         })?;
         let mapped = map_status(config, to);
-        let current = self.get(id).await?;
-        if let Some(expected) = expected_rev
-            && current.rev != expected
-        {
-            return Err(TrackerError::Conflict {
-                id: id.to_owned(),
-                expected: Some(expected),
-                actual: Some(current.rev),
-            });
-        }
-        // Only `varda:*` helper tags are touched; user tags keep their order.
-        let mut tags: Vec<String> = current
-            .tags
-            .iter()
-            .filter(|t| !mapped.remove_tags.iter().any(|r| r.eq_ignore_ascii_case(t)))
-            .cloned()
-            .collect();
-        for tag in &mapped.add_tags {
-            if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
-                tags.push(tag.clone());
+        // Without a caller rev we pin the PATCH to the rev we just read, so a
+        // concurrent human tag edit fails the test op instead of being
+        // overwritten by our stale-snapshot tags. Re-read and retry once.
+        let attempts = if expected_rev.is_some() { 1 } else { 2 };
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let current = self.get(id).await?;
+            if let Some(expected) = expected_rev
+                && current.rev != expected
+            {
+                return Err(TrackerError::Conflict {
+                    id: id.to_owned(),
+                    expected: Some(expected),
+                    actual: Some(current.rev),
+                });
+            }
+            // Only `varda:*` helper tags are touched; user tags keep their order.
+            let mut tags: Vec<String> = current
+                .tags
+                .iter()
+                .filter(|t| !mapped.remove_tags.iter().any(|r| r.eq_ignore_ascii_case(t)))
+                .cloned()
+                .collect();
+            for tag in &mapped.add_tags {
+                if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                    tags.push(tag.clone());
+                }
+            }
+            let mut ops = vec![
+                json!({"op": "test", "path": "/rev", "value": expected_rev.unwrap_or(current.rev)}),
+            ];
+            if let Some(state) = &mapped.state {
+                ops.push(json!({"op": "add", "path": "/fields/System.State", "value": state}));
+            }
+            if tags != current.tags {
+                ops.push(json!({"op": "add", "path": "/fields/System.Tags", "value": tags.join("; ")}));
+            }
+            if ops.iter().all(|op| op["op"] == "test") {
+                return Ok(current);
+            }
+            match self.patch_item(id, ops, expected_rev).await {
+                Err(e) if e.is_conflict() && attempt < attempts => continue,
+                result => return result,
             }
         }
-        let mut ops = Vec::new();
-        if let Some(rev) = expected_rev {
-            ops.push(json!({"op": "test", "path": "/rev", "value": rev}));
-        }
-        if let Some(state) = &mapped.state {
-            ops.push(json!({"op": "add", "path": "/fields/System.State", "value": state}));
-        }
-        if tags != current.tags {
-            ops.push(json!({"op": "add", "path": "/fields/System.Tags", "value": tags.join("; ")}));
-        }
-        if ops.iter().all(|op| op["op"] == "test") {
-            return Ok(current);
-        }
-        self.patch_item(id, ops, expected_rev).await
     }
 
     async fn comment(&self, id: &str, markdown: &str) -> Result<()> {
@@ -712,7 +722,7 @@ impl IssueTracker for AzdoTracker {
         let response = if response.status == 400 {
             // Org rejects `format=markdown`: post HTML (the default format).
             let url = format!("{base}?api-version={COMMENT_API_VERSION}");
-            let body = json!({ "text": markdown_to_html(&markdown) });
+            let body = json!({ "text": capped_html(&markdown) });
             self.call(self.request("POST", url, Some(body))).await?
         } else {
             response
@@ -736,7 +746,7 @@ impl IssueTracker for AzdoTracker {
     }
 
     async fn check_auth(&self) -> Result<()> {
-        let url = format!("{}/_apis/connectionData?api-version={API_VERSION}-preview", self.base_url);
+        let url = format!("{}/_apis/connectionData?api-version={API_VERSION}-preview.1", self.base_url);
         let request = self.request("GET", url, None);
         self.call_json(request, "connectionData").await.map(|_| ())
     }
@@ -749,16 +759,37 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Truncate to [`MAX_COMMENT_BYTES`] on a char boundary, appending a note.
+const TRUNCATION_NOTICE: &str = "\n\n_[truncated by Varda: comment exceeded 100 KB]_";
+
+/// Truncate to [`MAX_COMMENT_BYTES`] on a char boundary; the result, notice
+/// included, never exceeds the cap.
 fn cap_markdown(markdown: &str) -> String {
-    if markdown.len() <= MAX_COMMENT_BYTES {
+    cap_markdown_to(markdown, MAX_COMMENT_BYTES)
+}
+
+fn cap_markdown_to(markdown: &str, limit: usize) -> String {
+    if markdown.len() <= limit {
         return markdown.to_owned();
     }
-    let mut end = MAX_COMMENT_BYTES;
+    let mut end = limit.saturating_sub(TRUNCATION_NOTICE.len());
     while !markdown.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n\n_[truncated by Varda: comment exceeded 100 KB]_", &markdown[..end])
+    format!("{}{TRUNCATION_NOTICE}", &markdown[..end])
+}
+
+/// Render the HTML fallback payload within [`MAX_COMMENT_BYTES`]. Escaping can
+/// expand the text (`"` becomes `&quot;`), so shrink the markdown budget until
+/// the rendered HTML fits: truncating markdown never splits an entity or tag.
+fn capped_html(markdown: &str) -> String {
+    let mut limit = MAX_COMMENT_BYTES;
+    loop {
+        let html = markdown_to_html(&cap_markdown_to(markdown, limit));
+        if html.len() <= MAX_COMMENT_BYTES || limit <= TRUNCATION_NOTICE.len() * 2 {
+            return html;
+        }
+        limit = limit * 3 / 4;
+    }
 }
 
 fn html_escape(s: &str) -> String {
@@ -1448,13 +1479,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transition_without_expected_rev_has_no_test_op() {
+    async fn transition_without_expected_rev_tests_the_fetched_rev() {
         let (base, seen) = fake_server(vec![(200, vec![], item_json(0)), (200, vec![], item_json(0))]);
         agile_tracker(&base).transition("101", TaskStatus::Done, None).await.unwrap();
         let ops = body_of(&seen.lock().unwrap()[1]);
-        assert_eq!(ops[0]["path"], "/fields/System.State");
-        assert_eq!(ops[0]["value"], "Closed");
-        assert!(ops.as_array().unwrap().iter().all(|o| o["op"] != "test"));
+        assert_eq!(ops[0], json!({"op": "test", "path": "/rev", "value": 7}));
+        assert_eq!(ops[1]["path"], "/fields/System.State");
+        assert_eq!(ops[1]["value"], "Closed");
+    }
+
+    #[tokio::test]
+    async fn transition_without_expected_rev_retries_once_after_concurrent_edit() {
+        // First PATCH loses the race (412); the re-read sees the human's new tag.
+        let edited = item_json(0).replace("varda; backend; varda:ready", "varda; backend; varda:ready; human-tag");
+        assert_ne!(edited, item_json(0), "fixture tags changed");
+        let (base, seen) = fake_server(vec![
+            (200, vec![], item_json(0)),
+            (412, vec![], "{}".to_owned()),
+            (200, vec![], edited),
+            (200, vec![], item_json(0)),
+        ]);
+        agile_tracker(&base).transition("101", TaskStatus::NeedsUser, None).await.unwrap();
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let ops = body_of(&requests[3]);
+        assert_eq!(ops[0]["op"], "test");
+        assert_eq!(
+            ops[2]["value"],
+            "varda; backend; human-tag; varda:needs-user",
+            "{ops}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transition_without_expected_rev_persistent_conflict_is_returned_after_one_retry() {
+        let (base, seen) = fake_server(vec![
+            (200, vec![], item_json(0)),
+            (412, vec![], "{}".to_owned()),
+            (200, vec![], item_json(0)),
+            (412, vec![], "{}".to_owned()),
+        ]);
+        let err = agile_tracker(&base).transition("101", TaskStatus::Done, None).await.unwrap_err();
+        assert!(err.is_conflict(), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn transition_with_expected_rev_does_not_retry() {
+        let (base, seen) = fake_server(vec![(200, vec![], item_json(0)), (412, vec![], "{}".to_owned())]);
+        let err = agile_tracker(&base).transition("101", TaskStatus::Done, Some(7)).await.unwrap_err();
+        assert!(err.is_conflict(), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1539,9 +1614,40 @@ mod tests {
     fn long_comments_are_truncated_on_a_char_boundary() {
         let long = "é".repeat(MAX_COMMENT_BYTES); // 2 bytes each
         let capped = cap_markdown(&long);
-        assert!(capped.len() < MAX_COMMENT_BYTES + 100);
+        assert!(capped.len() <= MAX_COMMENT_BYTES, "{}", capped.len());
         assert!(capped.contains("truncated by Varda"));
         assert_eq!(cap_markdown("short"), "short");
+        let exact = "a".repeat(MAX_COMMENT_BYTES);
+        assert_eq!(cap_markdown(&exact), exact);
+        assert!(cap_markdown(&"a".repeat(MAX_COMMENT_BYTES + 1)).len() <= MAX_COMMENT_BYTES);
+    }
+
+    #[test]
+    fn html_fallback_payload_stays_within_the_cap() {
+        for ch in ["\"", "&", "<", "a\n"] {
+            let html = capped_html(&ch.repeat(MAX_COMMENT_BYTES));
+            assert!(html.len() <= MAX_COMMENT_BYTES, "{ch:?}: {}", html.len());
+            assert!(html.contains("truncated by Varda"), "{ch:?}");
+            // no entity split at the end of the escaped text
+            assert!(!html.contains("&quo</") && !html.contains("&am</"), "{ch:?}");
+        }
+        assert_eq!(capped_html("x < y"), "<p>x &lt; y</p>");
+    }
+
+    #[tokio::test]
+    async fn create_does_not_truncate_long_descriptions() {
+        let (base, seen) = fake_server(vec![(200, vec![], item_json(0))]);
+        let body = "d".repeat(MAX_COMMENT_BYTES + 1000);
+        let draft = IssueDraft {
+            title: "T".to_owned(),
+            body_markdown: body.clone(),
+            tags: vec![],
+            assignee: None,
+            work_item_type: None,
+        };
+        agile_tracker(&base).create(&draft).await.unwrap();
+        let ops = body_of(&seen.lock().unwrap()[0]);
+        assert_eq!(ops[1]["value"], format!("<p>{body}</p>"));
     }
 
     #[tokio::test]
