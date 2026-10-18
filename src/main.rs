@@ -476,6 +476,46 @@ enum TrackerSetupBackend {
         #[arg(long)]
         force: bool,
     },
+    /// Jira Cloud: prove the API token, map the project's workflow statuses, preview
+    /// the pickup, acknowledge the data disclaimer, then append the `[[trackers]]` block.
+    Jira {
+        /// Site URL, e.g. https://acme.atlassian.net
+        #[arg(long)]
+        site: String,
+        /// Jira project key, e.g. VAR
+        #[arg(long)]
+        project_key: String,
+        /// Atlassian account email (Basic-auth user for the API token).
+        #[arg(long)]
+        email: String,
+        /// Local repository the issues are worked on in.
+        #[arg(long)]
+        repo: PathBuf,
+        /// Tracker name (default: jira-<project key>).
+        #[arg(long)]
+        name: Option<String>,
+        /// Pickup label: only issues carrying it are imported.
+        #[arg(long, default_value = "varda")]
+        label: String,
+        /// API token stored under this fnox key.
+        #[arg(long, value_name = "KEY", conflicts_with_all = ["credential_env", "credential_command"])]
+        credential_fnox: Option<String>,
+        /// API token in this host environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "credential_command")]
+        credential_env: Option<String>,
+        /// Host command printing the token.
+        #[arg(long, value_name = "CMD")]
+        credential_command: Option<String>,
+        /// Issue type used when Varda creates issues.
+        #[arg(long, default_value = "Task")]
+        issue_type: String,
+        /// Skip the prompts (the acknowledgement is still recorded).
+        #[arg(long)]
+        yes: bool,
+        /// Replace an existing tracker of the same name.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -931,6 +971,70 @@ async fn run_cli() -> Result<()> {
                 tracker::build_tracker_within(t, Some(std::time::Duration::from_secs(30)))
             };
             match tracker::setup::run_setup(
+                &config,
+                &config_path,
+                &opts,
+                &mut tracker::setup::StdioIo,
+                &build,
+            )
+            .await?
+            {
+                tracker::setup::SetupOutcome::Written { doctor_failures: 0 } => {}
+                tracker::setup::SetupOutcome::Written { doctor_failures } => {
+                    anyhow::bail!("tracker written, but {doctor_failures} doctor check(s) failed")
+                }
+                tracker::setup::SetupOutcome::Declined => {}
+            }
+        }
+        Command::Tracker {
+            command:
+                TrackerCommand::Setup {
+                    backend:
+                        TrackerSetupBackend::Jira {
+                            site,
+                            project_key,
+                            email,
+                            repo,
+                            name,
+                            label,
+                            credential_fnox,
+                            credential_env,
+                            credential_command,
+                            issue_type,
+                            yes,
+                            force,
+                        },
+                },
+        } => {
+            let config_path = config::config_file()?;
+            let config = config::load_config(&config_path)?;
+            let credential = (credential_fnox.is_some()
+                || credential_env.is_some()
+                || credential_command.is_some())
+            .then(|| config::CredentialConfig {
+                from_fnox: credential_fnox,
+                from_env: credential_env,
+                command: credential_command,
+                ..config::CredentialConfig::default()
+            });
+            let opts = tracker::setup::JiraSetupOptions {
+                site,
+                project_key,
+                email,
+                repo,
+                name,
+                label,
+                credential,
+                issue_type,
+                yes,
+                force,
+                by: tracker::setup::acknowledging_user(),
+                at: tracker::setup::now_rfc3339(),
+            };
+            let build = |t: &config::TrackerConfig| {
+                tracker::build_tracker_within(t, Some(std::time::Duration::from_secs(30)))
+            };
+            match tracker::setup::run_setup_jira(
                 &config,
                 &config_path,
                 &opts,

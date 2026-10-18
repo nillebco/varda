@@ -8,6 +8,8 @@
 
 pub mod azdo;
 pub mod doctor;
+pub mod jira;
+pub mod jira_adf;
 pub mod push;
 pub mod setup;
 pub mod sync;
@@ -158,6 +160,22 @@ pub fn build_tracker_within(
                     )
                 })?;
             Ok(Box::new(azdo::AzdoTracker::from_config(tracker, pat)?))
+        }
+        TrackerKind::Jira => {
+            let source = tracker.credential.source()?;
+            let token = crate::resolve_credential_value_within(
+                &source,
+                tracker.credential.optional,
+                timeout,
+            )
+            .with_context(|| format!("resolving credential for tracker '{}'", tracker.name))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "credential for tracker '{}' resolved to nothing (unset/empty)",
+                    tracker.name
+                )
+            })?;
+            Ok(Box::new(jira::JiraTracker::from_config(tracker, token)?))
         }
         other => anyhow::bail!("tracker kind {other:?} is not implemented yet"),
     }

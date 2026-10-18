@@ -866,7 +866,7 @@ const TRUNCATION_NOTICE: &str = "\n\n_[truncated by Varda: comment exceeded 100 
 
 /// Truncate to [`MAX_COMMENT_BYTES`] on a char boundary; the result, notice
 /// included, never exceeds the cap.
-fn cap_markdown(markdown: &str) -> String {
+pub(super) fn cap_markdown(markdown: &str) -> String {
     cap_markdown_to(markdown, MAX_COMMENT_BYTES)
 }
 
@@ -954,7 +954,7 @@ fn markdown_to_html(markdown: &str) -> String {
 
 /// At most [`MAX_RETRIES`] retries on 429/503, honouring `Retry-After`
 /// (seconds), never waiting more than [`MAX_RETRY_WAIT`] in total.
-fn send_with_retry(transport: &dyn Transport, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+pub(super) fn send_with_retry(transport: &dyn Transport, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
     let mut waited = Duration::ZERO;
     let mut attempt = 0;
     loop {
@@ -1007,7 +1007,7 @@ pub fn build_wiql(filter: &TrackerFilter) -> String {
     )
 }
 
-fn url_encode(s: &str) -> String {
+pub(super) fn url_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -1019,7 +1019,7 @@ fn url_encode(s: &str) -> String {
     out
 }
 
-fn base64(input: &[u8]) -> String {
+pub(super) fn base64(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for c in input.chunks(3) {
