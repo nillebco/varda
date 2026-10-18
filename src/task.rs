@@ -871,32 +871,65 @@ pub fn create_task_with_egress(
 /// body onto the home task, so a body written only to the home file would be
 /// invisible on the next read. Returns every path written (home file first).
 pub fn write_task_and_definition_body(task: &TaskDocument) -> Result<Vec<PathBuf>> {
-    write_task(task)?;
-    let mut written = vec![task.path.clone()];
+    // Compute the definition's new text BEFORE writing anything, then write the
+    // DEFINITION first and the home file last: the home file carries the
+    // external `rev`, which must only advance once the body update succeeded.
+    let mut definition_update = None;
     if let Some((store, id)) = definition_store_for(task)
         && let Some(definition) = find_definition_document(&store, id)?
     {
         let content = fs::read_to_string(&definition.path).with_context(|| {
             format!("failed to read task definition {}", definition.path.display())
         })?;
-        let rest = content
-            .strip_prefix("---\n")
-            .with_context(|| format!("definition {} has no frontmatter", definition.path.display()))?;
-        let end = if rest.starts_with("---\n") {
-            0
-        } else {
-            rest.find("\n---\n").map(|i| i + 1).with_context(|| {
-                format!("definition {} has unterminated frontmatter", definition.path.display())
-            })?
-        };
-        let head = &content[..4 + end + 4];
-        let updated = format!("{head}\n{}", task.body.trim_start());
-        fs::write(&definition.path, updated).with_context(|| {
-            format!("failed to write task definition {}", definition.path.display())
+        let head_end = frontmatter_block_end(&content).with_context(|| {
+            format!(
+                "definition {} has missing or unterminated frontmatter",
+                definition.path.display()
+            )
         })?;
-        written.push(definition.path);
+        let eol = if content[..head_end].ends_with("\r\n") { "\r\n" } else { "\n" };
+        let updated = format!("{}{eol}{}", &content[..head_end], task.body.trim_start());
+        definition_update = Some((definition.path, updated));
     }
+    let mut written = vec![task.path.clone()];
+    if let Some((path, updated)) = definition_update {
+        fs::write(&path, updated)
+            .with_context(|| format!("failed to write task definition {}", path.display()))?;
+        written.push(path);
+    }
+    write_task(task)?;
     Ok(written)
+}
+
+/// Byte offset just past the closing `---` fence line (including its line
+/// terminator, if any) of the frontmatter block in `content`. Fences are
+/// recognised the same way as in [`rewrite_legacy_pending_status`]: the first
+/// line must be `---` and the first later `---` line closes the block, with
+/// CRLF endings and a closing fence at EOF accepted. `None` when there is no
+/// complete block.
+fn frontmatter_block_end(content: &str) -> Option<usize> {
+    let mut start = 0usize;
+    let mut first = true;
+    while start <= content.len() {
+        let (line_end, next) = match content[start..].find('\n') {
+            Some(i) => (start + i, start + i + 1),
+            None => (content.len(), content.len() + 1),
+        };
+        let is_fence = content[start..line_end].trim() == "---";
+        if first {
+            if !is_fence {
+                return None;
+            }
+            first = false;
+        } else if is_fence {
+            return Some(next.min(content.len()));
+        }
+        if next > content.len() {
+            return None;
+        }
+        start = next;
+    }
+    None
 }
 
 pub fn list_tasks(config: &Config, project_path: &Path) -> Result<Vec<TaskSummary>> {
@@ -3504,6 +3537,85 @@ external:
         let err = resolve_task_reference(&config, Path::new("other:12345")).unwrap_err();
         assert!(format!("{err:#}").contains("neither an existing path nor a numeric id"));
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn frontmatter_block_end_handles_crlf_eof_and_body_rules() {
+        let lf = "---\nid: 1\n---\n\nbody\n---\nmore\n";
+        assert_eq!(&lf[..frontmatter_block_end(lf).unwrap()], "---\nid: 1\n---\n");
+        let crlf = "---\r\nid: 1\r\n---\r\n\r\nbody\r\n---\r\n";
+        assert_eq!(&crlf[..frontmatter_block_end(crlf).unwrap()], "---\r\nid: 1\r\n---\r\n");
+        let eof = "---\nid: 1\n---";
+        assert_eq!(frontmatter_block_end(eof), Some(eof.len()));
+        assert_eq!(frontmatter_block_end("---\nid: 1\n"), None);
+        assert_eq!(frontmatter_block_end("id: 1\n---\n"), None);
+        let mixed = "---\nid: 1\r\n---\n\nx\n---\n";
+        assert_eq!(&mixed[..frontmatter_block_end(mixed).unwrap()], "---\nid: 1\r\n---\n");
+    }
+
+    fn definition_body_fixture(name: &str, def_text: &str) -> (PathBuf, TaskDocument, PathBuf) {
+        let root = std::env::temp_dir().join(format!("varda-defbody-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = root.join("proj/.varda/tasks");
+        fs::create_dir_all(&store).unwrap();
+        let def = store.join("5-x.md");
+        fs::write(&def, def_text).unwrap();
+        let home = root.join("home/5-x.md");
+        fs::create_dir_all(home.parent().unwrap()).unwrap();
+        let doc = TaskDocument {
+            path: home,
+            frontmatter: TaskFrontmatter {
+                bounds: TaskBounds::default(),
+                id: Some(5),
+                status: TaskStatus::Backlog,
+                project: Some(root.join("proj").display().to_string()),
+                mother_project: None,
+                assignee: None,
+                sandbox: None,
+                recap: None,
+                recaps: vec![],
+                plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
+                agent_resume_commands: vec![],
+                allow_commands: vec![],
+                requires_user: false,
+                external: None,
+            },
+            body: "# New\n\nnew body\n".to_owned(),
+        };
+        (root, doc, def)
+    }
+
+    #[test]
+    fn definition_body_replaced_with_crlf_eof_and_hr_in_old_body() {
+        let cases = [
+            ("crlf", "---\r\nid: 5\r\n---\r\n\r\nold\r\n", "---\r\nid: 5\r\n---\r\n"),
+            ("eof", "---\nid: 5\n---", "---\nid: 5\n---"),
+            ("hr", "---\nid: 5\n---\n\nold\n\n---\n\nrule\n", "---\nid: 5\n---\n"),
+        ];
+        for (name, text, head) in cases {
+            let (root, doc, def) = definition_body_fixture(name, text);
+            let written = write_task_and_definition_body(&doc).unwrap();
+            assert_eq!(written, vec![doc.path.clone(), def.clone()], "{name}");
+            let out = fs::read_to_string(&def).unwrap();
+            assert!(out.starts_with(head), "{name}: {out:?}");
+            assert!(out.ends_with("new body\n"), "{name}: {out:?}");
+            assert!(!out.contains("old") && !out.contains("rule"), "{name}: {out:?}");
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn definition_failure_leaves_home_file_unwritten() {
+        let (root, doc, def) = definition_body_fixture("fail", "---\nid: 5\n");
+        let err = write_task_and_definition_body(&doc).unwrap_err();
+        assert!(format!("{err:#}").contains("frontmatter"), "{err:#}");
+        assert!(!doc.path.exists());
+        assert_eq!(fs::read_to_string(&def).unwrap(), "---\nid: 5\n");
         fs::remove_dir_all(root).ok();
     }
 }
