@@ -87,7 +87,10 @@ pub fn filter_summary(tracker: &TrackerConfig) -> String {
 /// Refuse a tracker that was never acknowledged, or whose acknowledgement does
 /// not cover every agent the `project_path` route allows.
 pub fn check_acknowledged(config: &Config, tracker: &TrackerConfig) -> Result<()> {
-    let setup_hint = format!("run `varda tracker setup --tracker {}`", tracker.name);
+    let setup_hint = format!(
+        "run `varda tracker setup azdo --org ORG --project PROJECT --repo PATH --name {}`",
+        tracker.name
+    );
     let Some(ack) = tracker.acknowledged.as_ref() else {
         bail!(
             "tracker '{}' has not been acknowledged; {setup_hint}",

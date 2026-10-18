@@ -194,13 +194,21 @@ fn propose_status_map(
     (n, m, false)
 }
 
+/// Whether `line` is the table header `header`, allowing surrounding
+/// whitespace and a trailing `# comment`.
+fn header_is(line: &str, header: &str) -> bool {
+    let t = line.trim();
+    t.strip_prefix(header)
+        .is_some_and(|rest| rest.trim().is_empty() || rest.trim_start().starts_with('#'))
+}
+
 /// Remove the `[[trackers]]` block named `name` (with its `[trackers.*]`
 /// subtables). Returns `None` when there is no such block.
 fn remove_tracker_block(text: &str, name: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
     while i < lines.len() {
-        if lines[i].trim() == "[[trackers]]" {
+        if header_is(lines[i], "[[trackers]]") {
             let mut end = i + 1;
             while end < lines.len() {
                 let t = lines[end].trim_start();
@@ -387,14 +395,15 @@ pub async fn run_setup(
 
     let backend = match build(&draft) {
         Ok(b) => b,
-        Err(e) => {
-            fail(io, &format!("credential: {e:#}"));
+        Err(_) => {
+            // The chain may embed credential-command stderr; never print it.
+            fail(io, "credential could not be resolved (see `varda tracker doctor`)");
             bail!("credential could not be resolved");
         }
     };
     ok(io, "credential reference resolves");
-    if let Err(e) = backend.check_auth().await {
-        fail(io, &format!("connectionData: {e}"));
+    if backend.check_auth().await.is_err() {
+        fail(io, "connectionData: authentication failed (check the credential and its scope)");
         bail!("authentication failed");
     }
     ok(io, "authenticated (connectionData)");
@@ -405,8 +414,8 @@ pub async fn run_setup(
     match backend.query(&probe).await {
         Ok(items) if items.len() <= 1 => ok(io, "read access (WIQL query)"),
         Ok(_) => ok(io, "read access (WIQL query)"),
-        Err(e) => {
-            fail(io, &format!("read access: {e}"));
+        Err(_) => {
+            fail(io, "read access: the WIQL probe failed (check the `Work Items (Read)` scope)");
             bail!("cannot read work items with this credential");
         }
     }
@@ -429,16 +438,8 @@ pub async fn run_setup(
     if !exact && !opts.yes && !confirm(io, &format!("Use the {kind} mapping above?"), true)? {
         bail!("status_map not confirmed; nothing written (set `status_map` by hand after adding the tracker)");
     }
-    // Pull should see every live state, not only the importable ones.
-    let mut live: Vec<String> = Vec::new();
-    for s in ["backlog", "ready", "running", "review", "needs_user", "failed"] {
-        if let Some(state) = draft.status_map.get(s)
-            && !live.contains(state)
-        {
-            live.push(state.clone());
-        }
-    }
-    draft.filter.states = live;
+    // `filter.states` stays empty: pull must also see items closed remotely so
+    // it can mark the local task done (a new closed item is skipped by pull).
 
     // 3. Pickup tag.
     io.say(&format!(
@@ -459,7 +460,10 @@ pub async fn run_setup(
                 io.say(&format!("  #{} [{}] {}", i.id, i.remote_state, i.title));
             }
         }
-        Err(e) => fail(io, &format!("could not list tagged items: {e}")),
+        Err(_) => {
+            fail(io, "could not list tagged items");
+            bail!("the tagged-items query failed; nothing written");
+        }
     }
     io.say(&format!(
         "  To tag one: az boards work-item update --id N --fields System.Tags={}   (or use the web UI)",
@@ -486,7 +490,10 @@ pub async fn run_setup(
                 fail(io, e);
             }
         }
-        Err(e) => fail(io, &format!("dry run: {e:#}")),
+        Err(_) => {
+            fail(io, "dry run failed");
+            bail!("the pull dry run failed; nothing written");
+        }
     }
 
     // 5. Disclaimer + acknowledgement.
@@ -836,5 +843,160 @@ mod tests {
         assert!(out.contains("name = \"b\"") && !out.contains("name = \"a\"") && !out.contains("backlog"));
         assert!(out.contains("[defaults]"));
         assert!(remove_tracker_block(text, "zzz").is_none());
+    }
+
+    #[tokio::test]
+    async fn filter_states_do_not_exclude_done() {
+        let e = env("states");
+        let mut io = ScriptedIo::default();
+        let f = factory(Some("Agile"));
+        run_setup(&e.config, &e.config_path, &e.opts, &mut io, &f).await.unwrap();
+        let text = std::fs::read_to_string(&e.config_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let trackers: Vec<TrackerConfig> = parsed["trackers"].clone().try_into().unwrap();
+        let t = &trackers[0];
+        assert!(t.filter.states.is_empty(), "{:?}", t.filter.states);
+        // A remotely Closed item still matches the filter, so pull can see it.
+        let fake = FakeTracker::new(t.clone());
+        fake.insert("Closed", "finished", &["varda"]);
+        assert_eq!(fake.query(&t.filter).await.unwrap().len(), 1);
+        std::fs::remove_dir_all(e.root).ok();
+    }
+
+    const SECRET: &str = "s3cret-from-stderr";
+
+    #[tokio::test]
+    async fn credential_failure_does_not_print_the_error_chain() {
+        let e = env("credfail");
+        let mut io = ScriptedIo::default();
+        let f = |_: &TrackerConfig| -> Result<Box<dyn IssueTracker>> {
+            Err(anyhow::anyhow!("command failed: PAT={SECRET}"))
+        };
+        let err = run_setup(&e.config, &e.config_path, &e.opts, &mut io, &f).await.unwrap_err();
+        assert!(!format!("{err:#}").contains(SECRET));
+        assert!(!io.out.join("\n").contains(SECRET), "{:#?}", io.out);
+        std::fs::remove_dir_all(e.root).ok();
+    }
+
+    /// Backend whose selected calls fail with an error containing SECRET.
+    struct Failing {
+        inner: SetupFake,
+        auth: bool,
+        wiql: bool,
+        tagged: bool,
+    }
+
+    #[async_trait]
+    impl IssueTracker for Failing {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        async fn check_auth(&self) -> super::super::Result<()> {
+            if self.auth {
+                return Err(super::super::TrackerError::Other(anyhow::anyhow!("401 body {SECRET}")));
+            }
+            Ok(())
+        }
+        async fn query(&self, f: &TrackerFilter) -> super::super::Result<Vec<super::super::RemoteIssue>> {
+            if (f.wiql.is_some() && self.wiql) || (f.wiql.is_none() && self.tagged) {
+                return Err(super::super::TrackerError::Other(anyhow::anyhow!("boom {SECRET}")));
+            }
+            self.inner.query(f).await
+        }
+        async fn get(&self, id: &str) -> super::super::Result<super::super::RemoteIssue> {
+            self.inner.get(id).await
+        }
+        async fn create(&self, d: &super::super::IssueDraft) -> super::super::Result<super::super::RemoteIssue> {
+            self.inner.create(d).await
+        }
+        async fn transition(
+            &self,
+            id: &str,
+            to: crate::task::TaskStatus,
+            rev: Option<u64>,
+        ) -> super::super::Result<super::super::RemoteIssue> {
+            self.inner.transition(id, to, rev).await
+        }
+        async fn comment(&self, id: &str, m: &str) -> super::super::Result<()> {
+            self.inner.comment(id, m).await
+        }
+        async fn assign(&self, id: &str, w: Option<&str>) -> super::super::Result<()> {
+            self.inner.assign(id, w).await
+        }
+        async fn valid_states(&self) -> super::super::Result<Option<Vec<String>>> {
+            self.inner.valid_states().await
+        }
+        async fn process_template(&self) -> super::super::Result<Option<String>> {
+            self.inner.process_template().await
+        }
+    }
+
+    fn failing(auth: bool, wiql: bool, tagged: bool) -> impl Fn(&TrackerConfig) -> Result<Box<dyn IssueTracker>> {
+        move |t: &TrackerConfig| {
+            let fake = FakeTracker::new(t.clone());
+            fake.insert("New", "tagged item", &["varda"]);
+            Ok(Box::new(Failing {
+                inner: SetupFake {
+                    inner: fake,
+                    process: Some("Agile".to_owned()),
+                    states: ["New", "Active", "Closed"].map(str::to_owned).to_vec(),
+                },
+                auth,
+                wiql,
+                tagged,
+            }) as Box<dyn IssueTracker>)
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_and_read_failures_do_not_print_error_bodies() {
+        for (auth, wiql) in [(true, false), (false, true)] {
+            let e = env("authfail");
+            let mut io = ScriptedIo::default();
+            let f = failing(auth, wiql, false);
+            let err = run_setup(&e.config, &e.config_path, &e.opts, &mut io, &f).await.unwrap_err();
+            assert!(!format!("{err:#}").contains(SECRET));
+            assert!(!io.out.join("\n").contains(SECRET), "{:#?}", io.out);
+            std::fs::remove_dir_all(e.root).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_tagged_query_aborts_without_writing() {
+        let e = env("tagfail");
+        let before = std::fs::read(&e.config_path).unwrap();
+        let mut io = ScriptedIo::default();
+        let f = failing(false, false, true);
+        let err = run_setup(&e.config, &e.config_path, &e.opts, &mut io, &f).await.unwrap_err();
+        assert!(err.to_string().contains("nothing written"), "{err:#}");
+        assert!(!io.out.join("\n").contains(SECRET));
+        assert_eq!(std::fs::read(&e.config_path).unwrap(), before);
+        std::fs::remove_dir_all(e.root).ok();
+    }
+
+    #[tokio::test]
+    async fn unknown_process_asks_and_declining_aborts() {
+        let mut e = env("unknown");
+        e.opts.yes = false;
+        let before = std::fs::read(&e.config_path).unwrap();
+        let mut io = ScriptedIo {
+            answers: ["n".to_owned()].into(),
+            ..ScriptedIo::default()
+        };
+        let f = factory(Some("Inherited"));
+        let err = run_setup(&e.config, &e.config_path, &e.opts, &mut io, &f).await.unwrap_err();
+        assert!(err.to_string().contains("not confirmed"), "{err:#}");
+        assert!(io.out.iter().any(|l| l.contains("mapping above?")), "{:#?}", io.out);
+        assert_eq!(std::fs::read(&e.config_path).unwrap(), before);
+        std::fs::remove_dir_all(e.root).ok();
+    }
+
+    #[test]
+    fn remove_block_accepts_commented_headers() {
+        let text = "[[trackers]] # production\nname = \"a\"\n[trackers.status_map] # map\nbacklog = \"New\"\n\n[[trackers]]   # other\nname = \"b\"\n";
+        let out = remove_tracker_block(text, "a").unwrap();
+        assert!(!out.contains("name = \"a\"") && !out.contains("backlog"), "{out}");
+        assert!(out.contains("name = \"b\""), "{out}");
+        assert!(!header_is("[[trackers]]x", "[[trackers]]"));
     }
 }
