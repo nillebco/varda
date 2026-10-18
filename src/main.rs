@@ -427,11 +427,54 @@ enum TrackerCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Guided setup for a tracker, ending with the data-disclaimer acknowledgement.
+    Setup {
+        #[command(subcommand)]
+        backend: TrackerSetupBackend,
+    },
     /// Retry pushing task status to trackers for tasks that are out of sync.
     Sync {
         /// Only sync this tracker.
         #[arg(long, value_name = "NAME")]
         tracker: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TrackerSetupBackend {
+    /// Azure DevOps: check the credential, map the process states, preview the
+    /// pickup, acknowledge the data disclaimer, then append the `[[trackers]]` block.
+    Azdo {
+        #[arg(long)]
+        org: String,
+        #[arg(long)]
+        project: String,
+        /// Local repository the work items are worked on in.
+        #[arg(long)]
+        repo: PathBuf,
+        /// Tracker name (default: azdo-<project>).
+        #[arg(long)]
+        name: Option<String>,
+        /// Pickup tag: only work items carrying it are imported.
+        #[arg(long, default_value = "varda")]
+        tag: String,
+        /// PAT stored under this fnox key.
+        #[arg(long, value_name = "KEY", conflicts_with_all = ["credential_env", "credential_command"])]
+        credential_fnox: Option<String>,
+        /// PAT in this host environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "credential_command")]
+        credential_env: Option<String>,
+        /// Host command printing the token (e.g. an `az account get-access-token` call).
+        #[arg(long, value_name = "CMD")]
+        credential_command: Option<String>,
+        #[arg(long, default_value = "Task")]
+        work_item_type: String,
+        /// Skip the prompts (the acknowledgement is still recorded).
+        #[arg(long)]
+        yes: bool,
+        /// Replace an existing tracker of the same name.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -841,6 +884,68 @@ async fn run_cli() -> Result<()> {
                 }
             }
         },
+        Command::Tracker {
+            command:
+                TrackerCommand::Setup {
+                    backend:
+                        TrackerSetupBackend::Azdo {
+                            org,
+                            project,
+                            repo,
+                            name,
+                            tag,
+                            credential_fnox,
+                            credential_env,
+                            credential_command,
+                            work_item_type,
+                            yes,
+                            force,
+                        },
+                },
+        } => {
+            let config_path = config::config_file()?;
+            let config = config::load_config(&config_path)?;
+            let credential = (credential_fnox.is_some()
+                || credential_env.is_some()
+                || credential_command.is_some())
+            .then(|| config::CredentialConfig {
+                from_fnox: credential_fnox,
+                from_env: credential_env,
+                command: credential_command,
+                ..config::CredentialConfig::default()
+            });
+            let opts = tracker::setup::SetupOptions {
+                org,
+                project,
+                repo,
+                name,
+                tag,
+                credential,
+                work_item_type,
+                yes,
+                force,
+                by: tracker::setup::acknowledging_user(),
+                at: tracker::setup::now_rfc3339(),
+            };
+            let build = |t: &config::TrackerConfig| {
+                tracker::build_tracker_within(t, Some(std::time::Duration::from_secs(30)))
+            };
+            match tracker::setup::run_setup(
+                &config,
+                &config_path,
+                &opts,
+                &mut tracker::setup::StdioIo,
+                &build,
+            )
+            .await?
+            {
+                tracker::setup::SetupOutcome::Written { doctor_failures: 0 } => {}
+                tracker::setup::SetupOutcome::Written { doctor_failures } => {
+                    anyhow::bail!("tracker written, but {doctor_failures} doctor check(s) failed")
+                }
+                tracker::setup::SetupOutcome::Declined => {}
+            }
+        }
         Command::Tracker { command } => {
             let config_path = config::config_file()?;
             let config = config::load_config(&config_path)?;
@@ -852,6 +957,7 @@ async fn run_cli() -> Result<()> {
                 TrackerCommand::Sync { tracker } => {
                     tracker::push::sync_command(&config, tracker.as_deref()).await?
                 }
+                TrackerCommand::Setup { .. } => unreachable!("handled above"),
             }
         }
         Command::Skill { command } => match command {

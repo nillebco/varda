@@ -588,6 +588,22 @@ impl AzdoTracker {
             .collect())
     }
 
+    /// Process template name from `GET {org}/_apis/projects/{project}?includeCapabilities=true`.
+    pub async fn project_process_template(&self) -> Result<Option<String>> {
+        let url = format!(
+            "{}/_apis/projects/{}?includeCapabilities=true&api-version={API_VERSION}",
+            self.base_url,
+            url_encode(&self.project)
+        );
+        let value = self
+            .call_json(self.request("GET", url, None), &format!("project {}", self.project))
+            .await?;
+        Ok(value
+            .pointer("/capabilities/processTemplate/templateName")
+            .and_then(Value::as_str)
+            .map(str::to_owned))
+    }
+
     fn map_item(&self, item: &Value) -> anyhow::Result<RemoteIssue> {
         let id = item
             .get("id")
@@ -826,6 +842,10 @@ impl IssueTracker for AzdoTracker {
             None => json!({"op": "remove", "path": "/fields/System.AssignedTo"}),
         };
         self.patch_item(id, vec![op], None).await.map(|_| ())
+    }
+
+    async fn process_template(&self) -> Result<Option<String>> {
+        self.project_process_template().await
     }
 
     async fn check_auth(&self) -> Result<()> {
@@ -1831,6 +1851,17 @@ mod tests {
         assert_eq!(ops[1]["value"], "<p>x &lt; y</p>");
         assert_eq!(ops[2]["value"], "varda; a");
         assert_eq!(ops[3]["path"], "/fields/System.AssignedTo");
+    }
+
+    #[tokio::test]
+    async fn project_process_template_reads_capabilities() {
+        let body = r#"{"id":"x","name":"My Project","capabilities":{"processTemplate":{"templateName":"Agile","templateTypeId":"abc"}}}"#;
+        let (base, seen) = fake_server(vec![(200, vec![], body.to_owned()), (200, vec![], "{}".to_owned())]);
+        let t = tracker(&base);
+        assert_eq!(t.project_process_template().await.unwrap().as_deref(), Some("Agile"));
+        let req = seen.lock().unwrap()[0].clone();
+        assert!(req.starts_with("GET /_apis/projects/My%20Project?includeCapabilities=true"), "{req}");
+        assert_eq!(t.project_process_template().await.unwrap(), None);
     }
 
     #[tokio::test]

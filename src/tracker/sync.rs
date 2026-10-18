@@ -28,7 +28,7 @@ pub enum PullAction {
 }
 
 impl PullAction {
-    fn label(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             Self::Created => "create",
             Self::Updated => "update",
