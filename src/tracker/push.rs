@@ -342,7 +342,13 @@ pub async fn push_and_save(config: &Config, doc: &mut TaskDocument) {
 async fn push_and_save_within(config: &Config, doc: &mut TaskDocument, bound: Duration) -> bool {
     let before = doc.frontmatter.external.clone();
     push_transition_within(config, doc, bound).await;
-    if doc.frontmatter.external != before
+    save_if_changed(doc, &before)
+}
+
+/// Persist the task if its tracker bookkeeping differs from `before`.
+/// Returns `false` if it changed but could not be saved.
+fn save_if_changed(doc: &TaskDocument, before: &Option<ExternalRef>) -> bool {
+    if doc.frontmatter.external != *before
         && let Err(e) = task::write_task(doc)
     {
         eprintln!(
@@ -394,21 +400,30 @@ pub async fn sync_tasks(config: &Config, only: Option<&str>, bound: Duration) ->
             continue;
         }
         let saved = push_and_save_within(config, &mut doc, bound).await;
-        let ext = doc.frontmatter.external.as_ref().expect("external");
-        if !saved {
+        if report_outcome(&backend, &doc, saved) {
             failing += 1;
-            println!("{backend}: {} pushed but the task file could not be saved", ext.id);
-            continue;
-        }
-        match &ext.sync_error {
-            None => println!("{backend}: synced {} -> {:?}", ext.id, doc.frontmatter.status),
-            Some(e) => {
-                failing += 1;
-                println!("{backend}: {} still failing: {e}", ext.id);
-            }
         }
     }
     failing
+}
+
+/// Print the per-task sync result; returns `true` if the task counts as failing.
+fn report_outcome(backend: &str, doc: &TaskDocument, saved: bool) -> bool {
+    let ext = doc.frontmatter.external.as_ref().expect("external");
+    if !saved {
+        println!("{backend}: {} pushed but the task file could not be saved", ext.id);
+        return true;
+    }
+    match &ext.sync_error {
+        None => {
+            println!("{backend}: synced {} -> {:?}", ext.id, doc.frontmatter.status);
+            false
+        }
+        Some(e) => {
+            println!("{backend}: {} still failing: {e}", ext.id);
+            true
+        }
+    }
 }
 
 /// `varda tracker sync [--tracker NAME]`.
@@ -775,6 +790,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn save_failure_is_reported_and_counted_by_sync() {
         let (root, config, t) = setup("savefail");
@@ -803,6 +819,41 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&dir, perms).unwrap();
         assert!(!saved);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The remote push succeeds but the file cannot be saved: counted as failing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_push_with_unsavable_file_counts_as_failing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, config, t) = setup("savefailcount");
+        let fake = FakeTracker::new(t.clone());
+        fake.insert("New", "alpha", &[]);
+        let mut doc = imported(&config, &t, &fake).await;
+        let dir = doc.path.parent().unwrap().to_path_buf();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms.clone()).unwrap();
+        if std::fs::write(dir.join(".probe"), "x").is_ok() {
+            // Running as root: cannot make the directory unwritable.
+            std::fs::remove_file(dir.join(".probe")).ok();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dir, perms).unwrap();
+            std::fs::remove_dir_all(root).ok();
+            return;
+        }
+        let before = doc.frontmatter.external.clone();
+        doc.frontmatter.status = TaskStatus::Running;
+        push_via(&t, &fake, &mut doc).await;
+        let push_ok = ext(&doc).sync_error.is_none();
+        let saved = save_if_changed(&doc, &before);
+        let failing = report_outcome(&t.name, &doc, saved);
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        assert!(push_ok);
+        assert!(!saved);
+        assert!(failing);
         std::fs::remove_dir_all(root).ok();
     }
 
