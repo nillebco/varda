@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 
 use super::{IssueTracker, RemoteIssue, status_from_remote};
-use crate::config::{Config, TrackerConfig};
+use crate::config::{Config, TrackerConfig, TrackerKind};
 use crate::task::{self, ExternalRef, TaskStatus};
 
 /// What a pull did (or, with `--dry-run`, would do) for one work item.
@@ -87,10 +87,16 @@ pub fn filter_summary(tracker: &TrackerConfig) -> String {
 /// Refuse a tracker that was never acknowledged, or whose acknowledgement does
 /// not cover every agent the `project_path` route allows.
 pub fn check_acknowledged(config: &Config, tracker: &TrackerConfig) -> Result<()> {
-    let setup_hint = format!(
-        "run `varda tracker setup azdo --org ORG --project PROJECT --repo PATH --name {}`",
-        tracker.name
-    );
+    let setup_hint = match tracker.kind {
+        TrackerKind::Github => format!(
+            "run `varda tracker setup github --repo OWNER/NAME --project-path PATH --name {}`",
+            tracker.name
+        ),
+        _ => format!(
+            "run `varda tracker setup azdo --org ORG --project PROJECT --repo PATH --name {}`",
+            tracker.name
+        ),
+    };
     let Some(ack) = tracker.acknowledged.as_ref() else {
         bail!(
             "tracker '{}' has not been acknowledged; {setup_hint}",
@@ -398,7 +404,7 @@ mod tests {
     use super::super::fake::FakeTracker;
     use super::super::{AZDO_AGILE_STATUS_MAP, status_map_from};
     use super::*;
-    use crate::config::{CredentialConfig, Route, TrackerAck, TrackerFilter, TrackerKind};
+    use crate::config::{CredentialConfig, Route, TrackerAck, TrackerFilter};
     use std::collections::BTreeMap;
 
     fn setup(name: &str) -> (PathBuf, Config, TrackerConfig) {

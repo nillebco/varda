@@ -8,6 +8,7 @@
 
 pub mod azdo;
 pub mod doctor;
+pub mod github;
 pub mod push;
 pub mod setup;
 pub mod sync;
@@ -126,6 +127,17 @@ pub trait IssueTracker: Send + Sync {
     async fn process_template(&self) -> Result<Option<String>> {
         Ok(None)
     }
+    /// Which of the `wanted` labels do not exist on the remote yet (`tracker
+    /// setup`). Backends without a label catalogue report none missing.
+    async fn missing_labels(&self, _wanted: &[String]) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Create the given labels on the remote; already-existing ones are fine.
+    async fn create_labels(&self, _names: &[String]) -> Result<()> {
+        Err(TrackerError::Other(anyhow::anyhow!(
+            "this tracker cannot create labels"
+        )))
+    }
 }
 
 /// Build the backend for a (central-config) `[[trackers]]` entry, resolving its
@@ -144,23 +156,30 @@ pub fn build_tracker_within(
 ) -> anyhow::Result<Box<dyn IssueTracker>> {
     match tracker.kind {
         TrackerKind::Azdo => {
-            let source = tracker.credential.source()?;
-            let pat = crate::resolve_credential_value_within(
-                &source,
-                tracker.credential.optional,
-                timeout,
-            )
-                .with_context(|| format!("resolving credential for tracker '{}'", tracker.name))?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "credential for tracker '{}' resolved to nothing (unset/empty)",
-                        tracker.name
-                    )
-                })?;
+            let pat = resolve_tracker_credential(tracker, timeout)?;
             Ok(Box::new(azdo::AzdoTracker::from_config(tracker, pat)?))
+        }
+        TrackerKind::Github => {
+            let token = resolve_tracker_credential(tracker, timeout)?;
+            Ok(Box::new(github::GithubTracker::from_config(tracker, token)?))
         }
         other => anyhow::bail!("tracker kind {other:?} is not implemented yet"),
     }
+}
+
+fn resolve_tracker_credential(
+    tracker: &TrackerConfig,
+    timeout: Option<std::time::Duration>,
+) -> anyhow::Result<String> {
+    let source = tracker.credential.source()?;
+    crate::resolve_credential_value_within(&source, tracker.credential.optional, timeout)
+        .with_context(|| format!("resolving credential for tracker '{}'", tracker.name))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "credential for tracker '{}' resolved to nothing (unset/empty)",
+                tracker.name
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +243,12 @@ pub fn status_from_remote(
         tracker
             .status_map
             .get(status.as_str())
-            .is_some_and(|mapped| mapped.eq_ignore_ascii_case(remote_state))
+            .is_some_and(|mapped| {
+                mapped.eq_ignore_ascii_case(remote_state)
+                    // GitHub: a bare `closed` accepts any `closed:<reason>`.
+                    || (mapped.eq_ignore_ascii_case("closed")
+                        && remote_state.to_ascii_lowercase().starts_with("closed:"))
+            })
     };
     for (status, tag) in HELPER_TAGS {
         if tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) && state_is(*status) {
@@ -281,6 +305,18 @@ pub const AZDO_CMMI_STATUS_MAP: &[(&str, &str)] = &[
     ("needs_user", "Active"),
     ("failed", "Active"),
     ("done", "Closed"),
+];
+
+/// Default GitHub Issues `status_map`: issues only open/close, so everything but
+/// `done` stays open and the `varda:*` helper labels carry the rest.
+pub const GITHUB_STATUS_MAP: &[(&str, &str)] = &[
+    ("backlog", "open"),
+    ("ready", "open"),
+    ("running", "open"),
+    ("review", "open"),
+    ("needs_user", "open"),
+    ("failed", "open"),
+    ("done", "closed:completed"),
 ];
 
 /// Owned form of one of the default maps above.

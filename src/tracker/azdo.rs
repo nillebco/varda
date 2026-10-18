@@ -68,7 +68,7 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k == name)
@@ -866,7 +866,7 @@ const TRUNCATION_NOTICE: &str = "\n\n_[truncated by Varda: comment exceeded 100 
 
 /// Truncate to [`MAX_COMMENT_BYTES`] on a char boundary; the result, notice
 /// included, never exceeds the cap.
-fn cap_markdown(markdown: &str) -> String {
+pub(super) fn cap_markdown(markdown: &str) -> String {
     cap_markdown_to(markdown, MAX_COMMENT_BYTES)
 }
 
@@ -954,7 +954,7 @@ fn markdown_to_html(markdown: &str) -> String {
 
 /// At most [`MAX_RETRIES`] retries on 429/503, honouring `Retry-After`
 /// (seconds), never waiting more than [`MAX_RETRY_WAIT`] in total.
-fn send_with_retry(transport: &dyn Transport, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+pub(super) fn send_with_retry(transport: &dyn Transport, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
     let mut waited = Duration::ZERO;
     let mut attempt = 0;
     loop {
@@ -1007,7 +1007,7 @@ pub fn build_wiql(filter: &TrackerFilter) -> String {
     )
 }
 
-fn url_encode(s: &str) -> String {
+pub(super) fn url_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -1032,7 +1032,7 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-fn redact(text: &str, secret: &str) -> String {
+pub(super) fn redact(text: &str, secret: &str) -> String {
     let mut out = text.to_owned();
     if !secret.is_empty() {
         out = out.replace(secret, "[redacted]");

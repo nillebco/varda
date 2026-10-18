@@ -14,7 +14,7 @@ use anyhow::{Context as _, Result, bail};
 
 use super::{
     AZDO_AGILE_STATUS_MAP, AZDO_BASIC_STATUS_MAP, AZDO_CMMI_STATUS_MAP, AZDO_SCRUM_STATUS_MAP,
-    IssueTracker, status_map_from,
+    GITHUB_STATUS_MAP, IssueTracker, status_map_from,
 };
 use crate::config::{Config, CredentialConfig, TrackerAck, TrackerConfig, TrackerFilter, TrackerKind};
 
@@ -146,14 +146,19 @@ fn agent_provider(config: &Config, agent: &str) -> &'static str {
 
 /// The disclaimer screen. Wording is from the plan, filled in.
 pub fn disclaimer_text(config: &Config, org: &str, project: &str, agents: &[String]) -> String {
+    disclaimer_for(config, &format!("{org}/{project}"), "Work item", "work items", agents)
+}
+
+/// [`disclaimer_text`] for an arbitrary `scope` (`org/project`, `owner/repo`).
+fn disclaimer_for(config: &Config, scope: &str, noun: &str, plural: &str, agents: &[String]) -> String {
     let who: Vec<String> = agents
         .iter()
         .map(|a| format!("`{a}`, {}", agent_provider(config, a)))
         .collect();
     format!(
-        "Work item titles, descriptions, acceptance criteria and comments from\n\
-         `{org}/{project}` will be sent to the configured agent ({}) as\n\
-         prompt content, and run recaps will be posted back to those work items.\n\
+        "{noun} titles, descriptions, acceptance criteria and comments from\n\
+         `{scope}` will be sent to the configured agent ({}) as\n\
+         prompt content, and run recaps will be posted back to those {plural}.\n\
          Confirm that this is allowed for this organisation.",
         who.join("; ")
     )
@@ -250,7 +255,12 @@ fn toml_list(items: &[String]) -> String {
 /// Render the `[[trackers]]` block for `t` (reference-only credential).
 pub fn render_block(t: &TrackerConfig) -> String {
     let mut out = String::from("[[trackers]]\n");
-    out.push_str(&format!("name = {}\nkind = \"azdo\"\n", toml_str(&t.name)));
+    let kind = match t.kind {
+        TrackerKind::Azdo => "azdo",
+        TrackerKind::Github => "github",
+        TrackerKind::Jira => "jira",
+    };
+    out.push_str(&format!("name = {}\nkind = \"{kind}\"\n", toml_str(&t.name)));
     for (k, v) in &t.extra {
         out.push_str(&format!("{k} = {}\n", toml_str(v)));
     }
@@ -320,6 +330,25 @@ fn merged_config_text(existing: &str, t: &TrackerConfig, force: bool) -> Result<
     Ok(text)
 }
 
+/// Ask where the credential lives; only a reference is ever returned.
+fn prompt_credential(io: &mut dyn SetupIo, question: &str, command_hint: &str) -> Result<CredentialConfig> {
+    io.say(question);
+    io.say(&format!("  1) fnox key   2) environment variable   3) {command_hint}"));
+    let kind = io.ask("Choice [1-3]:")?;
+    let value = io.ask("Key / variable name / command:")?;
+    if value.is_empty() {
+        bail!("empty credential reference");
+    }
+    let mut c = CredentialConfig::default();
+    match kind.as_str() {
+        "1" => c.from_fnox = Some(value),
+        "2" => c.from_env = Some(value),
+        "3" => c.command = Some(value),
+        other => bail!("unknown credential choice '{other}'"),
+    }
+    Ok(c)
+}
+
 /// Run the guided setup. `config` is the loaded central config (routes,
 /// agents, existing trackers); `config_path` is where the block is appended.
 pub async fn run_setup(
@@ -353,23 +382,11 @@ pub async fn run_setup(
         None if opts.yes || !io.is_tty() => {
             bail!("no credential given; pass --credential-fnox, --credential-env or --credential-command")
         }
-        None => {
-            io.say("Where does the Azure DevOps PAT live?");
-            io.say("  1) fnox key   2) environment variable   3) command (e.g. az account get-access-token ...)");
-            let kind = io.ask("Choice [1-3]:")?;
-            let value = io.ask("Key / variable name / command:")?;
-            if value.is_empty() {
-                bail!("empty credential reference");
-            }
-            let mut c = CredentialConfig::default();
-            match kind.as_str() {
-                "1" => c.from_fnox = Some(value),
-                "2" => c.from_env = Some(value),
-                "3" => c.command = Some(value),
-                other => bail!("unknown credential choice '{other}'"),
-            }
-            c
-        }
+        None => prompt_credential(
+            io,
+            "Where does the Azure DevOps PAT live?",
+            "command (e.g. az account get-access-token ...)",
+        )?,
     };
     credential.source().context("invalid credential reference")?;
 
@@ -471,16 +488,56 @@ pub async fn run_setup(
     ));
     io.say("  The varda:ready / varda:needs-user / varda:failed helper tags appear on first use.");
 
-    // 4. Dry run (reuses the pull dry-run). A provisional acknowledgement lets
+    let agents_for_text = agents.clone();
+    finalize(
+        config,
+        config_path,
+        FinalizeArgs {
+            draft,
+            agents,
+            disclaimer: disclaimer_text(config, &opts.org, &opts.project, &agents_for_text),
+            yes: opts.yes,
+            force: opts.force,
+            by: &opts.by,
+            at: &opts.at,
+        },
+        backend.as_ref(),
+        io,
+    )
+    .await
+}
+
+/// Everything the shared setup tail needs.
+struct FinalizeArgs<'a> {
+    draft: TrackerConfig,
+    agents: Vec<String>,
+    disclaimer: String,
+    yes: bool,
+    force: bool,
+    by: &'a str,
+    at: &'a str,
+}
+
+/// Dry-run pull, disclaimer + acknowledgement, append the block, doctor checks.
+async fn finalize(
+    config: &Config,
+    config_path: &Path,
+    args: FinalizeArgs<'_>,
+    backend: &dyn IssueTracker,
+    io: &mut dyn SetupIo,
+) -> Result<SetupOutcome> {
+    let FinalizeArgs { mut draft, agents, disclaimer, yes, force, by, at } = args;
+    let name = draft.name.clone();
+    // Dry run (reuses the pull dry-run). A provisional acknowledgement lets
     // the pull gate pass; it is not persisted unless confirmed below.
     let ack = TrackerAck {
-        by: opts.by.clone(),
-        at: opts.at.clone(),
+        by: by.to_owned(),
+        at: at.to_owned(),
         agents: agents.clone(),
     };
     let mut dry = draft.clone();
     dry.acknowledged = Some(ack.clone());
-    match super::sync::pull_tracker(config, &dry, backend.as_ref(), true).await {
+    match super::sync::pull_tracker(config, &dry, backend, true).await {
         Ok(outcome) => {
             ok(io, &format!("dry run: pull would process {} work item(s)", outcome.items.len()));
             for item in &outcome.items {
@@ -499,10 +556,10 @@ pub async fn run_setup(
         }
     }
 
-    // 5. Disclaimer + acknowledgement.
+    // Disclaimer + acknowledgement.
     io.say("");
-    io.say(&disclaimer_text(config, &opts.org, &opts.project, &agents));
-    if opts.yes {
+    io.say(&disclaimer);
+    if yes {
         io.say("(--yes: acknowledgement recorded without prompting)");
     } else if !confirm(io, "Do you confirm?", false)? {
         io.say("Not acknowledged; nothing written.");
@@ -510,13 +567,13 @@ pub async fn run_setup(
     }
     draft.acknowledged = Some(ack);
 
-    // 6. Write config (append) and run the doctor checks.
+    // Write config (append) and run the doctor checks.
     let existing = match std::fs::read_to_string(config_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", config_path.display())),
     };
-    let text = merged_config_text(&existing, &draft, opts.force)?;
+    let text = merged_config_text(&existing, &draft, force)?;
     if let Some(dir) = config_path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -534,7 +591,7 @@ pub async fn run_setup(
             .map(|()| "yes".to_owned())
             .map_err(|_| String::new()),
     )];
-    checks.extend(super::doctor::backend_checks(&draft, backend.as_ref()).await);
+    checks.extend(super::doctor::backend_checks(&draft, backend).await);
     for (check, verdict) in checks {
         match verdict {
             Ok(detail) => ok(io, &format!("doctor {check}: {detail}")),
@@ -546,6 +603,178 @@ pub async fn run_setup(
         }
     }
     Ok(SetupOutcome::Written { doctor_failures: failures })
+}
+
+#[derive(Debug, Clone)]
+pub struct GithubSetupOptions {
+    /// `owner/name` of the GitHub repository holding the issues.
+    pub github_repo: String,
+    /// REST API root for GitHub Enterprise; `None` ⇒ `https://api.github.com`.
+    pub api_base: Option<String>,
+    /// Local repository the issues are worked on in.
+    pub project_path: PathBuf,
+    pub name: Option<String>,
+    /// Pickup label: only issues carrying it are imported.
+    pub label: String,
+    pub credential: Option<CredentialConfig>,
+    /// Create missing labels without asking.
+    pub yes: bool,
+    pub force: bool,
+    pub by: String,
+    pub at: String,
+}
+
+/// `varda tracker setup github`: same shape as [`run_setup`] — credential proof
+/// (`GET /repos/{o}/{r}`), pickup/helper label check with an offer to create
+/// them (GitHub can), dry run, disclaimer, write config.
+pub async fn run_setup_github(
+    config: &Config,
+    config_path: &Path,
+    opts: &GithubSetupOptions,
+    io: &mut dyn SetupIo,
+    build: BackendFactory<'_>,
+) -> Result<SetupOutcome> {
+    if !super::github::valid_repo_slug(&opts.github_repo) {
+        bail!("--repo must look like `owner/name`, got '{}'", opts.github_repo);
+    }
+    let name = opts
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("github-{}", slug(&opts.github_repo)));
+    if name.trim().is_empty() {
+        bail!("could not derive a tracker name; pass --name");
+    }
+    if config.trackers.iter().any(|t| t.name == name) && !opts.force {
+        bail!("tracker '{name}' already exists in {}; pass --force to replace it, or --name to pick another", config_path.display());
+    }
+    let repo = std::fs::canonicalize(&opts.project_path)
+        .with_context(|| format!("--project-path {} does not exist", opts.project_path.display()))?;
+    let route = crate::routing::find_route_public(config, &repo)
+        .with_context(|| format!("--project-path {} matches no route in the central config", repo.display()))?;
+    let agents = route.agents.clone();
+
+    // 1. Credential.
+    let credential = match &opts.credential {
+        Some(c) => c.clone(),
+        None if opts.yes || !io.is_tty() => {
+            bail!("no credential given; pass --credential-fnox, --credential-env or --credential-command")
+        }
+        None => prompt_credential(
+            io,
+            "Where does the GitHub token live? (fine-grained PAT with Issues read/write)",
+            "command (e.g. gh auth token)",
+        )?,
+    };
+    credential.source().context("invalid credential reference")?;
+
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert("repo".to_owned(), opts.github_repo.clone());
+    if let Some(base) = opts.api_base.as_deref().filter(|b| !b.trim().is_empty()) {
+        extra.insert("api_base".to_owned(), base.trim().to_owned());
+    }
+    let mut draft = TrackerConfig {
+        name: name.clone(),
+        kind: TrackerKind::Github,
+        project_path: repo.display().to_string(),
+        credential,
+        filter: TrackerFilter {
+            tags: vec![opts.label.clone()],
+            ..TrackerFilter::default()
+        },
+        status_map: status_map_from(GITHUB_STATUS_MAP),
+        acknowledged: None,
+        extra,
+    };
+
+    let backend = match build(&draft) {
+        Ok(b) => b,
+        Err(_) => {
+            // The chain may embed credential-command stderr; never print it.
+            fail(io, "credential could not be resolved (see `varda tracker doctor`)");
+            bail!("credential could not be resolved");
+        }
+    };
+    ok(io, "credential reference resolves");
+    if backend.check_auth().await.is_err() {
+        fail(io, &format!("GET /repos/{}: authentication failed (check the token, its Issues scope and the repo name)", opts.github_repo));
+        bail!("authentication failed");
+    }
+    ok(io, &format!("authenticated (GET /repos/{})", opts.github_repo));
+    io.say("  (write access is not probed: it would modify an issue; Issues read/write permission is required)");
+
+    // 2. status_map.
+    ok(io, "status_map: GitHub issues only open/close; the varda:* labels carry the finer statuses");
+    io.say(&format!("  {:<12} -> {}", "varda status", "state"));
+    for (status, state) in &draft.status_map {
+        io.say(&format!("  {status:<12} -> {state}"));
+    }
+
+    // 3. Pickup + helper labels.
+    let mut wanted = vec![opts.label.clone()];
+    wanted.extend(["varda:ready", "varda:needs-user", "varda:failed"].map(str::to_owned));
+    io.say(&format!(
+        "Pickup label: Varda only touches issues labelled `{}`; this scopes it inside a repository that holds other issues.",
+        opts.label
+    ));
+    match backend.missing_labels(&wanted).await {
+        Ok(missing) if missing.is_empty() => ok(io, "pickup and helper labels exist"),
+        Ok(missing) => {
+            io.say(&format!("  missing labels: {}", missing.join(", ")));
+            let create = opts.yes
+                || (io.is_tty() && confirm(io, "Create them on the repository now?", true)?);
+            if create {
+                if backend.create_labels(&missing).await.is_err() {
+                    fail(io, "could not create labels (needs Issues write permission; create them by hand)");
+                    bail!("label creation failed; nothing written");
+                }
+                ok(io, &format!("created {} label(s)", missing.len()));
+            } else {
+                io.say("  (not created; add them in the web UI, or re-run with --yes. Helper labels are also created on first use.)");
+            }
+        }
+        Err(_) => {
+            fail(io, "could not list labels");
+            bail!("the label check failed; nothing written");
+        }
+    }
+    let tagged = TrackerFilter {
+        tags: vec![opts.label.clone()],
+        ..TrackerFilter::default()
+    };
+    match backend.query(&tagged).await {
+        Ok(items) if items.is_empty() => ok(io, &format!("read access; no issues carry `{}` yet", opts.label)),
+        Ok(items) => {
+            ok(io, &format!("read access; {} issue(s) already carry `{}`:", items.len(), opts.label));
+            for i in items.iter().take(10) {
+                io.say(&format!("  #{} [{}] {}", i.id, i.remote_state, i.title));
+            }
+        }
+        Err(_) => {
+            fail(io, "could not list labelled issues");
+            bail!("the labelled-issues query failed; nothing written");
+        }
+    }
+    // `filter.states` stays empty: pull must also see issues closed remotely so
+    // it can mark the local task done.
+
+    let ack_agents = agents.clone();
+    draft.acknowledged = None;
+    finalize(
+        config,
+        config_path,
+        FinalizeArgs {
+            draft,
+            agents,
+            disclaimer: disclaimer_for(config, &opts.github_repo, "Issue", "issues", &ack_agents),
+            yes: opts.yes,
+            force: opts.force,
+            by: &opts.by,
+            at: &opts.at,
+        },
+        backend.as_ref(),
+        io,
+    )
+    .await
 }
 
 /// Current UTC time as RFC 3339 (`2026-10-18T09:30:00Z`).
@@ -1115,5 +1344,183 @@ mod tests {
         assert!(!out.contains("name = \"a\"") && !out.contains("backlog"), "{out}");
         assert!(out.contains("name = \"b\""), "{out}");
         assert!(!header_is("[[trackers]]x", "[[trackers]]"));
+    }
+    /// FakeTracker plus a label catalogue.
+    struct LabelFake {
+        inner: FakeTracker,
+        labels: std::sync::Mutex<Vec<String>>,
+        deny_create: bool,
+    }
+
+    #[async_trait]
+    impl IssueTracker for LabelFake {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        async fn query(&self, f: &TrackerFilter) -> super::super::Result<Vec<super::super::RemoteIssue>> {
+            self.inner.query(f).await
+        }
+        async fn get(&self, id: &str) -> super::super::Result<super::super::RemoteIssue> {
+            self.inner.get(id).await
+        }
+        async fn create(&self, d: &super::super::IssueDraft) -> super::super::Result<super::super::RemoteIssue> {
+            self.inner.create(d).await
+        }
+        async fn transition(
+            &self,
+            id: &str,
+            to: crate::task::TaskStatus,
+            rev: Option<u64>,
+        ) -> super::super::Result<super::super::RemoteIssue> {
+            self.inner.transition(id, to, rev).await
+        }
+        async fn comment(&self, id: &str, m: &str) -> super::super::Result<()> {
+            self.inner.comment(id, m).await
+        }
+        async fn assign(&self, id: &str, w: Option<&str>) -> super::super::Result<()> {
+            self.inner.assign(id, w).await
+        }
+        async fn valid_states(&self) -> super::super::Result<Option<Vec<String>>> {
+            Ok(Some(["open", "closed", "closed:completed", "closed:not_planned"].map(str::to_owned).to_vec()))
+        }
+        async fn missing_labels(&self, wanted: &[String]) -> super::super::Result<Vec<String>> {
+            let have = self.labels.lock().unwrap();
+            Ok(wanted.iter().filter(|w| !have.contains(w)).cloned().collect())
+        }
+        async fn create_labels(&self, names: &[String]) -> super::super::Result<()> {
+            if self.deny_create {
+                return Err(super::super::TrackerError::Other(anyhow::anyhow!("403 secret-body")));
+            }
+            self.labels.lock().unwrap().extend(names.iter().cloned());
+            Ok(())
+        }
+    }
+
+    fn gh_factory(existing: &[&str], deny_create: bool) -> impl Fn(&TrackerConfig) -> Result<Box<dyn IssueTracker>> {
+        let existing: Vec<String> = existing.iter().map(|s| (*s).to_owned()).collect();
+        move |t: &TrackerConfig| {
+            let mut gh = t.clone();
+            gh.status_map = status_map_from(GITHUB_STATUS_MAP);
+            let fake = FakeTracker::new(gh);
+            fake.insert("open", "tagged item", &["varda"]);
+            let labels = LabelFake {
+                inner: fake,
+                labels: std::sync::Mutex::new(existing.clone()),
+                deny_create,
+            };
+            Ok(Box::new(labels) as Box<dyn IssueTracker>)
+        }
+    }
+
+    fn gh_opts(e: &Env) -> GithubSetupOptions {
+        GithubSetupOptions {
+            github_repo: "acme/widgets".to_owned(),
+            api_base: None,
+            project_path: e.opts.repo.clone(),
+            name: None,
+            label: "varda".to_owned(),
+            credential: Some(CredentialConfig {
+                command: Some("gh auth token".to_owned()),
+                ..CredentialConfig::default()
+            }),
+            yes: true,
+            force: false,
+            by: "me@example.com".to_owned(),
+            at: "2026-10-18T09:30:00Z".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn github_happy_path_with_yes_creates_labels_and_writes_block() {
+        let e = env("gh-happy");
+        let mut io = ScriptedIo::default();
+        let f = gh_factory(&["bug"], false);
+        let out = run_setup_github(&e.config, &e.config_path, &gh_opts(&e), &mut io, &f).await.unwrap();
+        assert_eq!(out, SetupOutcome::Written { doctor_failures: 0 }, "{:#?}", io.out);
+        let text = std::fs::read_to_string(&e.config_path).unwrap();
+        assert!(text.starts_with("# my comment\n[defaults]"), "{text}");
+        assert!(text.contains("kind = \"github\"") && text.contains("repo = \"acme/widgets\""), "{text}");
+        assert!(text.contains("command = \"gh auth token\""), "{text}");
+        assert!(!text.contains("api_base"), "{text}");
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let trackers: Vec<TrackerConfig> = parsed["trackers"].clone().try_into().unwrap();
+        assert_eq!(trackers[0].name, "github-acme-widgets");
+        assert_eq!(trackers[0].kind, TrackerKind::Github);
+        assert_eq!(trackers[0].status_map["done"], "closed:completed");
+        assert_eq!(trackers[0].status_map["running"], "open");
+        assert_eq!(trackers[0].filter.tags, vec!["varda"]);
+        assert!(trackers[0].filter.states.is_empty());
+        assert_eq!(trackers[0].acknowledged.as_ref().unwrap().agents, vec!["claude"]);
+        let joined = io.out.join("\n");
+        assert!(joined.contains("created 4 label(s)"), "{joined}");
+        assert!(joined.contains("dry run: pull would process 1 work item(s)"), "{joined}");
+        assert!(joined.contains("`acme/widgets`") && joined.contains("Issue titles"), "{joined}");
+        std::fs::remove_dir_all(e.root).ok();
+    }
+
+    #[tokio::test]
+    async fn github_records_api_base_for_enterprise() {
+        let e = env("gh-ghe");
+        let mut opts = gh_opts(&e);
+        opts.api_base = Some("https://ghe.example/api/v3".to_owned());
+        let mut io = ScriptedIo::default();
+        let f = gh_factory(&["varda", "varda:ready", "varda:needs-user", "varda:failed"], false);
+        run_setup_github(&e.config, &e.config_path, &opts, &mut io, &f).await.unwrap();
+        let text = std::fs::read_to_string(&e.config_path).unwrap();
+        assert!(text.contains("api_base = \"https://ghe.example/api/v3\""), "{text}");
+        assert!(io.out.join("\n").contains("pickup and helper labels exist"));
+        std::fs::remove_dir_all(e.root).ok();
+    }
+
+    #[tokio::test]
+    async fn github_without_yes_offers_labels_and_decline_leaves_them() {
+        let e = env("gh-offer");
+        let mut opts = gh_opts(&e);
+        opts.yes = false;
+        // tty: create-labels? n; disclaimer? y
+        let mut io = ScriptedIo {
+            tty: true,
+            answers: ["n", "y"].map(str::to_owned).into(),
+            ..ScriptedIo::default()
+        };
+        let f = gh_factory(&[], false);
+        let out = run_setup_github(&e.config, &e.config_path, &opts, &mut io, &f).await.unwrap();
+        assert!(matches!(out, SetupOutcome::Written { .. }));
+        let joined = io.out.join("\n");
+        assert!(joined.contains("missing labels: varda, varda:ready"), "{joined}");
+        assert!(joined.contains("not created"), "{joined}");
+        std::fs::remove_dir_all(e.root).ok();
+    }
+
+    #[tokio::test]
+    async fn github_label_creation_failure_aborts_without_echoing_the_body() {
+        let e = env("gh-deny");
+        let mut io = ScriptedIo::default();
+        let f = gh_factory(&[], true);
+        let err = run_setup_github(&e.config, &e.config_path, &gh_opts(&e), &mut io, &f).await.unwrap_err();
+        assert!(err.to_string().contains("label creation failed"), "{err}");
+        assert!(!io.out.join("\n").contains("secret-body"));
+        assert!(!std::fs::read_to_string(&e.config_path).unwrap().contains("trackers"));
+        std::fs::remove_dir_all(e.root).ok();
+    }
+
+    #[tokio::test]
+    async fn github_rejects_bad_repo_and_existing_name() {
+        let e = env("gh-bad");
+        let mut opts = gh_opts(&e);
+        opts.github_repo = "not-a-slug".to_owned();
+        let mut io = ScriptedIo::default();
+        let f = gh_factory(&[], false);
+        let err = run_setup_github(&e.config, &e.config_path, &opts, &mut io, &f).await.unwrap_err();
+        assert!(err.to_string().contains("owner/name"), "{err}");
+
+        let mut first = ScriptedIo::default();
+        run_setup_github(&e.config, &e.config_path, &gh_opts(&e), &mut first, &f).await.unwrap();
+        let mut config = e.config.clone();
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&e.config_path).unwrap()).unwrap();
+        config.trackers = parsed["trackers"].clone().try_into().unwrap();
+        let err = run_setup_github(&config, &e.config_path, &gh_opts(&e), &mut io, &f).await.unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        std::fs::remove_dir_all(e.root).ok();
     }
 }

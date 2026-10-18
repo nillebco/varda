@@ -1,0 +1,5 @@
+[
+  {"id": 1, "name": "varda", "color": "5319e7", "description": null},
+  {"id": 2, "name": "varda:ready", "color": "5319e7", "description": "Managed by Varda"},
+  {"id": 3, "name": "bug", "color": "d73a4a", "description": "Something isn't working"}
+]

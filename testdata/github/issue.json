@@ -1,0 +1,14 @@
+{
+  "number": 11,
+  "state": "open",
+  "state_reason": null,
+  "title": "Retry on 429",
+  "body": "Honour **Retry-After**.\n\n- give up after 2 retries",
+  "html_url": "https://github.com/acme/widgets/issues/11",
+  "created_at": "2026-09-20T08:00:00Z",
+  "updated_at": "2026-10-01T09:00:00Z",
+  "user": {"login": "grace"},
+  "assignee": {"login": "ada"},
+  "assignees": [{"login": "ada"}],
+  "labels": [{"id": 1, "name": "varda", "color": "5319e7"}]
+}
