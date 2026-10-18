@@ -805,7 +805,7 @@ pub enum TrackerKind {
 }
 
 /// Which remote work items a tracker picks up. All fields optional; `wiql`
-/// (azdo) replaces the simple filter when set.
+/// (azdo) / `jql` (Jira) replaces the simple filter when set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrackerFilter {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -816,6 +816,9 @@ pub struct TrackerFilter {
     pub area_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wiql: Option<String>,
+    /// Jira: a JQL query that replaces the simple filter when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jql: Option<String>,
 }
 
 /// Recorded data-handling acknowledgement written by `tracker setup`.

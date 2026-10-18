@@ -92,7 +92,11 @@ pub fn check_acknowledged(config: &Config, tracker: &TrackerConfig) -> Result<()
             "run `varda tracker setup github --repo OWNER/NAME --project-path PATH --name {}`",
             tracker.name
         ),
-        _ => format!(
+        TrackerKind::Jira => format!(
+            "run `varda tracker setup jira --site URL --project-key KEY --email EMAIL --repo PATH --name {}`",
+            tracker.name
+        ),
+        TrackerKind::Azdo => format!(
             "run `varda tracker setup azdo --org ORG --project PROJECT --repo PATH --name {}`",
             tracker.name
         ),

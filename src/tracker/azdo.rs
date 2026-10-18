@@ -1019,7 +1019,7 @@ pub(super) fn url_encode(s: &str) -> String {
     out
 }
 
-fn base64(input: &[u8]) -> String {
+pub(super) fn base64(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for c in input.chunks(3) {

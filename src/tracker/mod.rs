@@ -9,6 +9,8 @@
 pub mod azdo;
 pub mod doctor;
 pub mod github;
+pub mod jira;
+pub mod jira_adf;
 pub mod push;
 pub mod setup;
 pub mod sync;
@@ -163,7 +165,10 @@ pub fn build_tracker_within(
             let token = resolve_tracker_credential(tracker, timeout)?;
             Ok(Box::new(github::GithubTracker::from_config(tracker, token)?))
         }
-        other => anyhow::bail!("tracker kind {other:?} is not implemented yet"),
+        TrackerKind::Jira => {
+            let token = resolve_tracker_credential(tracker, timeout)?;
+            Ok(Box::new(jira::JiraTracker::from_config(tracker, token)?))
+        }
     }
 }
 

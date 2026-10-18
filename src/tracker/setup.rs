@@ -777,6 +777,274 @@ pub async fn run_setup_github(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// Jira
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct JiraSetupOptions {
+    /// `https://x.atlassian.net`
+    pub site: String,
+    pub project_key: String,
+    /// Atlassian account email (the Basic-auth user; the token is the password).
+    pub email: String,
+    pub repo: PathBuf,
+    pub name: Option<String>,
+    /// Pickup label: only issues carrying it are imported.
+    pub label: String,
+    pub credential: Option<CredentialConfig>,
+    pub issue_type: String,
+    pub yes: bool,
+    pub force: bool,
+    pub by: String,
+    pub at: String,
+}
+
+/// Propose a `status_map` (values are target STATUS names; Jira moves by
+/// transition) from the project's workflow statuses. The flag is `true` when
+/// backlog, running and done all matched a well-known name; otherwise the map
+/// is a positional guess the pilot must confirm.
+pub fn propose_jira_status_map(
+    statuses: &[String],
+) -> (std::collections::BTreeMap<String, String>, bool) {
+    let pick = |candidates: &[&str]| -> Option<String> {
+        candidates.iter().find_map(|c| {
+            statuses.iter().find(|s| s.eq_ignore_ascii_case(c)).cloned()
+        })
+    };
+    let backlog = pick(&["Backlog", "To Do", "Open", "Selected for Development"]);
+    let running = pick(&["In Progress", "In Development", "Doing"]);
+    let review = pick(&["In Review", "Review", "Code Review", "In QA", "Testing"]);
+    let done = pick(&["Done", "Closed", "Resolved", "Complete", "Completed"]);
+    let exact = backlog.is_some() && running.is_some() && done.is_some();
+    let first = statuses.first().cloned().unwrap_or_default();
+    let last = statuses.last().cloned().unwrap_or_default();
+    let middle = statuses.get(statuses.len() / 2).cloned().unwrap_or_default();
+    let backlog = backlog.unwrap_or(first);
+    let running = running.unwrap_or(middle);
+    let done = done.unwrap_or(last);
+    let review = review.unwrap_or_else(|| running.clone());
+    let map = [
+        ("backlog", &backlog),
+        ("ready", &backlog),
+        ("running", &running),
+        ("review", &review),
+        ("needs_user", &running),
+        ("failed", &running),
+        ("done", &done),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.clone()))
+    .collect();
+    (map, exact)
+}
+
+/// `varda tracker setup jira`: credential proof (`/myself`), workflow statuses
+/// to propose the `status_map`, label explanation, dry run, disclaimer, write.
+pub async fn run_setup_jira(
+    config: &Config,
+    config_path: &Path,
+    opts: &JiraSetupOptions,
+    io: &mut dyn SetupIo,
+    build: BackendFactory<'_>,
+) -> Result<SetupOutcome> {
+    let name = opts
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("jira-{}", slug(&opts.project_key)));
+    if name.trim().is_empty() {
+        bail!("could not derive a tracker name; pass --name");
+    }
+    if config.trackers.iter().any(|t| t.name == name) && !opts.force {
+        bail!("tracker '{name}' already exists in {}; pass --force to replace it, or --name to pick another", config_path.display());
+    }
+    let repo = std::fs::canonicalize(&opts.repo)
+        .with_context(|| format!("--repo {} does not exist", opts.repo.display()))?;
+    let route = crate::routing::find_route_public(config, &repo)
+        .with_context(|| format!("--repo {} matches no route in the central config", repo.display()))?;
+    let agents = route.agents.clone();
+
+    // 1. Credential.
+    let credential = match &opts.credential {
+        Some(c) => c.clone(),
+        None if opts.yes || !io.is_tty() => {
+            bail!("no credential given; pass --credential-fnox, --credential-env or --credential-command")
+        }
+        None => {
+            io.say("Where does the Jira API token live?");
+            io.say("  1) fnox key   2) environment variable   3) command");
+            let kind = io.ask("Choice [1-3]:")?;
+            let value = io.ask("Key / variable name / command:")?;
+            if value.is_empty() {
+                bail!("empty credential reference");
+            }
+            let mut c = CredentialConfig::default();
+            match kind.as_str() {
+                "1" => c.from_fnox = Some(value),
+                "2" => c.from_env = Some(value),
+                "3" => c.command = Some(value),
+                other => bail!("unknown credential choice '{other}'"),
+            }
+            c
+        }
+    };
+    credential.source().context("invalid credential reference")?;
+
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert("site".to_owned(), opts.site.trim_end_matches('/').to_owned());
+    extra.insert("project_key".to_owned(), opts.project_key.clone());
+    extra.insert("email".to_owned(), opts.email.clone());
+    if opts.issue_type != "Task" {
+        extra.insert("issue_type".to_owned(), opts.issue_type.clone());
+    }
+    let mut draft = TrackerConfig {
+        name: name.clone(),
+        kind: TrackerKind::Jira,
+        project_path: repo.display().to_string(),
+        credential,
+        filter: TrackerFilter {
+            tags: vec![opts.label.clone()],
+            ..TrackerFilter::default()
+        },
+        status_map: Default::default(),
+        acknowledged: None,
+        extra,
+    };
+    let backend = match build(&draft) {
+        Ok(b) => b,
+        Err(_) => {
+            fail(io, "credential could not be resolved or the Jira settings are invalid (see `varda tracker doctor`)");
+            bail!("credential could not be resolved");
+        }
+    };
+    ok(io, "credential reference resolves");
+    if backend.check_auth().await.is_err() {
+        fail(io, "/rest/api/3/myself: authentication failed (check the email, the token and the site)");
+        bail!("authentication failed");
+    }
+    ok(io, "authenticated (/rest/api/3/myself)");
+
+    // 2. Workflow statuses -> status_map.
+    let statuses = match backend.valid_states().await {
+        Ok(Some(s)) if !s.is_empty() => s,
+        _ => {
+            fail(io, "could not read the project's statuses (check the project key and the `Browse projects` permission)");
+            bail!("cannot read project statuses; nothing written");
+        }
+    };
+    ok(io, &format!("project statuses: {}", statuses.join(", ")));
+    let (map, exact) = propose_jira_status_map(&statuses);
+    draft.status_map = map;
+    io.say("  Jira moves issues by workflow TRANSITION; each value below is the target status Varda asks for.");
+    io.say(&format!("  {:<12} -> {}", "varda status", "target status"));
+    for (status, target) in &draft.status_map {
+        io.say(&format!("  {status:<12} -> {target}"));
+    }
+    if !exact && !opts.yes && !confirm(io, "These statuses are a guess; use the mapping above?", true)? {
+        bail!("status_map not confirmed; nothing written (set `status_map` by hand after adding the tracker)");
+    }
+
+    // 3. Pickup label.
+    io.say(&format!(
+        "Pickup label: Varda only touches issues labelled `{}`; this scopes it inside a project that holds other tickets.",
+        opts.label
+    ));
+    let tagged = TrackerFilter {
+        tags: vec![opts.label.clone()],
+        ..TrackerFilter::default()
+    };
+    match backend.query(&tagged).await {
+        Ok(items) if items.is_empty() => ok(io, &format!("no issues carry `{}` yet", opts.label)),
+        Ok(items) => {
+            ok(io, &format!("{} issue(s) already carry `{}`:", items.len(), opts.label));
+            for i in items.iter().take(10) {
+                io.say(&format!("  {} [{}] {}", i.id, i.remote_state, i.title));
+            }
+        }
+        Err(_) => {
+            fail(io, "could not list labelled issues (check the `Browse projects` permission)");
+            bail!("the labelled-issues query failed; nothing written");
+        }
+    }
+    io.say(&format!("  To label one: open the issue and add the label `{}`.", opts.label));
+    io.say("  The varda:ready / varda:needs-user / varda:failed helper labels appear on first use.");
+    io.say("  (write access is not probed: it would modify an issue; the token's user needs `Edit issues`, `Transition issues` and `Add comments`)");
+
+    // 4. Dry run.
+    let ack = TrackerAck {
+        by: opts.by.clone(),
+        at: opts.at.clone(),
+        agents: agents.clone(),
+    };
+    let mut dry = draft.clone();
+    dry.acknowledged = Some(ack.clone());
+    match super::sync::pull_tracker(config, &dry, backend.as_ref(), true).await {
+        Ok(outcome) => {
+            ok(io, &format!("dry run: pull would process {} issue(s)", outcome.items.len()));
+            for item in &outcome.items {
+                io.say(&format!("  {} {} {}", item.action.label(), item.id, item.title));
+            }
+            if !outcome.errors.is_empty() {
+                for e in &outcome.errors {
+                    fail(io, e);
+                }
+                bail!("the pull dry run reported errors; nothing written");
+            }
+        }
+        Err(_) => {
+            fail(io, "dry run failed");
+            bail!("the pull dry run failed; nothing written");
+        }
+    }
+
+    // 5. Disclaimer + acknowledgement.
+    io.say("");
+    io.say(&disclaimer_text(config, &opts.site, &opts.project_key, &agents));
+    if opts.yes {
+        io.say("(--yes: acknowledgement recorded without prompting)");
+    } else if !confirm(io, "Do you confirm?", false)? {
+        io.say("Not acknowledged; nothing written.");
+        return Ok(SetupOutcome::Declined);
+    }
+    draft.acknowledged = Some(ack);
+
+    // 6. Write config (append) and run the doctor checks.
+    let existing = match std::fs::read_to_string(config_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", config_path.display())),
+    };
+    let text = merged_config_text(&existing, &draft, opts.force)?;
+    if let Some(dir) = config_path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    std::fs::write(config_path, text)
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    ok(io, &format!("tracker '{name}' written to {}", config_path.display()));
+
+    let mut config_after = config.clone();
+    config_after.trackers.retain(|t| t.name != name);
+    config_after.trackers.push(draft.clone());
+    let mut failures = 0;
+    let mut checks = vec![(
+        "acknowledged",
+        super::sync::check_acknowledged(&config_after, &draft)
+            .map(|()| "yes".to_owned())
+            .map_err(|_| String::new()),
+    )];
+    checks.extend(super::doctor::backend_checks(&draft, backend.as_ref()).await);
+    for (check, verdict) in checks {
+        match verdict {
+            Ok(detail) => ok(io, &format!("doctor {check}: {detail}")),
+            Err(_) => {
+                failures += 1;
+                fail(io, &format!("doctor {check}: failed (run `varda tracker doctor` for details)"));
+            }
+        }
+    }
+    Ok(SetupOutcome::Written { doctor_failures: failures })
+}
+
 /// Current UTC time as RFC 3339 (`2026-10-18T09:30:00Z`).
 pub fn now_rfc3339() -> String {
     let secs = std::time::SystemTime::now()
@@ -1522,5 +1790,67 @@ mod tests {
         let err = run_setup_github(&config, &e.config_path, &gh_opts(&e), &mut io, &f).await.unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
         std::fs::remove_dir_all(e.root).ok();
+    }
+
+    #[test]
+    fn jira_status_map_proposals() {
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let (m, exact) = propose_jira_status_map(&names(&["To Do", "in progress", "In Review", "Done"]));
+        assert!(exact);
+        assert_eq!(m["backlog"], "To Do");
+        assert_eq!(m["running"], "in progress");
+        assert_eq!(m["review"], "In Review");
+        assert_eq!(m["done"], "Done");
+        // No review status: review shares the running one.
+        let (m, exact) = propose_jira_status_map(&names(&["Open", "In Progress", "Closed"]));
+        assert!(exact);
+        assert_eq!((m["backlog"].as_str(), m["review"].as_str(), m["done"].as_str()), ("Open", "In Progress", "Closed"));
+        // Custom workflow: positional guess, flagged.
+        let (m, exact) = propose_jira_status_map(&names(&["Intake", "Building", "Shipped"]));
+        assert!(!exact);
+        assert_eq!((m["backlog"].as_str(), m["running"].as_str(), m["done"].as_str()), ("Intake", "Building", "Shipped"));
+    }
+
+    #[tokio::test]
+    async fn jira_setup_happy_path_writes_a_jira_block_without_the_token() {
+        let e = env("jira-happy");
+        let opts = JiraSetupOptions {
+            site: "https://acme.atlassian.net/".to_owned(),
+            project_key: "VAR".to_owned(),
+            email: "me@example.com".to_owned(),
+            repo: e.opts.repo.clone(),
+            name: None,
+            label: "varda".to_owned(),
+            credential: Some(CredentialConfig {
+                from_env: Some("JIRA_TOKEN".to_owned()),
+                ..CredentialConfig::default()
+            }),
+            issue_type: "Task".to_owned(),
+            yes: true,
+            force: false,
+            by: "me@example.com".to_owned(),
+            at: "2026-10-18T09:30:00Z".to_owned(),
+        };
+        let build = |t: &TrackerConfig| -> Result<Box<dyn IssueTracker>> {
+            let fake = FakeTracker::new(t.clone());
+            fake.insert("To Do", "labelled", &["varda"]);
+            Ok(Box::new(SetupFake {
+                inner: fake,
+                process: None,
+                states: ["To Do", "In Progress", "In Review", "Done"].map(str::to_owned).to_vec(),
+            }) as Box<dyn IssueTracker>)
+        };
+        let mut io = ScriptedIo::default();
+        let outcome = run_setup_jira(&e.config, &e.config_path, &opts, &mut io, &build).await.unwrap();
+        assert_eq!(outcome, SetupOutcome::Written { doctor_failures: 0 });
+        let written = std::fs::read_to_string(&e.config_path).unwrap();
+        assert!(written.contains("# my comment"), "{written}");
+        assert!(written.contains("kind = \"jira\"") && written.contains("name = \"jira-var\""), "{written}");
+        assert!(written.contains("site = \"https://acme.atlassian.net\""), "{written}");
+        assert!(written.contains("project_key = \"VAR\"") && written.contains("email = \"me@example.com\""), "{written}");
+        assert!(written.contains("from_env = \"JIRA_TOKEN\""), "{written}");
+        assert!(written.contains("review = \"In Review\""), "{written}");
+        assert!(written.contains("acknowledged"), "{written}");
+        let _ = std::fs::remove_dir_all(&e.root);
     }
 }
