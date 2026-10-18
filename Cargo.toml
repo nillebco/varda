@@ -18,6 +18,8 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 tokio = { version = "1.48", features = ["sync", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
 toml = "0.9"
+# HTTPS client for issue-tracker backends (rustls + webpki roots; no gzip/json/native-tls).
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 uuid = { version = "1.19", features = ["v4"] }
 sha2 = "0.11.0"
 
