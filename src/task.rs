@@ -549,11 +549,16 @@ pub fn render_task_document(task: &TaskDocument) -> Result<String> {
 
 pub fn write_task(task: &TaskDocument) -> Result<()> {
     let content = render_task_document(task)?;
+    write_task_text(&task.path, &content)
+}
 
-    let parent = task.path.parent().unwrap_or_else(|| Path::new("."));
+/// Atomically (tmp file + rename, preserving existing permissions) replace the
+/// task file at `path` with already-rendered `content`.
+fn write_task_text(path: &Path, content: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp_path = parent.join(format!(
         ".{}.tmp-{}-{}",
-        task.path
+        path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("task"),
@@ -565,20 +570,20 @@ pub fn write_task(task: &TaskDocument) -> Result<()> {
         fs::write(&tmp_path, content)
             .with_context(|| format!("failed to write task tmp file at {}", tmp_path.display()))?;
 
-        if let Ok(metadata) = fs::metadata(&task.path) {
+        if let Ok(metadata) = fs::metadata(&path) {
             fs::set_permissions(&tmp_path, metadata.permissions()).with_context(|| {
                 format!(
                     "failed to apply permissions from {} to tmp file {}",
-                    task.path.display(),
+                    path.display(),
                     tmp_path.display()
                 )
             })?;
         }
 
-        fs::rename(&tmp_path, &task.path).with_context(|| {
+        fs::rename(&tmp_path, &path).with_context(|| {
             format!(
                 "failed to atomically replace task at {} (tmp file: {})",
-                task.path.display(),
+                path.display(),
                 tmp_path.display()
             )
         })?;
@@ -871,9 +876,18 @@ pub fn create_task_with_egress(
 /// body onto the home task, so a body written only to the home file would be
 /// invisible on the next read. Returns every path written (home file first).
 pub fn write_task_and_definition_body(task: &TaskDocument) -> Result<Vec<PathBuf>> {
-    // Compute the definition's new text BEFORE writing anything, then write the
-    // DEFINITION first and the home file last: the home file carries the
-    // external `rev`, which must only advance once the body update succeeded.
+    write_task_and_definition_body_with(task, render_task_document)
+}
+
+fn write_task_and_definition_body_with(
+    task: &TaskDocument,
+    render: impl FnOnce(&TaskDocument) -> Result<String>,
+) -> Result<Vec<PathBuf>> {
+    // Compute BOTH texts (home document and definition) BEFORE writing anything,
+    // then write the DEFINITION first and the home file last: the home file
+    // carries the external `rev`, which must only advance once the body update
+    // succeeded. A render failure therefore leaves every file untouched.
+    let home_text = render(task)?;
     let mut definition_update = None;
     if let Some((store, id)) = definition_store_for(task)
         && let Some(definition) = find_definition_document(&store, id)?
@@ -887,8 +901,18 @@ pub fn write_task_and_definition_body(task: &TaskDocument) -> Result<Vec<PathBuf
                 definition.path.display()
             )
         })?;
-        let eol = if content[..head_end].ends_with("\r\n") { "\r\n" } else { "\n" };
-        let updated = format!("{}{eol}{}", &content[..head_end], task.body.trim_start());
+        let head = &content[..head_end];
+        let updated = if head.ends_with('\n') {
+            let eol = if head.ends_with("\r\n") { "\r\n" } else { "\n" };
+            format!("{head}{eol}{}", task.body.trim_start())
+        } else {
+            // Closing fence at EOF has no terminator: infer the newline style
+            // from the first frontmatter line, and supply the fence terminator
+            // plus the blank-line separator ourselves.
+            let first_line = content.split('\n').next().unwrap_or("");
+            let eol = if first_line.ends_with('\r') { "\r\n" } else { "\n" };
+            format!("{head}{eol}{eol}{}", task.body.trim_start())
+        };
         definition_update = Some((definition.path, updated));
     }
     let mut written = vec![task.path.clone()];
@@ -897,7 +921,7 @@ pub fn write_task_and_definition_body(task: &TaskDocument) -> Result<Vec<PathBuf
             .with_context(|| format!("failed to write task definition {}", path.display()))?;
         written.push(path);
     }
-    write_task(task)?;
+    write_task_text(&task.path, &home_text)?;
     Ok(written)
 }
 
@@ -3594,7 +3618,8 @@ external:
     fn definition_body_replaced_with_crlf_eof_and_hr_in_old_body() {
         let cases = [
             ("crlf", "---\r\nid: 5\r\n---\r\n\r\nold\r\n", "---\r\nid: 5\r\n---\r\n"),
-            ("eof", "---\nid: 5\n---", "---\nid: 5\n---"),
+            ("eof", "---\nid: 5\n---", "---\nid: 5\n---\n"),
+            ("crlf-eof", "---\r\nid: 5\r\n---", "---\r\nid: 5\r\n---\r\n\r\n"),
             ("hr", "---\nid: 5\n---\n\nold\n\n---\n\nrule\n", "---\nid: 5\n---\n"),
         ];
         for (name, text, head) in cases {
@@ -3607,6 +3632,34 @@ external:
             assert!(!out.contains("old") && !out.contains("rule"), "{name}: {out:?}");
             fs::remove_dir_all(root).ok();
         }
+    }
+
+    #[test]
+    fn definition_eof_fence_exact_output_follows_newline_style() {
+        for (name, text, want) in [
+            ("exact-lf", "---\nid: 5\n---", "---\nid: 5\n---\n\n# New\n\nnew body\n"),
+            (
+                "exact-crlf",
+                "---\r\nid: 5\r\n---",
+                "---\r\nid: 5\r\n---\r\n\r\n# New\n\nnew body\n",
+            ),
+        ] {
+            let (root, doc, def) = definition_body_fixture(name, text);
+            write_task_and_definition_body(&doc).unwrap();
+            assert_eq!(fs::read_to_string(&def).unwrap(), want, "{name}");
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn render_failure_writes_neither_definition_nor_home_file() {
+        let (root, doc, def) = definition_body_fixture("render-fail", "---\nid: 5\n---\n\nold\n");
+        let err = write_task_and_definition_body_with(&doc, |_| anyhow::bail!("render boom"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("render boom"), "{err:#}");
+        assert!(!doc.path.exists());
+        assert_eq!(fs::read_to_string(&def).unwrap(), "---\nid: 5\n---\n\nold\n");
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
