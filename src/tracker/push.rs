@@ -173,6 +173,22 @@ pub async fn push_via(
     backend: &dyn IssueTracker,
     doc: &mut TaskDocument,
 ) {
+    push_via_tracked(tracker, backend, doc, None).await
+}
+
+/// Bookkeeping confirmed by a successful transition, readable by a caller whose
+/// timeout drops the push future before it finishes (see [`push_via_tracked`]).
+type Progress = std::sync::Mutex<Option<ExternalRef>>;
+
+/// [`push_via`], publishing the bookkeeping to `progress` right after the
+/// transition succeeds and before the comment phase, so a timeout in the
+/// comment cannot discard it.
+async fn push_via_tracked(
+    tracker: &TrackerConfig,
+    backend: &dyn IssueTracker,
+    doc: &mut TaskDocument,
+    progress: Option<&Progress>,
+) {
     let Some(mut ext) = doc.frontmatter.external.clone() else {
         return;
     };
@@ -210,6 +226,9 @@ pub async fn push_via(
             ext.remote_state = Some(issue.remote_state);
             ext.synced_status = Some(status);
             ext.sync_error = None;
+            if let Some(progress) = progress {
+                *progress.lock().unwrap_or_else(|p| p.into_inner()) = Some(ext.clone());
+            }
             if let Some(text) = comment_for(doc) {
                 match backend.comment(&ext.id, &text).await {
                     // A comment bumps the rev; refresh it so the next
@@ -254,24 +273,57 @@ pub async fn push_transition_within(config: &Config, doc: &mut TaskDocument, bou
     if let Err(e) = super::sync::check_acknowledged(config, &tracker) {
         return record_error(doc, format!("{e:#}"));
     }
-    let work = async {
+    let for_build = tracker.clone();
+    let build = async move {
         // Credential resolution can block (fnox / user command): run it on a
         // blocking thread, with its own deadline so the child is killed.
-        let for_build = tracker.clone();
-        let backend = tokio::task::spawn_blocking(move || {
-            super::build_tracker_within(&for_build, Some(bound))
-        })
-        .await
-        .map_err(|e| format!("building tracker failed: {e}"))?
-        .map_err(|e| format!("building tracker failed: {e:#}"))?;
+        tokio::task::spawn_blocking(move || super::build_tracker_within(&for_build, Some(bound)))
+            .await
+            .map_err(|e| format!("building tracker failed: {e}"))?
+            .map_err(|e| format!("building tracker failed: {e:#}"))
+    };
+    push_bounded(&tracker, doc, bound, build).await
+}
+
+/// Build the backend and push, all within `bound`. If the timeout fires after a
+/// successful transition, the transitioned bookkeeping is kept and only the
+/// comment phase is reported as timed out.
+async fn push_bounded(
+    tracker: &TrackerConfig,
+    doc: &mut TaskDocument,
+    bound: Duration,
+    build: impl std::future::Future<Output = std::result::Result<Box<dyn IssueTracker>, String>>,
+) {
+    let progress: Progress = std::sync::Mutex::new(None);
+    let work = async {
+        let backend = build.await?;
         let mut pushed = doc.clone();
-        push_via(&tracker, backend.as_ref(), &mut pushed).await;
+        push_via_tracked(tracker, backend.as_ref(), &mut pushed, Some(&progress)).await;
         Ok::<_, String>(pushed.frontmatter.external)
     };
     match tokio::time::timeout(bound, work).await {
         Ok(Ok(external)) => doc.frontmatter.external = external,
         Ok(Err(error)) => record_error(doc, error),
-        Err(_) => record_error(doc, format!("push timed out after {}s", bound.as_secs_f32())),
+        Err(_) => {
+            let confirmed = progress.lock().unwrap_or_else(|p| p.into_inner()).take();
+            match confirmed {
+                // The transition landed remotely; keep its bookkeeping so the
+                // next push sees the new baseline, and retry the comment later.
+                Some(ext) => {
+                    doc.frontmatter.external = Some(ext);
+                    record_error(
+                        doc,
+                        format!(
+                            "comment timed out after {}s (state already transitioned)",
+                            bound.as_secs_f32()
+                        ),
+                    );
+                }
+                None => {
+                    record_error(doc, format!("push timed out after {}s", bound.as_secs_f32()))
+                }
+            }
+        }
     }
 }
 
@@ -282,10 +334,12 @@ pub async fn push_transition(config: &Config, doc: &mut TaskDocument) {
 /// [`push_transition`] then persist the task if its tracker bookkeeping changed.
 /// The runner's single hook per status settle.
 pub async fn push_and_save(config: &Config, doc: &mut TaskDocument) {
-    push_and_save_within(config, doc, PUSH_TIMEOUT).await
+    // Never fails a run; a save failure is already printed.
+    let _ = push_and_save_within(config, doc, PUSH_TIMEOUT).await;
 }
 
-async fn push_and_save_within(config: &Config, doc: &mut TaskDocument, bound: Duration) {
+/// Returns `false` if the bookkeeping changed but could not be saved.
+async fn push_and_save_within(config: &Config, doc: &mut TaskDocument, bound: Duration) -> bool {
     let before = doc.frontmatter.external.clone();
     push_transition_within(config, doc, bound).await;
     if doc.frontmatter.external != before
@@ -295,7 +349,9 @@ async fn push_and_save_within(config: &Config, doc: &mut TaskDocument, bound: Du
             "tracker sync: could not save task {}: {e:#}",
             doc.path.display()
         );
+        return false;
     }
+    true
 }
 
 fn needs_sync(doc: &TaskDocument) -> bool {
@@ -337,8 +393,13 @@ pub async fn sync_tasks(config: &Config, only: Option<&str>, bound: Duration) ->
         if !needs_sync(&doc) {
             continue;
         }
-        push_and_save_within(config, &mut doc, bound).await;
+        let saved = push_and_save_within(config, &mut doc, bound).await;
         let ext = doc.frontmatter.external.as_ref().expect("external");
+        if !saved {
+            failing += 1;
+            println!("{backend}: {} pushed but the task file could not be saved", ext.id);
+            continue;
+        }
         match &ext.sync_error {
             None => println!("{backend}: synced {} -> {:?}", ext.id, doc.frontmatter.status),
             Some(e) => {
@@ -653,6 +714,95 @@ mod tests {
         let err = ext(&doc).sync_error.clone().unwrap();
         assert!(err.contains("timed out"), "{err}");
         assert_eq!(doc.frontmatter.status, TaskStatus::Running);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Wraps a backend; `comment` sleeps past any sane bound.
+    struct SlowComment(std::sync::Arc<FakeTracker>);
+
+    #[async_trait::async_trait]
+    impl IssueTracker for SlowComment {
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+        async fn query(&self, f: &crate::config::TrackerFilter) -> super::super::Result<Vec<RemoteIssue>> {
+            self.0.query(f).await
+        }
+        async fn get(&self, id: &str) -> super::super::Result<RemoteIssue> {
+            self.0.get(id).await
+        }
+        async fn create(&self, d: &super::super::IssueDraft) -> super::super::Result<RemoteIssue> {
+            self.0.create(d).await
+        }
+        async fn transition(
+            &self,
+            id: &str,
+            to: TaskStatus,
+            rev: Option<u64>,
+        ) -> super::super::Result<RemoteIssue> {
+            self.0.transition(id, to, rev).await
+        }
+        async fn comment(&self, _id: &str, _m: &str) -> super::super::Result<()> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        }
+        async fn assign(&self, id: &str, who: Option<&str>) -> super::super::Result<()> {
+            self.0.assign(id, who).await
+        }
+    }
+
+    #[tokio::test]
+    async fn comment_timeout_after_transition_keeps_transitioned_bookkeeping() {
+        let (root, config, t) = setup("commenttimeout");
+        let fake = std::sync::Arc::new(FakeTracker::new(t.clone()));
+        let item = fake.insert("New", "alpha", &[]);
+        let mut doc = imported(&config, &t, &fake).await;
+        doc.frontmatter.status = TaskStatus::Running;
+        doc.frontmatter.assignee = Some("claude".to_owned());
+        doc.frontmatter.agent_session_ids.push("run-1".to_owned());
+
+        let slow = SlowComment(fake.clone());
+        let boxed: Box<dyn IssueTracker> = Box::new(slow);
+        push_bounded(&t, &mut doc, Duration::from_millis(300), async { Ok(boxed) }).await;
+        assert_eq!(fake.get(&item.id).await.unwrap().remote_state, "Active");
+        assert_eq!(ext(&doc).remote_state.as_deref(), Some("Active"));
+        assert_eq!(ext(&doc).synced_status, Some(TaskStatus::Running));
+        assert!(ext(&doc).sync_error.as_deref().unwrap().contains("comment timed out"));
+
+        // The retry is not treated as a human change.
+        push_via(&t, &*fake, &mut doc).await;
+        assert_eq!(ext(&doc).sync_error, None);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn save_failure_is_reported_and_counted_by_sync() {
+        let (root, config, t) = setup("savefail");
+        let fake = FakeTracker::new(t.clone());
+        fake.insert("New", "alpha", &[]);
+        let mut doc = imported(&config, &t, &fake).await;
+        let dir = doc.path.parent().unwrap().to_path_buf();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms.clone()).unwrap();
+        let writable = std::fs::write(dir.join(".probe"), "x").is_ok();
+        if writable {
+            // Running as root: cannot make the directory unwritable.
+            std::fs::remove_file(dir.join(".probe")).ok();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dir, perms).unwrap();
+            std::fs::remove_dir_all(root).ok();
+            return;
+        }
+        // Bookkeeping change only, no remote needed: unconfigured tracker.
+        doc.frontmatter.status = TaskStatus::Running;
+        let mut cfg = config.clone();
+        cfg.trackers.clear();
+        let saved = push_and_save_within(&cfg, &mut doc, Duration::from_secs(1)).await;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        assert!(!saved);
         std::fs::remove_dir_all(root).ok();
     }
 
