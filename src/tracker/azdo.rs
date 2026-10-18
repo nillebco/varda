@@ -81,11 +81,89 @@ pub trait Transport: Send + Sync {
     fn send(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse>;
 }
 
-/// Minimal std-only HTTP/1.1 client (`Connection: close`, plain `http://`).
-///
-/// TODO(T1 blocker): TLS. `https://dev.azure.com` needs a TLS client (`ureq` with
-/// rustls per the brief); it could not be added in the offline build box. Swap
-/// this transport for a `ureq`-backed one — nothing else changes.
+/// HTTPS-capable transport (`ureq` + rustls, webpki roots) — the production
+/// transport for `https://` base URLs. Redirects are NOT followed: Azure DevOps
+/// answers a bad/expired PAT with a redirect to the sign-in page, which must
+/// surface as an error rather than as a 200 HTML body. Non-2xx statuses are
+/// returned as responses (the caller maps them), only transport failures error.
+pub struct UreqTransport {
+    agent: ureq::Agent,
+}
+
+impl UreqTransport {
+    pub fn new() -> Self {
+        Self {
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .redirects(0)
+                .build(),
+        }
+    }
+}
+
+impl Default for UreqTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Transport for UreqTransport {
+    fn send(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+        let mut call = self.agent.request(request.method, &request.url);
+        for (k, v) in &request.headers {
+            call = call.set(k, v);
+        }
+        let result = match &request.body {
+            Some(body) => call.send_bytes(body),
+            None => call.call(),
+        };
+        let response = match result {
+            Ok(response) => response,
+            Err(ureq::Error::Status(_, response)) => response,
+            // The PAT travels only in a header, never in the URL, so the
+            // transport error text cannot carry it.
+            Err(ureq::Error::Transport(error)) => bail!("HTTP transport error: {error}"),
+        };
+        let status = response.status();
+        let headers = response
+            .headers_names()
+            .into_iter()
+            .filter_map(|name| {
+                let value = response.header(&name)?.to_owned();
+                Some((name.to_ascii_lowercase(), value))
+            })
+            .collect();
+        let mut body = Vec::new();
+        response
+            .into_reader()
+            .take(MAX_RESPONSE_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .context("failed to read HTTP response body")?;
+        if body.len() > MAX_RESPONSE_BYTES {
+            bail!("HTTP response exceeds {MAX_RESPONSE_BYTES} bytes");
+        }
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+/// Pick the transport for a base URL: `https://` → [`UreqTransport`]; plain
+/// `http://` (local fakes, tests) → the std-only [`StdHttpTransport`].
+pub fn transport_for(base_url: &str) -> Arc<dyn Transport> {
+    if base_url.starts_with("https://") {
+        Arc::new(UreqTransport::new())
+    } else {
+        Arc::new(StdHttpTransport)
+    }
+}
+
+/// Minimal std-only HTTP/1.1 client (`Connection: close`, plain `http://`),
+/// used for local fakes and tests; production `https://` goes through
+/// [`UreqTransport`] (see [`transport_for`]).
 pub struct StdHttpTransport;
 
 /// Timeouts and size caps for one [`StdHttpTransport`] request.
@@ -317,14 +395,9 @@ impl AzdoTracker {
                 format!("https://dev.azure.com/{}", url_encode(org))
             }
         };
-        Ok(Self::new(
-            config.name.clone(),
-            base_url,
-            project,
-            pat,
-            Arc::new(StdHttpTransport),
-        )
-        .with_config(config.clone()))
+        let transport = transport_for(&base_url);
+        Ok(Self::new(config.name.clone(), base_url, project, pat, transport)
+            .with_config(config.clone()))
     }
 
     /// Attach the tracker entry that drives `transition` (status map) and `create`.
@@ -1283,6 +1356,60 @@ mod tests {
         )
     }
 
+    /// Real TLS handshake against dev.azure.com, unauthenticated — any HTTP
+    /// status proves rustls + webpki roots work. `VARDA_AZDO_LIVE_TLS=1`.
+    #[test]
+    #[ignore]
+    fn live_tls_handshake() {
+        if std::env::var("VARDA_AZDO_LIVE_TLS").as_deref() != Ok("1") {
+            return;
+        }
+        let response = transport_for("https://dev.azure.com")
+            .send(&HttpRequest {
+                method: "GET",
+                url: "https://dev.azure.com/_apis/connectionData".to_owned(),
+                headers: vec![],
+                body: None,
+            })
+            .expect("TLS round trip to dev.azure.com");
+        println!("dev.azure.com answered HTTP {}", response.status);
+        assert!((100..600).contains(&response.status));
+    }
+
+    #[test]
+    fn ureq_transport_returns_non_2xx_as_response_and_lowercases_headers() {
+        let (base, seen) = fake_server(vec![
+            (200, vec![("X-Echo", "a")], "{\"ok\":true}".to_owned()),
+            (429, vec![("Retry-After", "1")], "slow down".to_owned()),
+            (302, vec![("Location", "https://login.example/")], String::new()),
+        ]);
+        let t = UreqTransport::new();
+        let req = |method: &'static str, body: Option<Vec<u8>>| HttpRequest {
+            method,
+            url: format!("{base}/x"),
+            headers: vec![("Authorization".to_owned(), "Basic abc".to_owned())],
+            body,
+        };
+
+        let ok = t.send(&req("POST", Some(b"{\"q\":1}".to_vec()))).unwrap();
+        assert_eq!(ok.status, 200);
+        assert_eq!(ok.header("x-echo"), Some("a"));
+        assert_eq!(ok.body, b"{\"ok\":true}");
+
+        let limited = t.send(&req("GET", None)).unwrap();
+        assert_eq!(limited.status, 429);
+        assert_eq!(limited.header("retry-after"), Some("1"));
+
+        // Redirects are surfaced, not followed (a bad PAT redirects to sign-in).
+        let redirect = t.send(&req("GET", None)).unwrap();
+        assert_eq!(redirect.status, 302);
+
+        let first = seen.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(first.starts_with("post /x"), "{first}");
+        assert!(first.contains("authorization: basic abc"), "{first}");
+        assert!(first.ends_with("{\"q\":1}"), "{first}");
+    }
+
     #[test]
     fn dechunk_huge_chunk_size_errors_without_panic() {
         let err = dechunk(b"FFFFFFFFFFFFFFFF\r\nabc\r\n0\r\n\r\n", 1024).unwrap_err();
@@ -1766,8 +1893,8 @@ mod tests {
         assert_eq!(t.base_url, "https://dev.azure.com/acme");
     }
 
-    /// Live smoke test; needs `VARDA_AZDO_LIVE=1` plus org/project/PAT, and an
-    /// HTTPS-capable transport (not yet available — see [`StdHttpTransport`]).
+    /// Live smoke test; needs `VARDA_AZDO_LIVE=1` plus org/project/PAT. Uses the
+    /// production HTTPS transport ([`UreqTransport`]).
     #[tokio::test]
     #[ignore]
     async fn live_query() {
@@ -1777,8 +1904,8 @@ mod tests {
         let org = std::env::var("VARDA_AZDO_ORG").unwrap();
         let project = std::env::var("VARDA_AZDO_PROJECT").unwrap();
         let pat = std::env::var("VARDA_AZDO_PAT").unwrap();
-        let t = tracker(&format!("https://dev.azure.com/{org}"));
-        let t = AzdoTracker { project, pat, ..t };
+        let base = format!("https://dev.azure.com/{org}");
+        let t = AzdoTracker::new("azdo".to_owned(), base.clone(), project, pat, transport_for(&base));
         let issues = t.query(&TrackerFilter::default()).await.unwrap();
         println!("{} items", issues.len());
     }
