@@ -7,6 +7,8 @@
 #![allow(dead_code)]
 
 pub mod azdo;
+pub mod doctor;
+pub mod push;
 pub mod sync;
 
 use std::collections::BTreeMap;
@@ -113,6 +115,11 @@ pub trait IssueTracker: Send + Sync {
     async fn check_auth(&self) -> Result<()> {
         Ok(())
     }
+    /// State names valid for the configured work-item type, so `doctor` can
+    /// validate the `status_map`. `None` ⇒ the backend cannot enumerate them.
+    async fn valid_states(&self) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
 }
 
 /// Build the backend for a (central-config) `[[trackers]]` entry, resolving its
@@ -121,10 +128,22 @@ pub fn build_tracker(
     tracker: &TrackerConfig,
     _config: &Config,
 ) -> anyhow::Result<Box<dyn IssueTracker>> {
+    build_tracker_within(tracker, None)
+}
+
+/// [`build_tracker`] whose credential command (if any) is killed after `timeout`.
+pub fn build_tracker_within(
+    tracker: &TrackerConfig,
+    timeout: Option<std::time::Duration>,
+) -> anyhow::Result<Box<dyn IssueTracker>> {
     match tracker.kind {
         TrackerKind::Azdo => {
             let source = tracker.credential.source()?;
-            let pat = crate::resolve_credential_value(&source, tracker.credential.optional)
+            let pat = crate::resolve_credential_value_within(
+                &source,
+                tracker.credential.optional,
+                timeout,
+            )
                 .with_context(|| format!("resolving credential for tracker '{}'", tracker.name))?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -275,6 +294,7 @@ pub mod fake {
         /// The next `transition` fails with a conflict regardless of the rev,
         /// and bumps the remote rev as a concurrent human edit would.
         conflict_next: bool,
+        valid_states: Option<Vec<String>>,
     }
 
     /// In-memory tracker with rev bumping and conflict simulation.
@@ -319,6 +339,20 @@ pub mod fake {
             if let Some(issue) = s.issues.get_mut(id) {
                 issue.rev += 1;
             }
+        }
+
+        /// Simulate a human moving the item to `state` (bumps the rev).
+        pub fn set_state(&self, id: &str, state: &str) {
+            let mut s = self.state.lock().unwrap();
+            if let Some(issue) = s.issues.get_mut(id) {
+                issue.remote_state = state.to_owned();
+                issue.rev += 1;
+            }
+        }
+
+        pub fn set_valid_states(&self, states: &[&str]) {
+            self.state.lock().unwrap().valid_states =
+                Some(states.iter().map(|s| (*s).to_owned()).collect());
         }
 
         pub fn fail_next_transition_with_conflict(&self) {
@@ -418,6 +452,10 @@ pub mod fake {
             }
             s.comments.push((id.to_owned(), markdown.to_owned()));
             Ok(())
+        }
+
+        async fn valid_states(&self) -> Result<Option<Vec<String>>> {
+            Ok(self.state.lock().unwrap().valid_states.clone())
         }
 
         async fn assign(&self, id: &str, who: Option<&str>) -> Result<()> {

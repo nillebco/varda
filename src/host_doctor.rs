@@ -92,7 +92,13 @@ pub async fn doctor_host_command() -> Result<()> {
             return Ok(());
         }
     };
-    report_sandboxes(&config, &backends)
+    let sandboxes = report_sandboxes(&config, &backends);
+    let tracker_failures = crate::tracker::doctor::report(&config).await;
+    sandboxes?;
+    if tracker_failures > 0 {
+        anyhow::bail!("{tracker_failures} tracker check(s) failed");
+    }
+    Ok(())
 }
 
 fn report_sandboxes(config: &Config, backends: &BTreeMap<String, Availability>) -> Result<()> {

@@ -688,6 +688,16 @@ impl IssueTracker for AzdoTracker {
         Ok(self.map_item(&value)?)
     }
 
+    async fn valid_states(&self) -> Result<Option<Vec<String>>> {
+        let work_item_type = self
+            .config
+            .as_ref()
+            .and_then(|c| c.extra_str("work_item_type"))
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or(DEFAULT_WORK_ITEM_TYPE);
+        self.work_item_states(work_item_type).await.map(Some)
+    }
+
     async fn create(&self, draft: &IssueDraft) -> Result<RemoteIssue> {
         let work_item_type = draft
             .work_item_type
