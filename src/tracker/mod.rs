@@ -9,6 +9,7 @@
 pub mod azdo;
 pub mod doctor;
 pub mod push;
+pub mod setup;
 pub mod sync;
 
 use std::collections::BTreeMap;
@@ -118,6 +119,11 @@ pub trait IssueTracker: Send + Sync {
     /// State names valid for the configured work-item type, so `doctor` can
     /// validate the `status_map`. `None` ⇒ the backend cannot enumerate them.
     async fn valid_states(&self) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+    /// Name of the project's process template (`tracker setup` proposes a
+    /// `status_map` from it). `None` ⇒ the backend has no such notion.
+    async fn process_template(&self) -> Result<Option<String>> {
         Ok(None)
     }
 }
@@ -266,6 +272,15 @@ pub const AZDO_BASIC_STATUS_MAP: &[(&str, &str)] = &[
     ("needs_user", "Doing"),
     ("failed", "Doing"),
     ("done", "Done"),
+];
+pub const AZDO_CMMI_STATUS_MAP: &[(&str, &str)] = &[
+    ("backlog", "Proposed"),
+    ("ready", "Proposed"),
+    ("running", "Active"),
+    ("review", "Resolved"),
+    ("needs_user", "Active"),
+    ("failed", "Active"),
+    ("done", "Closed"),
 ];
 
 /// Owned form of one of the default maps above.
