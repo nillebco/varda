@@ -614,6 +614,7 @@ pub async fn run_task(
         .agent_session_logs
         .push(session_log_path.display().to_string());
     write_task(&task)?;
+    crate::tracker::push::push_and_save(config, &mut task).await;
 
     write_session_log(
         &session_log_path,
@@ -768,6 +769,7 @@ pub async fn run_task(
 
     task.set_status(status);
     write_task(&task)?;
+    crate::tracker::push::push_and_save(config, &mut task).await;
 
     Ok(RunOutcome {
         status,
@@ -812,6 +814,7 @@ pub async fn resume_interactive_task(
         .agent_session_logs
         .push(session_log_path.display().to_string());
     write_task(&task)?;
+    crate::tracker::push::push_and_save(config, &mut task).await;
 
     write_session_log(
         &session_log_path,
@@ -922,6 +925,7 @@ pub async fn resume_interactive_task(
 
     task.set_status(status);
     write_task(&task)?;
+    crate::tracker::push::push_and_save(config, &mut task).await;
 
     Ok(RunOutcome {
         status,

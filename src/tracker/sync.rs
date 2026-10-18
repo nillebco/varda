@@ -197,6 +197,7 @@ fn apply_issue(
                 url: issue.url.clone(),
                 rev: Some(issue.rev),
                 synced_status: None,
+                remote_state: Some(issue.remote_state.clone()),
                 sync_error: None,
             });
             doc.body = task_body(issue);
@@ -217,6 +218,7 @@ fn apply_issue(
             if !dry_run {
                 if let Some(ext) = doc.frontmatter.external.as_mut() {
                     ext.rev = Some(issue.rev);
+                    ext.remote_state = Some(issue.remote_state.clone());
                     ext.url = issue.url.clone();
                 }
                 doc.body = task_body(issue);

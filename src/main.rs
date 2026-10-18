@@ -427,6 +427,12 @@ enum TrackerCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Retry pushing task status to trackers for tasks that are out of sync.
+    Sync {
+        /// Only sync this tracker.
+        #[arg(long, value_name = "NAME")]
+        tracker: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -842,6 +848,9 @@ async fn run_cli() -> Result<()> {
                 TrackerCommand::List => tracker::sync::list_command(&config).await?,
                 TrackerCommand::Pull { tracker, dry_run } => {
                     tracker::sync::pull_command(&config, tracker.as_deref(), dry_run).await?
+                }
+                TrackerCommand::Sync { tracker } => {
+                    tracker::push::sync_command(&config, tracker.as_deref()).await?
                 }
             }
         }
@@ -2571,6 +2580,16 @@ fn resolve_credential_value(
     source: &config::CredentialSource<'_>,
     optional: bool,
 ) -> Result<Option<String>> {
+    resolve_credential_value_within(source, optional, None)
+}
+
+/// [`resolve_credential_value`] with an optional deadline for host credential
+/// commands: past it the child is killed and the resolution fails.
+fn resolve_credential_value_within(
+    source: &config::CredentialSource<'_>,
+    optional: bool,
+    timeout: Option<std::time::Duration>,
+) -> Result<Option<String>> {
     match source {
         config::CredentialSource::Env(name) => match std::env::var(name) {
             Ok(value) if !value.is_empty() => Ok(Some(value)),
@@ -2583,7 +2602,7 @@ fn resolve_credential_value(
             }
         },
         config::CredentialSource::Secret(name) => {
-            let value = run_host_credential_command("fnox", &["get", name]).with_context(|| {
+            let value = run_host_credential_command("fnox", &["get", name], timeout).with_context(|| {
                 format!("failed to resolve secret '{name}' from the host secret store (`fnox get {name}`)")
             })?;
             if value.is_empty() {
@@ -2598,7 +2617,7 @@ fn resolve_credential_value(
             Ok(Some(value))
         }
         config::CredentialSource::Command(cmd) => {
-            let value = run_host_credential_command("sh", &["-c", cmd])
+            let value = run_host_credential_command("sh", &["-c", cmd], timeout)
                 .with_context(|| format!("credential command failed on the host: {cmd}"))?;
             if value.is_empty() {
                 if optional {
@@ -2655,7 +2674,7 @@ fn resolve_env_secrets(
             );
         }
         let resolved =
-            run_host_credential_command("fnox", &["get", &secret]).with_context(|| {
+            run_host_credential_command("fnox", &["get", &secret], None).with_context(|| {
                 format!(
                     "failed to resolve env '{key}' from the host secret store (`fnox get {secret}`)"
                 )
@@ -2673,11 +2692,71 @@ fn resolve_env_secrets(
 /// Run a host-side credential minting command and return its stdout with the
 /// trailing newline trimmed. Never logs stdout (it is a secret); errors surface
 /// only the command and its stderr.
-fn run_host_credential_command(program: &str, args: &[&str]) -> Result<String> {
-    let output = std::process::Command::new(program)
+fn run_host_credential_command(
+    program: &str,
+    args: &[&str],
+    timeout: Option<std::time::Duration>,
+) -> Result<String> {
+    let Some(timeout) = timeout else {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to spawn host credential command `{program}`"))?;
+        return credential_command_output(program, args, output);
+    };
+    // Bounded: poll the child, drain its pipes on helper threads (so a chatty
+    // child cannot block on a full pipe) and kill it at the deadline. The readers
+    // are abandoned, not joined, on timeout: a grandchild may still hold the pipe.
+    let mut child = std::process::Command::new(program)
         .args(args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| format!("failed to spawn host credential command `{program}`"))?;
+    fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("waiting on host credential command")? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "`{program} {}` timed out after {}s and was killed",
+                args.join(" "),
+                timeout.as_secs_f32()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let grace = std::time::Duration::from_secs(2);
+    let output = std::process::Output {
+        status,
+        stdout: stdout.recv_timeout(grace).unwrap_or_default(),
+        stderr: stderr.recv_timeout(grace).unwrap_or_default(),
+    };
+    credential_command_output(program, args, output)
+}
+
+fn credential_command_output(
+    program: &str,
+    args: &[&str],
+    output: std::process::Output,
+) -> Result<String> {
     if !output.status.success() {
         anyhow::bail!(
             "`{program} {}` exited with {}: {}",
@@ -2896,6 +2975,12 @@ fn render_show_task_output(task_path: &Path, task_document: &task::TaskDocument)
     out.push_str(&task_content);
     if !task_content.ends_with('\n') {
         out.push('\n');
+    }
+    if let Some(external) = &task_document.frontmatter.external {
+        out.push_str(&format!("\nTracker: {} {}\n", external.backend, external.url));
+        if let Some(error) = &external.sync_error {
+            out.push_str(&format!("Tracker sync error: {error}\n"));
+        }
     }
     out.push_str("\n---\n\n");
 

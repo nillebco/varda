@@ -121,6 +121,11 @@ pub struct ExternalRef {
     /// Last status successfully pushed to the tracker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_status: Option<TaskStatus>,
+    /// Remote state last seen at import / pull refresh / successful push: the
+    /// baseline a push compares the live state against. A difference means a
+    /// human changed the item, so Varda refuses to overwrite it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_state: Option<String>,
     /// Last push failure, retried on the next sync.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_error: Option<String>,
@@ -159,6 +164,7 @@ impl TaskFrontmatter {
         if let Some(external) = fm.external.as_mut() {
             external.rev = None;
             external.synced_status = None;
+            external.remote_state = None;
             external.sync_error = None;
         }
         fm
