@@ -48,6 +48,8 @@ pub struct PullItem {
     pub action: PullAction,
     /// Every file written for this item (home task, plus the repo definition).
     pub paths: Vec<PathBuf>,
+    /// Extra operator-facing explanation printed after the item line.
+    pub note: Option<String>,
 }
 
 /// Result of pulling one tracker: the items that succeeded (with the paths they
@@ -141,12 +143,21 @@ pub async fn pull_tracker(
     let mut outcome = PullOutcome::default();
     for issue in issues {
         match apply_issue(config, tracker, &issue, dry_run) {
-            Ok((action, paths)) => outcome.items.push(PullItem {
-                id: issue.id,
-                title: issue.title,
-                action,
-                paths,
-            }),
+            Ok((action, paths)) => {
+                let note = (action == PullAction::SkippedState).then(|| {
+                    format!(
+                        "remote state '{}' is not importable with this status_map; to import items in that state, set `ready` (or `backlog`) to '{}' in the tracker's status_map",
+                        issue.remote_state, issue.remote_state
+                    )
+                });
+                outcome.items.push(PullItem {
+                    id: issue.id,
+                    title: issue.title,
+                    action,
+                    paths,
+                    note,
+                })
+            }
             Err(e) => outcome
                 .errors
                 .push(format!("tracker '{}' item {}: {e:#}", tracker.name, issue.id)),
@@ -260,6 +271,49 @@ pub async fn list_command(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of [`commit_in_groups`].
+#[derive(Debug, Default)]
+struct CommitReport {
+    committed: usize,
+    errors: Vec<String>,
+    uncommitted: Vec<PathBuf>,
+}
+
+/// Group `paths` by git repository and commit each group independently: a
+/// path whose repository cannot be found, or a group whose commit fails, is
+/// recorded (with its paths in `uncommitted`) and the remaining groups are
+/// still attempted.
+fn commit_in_groups(
+    paths: &[PathBuf],
+    root_for: impl Fn(&Path) -> Result<PathBuf>,
+    mut commit: impl FnMut(&[&Path]) -> Result<()>,
+) -> CommitReport {
+    let mut report = CommitReport::default();
+    let mut groups: Vec<(PathBuf, Vec<&Path>)> = Vec::new();
+    for path in paths {
+        match root_for(path) {
+            Ok(root) => match groups.iter_mut().find(|(r, _)| *r == root) {
+                Some((_, group)) => group.push(path),
+                None => groups.push((root, vec![path])),
+            },
+            Err(e) => {
+                report.errors.push(format!("{}: {e:#}", path.display()));
+                report.uncommitted.push(path.clone());
+            }
+        }
+    }
+    for (root, refs) in &groups {
+        match commit(refs) {
+            Ok(()) => report.committed += refs.len(),
+            Err(e) => {
+                report.errors.push(format!("{}: {e:#}", root.display()));
+                report.uncommitted.extend(refs.iter().map(|p| p.to_path_buf()));
+            }
+        }
+    }
+    report
+}
+
 /// `varda tracker pull`: every tracker (or just `only`), best-effort across
 /// trackers, then one control-plane commit of what was written.
 pub async fn pull_command(config: &Config, only: Option<&str>, dry_run: bool) -> Result<()> {
@@ -275,6 +329,7 @@ pub async fn pull_command(config: &Config, only: Option<&str>, dry_run: bool) ->
         }
     }
     let mut failed = 0usize;
+    let mut commit_failures = 0usize;
     let mut written: Vec<PathBuf> = Vec::new();
     for t in selected {
         let result = match super::build_tracker(t, config) {
@@ -286,6 +341,9 @@ pub async fn pull_command(config: &Config, only: Option<&str>, dry_run: bool) ->
                 for item in &outcome.items {
                     let prefix = if dry_run { "would " } else { "" };
                     println!("{}: {prefix}{} {} {}", t.name, item.action.label(), item.id, item.title);
+                    if let Some(note) = &item.note {
+                        println!("{}:   note: {note}", t.name);
+                    }
                     written.extend(item.paths.iter().cloned());
                 }
                 if !outcome.errors.is_empty() {
@@ -302,20 +360,27 @@ pub async fn pull_command(config: &Config, only: Option<&str>, dry_run: bool) ->
         }
     }
     if !dry_run && config.git.auto_commit && !written.is_empty() {
-        // The home task files and the project's repo definitions live in
-        // different git repositories: commit each group separately.
-        let mut groups: Vec<(PathBuf, Vec<&Path>)> = Vec::new();
-        for path in &written {
-            let root = crate::git::repo_root_for_path(path)?;
-            match groups.iter_mut().find(|(r, _)| *r == root) {
-                Some((_, paths)) => paths.push(path),
-                None => groups.push((root, vec![path])),
+        let report = commit_in_groups(
+            &written,
+            crate::git::repo_root_for_path,
+            |refs| crate::git::commit_task_files(refs, "Pull tracker work items"),
+        );
+        if report.committed > 0 {
+            println!("committed {} task file(s)", report.committed);
+        }
+        if !report.errors.is_empty() {
+            for e in &report.errors {
+                eprintln!("commit failed: {e}");
             }
+            eprintln!("left uncommitted (commit these by hand):");
+            for p in &report.uncommitted {
+                eprintln!("  {}", p.display());
+            }
+            commit_failures = report.errors.len();
         }
-        for (_, refs) in &groups {
-            crate::git::commit_task_files(refs, "Pull tracker work items")?;
-        }
-        println!("committed {} task file(s)", written.len());
+    }
+    if commit_failures > 0 {
+        bail!("{commit_failures} commit group(s) failed");
     }
     if failed > 0 {
         bail!("{failed} tracker(s) failed");
@@ -608,5 +673,76 @@ mod tests {
         assert_eq!(b2.items[0].action, PullAction::Unchanged);
         assert_eq!(count_tasks(&root), 2);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn default_agile_map_active_item_is_skipped_visibly_even_with_pickup_tag() {
+        let (root, config, t) = setup("activepickup");
+        let fake = FakeTracker::new(t.clone());
+        fake.insert("Active", "tagged", &["varda"]);
+        fake.insert("Active", "untagged", &[]);
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(item.action, PullAction::SkippedState);
+            let note = item.note.as_deref().unwrap();
+            assert!(note.contains("'Active'") && note.contains("status_map"), "{note}");
+        }
+        assert_eq!(count_tasks(&root), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn definition_failure_does_not_advance_rev_and_retry_repairs() {
+        let (root, config, t) = setup("defrepair");
+        make_varda_dir(&root);
+        let fake = FakeTracker::new(t.clone());
+        let a = fake.insert("New", "alpha", &["varda:ready"]);
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
+        let (home, def) = (items[0].paths[0].clone(), items[0].paths[1].clone());
+        let good = std::fs::read_to_string(&def).unwrap();
+
+        std::fs::write(&def, "no frontmatter here\n").unwrap();
+        fake.human_edit(&a.id);
+        let outcome = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+        let raw = std::fs::read_to_string(&home).unwrap();
+        assert!(raw.contains("rev: 1"), "{raw}");
+
+        std::fs::write(&def, &good).unwrap();
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
+        assert_eq!(items[0].action, PullAction::Updated);
+        assert!(std::fs::read_to_string(&home).unwrap().contains("rev: 2"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn commit_groups_continue_past_failing_group_and_report_uncommitted() {
+        let paths: Vec<PathBuf> = ["/a/1.md", "/b/2.md", "/c/3.md", "/nogit/4.md", "/a/5.md"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let root_for = |p: &Path| -> Result<PathBuf> {
+            let top = p.components().nth(1).unwrap().as_os_str().to_owned();
+            if top == "nogit" {
+                bail!("not in a git repository");
+            }
+            Ok(PathBuf::from("/").join(top))
+        };
+        let mut attempted = Vec::new();
+        let report = commit_in_groups(&paths, root_for, |refs| {
+            attempted.push(refs.len());
+            if refs[0].starts_with("/b") {
+                bail!("commit boom");
+            }
+            Ok(())
+        });
+        assert_eq!(attempted, vec![2, 1, 1]);
+        assert_eq!(report.committed, 3);
+        assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
+        assert_eq!(
+            report.uncommitted,
+            vec![PathBuf::from("/nogit/4.md"), PathBuf::from("/b/2.md")]
+        );
     }
 }
