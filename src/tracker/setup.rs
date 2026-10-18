@@ -486,8 +486,11 @@ pub async fn run_setup(
             for item in &outcome.items {
                 io.say(&format!("  {} {} {}", item.action.label(), item.id, item.title));
             }
-            for e in &outcome.errors {
-                fail(io, e);
+            if !outcome.errors.is_empty() {
+                for e in &outcome.errors {
+                    fail(io, e);
+                }
+                bail!("the pull dry run reported errors; nothing written");
             }
         }
         Err(_) => {
@@ -529,15 +532,16 @@ pub async fn run_setup(
         "acknowledged",
         super::sync::check_acknowledged(&config_after, &draft)
             .map(|()| "yes".to_owned())
-            .map_err(|e| format!("{e:#}")),
+            .map_err(|_| String::new()),
     )];
     checks.extend(super::doctor::backend_checks(&draft, backend.as_ref()).await);
     for (check, verdict) in checks {
         match verdict {
             Ok(detail) => ok(io, &format!("doctor {check}: {detail}")),
-            Err(reason) => {
+            // The raw reason may carry response bodies; never print it here.
+            Err(_) => {
                 failures += 1;
-                fail(io, &format!("doctor {check}: {reason}"));
+                fail(io, &format!("doctor {check}: failed (run `varda tracker doctor` for details)"));
             }
         }
     }
@@ -959,6 +963,119 @@ mod tests {
             assert!(!io.out.join("\n").contains(SECRET), "{:#?}", io.out);
             std::fs::remove_dir_all(e.root).ok();
         }
+    }
+
+    /// `check_auth` succeeds on the first call (setup's own probe) and fails
+    /// afterwards (the post-write doctor) with an error containing SECRET.
+    struct LateAuth {
+        inner: SetupFake,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl IssueTracker for LateAuth {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        async fn check_auth(&self) -> super::super::Result<()> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                return Err(super::super::TrackerError::Other(anyhow::anyhow!("401 body {SECRET}")));
+            }
+            Ok(())
+        }
+        async fn query(&self, f: &TrackerFilter) -> super::super::Result<Vec<super::super::RemoteIssue>> {
+            self.inner.query(f).await
+        }
+        async fn get(&self, id: &str) -> super::super::Result<super::super::RemoteIssue> {
+            self.inner.get(id).await
+        }
+        async fn create(&self, d: &super::super::IssueDraft) -> super::super::Result<super::super::RemoteIssue> {
+            self.inner.create(d).await
+        }
+        async fn transition(
+            &self,
+            id: &str,
+            to: crate::task::TaskStatus,
+            rev: Option<u64>,
+        ) -> super::super::Result<super::super::RemoteIssue> {
+            self.inner.transition(id, to, rev).await
+        }
+        async fn comment(&self, id: &str, m: &str) -> super::super::Result<()> {
+            self.inner.comment(id, m).await
+        }
+        async fn assign(&self, id: &str, w: Option<&str>) -> super::super::Result<()> {
+            self.inner.assign(id, w).await
+        }
+        async fn valid_states(&self) -> super::super::Result<Option<Vec<String>>> {
+            self.inner.valid_states().await
+        }
+        async fn process_template(&self) -> super::super::Result<Option<String>> {
+            self.inner.process_template().await
+        }
+    }
+
+    #[tokio::test]
+    async fn late_doctor_failure_does_not_print_error_body() {
+        let e = env("lateauth");
+        let mut io = ScriptedIo::default();
+        let f = |t: &TrackerConfig| -> Result<Box<dyn IssueTracker>> {
+            let fake = FakeTracker::new(t.clone());
+            fake.insert("New", "tagged item", &["varda"]);
+            Ok(Box::new(LateAuth {
+                inner: SetupFake {
+                    inner: fake,
+                    process: Some("Agile".to_owned()),
+                    states: ["New", "Active", "Closed"].map(str::to_owned).to_vec(),
+                },
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }) as Box<dyn IssueTracker>)
+        };
+        let out = run_setup(&e.config, &e.config_path, &e.opts, &mut io, &f).await.unwrap();
+        match out {
+            SetupOutcome::Written { doctor_failures } => assert!(doctor_failures >= 1, "{:#?}", io.out),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+        assert!(!io.out.join("\n").contains(SECRET), "{:#?}", io.out);
+        assert!(io.out.iter().any(|l| l.contains("doctor auth: failed")), "{:#?}", io.out);
+        std::fs::remove_dir_all(e.root).ok();
+    }
+
+    #[tokio::test]
+    async fn dry_run_errors_abort_without_writing() {
+        let e = env("dryerrors");
+        let before = std::fs::read(&e.config_path).unwrap();
+        let mut io = ScriptedIo::default();
+        let config = e.config.clone();
+        // Two local tasks claim the tagged item's external id, so the dry run
+        // reports a per-item error instead of failing outright.
+        let f = move |t: &TrackerConfig| -> Result<Box<dyn IssueTracker>> {
+            let fake = FakeTracker::new(t.clone());
+            let item = fake.insert("New", "tagged item", &["varda"]);
+            for name in ["dup a", "dup b"] {
+                let path = crate::task::create_task(&config, name, Path::new(&t.project_path), None, None, None)
+                    .unwrap();
+                let mut doc = crate::task::load_task(&path).unwrap();
+                doc.frontmatter.external = Some(crate::task::ExternalRef {
+                    backend: t.name.clone(),
+                    id: item.id.clone(),
+                    url: String::new(),
+                    rev: Some(0),
+                    synced_status: None,
+                    remote_state: None,
+                    sync_error: None,
+                });
+                crate::task::write_task(&doc).unwrap();
+            }
+            Ok(Box::new(SetupFake {
+                inner: fake,
+                process: Some("Agile".to_owned()),
+                states: ["New", "Active", "Closed"].map(str::to_owned).to_vec(),
+            }) as Box<dyn IssueTracker>)
+        };
+        let err = run_setup(&e.config, &e.config_path, &e.opts, &mut io, &f).await.unwrap_err();
+        assert!(err.to_string().contains("dry run reported errors"), "{err:#}");
+        assert_eq!(std::fs::read(&e.config_path).unwrap(), before);
+        std::fs::remove_dir_all(e.root).ok();
     }
 
     #[tokio::test]
