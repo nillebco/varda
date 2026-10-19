@@ -138,10 +138,10 @@ impl GithubTracker {
     }
 
     fn http_error(&self, what: &str, response: &HttpResponse) -> TrackerError {
-        let snippet: String = String::from_utf8_lossy(&response.body)
-            .chars()
-            .take(300)
-            .collect();
+        // Redact the WHOLE body before truncating: a secret straddling the cut
+        // would otherwise survive as an unmatched prefix.
+        let body = redact(&String::from_utf8_lossy(&response.body), &self.token);
+        let snippet: String = body.chars().take(300).collect();
         TrackerError::Other(anyhow!(redact(
             &format!("github {what}: HTTP {}: {snippet}", response.status),
             &self.token
@@ -206,7 +206,10 @@ impl GithubTracker {
             .ok_or_else(|| anyhow!("issue without numeric `number`"))?;
         let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
         let updated_at = item.get("updated_at").and_then(Value::as_str);
-        let rev = updated_at.and_then(epoch_from_rfc3339).unwrap_or(0);
+        // `updated_at` is the only conflict signal; never manufacture one.
+        let rev = updated_at
+            .and_then(epoch_from_rfc3339)
+            .ok_or_else(|| anyhow!("issue #{number}: missing or invalid `updated_at`"))?;
         let remote_state = match (text("state"), item.get("state_reason").and_then(Value::as_str)) {
             ("closed", Some(reason)) => format!("closed:{}", reason.to_ascii_lowercase()),
             ("closed", None) => "closed".to_owned(),
@@ -367,7 +370,12 @@ impl IssueTracker for GithubTracker {
         if let Some(desired) = &mapped.state {
             let (state, reason) = parse_state(desired).map_err(TrackerError::Other)?;
             let is_open = current.remote_state == "open";
-            if is_open != (state == "open") {
+            // An already-closed issue whose close reason differs (e.g.
+            // not_planned → completed) still needs the PATCH.
+            let reason_differs = !is_open
+                && state != "open"
+                && reason.is_some_and(|r| current_state_reason(&current) != Some(r));
+            if is_open != (state == "open") || reason_differs {
                 let mut body = json!({ "state": state });
                 if let Some(reason) = reason {
                     body["state_reason"] = json!(reason);
@@ -467,6 +475,11 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The close reason encoded in a mapped `remote_state` (`closed:<reason>`).
+fn current_state_reason(issue: &RemoteIssue) -> Option<&str> {
+    issue.remote_state.strip_prefix("closed:")
+}
+
 /// `open` / `closed` / `closed:<reason>` → (API state, optional state_reason).
 fn parse_state(value: &str) -> anyhow::Result<(&'static str, Option<&'static str>)> {
     match value.to_ascii_lowercase().as_str() {
@@ -520,6 +533,9 @@ pub fn epoch_from_rfc3339(text: &str) -> Option<u64> {
         }
         _ => 0,
     };
+    if !super::civil_time_is_valid(y, m, day, hour, min, sec, offset / 60) || offset % 60 != 0 {
+        return None;
+    }
     // Howard Hinnant's days-from-civil.
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -962,5 +978,49 @@ mod tests {
         t.check_auth().await.expect("auth");
         let issues = t.query(&TrackerFilter::default()).await.expect("query");
         println!("{} issue(s)", issues.len());
+    }
+
+    // Review #1235: a token straddling the 300-char snippet cut must not leak.
+    #[test]
+    fn http_error_redacts_before_truncating() {
+        let t = tracker("http://127.0.0.1:9");
+        let body = format!("{}ghp_s3cret tail", "x".repeat(295));
+        let response = HttpResponse { status: 500, headers: vec![], body: body.into_bytes() };
+        let err = format!("{:#}", anyhow::Error::from(t.http_error("probe", &response)));
+        assert!(!err.contains("ghp_s"), "{err}");
+    }
+
+    // Review #1235: closed:not_planned → done (closed:completed) must PATCH the reason.
+    #[tokio::test]
+    async fn transition_changes_close_reason_on_already_closed_issue() {
+        let not_planned = with_state(ISSUE_FIXTURE, "closed", Some("not_planned"), &["varda"], "2026-10-01T09:00:00Z");
+        let completed = with_state(ISSUE_FIXTURE, "closed", Some("completed"), &["varda"], "2026-10-01T09:05:00Z");
+        let (base, seen) = fake_server(vec![ok(&not_planned), ok(&completed), ok(&completed)]);
+        let moved = tracker(&base).transition("11", TaskStatus::Done, None).await.unwrap();
+        assert_eq!(moved.remote_state, "closed:completed");
+        let reqs = seen.lock().unwrap().clone();
+        assert!(reqs[1].starts_with("PATCH /repos/acme/widgets/issues/11 "), "{reqs:#?}");
+        assert!(reqs[1].contains("\"state_reason\":\"completed\""), "{}", reqs[1]);
+    }
+
+    #[test]
+    fn issue_without_updated_at_is_rejected() {
+        let t = tracker("http://127.0.0.1:9");
+        let mut v: Value = serde_json::from_str(ISSUE_FIXTURE).unwrap();
+        v.as_object_mut().unwrap().remove("updated_at");
+        let err = t.map_issue(&v).unwrap_err().to_string();
+        assert!(err.contains("updated_at"), "{err}");
+    }
+
+    #[test]
+    fn impossible_timestamps_are_rejected() {
+        for bad in ["2026-99-99T09:00:00Z", "2026-02-30T09:00:00Z", "2026-10-01T25:00:00Z", "2026-10-01T09:61:00Z", "2026-10-01T09:00:00+15:00"] {
+            assert_eq!(epoch_from_rfc3339(bad), None, "{bad}");
+        }
+        assert!(epoch_from_rfc3339("2024-02-29T23:59:60Z").is_some());
+        let t = tracker("http://127.0.0.1:9");
+        let mut v: Value = serde_json::from_str(ISSUE_FIXTURE).unwrap();
+        v["updated_at"] = json!("2026-99-99T09:00:00Z");
+        assert!(t.map_issue(&v).unwrap_err().to_string().contains("updated_at"));
     }
 }

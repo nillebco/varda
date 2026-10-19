@@ -142,6 +142,26 @@ pub trait IssueTracker: Send + Sync {
     }
 }
 
+/// Whether a parsed civil timestamp is a real one (calendar day, clock, and a
+/// UTC offset within ±14:00). Revision parsers use it so an impossible
+/// `updated` value is rejected instead of silently becoming a revision.
+pub(crate) fn civil_time_is_valid(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64, offset_min: i64) -> bool {
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=9999).contains(&y)
+        && (1..=month_days).contains(&d)
+        && (0..24).contains(&h)
+        && (0..60).contains(&mi)
+        && (0..=60).contains(&s)
+        && offset_min.abs() <= 14 * 60
+}
+
 /// Build the backend for a (central-config) `[[trackers]]` entry, resolving its
 /// credential on the HOST. The token never leaves this process.
 pub fn build_tracker(

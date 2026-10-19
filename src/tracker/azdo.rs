@@ -555,10 +555,10 @@ impl AzdoTracker {
     }
 
     fn http_error(&self, what: &str, response: &HttpResponse) -> TrackerError {
-        let snippet: String = String::from_utf8_lossy(&response.body)
-            .chars()
-            .take(300)
-            .collect();
+        // Redact the WHOLE body before truncating: a secret straddling the cut
+        // would otherwise survive as an unmatched prefix.
+        let body = redact(&String::from_utf8_lossy(&response.body), &self.pat);
+        let snippet: String = body.chars().take(300).collect();
         TrackerError::Other(anyhow!(redact(
             &format!("azdo {what}: HTTP {}: {snippet}", response.status),
             &self.pat
@@ -1949,5 +1949,14 @@ mod tests {
         let t = AzdoTracker::new("azdo".to_owned(), base.clone(), project, pat, transport_for(&base));
         let issues = t.query(&TrackerFilter::default()).await.unwrap();
         println!("{} items", issues.len());
+    }
+
+    #[test]
+    fn http_error_redacts_before_truncating() {
+        let t = tracker("http://127.0.0.1:9");
+        let body = format!("{}s3cret-pat tail", "x".repeat(295));
+        let response = HttpResponse { status: 500, headers: vec![], body: body.into_bytes() };
+        let err = format!("{:#}", anyhow::Error::from(t.http_error("probe", &response)));
+        assert!(!err.contains("s3cr"), "{err}");
     }
 }

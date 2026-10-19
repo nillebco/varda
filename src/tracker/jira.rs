@@ -25,6 +25,9 @@ use crate::task::TaskStatus;
 const PAGE_SIZE: usize = 100;
 /// Hard cap on issues returned by one `query`.
 const MAX_ISSUES: usize = 1000;
+/// Hard page ceiling, independent of issue count (empty pages with a token
+/// must not loop forever).
+const MAX_PAGES: usize = 20;
 const DEFAULT_ISSUE_TYPE: &str = "Task";
 const MAX_COMMENT_BYTES: usize = 100 * 1024;
 const FIELDS: &[&str] = &[
@@ -133,7 +136,9 @@ impl JiraTracker {
     }
 
     fn http_error(&self, what: &str, response: &HttpResponse) -> TrackerError {
-        let snippet: String = String::from_utf8_lossy(&response.body).chars().take(300).collect();
+        // Redact the WHOLE body before truncating (see azdo::http_error).
+        let body = self.redact(&String::from_utf8_lossy(&response.body));
+        let snippet: String = body.chars().take(300).collect();
         TrackerError::Other(anyhow!(self.redact(&format!(
             "jira {what}: HTTP {}: {snippet}",
             response.status
@@ -197,7 +202,9 @@ impl JiraTracker {
         let empty = serde_json::Map::new();
         let fields = item.get("fields").and_then(Value::as_object).unwrap_or(&empty);
         let text = |k: &str| fields.get(k).and_then(Value::as_str).unwrap_or("");
-        let rev = parse_jira_time_millis(text("updated")).unwrap_or(0);
+        // `updated` is the only conflict signal; never manufacture one.
+        let rev = parse_jira_time_millis(text("updated"))
+            .ok_or_else(|| anyhow!("issue {key}: missing or invalid `fields.updated`"))?;
         let assignee = fields.get("assignee").filter(|a| a.is_object()).and_then(|a| {
             ["emailAddress", "displayName", "accountId"]
                 .iter()
@@ -230,7 +237,8 @@ impl JiraTracker {
     async fn search(&self, jql: &str) -> Result<Vec<RemoteIssue>> {
         let mut issues = Vec::new();
         let mut token: Option<String> = None;
-        loop {
+        let mut seen_tokens = std::collections::HashSet::new();
+        for _page in 0..MAX_PAGES {
             let mut body = json!({"jql": jql, "fields": FIELDS, "maxResults": PAGE_SIZE});
             if let Some(t) = &token {
                 body["nextPageToken"] = json!(t);
@@ -252,7 +260,17 @@ impl JiraTracker {
             if token.is_none() || last {
                 return Ok(issues);
             }
+            if let Some(t) = &token
+                && !seen_tokens.insert(t.clone())
+            {
+                return Err(TrackerError::Other(anyhow!(
+                    "jira search: repeated nextPageToken; aborting pagination"
+                )));
+            }
         }
+        Err(TrackerError::Other(anyhow!(
+            "jira search: more than {MAX_PAGES} pages; narrow the filter"
+        )))
     }
 
     async fn account_id(&self, who: &str) -> Result<String> {
@@ -369,11 +387,12 @@ impl IssueTracker for JiraTracker {
                         )
                     })
                     .collect();
-                return Err(TrackerError::Other(anyhow!(
+                // Server-provided names are remote text: scrub them like any body.
+                return Err(TrackerError::Other(anyhow!(self.redact(&format!(
                     "jira {id} (currently '{}') has no transition to '{target}'; available: {}",
                     current.remote_state,
                     if names.is_empty() { "none".to_owned() } else { names.join(", ") }
-                )));
+                )))));
             };
             let body = json!({"transition": {"id": transition_id}});
             let response = self.call(self.request("POST", url, Some(body))).await?;
@@ -493,6 +512,9 @@ pub fn parse_jira_time_millis(s: &str) -> Option<u64> {
         }
         _ => return None,
     };
+    if !super::civil_time_is_valid(y, mo, d, h, mi, sec, offset_min) {
+        return None;
+    }
     // Howard Hinnant's days-from-civil.
     let y = y - i64::from(mo <= 2);
     let era = y.div_euclid(400);
@@ -835,5 +857,53 @@ mod tests {
         );
         t.check_auth().await.unwrap();
         t.query(&TrackerFilter::default()).await.unwrap();
+    }
+
+    // Review #1236: empty pages that keep handing out tokens must terminate.
+    #[tokio::test]
+    async fn query_stops_on_repeated_page_token() {
+        let page = r#"{"issues":[],"nextPageToken":"same","isLast":false}"#.to_owned();
+        let (base, seen) = fake_server(vec![(200, page.clone()), (200, page.clone()), (200, page)]);
+        let err = tracker(&base).query(&TrackerFilter::default()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("repeated nextPageToken"), "{err:#}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn query_is_bounded_by_page_count() {
+        let replies = (0..MAX_PAGES)
+            .map(|i| (200, format!(r#"{{"issues":[],"nextPageToken":"t{i}","isLast":false}}"#)))
+            .collect();
+        let (base, seen) = fake_server(replies);
+        let err = tracker(&base).query(&TrackerFilter::default()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("more than"), "{err:#}");
+        assert_eq!(seen.lock().unwrap().len(), MAX_PAGES);
+    }
+
+    #[test]
+    fn issue_without_updated_is_rejected() {
+        let t = tracker("http://127.0.0.1:9");
+        let item = json!({"key": "VAR-1", "fields": {"summary": "x", "status": {"name": "To Do"}}});
+        let err = t.map_issue(&item).unwrap_err().to_string();
+        assert!(err.contains("updated"), "{err}");
+    }
+
+    #[test]
+    fn http_error_redacts_before_truncating() {
+        let t = tracker("http://127.0.0.1:9");
+        let body = format!("{}s3cret-token tail", "x".repeat(295));
+        let response = HttpResponse { status: 500, headers: vec![], body: body.into_bytes() };
+        let err = format!("{:#}", anyhow::Error::from(t.http_error("probe", &response)));
+        assert!(!err.contains("s3cr"), "{err}");
+    }
+
+    #[test]
+    fn impossible_timestamps_are_rejected() {
+        for bad in ["2026-99-99T09:00:00.000+0000", "2026-02-30T09:00:00.000+0000", "2026-10-01T24:00:00.000+0000", "2026-10-01T09:00:00.000+1500"] {
+            assert_eq!(parse_jira_time_millis(bad), None, "{bad}");
+        }
+        let t = tracker("http://127.0.0.1:9");
+        let item = json!({"key": "VAR-1", "fields": {"updated": "2026-13-01T09:00:00.000+0000", "status": {"name": "To Do"}}});
+        assert!(t.map_issue(&item).unwrap_err().to_string().contains("updated"));
     }
 }
