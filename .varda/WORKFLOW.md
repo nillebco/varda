@@ -59,13 +59,13 @@ worktree copy does not exist.
   another task's worktree.
 - Branch names track the task (e.g. `feat/<slug>`).
 
-## No agent git commits
+## Git handoff
 
-- Agents MUST NOT run `git add`, `git commit`, `git push`, `git rebase`, or
-  `git merge`. Varda owns committing.
-- Agents leave changes unstaged in the working tree and list every changed file
-  (one path per line) under a `## Files touched` heading in their recap. Varda
-  stages and commits exactly those paths.
+- Agents MUST NOT run `git rebase` or `git merge`; Varda owns integration.
+  `git add` / `git commit` are fine — committing your own work is allowed.
+- Either commit your work yourself or leave it unstaged in the working tree,
+  and list every changed file (one path per line) under a `## Files touched`
+  heading in your recap. Varda stages and commits exactly those paths.
 
 ## File ownership & disjoint footprints
 

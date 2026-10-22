@@ -210,7 +210,7 @@ Behavior:
 - `varda task list` unions the repo's definitions with the home store, so a
   clone sees every task the code ships even before it has run anything.
 - `.varda/WORKFLOW.md` documents the multi-agent contribution rules
-  (worktree-per-task, no agent git commits, file ownership, local gate,
+  (worktree-per-task, git handoff, file ownership, local gate,
   cross-review, resolver + post-merge check).
 
 **Back-compat:** repos WITHOUT a `.varda/` directory keep the existing
