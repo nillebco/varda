@@ -48,6 +48,18 @@ pub struct IssueDraft {
     /// Backend work-item type (Azure DevOps: `Task`, `Bug`, ...); `None` ⇒ the
     /// tracker's configured default.
     pub work_item_type: Option<String>,
+    /// Azure DevOps area path (`System.AreaPath`), so the created item falls
+    /// inside an area-filtered pull. GitHub and Jira filters have no area
+    /// notion, so those backends ignore it.
+    pub area_path: Option<String>,
+}
+
+/// A commit Varda made for a task, as the tracker may want to link it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitRef {
+    pub sha: String,
+    /// The repository's `origin` remote URL, when it has one.
+    pub origin_url: Option<String>,
 }
 
 /// Tracker failures. A revision conflict is distinguished from every other
@@ -114,6 +126,11 @@ pub trait IssueTracker: Send + Sync {
     ) -> Result<RemoteIssue>;
     async fn comment(&self, id: &str, markdown: &str) -> Result<()>;
     async fn assign(&self, id: &str, who: Option<&str>) -> Result<()>;
+    /// Attach a structured link to `commit` on the work item. Backends without
+    /// such a notion, or whose repo is not hosted by this tracker, skip silently.
+    async fn link_commit(&self, _id: &str, _commit: &CommitRef) -> Result<()> {
+        Ok(())
+    }
     /// Cheap authenticated call proving the credential works (`tracker list`).
     /// Backends without a dedicated endpoint accept by default.
     async fn check_auth(&self) -> Result<()> {
@@ -366,6 +383,7 @@ pub mod fake {
     struct State {
         issues: BTreeMap<String, RemoteIssue>,
         comments: Vec<(String, String)>,
+        links: Vec<(String, String)>,
         next_id: u64,
         /// The next `transition` fails with a conflict regardless of the rev,
         /// and bumps the remote rev as a concurrent human edit would.
@@ -437,6 +455,11 @@ pub mod fake {
 
         pub fn comments(&self) -> Vec<(String, String)> {
             self.state.lock().unwrap().comments.clone()
+        }
+
+        /// `(item id, commit sha)` pairs passed to `link_commit`.
+        pub fn links(&self) -> Vec<(String, String)> {
+            self.state.lock().unwrap().links.clone()
         }
     }
 
@@ -527,6 +550,15 @@ pub mod fake {
                 return Err(TrackerError::NotFound(id.to_owned()));
             }
             s.comments.push((id.to_owned(), markdown.to_owned()));
+            Ok(())
+        }
+
+        async fn link_commit(&self, id: &str, commit: &CommitRef) -> Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .links
+                .push((id.to_owned(), commit.sha.clone()));
             Ok(())
         }
 

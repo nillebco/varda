@@ -70,6 +70,10 @@ enum Command {
         /// Skip the confirmation prompt and run immediately.
         #[arg(long)]
         yes: bool,
+        /// Pull every configured issue tracker (`tracker pull`) before running.
+        /// Best-effort: a failing tracker is reported and the run continues.
+        #[arg(long)]
+        pull: bool,
     },
     /// Create a reviewable execution plan for ready tasks.
     Plan,
@@ -118,6 +122,11 @@ enum Command {
         /// `$HOME`/`~/dev`.
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Pull the issue trackers whose project_path the workspace covers every
+        /// SECS seconds (minimum 60) while the resident runs. Host-side only; the
+        /// broker surface is unchanged.
+        #[arg(long, value_name = "SECS")]
+        pull_every: Option<u64>,
     },
     /// Internal: run a `processcontainer` relay request (Windows MXC). Written
     /// by the provider's `wrap()`; not meant to be typed by hand.
@@ -185,6 +194,11 @@ enum TaskCommand {
         /// Set the task status to ready after creation (skips backlog).
         #[arg(long)]
         ready: bool,
+        /// Create the work item in this issue tracker first (tagged for pickup),
+        /// then the local task linked to it. The task lands in the tracker's
+        /// project_path; refuses an unacknowledged tracker.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["project", "reuse"])]
+        tracker: Option<String>,
         /// Resume-or-create: if a task with this name already exists for the project,
         /// resume it instead of erroring. Continues the previously captured agent
         /// session when one is available (falling back to fresh, with a message, if
@@ -583,7 +597,16 @@ async fn run_cli() -> Result<()> {
                 result.config_path, result.operations_dir
             );
         }
-        Command::Run { task, plan, yes } => {
+        Command::Run {
+            task,
+            plan,
+            yes,
+            pull,
+        } => {
+            if pull {
+                let config = config::resolve_config(&config::config_file()?)?;
+                tracker::sync::pull_before_run(&config, tracker::sync::PULL_TIMEOUT).await;
+            }
             run_command(task.as_deref(), plan.as_deref(), yes).await?;
         }
         Command::Plan => {
@@ -630,6 +653,7 @@ async fn run_cli() -> Result<()> {
                 interactive,
                 quiet,
                 ready,
+                tracker,
                 reuse,
                 print_result,
                 result_file,
@@ -681,7 +705,21 @@ async fn run_cli() -> Result<()> {
                 };
                 let config_path = config::config_file()?;
                 let config = config::resolve_config(&config_path)?;
-                let project_path = task::resolve_project_path(project.as_deref())?;
+                let tracked_project = match tracker.as_deref() {
+                    Some(name) => Some(
+                        config
+                            .trackers
+                            .iter()
+                            .find(|t| t.name == name)
+                            .map(|t| PathBuf::from(&t.project_path))
+                            .with_context(|| format!("no tracker named '{name}' is configured"))?,
+                    ),
+                    None => None,
+                };
+                let project_path = match tracked_project {
+                    Some(path) => path,
+                    None => task::resolve_project_path(project.as_deref())?,
+                };
                 validate_egress_override(&egress)?;
                 // --reuse (with --exec): if this (project, name) task already exists,
                 // resume it instead of erroring on the collision. Lets the shell aliases
@@ -762,15 +800,31 @@ async fn run_cli() -> Result<()> {
                     }
                     assignee
                 };
-                let task_path = task::create_task_with_egress(
-                    &config,
-                    &taskname,
-                    &project_path,
-                    assignee.as_deref(),
-                    description.as_deref(),
-                    sandbox.as_deref(),
-                    &egress,
-                )?;
+                let task_path = if let Some(tracker_name) = tracker.as_deref() {
+                    tracker::sync::add_tracker_task(
+                        &config,
+                        tracker_name,
+                        &taskname,
+                        description.as_deref(),
+                        &tracker::sync::LocalTaskOptions {
+                            assignee: assignee.clone(),
+                            sandbox: sandbox.clone(),
+                            egress: egress.clone(),
+                        },
+                        tracker::push::PUSH_TIMEOUT,
+                    )
+                    .await?
+                } else {
+                    task::create_task_with_egress(
+                        &config,
+                        &taskname,
+                        &project_path,
+                        assignee.as_deref(),
+                        description.as_deref(),
+                        sandbox.as_deref(),
+                        &egress,
+                    )?
+                };
                 let mut task_doc = task::load_task(&task_path)?;
                 if ready || exec {
                     task_doc.set_status(task::TaskStatus::Ready);
@@ -1167,8 +1221,9 @@ async fn run_cli() -> Result<()> {
         Command::Orchestrate {
             interactive,
             workspace,
+            pull_every,
         } => {
-            orchestrate_command(interactive, workspace.as_deref()).await?;
+            orchestrate_command(interactive, workspace.as_deref(), pull_every).await?;
         }
         Command::SandboxExec { request } => {
             let code = sandbox::processcontainer::run_relay(&request).await?;
@@ -1817,11 +1872,13 @@ async fn run_task_paths_in_parallel(
                 if config.git.auto_commit {
                     if may_commit_files && let Some(project) = report.project.as_deref() {
                         commit_agent_files_for_task(
+                            &config,
                             &report.task_path,
                             project,
                             &report.outcome.files_touched,
                             false,
-                        );
+                        )
+                        .await;
                     }
                     git::commit_task_update(
                         &report.task_path,
@@ -5101,7 +5158,12 @@ fn default_orchestrate_workspace(
         .unwrap_or_else(|| varda_home.join("orchestrate").join("workspace"))
 }
 
-async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Result<()> {
+async fn orchestrate_command(
+    interactive: bool,
+    workspace: Option<&Path>,
+    pull_every: Option<u64>,
+) -> Result<()> {
+    let pull_every = pull_every.map(tracker::sync::check_pull_every).transpose()?;
     let config_path = config::config_file()?;
     let config = config::resolve_config(&config_path)?;
 
@@ -5159,7 +5221,29 @@ async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Res
     // wraps the session in the 461d interactive broker so `run_subtask` is served
     // for the whole session. `--interactive` attaches the TTY (M13b); headless runs
     // the resident autonomously until it terminates or signals needs_user.
-    run_task_command(&task_path, interactive, false).await
+    let puller = pull_every.and_then(|every| {
+        let names = tracker::sync::trackers_covered_by(&config, &workspace);
+        if names.is_empty() {
+            println!("orchestrate: --pull-every ignored: no tracker covers this workspace");
+            return None;
+        }
+        println!(
+            "orchestrate: pulling tracker(s) {} every {}s (host-side)",
+            names.join(", "),
+            every.as_secs()
+        );
+        Some(tokio::spawn(tracker::sync::pull_loop(
+            config.clone(),
+            names,
+            every,
+            tracker::sync::PULL_TIMEOUT,
+        )))
+    });
+    let result = run_task_command(&task_path, interactive, false).await;
+    if let Some(handle) = puller {
+        handle.abort();
+    }
+    result
 }
 
 /// Where a scripted caller wants the agent's final answer (`--print-result` /
@@ -5399,7 +5483,14 @@ async fn run_task_command_with(
     };
     if config.git.auto_commit {
         if may_commit_files && let Some(project) = task_document.frontmatter.project.as_deref() {
-            commit_agent_files_for_task(&task_path, project, &outcome.files_touched, to_stderr);
+            commit_agent_files_for_task(
+                &config,
+                &task_path,
+                project,
+                &outcome.files_touched,
+                to_stderr,
+            )
+            .await;
         }
         git::commit_task_update(
             &task_path,
@@ -5430,7 +5521,8 @@ async fn run_task_command_with(
     Ok(())
 }
 
-fn commit_agent_files_for_task(
+async fn commit_agent_files_for_task(
+    config: &config::Config,
     task_path: &Path,
     project: &str,
     files_touched: &[PathBuf],
@@ -5445,18 +5537,35 @@ fn commit_agent_files_for_task(
         .and_then(|s| s.to_str())
         .unwrap_or("task");
     let message = format!("Apply task {id} agent changes");
-    if let Err(error) = git::commit_agent_files(project_path, files_touched, &message) {
-        eprintln!(
+    match git::commit_agent_files(project_path, files_touched, &message) {
+        Err(error) => eprintln!(
             "warning: failed to commit agent files for task {}: {error:#}",
             task_path.display()
-        );
-    } else {
-        say!(
-            to_stderr,
-            "committed {} agent file(s) in {}",
-            files_touched.len(),
-            project_path.display()
-        );
+        ),
+        Ok(sha) => {
+            say!(
+                to_stderr,
+                "committed {} agent file(s) in {}",
+                files_touched.len(),
+                project_path.display()
+            );
+            // A tracker-linked task gets the commit hash (and branch / artifact
+            // link) as a follow-up comment; a plain task skips this entirely.
+            if let Some(sha) = sha {
+                let report = tracker::push::CommitReport {
+                    shas: vec![sha],
+                    branch: git::current_branch(project_path).ok().flatten(),
+                    origin_url: git::origin_url(project_path),
+                };
+                tracker::push::push_commit_links(
+                    config,
+                    task_path,
+                    &report,
+                    tracker::push::PUSH_TIMEOUT,
+                )
+                .await;
+            }
+        }
     }
 }
 

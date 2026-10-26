@@ -426,6 +426,99 @@ fn report_outcome(backend: &str, doc: &TaskDocument, saved: bool) -> bool {
     }
 }
 
+/// The commits Varda made for a task's `Files touched`, plus where they live.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitReport {
+    pub shas: Vec<String>,
+    pub branch: Option<String>,
+    pub origin_url: Option<String>,
+}
+
+/// The follow-up comment announcing the commits. The review comment itself is
+/// posted when the status settles, which is before the host commits the files,
+/// so the hashes arrive in this second comment.
+pub fn commit_comment(report: &CommitReport) -> String {
+    let hashes: Vec<String> = report
+        .shas
+        .iter()
+        .map(|sha| format!("`{}`", sha.chars().take(12).collect::<String>()))
+        .collect();
+    let noun = if hashes.len() == 1 { "commit" } else { "commits" };
+    let mut text = format!("Varda committed the changes for this item: {noun} {}", hashes.join(", "));
+    if let Some(branch) = &report.branch {
+        text.push_str(&format!(" on branch `{branch}`"));
+    }
+    text.push('.');
+    text
+}
+
+/// Comment the commits on the work item and, where the backend supports it (Azure
+/// DevOps with an Azure Repos origin), attach artifact links. Returns the error
+/// text if the comment failed; link failures are reported on stderr only.
+pub async fn push_commit_links_via(
+    backend: &dyn IssueTracker,
+    id: &str,
+    report: &CommitReport,
+) -> std::result::Result<(), String> {
+    if report.shas.is_empty() {
+        return Ok(());
+    }
+    for sha in &report.shas {
+        let commit = super::CommitRef {
+            sha: sha.clone(),
+            origin_url: report.origin_url.clone(),
+        };
+        if let Err(e) = backend.link_commit(id, &commit).await {
+            eprintln!("tracker sync: could not link commit {sha} on {id}: {e}");
+        }
+    }
+    backend
+        .comment(id, &truncate_comment(&commit_comment(report), COMMENT_CAP))
+        .await
+        .map_err(|e| format!("commit comment failed: {e}"))
+}
+
+/// Report the commits Varda made for the task at `task_path` to its tracker.
+/// No-op without `external`. Never fails the run: problems go to stderr, and
+/// the whole thing (tracker build + HTTP) is bounded by `bound`.
+pub async fn push_commit_links(
+    config: &Config,
+    task_path: &Path,
+    report: &CommitReport,
+    bound: Duration,
+) {
+    if report.shas.is_empty() {
+        return;
+    }
+    let Some(ext) = task::load_task(task_path)
+        .ok()
+        .and_then(|doc| doc.frontmatter.external)
+    else {
+        return;
+    };
+    let warn = |error: String| eprintln!("tracker sync: {} {}: {error}", ext.backend, ext.id);
+    let Some(tracker) = config.trackers.iter().find(|t| t.name == ext.backend).cloned() else {
+        return warn(format!("tracker '{}' is not configured", ext.backend));
+    };
+    if let Err(e) = super::sync::check_acknowledged(config, &tracker) {
+        return warn(format!("{e:#}"));
+    }
+    let work = async {
+        let backend = tokio::task::spawn_blocking(move || {
+            super::build_tracker_within(&tracker, Some(bound))
+        })
+        .await
+        .map_err(|e| format!("building tracker failed: {e}"))?
+        .map_err(|e| format!("building tracker failed: {e:#}"))?;
+        push_commit_links_via(backend.as_ref(), &ext.id, report).await
+    };
+    match tokio::time::timeout(bound, work).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn(error),
+        Err(_) => warn(format!("commit comment timed out after {}s", bound.as_secs())),
+    }
+}
+
 /// `varda tracker sync [--tracker NAME]`.
 pub async fn sync_command(config: &Config, only: Option<&str>) -> Result<()> {
     if let Some(name) = only
@@ -519,6 +612,44 @@ mod tests {
 
     fn ext(doc: &TaskDocument) -> &ExternalRef {
         doc.frontmatter.external.as_ref().unwrap()
+    }
+
+    #[tokio::test]
+    async fn commit_comment_names_hashes_and_branch_and_links_each_commit() {
+        let (root, _config, t) = setup("commitlinks");
+        let fake = FakeTracker::new(t);
+        let item = fake.insert("New", "alpha", &[]);
+        let report = CommitReport {
+            shas: vec!["0123456789abcdef0123".to_owned(), "fedcba9876543210".to_owned()],
+            branch: Some("wip/task-1".to_owned()),
+            origin_url: Some("https://dev.azure.com/o/p/_git/r".to_owned()),
+        };
+        push_commit_links_via(&fake, &item.id, &report).await.unwrap();
+        let comments = fake.comments();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].1.contains("`0123456789ab`, `fedcba987654`"), "{}", comments[0].1);
+        assert!(comments[0].1.contains("branch `wip/task-1`"), "{}", comments[0].1);
+        assert_eq!(fake.links().len(), 2);
+
+        let single = CommitReport { shas: vec!["abc".to_owned()], ..CommitReport::default() };
+        let text = commit_comment(&single);
+        assert!(text.contains("commit `abc`.") && !text.contains("branch"), "{text}");
+
+        // No commits ⇒ nothing posted.
+        push_commit_links_via(&fake, &item.id, &CommitReport::default()).await.unwrap();
+        assert_eq!(fake.comments().len(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn commit_links_for_a_plain_task_do_nothing() {
+        let (root, config, _t) = setup("commitplain");
+        let task_path = task::create_task(&config, "plain", &root.join("proj"), None, None, None).unwrap();
+        let before = std::fs::read_to_string(&task_path).unwrap();
+        let report = CommitReport { shas: vec!["abc".to_owned()], ..CommitReport::default() };
+        push_commit_links(&config, &task_path, &report, Duration::from_secs(5)).await;
+        assert_eq!(std::fs::read_to_string(&task_path).unwrap(), before);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

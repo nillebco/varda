@@ -904,6 +904,7 @@ mod tests {
                 tags: vec!["varda".to_owned()],
                 assignee: Some("ada".to_owned()),
                 work_item_type: None,
+                area_path: None,
             })
             .await
             .unwrap();
