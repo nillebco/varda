@@ -8,8 +8,9 @@ No tracker? A folder of markdown files works too — each task is a file carryin
 
 ```sh
 varda tracker setup azdo --org acme --project Platform --repo ~/dev/acme/platform   # guided, once
-# tag an item `varda` AND `varda:ready` BEFORE the first pull — readiness is decided at import
-varda tracker pull                                                                 # imports it as a `ready` task (without `varda:ready`: `backlog`)
+# Agile: tag an item `varda` AND `varda:ready` BEFORE the first pull — readiness is decided at import
+# (Scrum: tag `varda` and move it to `Approved`; other processes: see docs/trackers.md)
+varda tracker pull                                                                 # imports it as a `ready` task (Agile without `varda:ready`: `backlog`)
 varda run                                                                          # ready items → agents → recap on the item
 varda task add "Fix the flaky auth test" --exec                                    # or, with no tracker: a local markdown task
 ```
