@@ -6,7 +6,7 @@ Supported backends: **Azure DevOps Boards** (`azdo`), **GitHub Issues** (`github
 
 ## Concepts
 
-- **The tracker is the source of truth for the definition and the lifecycle.** Title, description, and the done/closed state live in the tracker. A human closing the item there is what finally marks the local task `done`.
+- **The tracker is the source of truth for the definition and the lifecycle.** Title, description, and the done/closed state live in the tracker. A human closing the item there marks the local task `done` only if the closed state matches the configured `done` mapping (on GitHub the default accepts only `closed:completed`, so closing as "not planned" does not mark it done).
 - **The local task file is the run record.** Session ids, logs, resume commands, recap paths and budget bookkeeping stay in `~/.varda` — they do not belong in a tracker. A tracker-linked task is an ordinary home task with an extra `external:` frontmatter block (backend name, remote id, url, last revision seen, last synced status, `sync_error`). A task without `external` behaves exactly as before.
 - **Sync happens at the edges.** `pull` imports/refreshes items; Varda pushes status and recaps back when a task changes status. The runner, orchestrator and MCP broker keep reading the local board.
 - **One tracker → one local repo.** Each `[[trackers]]` entry has a `project_path`; imported tasks land there and go through the normal route/sandbox resolution.
@@ -32,7 +32,7 @@ Setup prints each step as it runs:
 
 `--yes` skips the prompts (the acknowledgement is still recorded); `--force` replaces an existing tracker of the same name; `--name` overrides the default name `azdo-<project>`; `--work-item-type` (default `Task`) sets the type used when Varda creates items.
 
-Then tag a work item `varda` and:
+Then tag a work item `varda`. Under the default Agile `status_map` a pulled `New` item becomes `backlog`, and `varda run` only runs `ready` tasks, so also add the `varda:ready` tag to the item (GitHub and Jira behave the same when `ready` shares a remote state with `backlog`; tag the issue `varda:ready` there too). Then:
 
 ```sh
 varda tracker list            # configured trackers + auth check
@@ -126,7 +126,7 @@ Jira has no fixed default: setup derives the map from the project's workflow (lo
 | task → `needs_user` | `varda:needs-user` tag + comment with the agent's question |
 | task → `failed` | `varda:failed` tag + comment with the failure summary |
 | after the commit | follow-up comment with the commit hash(es) and branch; on Azure DevOps with an Azure Repos origin, artifact links too |
-| human moves the item to a done state | next `pull` marks the local task `done` |
+| human moves the item to a state matching the `done` mapping | next `pull` marks the local task `done` (GitHub default: only `closed:completed`; "not planned" does not) |
 | human edits title/description | next `pull` refreshes the task body — never while the task is `running` |
 
 Comments are capped at 20,000 bytes (truncated with a notice). A new remote item that is already closed, in an in-flight state, or in a state the `status_map` doesn't know is not imported.
@@ -150,7 +150,7 @@ varda orchestrate --pull-every SECS    # pull in the background while the reside
 
 Varda never overwrites a human change. Before each push it re-reads the item; if the remote state differs from the one Varda last saw (or the item is closed), the push is **refused** and `external.sync_error` explains why. Azure DevOps additionally sends a `test /rev` operation, so an edit landing between the read and the write fails with a conflict; Varda re-reads and retries once. Jira and GitHub have no atomic compare-and-set, so there the check is read-then-write and a narrow race remains. Re-run `varda tracker pull` to accept the human's change.
 
-A push failure never fails or slows a run: the error is stored in `external.sync_error`, shown by `varda task show`, and retried by `varda tracker sync`. Every outbound request has a timeout, and a whole push is bounded at 60 s.
+A push failure never fails a run: the error is stored in `external.sync_error`, shown by `varda task show`, and retried by `varda tracker sync`. Every outbound request has a timeout, and a whole push is bounded at 60 s. The runner awaits the push, so a slow tracker can delay a run by up to that bound.
 
 ## Data disclaimer
 
