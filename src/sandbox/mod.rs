@@ -6393,6 +6393,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn microsandbox_staged_credential_is_private_and_cleaned() {
         use std::os::unix::fs::PermissionsExt as _;
