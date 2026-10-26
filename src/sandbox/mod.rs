@@ -1826,9 +1826,9 @@ fn varda_sessions_root() -> PathBuf {
     base.join("sessions")
 }
 
-/// Deterministic-per-content filename suffix for a staged temp file. Avoids
-/// `rand`/time (unavailable in some contexts) while keeping distinct contents in
-/// distinct files: a short FNV-1a hash of the content.
+/// Deterministic-per-content filename suffix (a short FNV-1a hash), used by the
+/// processcontainer provider, whose staging dir is per-session. Not for a dir
+/// shared between sessions: equal contents share a name (see `write_stage_temp`).
 fn staged_temp_suffix(content: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in content.as_bytes() {
@@ -1847,11 +1847,22 @@ fn staged_temp_suffix(content: &str) -> String {
 /// The prompt uses the default (world-readable) perms so a non-root agent can
 /// still read it. Returns the host temp path.
 fn write_stage_temp(content: &str, read_only: bool) -> Result<PathBuf> {
-    let tmp = std::env::temp_dir().join(format!("varda-stage-{}", staged_temp_suffix(content)));
-    // The filename is content-addressed, so a prior run staging the SAME value may
-    // have left a temp here (a read-only `0o400` credential temp `std::fs::write`
-    // cannot truncate, or an attacker-planted file). Clear it first (best-effort)
-    // so the credential create below owns a FRESH inode.
+    // Unique per call, never content-addressed: concurrent sessions staging the
+    // SAME value (parallel workers sharing a scoped token, or the same prompt)
+    // would otherwise share one path, and one session's teardown would delete
+    // the file the other is about to copy into its guest.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "varda-stage-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // Belt to `create_new` below: clear anything planted at the name first
+    // (best-effort) so the create owns a FRESH inode.
     let _ = std::fs::remove_file(&tmp);
     #[cfg(unix)]
     if read_only {
@@ -1880,6 +1891,7 @@ fn write_stage_temp(content: &str, read_only: bool) -> Result<PathBuf> {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).with_context(
             || format!("failed to lock down credential stage dir {}", dir.display()),
         )?;
+        sweep_stale_stage_files(&dir);
         let tmp = dir.join(
             tmp.file_name()
                 .expect("staged temp path always has a file name"),
@@ -1906,6 +1918,29 @@ fn write_stage_temp(content: &str, read_only: bool) -> Result<PathBuf> {
     std::fs::write(&tmp, content)
         .with_context(|| format!("failed to stage file {}", tmp.display()))?;
     Ok(tmp)
+}
+
+/// Best-effort: remove credential temps a crashed run left in the stage dir.
+/// Staged files are copied into the guest before it boots, so anything a day
+/// old belongs to no live session.
+#[cfg(unix)]
+fn sweep_stale_stage_files(dir: &Path) {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry.file_name().to_string_lossy().starts_with("varda-stage-")
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > MAX_AGE);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Sanitize a session id into a docker-safe name/volume component.
@@ -6335,6 +6370,29 @@ mod tests {
     /// the now-removed clawk provider; ported to microsandbox, the surviving
     /// own-kernel microVM primitive, to keep that normal-path guarantee tested.
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn stage_sweep_removes_only_day_old_stage_files() {
+        let dir = std::env::temp_dir().join(format!("varda-stage-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("varda-stage-old");
+        let fresh = dir.join("varda-stage-fresh");
+        let other = dir.join("unrelated");
+        for f in [&old, &fresh, &other] {
+            std::fs::write(f, "x").unwrap();
+        }
+        let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        for f in [&old, &other] {
+            std::fs::File::options().write(true).open(f).unwrap().set_modified(two_days_ago).unwrap();
+        }
+        sweep_stale_stage_files(&dir);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(other.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn microsandbox_staged_credential_is_private_and_cleaned() {
         use std::os::unix::fs::PermissionsExt as _;
