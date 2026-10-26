@@ -81,11 +81,17 @@ pub fn commit_task_file(task_path: &Path, message: &str) -> Result<()> {
 /// `project_repo` should be the project root (or any path inside it); the repo
 /// root is discovered automatically. Paths that fall outside the discovered
 /// repo are skipped with a warning rather than aborting the commit, so a
-/// careless agent recap can't break the run. Returns Ok(()) when there is
-/// nothing to commit.
-pub fn commit_agent_files(project_repo: &Path, files: &[PathBuf], message: &str) -> Result<()> {
+/// careless agent recap can't break the run.
+///
+/// Returns the full SHA of the commit it made, or `None` when there was nothing
+/// to commit.
+pub fn commit_agent_files(
+    project_repo: &Path,
+    files: &[PathBuf],
+    message: &str,
+) -> Result<Option<String>> {
     if files.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let repo = repo_root_for_path(project_repo)?;
     let absolute_repo = repo
@@ -106,7 +112,7 @@ pub fn commit_agent_files(project_repo: &Path, files: &[PathBuf], message: &str)
     }
 
     if rel_paths.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let output = Command::new("git")
@@ -126,7 +132,7 @@ pub fn commit_agent_files(project_repo: &Path, files: &[PathBuf], message: &str)
     }
 
     if !has_staged_changes(&repo)? {
-        return Ok(());
+        return Ok(None);
     }
 
     let output = Command::new("git")
@@ -143,7 +149,22 @@ pub fn commit_agent_files(project_repo: &Path, files: &[PathBuf], message: &str)
         );
     }
 
-    Ok(())
+    head_commit(&repo).map(Some)
+}
+
+/// The `origin` remote URL of the repository containing `repo`, if it has one.
+pub fn origin_url(repo: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!url.is_empty()).then_some(url)
 }
 
 /// Repo-relative paths with ANY local modification at `worktree` — tracked or
@@ -230,23 +251,79 @@ pub fn unreported_changes(
 }
 
 pub fn commit_task_files(task_paths: &[&Path], message: &str) -> Result<()> {
+    commit_task_files_within(task_paths, message, None)
+}
+
+/// [`commit_task_files`] with an enforced wall-clock bound across all of its git
+/// invocations: a stuck hook or signing step is killed (with its process group)
+/// at the deadline and the commit fails instead of blocking the caller.
+pub fn commit_task_files_within(
+    task_paths: &[&Path],
+    message: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<()> {
+    commit_task_files_until(
+        task_paths,
+        message,
+        timeout.map(|t| std::time::Instant::now() + t),
+    )
+}
+
+/// Marker error: a bounded git invocation hit its deadline and was stopped.
+#[derive(Debug)]
+struct GitTimedOut;
+
+impl std::fmt::Display for GitTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("git timed out and was stopped")
+    }
+}
+
+impl std::error::Error for GitTimedOut {}
+
+/// [`commit_task_files_within`] against an absolute `deadline` that the caller
+/// may share with other bounded git calls (e.g. repo discovery).
+pub fn commit_task_files_until(
+    task_paths: &[&Path],
+    message: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
     if task_paths.is_empty() {
         return Ok(());
     }
-    let repo = repo_root_for_path(task_paths[0])?;
+    let repo = repo_root_for_path_until(task_paths[0], deadline)?;
+    let lock = git_path_until(&repo, "index.lock", deadline).ok();
 
+    let result = commit_in_repo(&repo, task_paths, message, deadline);
+    if let Err(e) = &result {
+        // Varda never deletes a git lock: it cannot prove the lock is still ours.
+        // Git removes its own lockfiles on SIGTERM; if one survives, say so.
+        if e.chain().any(|c| c.is::<GitTimedOut>()) {
+            if let Some(lock) = lock.filter(|l| l.exists()) {
+                return Err(anyhow::anyhow!(
+                    "{e:#}; {} may be stale and must be removed by hand once no git process is running",
+                    lock.display()
+                ));
+            }
+        }
+    }
+    result
+}
+
+fn commit_in_repo(
+    repo: &Path,
+    task_paths: &[&Path],
+    message: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
     let rel_paths: Vec<String> = task_paths
         .iter()
-        .map(|p| repo_relative_path(&repo, p))
+        .map(|p| repo_relative_path(repo, p))
         .collect::<Result<_>>()?;
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&repo)
-        .arg("add")
-        .args(&rel_paths)
-        .output()
-        .context("failed to stage task files")?;
+    let mut add = Command::new("git");
+    add.arg("-C").arg(repo).arg("add").args(&rel_paths);
+    let output = run_bounded(add, deadline).context("failed to stage task files")?;
 
     if !output.status.success() {
         bail!(
@@ -255,16 +332,17 @@ pub fn commit_task_files(task_paths: &[&Path], message: &str) -> Result<()> {
         );
     }
 
-    if !has_staged_changes(&repo)? {
+    let mut staged = Command::new("git");
+    staged.arg("-C").arg(repo).args(["diff", "--cached", "--quiet"]);
+    let output = run_bounded(staged, deadline).context("failed to check staged changes")?;
+    // exit 0 = no diff, exit 1 = has diff
+    if output.status.success() {
         return Ok(());
     }
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&repo)
-        .args(["commit", "-m", message])
-        .output()
-        .context("failed to commit task files")?;
+    let mut commit = Command::new("git");
+    commit.arg("-C").arg(repo).args(["commit", "-m", message]);
+    let output = run_bounded(commit, deadline).context("failed to commit task files")?;
 
     if !output.status.success() {
         bail!(
@@ -274,6 +352,92 @@ pub fn commit_task_files(task_paths: &[&Path], message: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve `git rev-parse --git-path <name>` inside `repo` (bounded).
+fn git_path_until(
+    repo: &Path,
+    name: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<PathBuf> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).args(["rev-parse", "--git-path", name]);
+    let output = run_bounded(cmd, deadline)?;
+    if !output.status.success() {
+        bail!("git rev-parse --git-path {name} failed");
+    }
+    let rel = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Ok(if rel.is_absolute() { rel } else { repo.join(rel) })
+}
+
+/// Run `cmd` to completion; with a `deadline`, poll it and, when the deadline
+/// passes, SIGTERM its process group (so git can drop `index.lock` and hooks
+/// die), wait a short grace period, then SIGKILL. Pipe readers are abandoned,
+/// not joined, on timeout: a grandchild may still hold the pipe.
+fn run_bounded(
+    mut cmd: Command,
+    deadline: Option<std::time::Instant>,
+) -> Result<std::process::Output> {
+    use std::process::Stdio;
+    let Some(deadline) = deadline else {
+        return Ok(cmd.output()?);
+    };
+    if std::time::Instant::now() >= deadline {
+        return Err(GitTimedOut.into());
+    }
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            #[cfg(unix)]
+            // SAFETY: plain kill(2) on the child's own process group.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            }
+            let grace_end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < grace_end {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // Always escalate on the GROUP: a descendant may ignore SIGTERM even
+            // though the leader exited.
+            #[cfg(unix)]
+            // SAFETY: plain kill(2) on the child's own process group (ESRCH ignored).
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GitTimedOut.into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let grace = std::time::Duration::from_secs(2);
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.recv_timeout(grace).unwrap_or_default(),
+        stderr: stderr.recv_timeout(grace).unwrap_or_default(),
+    })
 }
 
 /// Stage and commit the removal of task files that have ALREADY been deleted from
@@ -1109,6 +1273,14 @@ pub fn integrate_worker_branches(
 }
 
 pub(crate) fn repo_root_for_path(path: &Path) -> Result<PathBuf> {
+    repo_root_for_path_until(path, None)
+}
+
+/// [`repo_root_for_path`] bounded by an absolute `deadline` (see [`run_bounded`]).
+pub(crate) fn repo_root_for_path_until(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<PathBuf> {
     let git_dir = if path.is_dir() {
         path
     } else {
@@ -1116,11 +1288,9 @@ pub(crate) fn repo_root_for_path(path: &Path) -> Result<PathBuf> {
             .with_context(|| format!("path {} has no parent directory", path.display()))?
     };
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(git_dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(git_dir).args(["rev-parse", "--show-toplevel"]);
+    let output = run_bounded(cmd, deadline)
         .with_context(|| format!("failed to inspect git repository for {}", path.display()))?;
 
     if !output.status.success() {
@@ -1265,6 +1435,151 @@ mod tests {
         root
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn commit_task_files_within_kills_a_hanging_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = init_test_repo("hook-timeout");
+        let hook = root.join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = root.join("a.md");
+        std::fs::write(&file, "x").unwrap();
+        let started = std::time::Instant::now();
+        let res = commit_task_files_within(
+            &[file.as_path()],
+            "msg",
+            Some(std::time::Duration::from_secs(1)),
+        );
+        assert!(res.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_task_files_within_survives_a_hanging_clean_filter() {
+        let root = init_test_repo("filter-timeout");
+        let run = |args: &[&str]| {
+            let st = Command::new("git").arg("-C").arg(&root).args(args).status().unwrap();
+            assert!(st.success());
+        };
+        run(&["config", "--local", "filter.slow.clean", "sleep 30; cat"]);
+        std::fs::write(root.join(".gitattributes"), "*.md filter=slow\n").unwrap();
+        let file = root.join("a.md");
+        std::fs::write(&file, "x").unwrap();
+        let started = std::time::Instant::now();
+        let res = commit_task_files_within(
+            &[file.as_path()],
+            "msg",
+            Some(std::time::Duration::from_secs(1)),
+        );
+        let err = res.expect_err("the stuck filter must time out");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        // Git drops its own index.lock on SIGTERM; Varda never deletes it.
+        assert!(!root.join(".git/index.lock").exists(), "git should clean its lock on SIGTERM");
+        // Staging works again once the filter is gone.
+        std::fs::remove_file(root.join(".gitattributes")).unwrap();
+        commit_task_files_within(&[file.as_path()], "msg", Some(std::time::Duration::from_secs(20)))
+            .expect("a later commit must succeed");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_kills_a_descendant_that_ignores_sigterm() {
+        let dir = std::env::temp_dir().join(format!("varda-grp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        // The path travels as `$1`, never interpolated into the script.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sh -c 'trap \"\" TERM; echo $$ > \"$1\"; sleep 60' inner \"$1\" & sleep 60")
+            .arg("outer")
+            .arg(&pidfile);
+        let started = std::time::Instant::now();
+        // Generous enough for the descendant to start and write its pid even
+        // on a contended machine; the assertion below names that case.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let err = run_bounded(cmd, Some(deadline)).expect_err("must time out");
+        assert!(err.is::<GitTimedOut>());
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .expect("descendant never wrote its pid before the deadline (machine contention?)");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match descendant_state(pid) {
+                ProbeState::Gone | ProbeState::Zombie => break,
+                ProbeState::Running => {}
+                ProbeState::Unknown => panic!("cannot determine whether pid {pid} is alive"),
+            }
+            assert!(std::time::Instant::now() < end, "descendant {pid} survived");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    enum ProbeState {
+        Gone,
+        Zombie,
+        Running,
+        Unknown,
+    }
+
+    /// A killed process can linger as a zombie (signal 0 still succeeds) when
+    /// its reaper is a container PID 1 that never waits, so a zombie counts as
+    /// killed. Linux reads `/proc`; elsewhere `ps`, whose failure is Unknown,
+    /// never "dead".
+    #[cfg(unix)]
+    fn descendant_state(pid: i32) -> ProbeState {
+        // SAFETY: signal 0 only probes for existence.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return ProbeState::Gone;
+        }
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // Format: `pid (comm) S ...`; comm may contain spaces/parens.
+            return match stat.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()) {
+                Some('Z') | Some('X') => ProbeState::Zombie,
+                Some(_) => ProbeState::Running,
+                None => ProbeState::Unknown,
+            };
+        }
+        match Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output() {
+            Ok(o) if o.status.success() => {
+                let stat = String::from_utf8_lossy(&o.stdout);
+                match stat.trim().chars().next() {
+                    Some('Z') => ProbeState::Zombie,
+                    Some(_) => ProbeState::Running,
+                    None => ProbeState::Gone,
+                }
+            }
+            // `ps -p` also fails when the pid vanished after the probe above,
+            // so only a still-present pid makes the failure inconclusive.
+            // SAFETY: signal 0 only probes for existence.
+            _ if unsafe { libc::kill(pid, 0) } != 0 => ProbeState::Gone,
+            _ => ProbeState::Unknown,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_root_for_path_until_honors_an_expired_deadline() {
+        let root = init_test_repo("discovery-deadline");
+        let err = repo_root_for_path_until(&root, Some(std::time::Instant::now()))
+            .expect_err("an already-expired deadline must not hang or succeed");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        assert_eq!(
+            repo_root_for_path_until(&root, None).unwrap().canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn commit_agent_files_stages_and_commits_listed_paths() {
         let repo = init_test_repo("commit-agent-files");
@@ -1288,6 +1603,36 @@ mod tests {
         assert!(stdout.contains("agent commit"), "log was {stdout}");
 
         let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn commit_agent_files_returns_head_and_origin_url_reads_remote() {
+        let repo = init_test_repo("commit-agent-files-hash");
+        let file = repo.join("changed.txt");
+        std::fs::write(&file, "hello").expect("file should be written");
+        let sha = commit_agent_files(&repo, &[file.clone()], "agent commit")
+            .expect("commit should succeed")
+            .expect("a commit was made");
+        assert_eq!(sha, head_commit(&repo).unwrap());
+        // Nothing left to commit: no hash.
+        assert_eq!(
+            commit_agent_files(&repo, &[file], "again").unwrap(),
+            None
+        );
+
+        assert_eq!(origin_url(&repo), None);
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["remote", "add", "origin", "https://dev.azure.com/o/p/_git/r"])
+            .status()
+            .expect("git remote should run");
+        assert!(status.success());
+        assert_eq!(
+            origin_url(&repo).as_deref(),
+            Some("https://dev.azure.com/o/p/_git/r")
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 

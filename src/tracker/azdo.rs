@@ -16,7 +16,7 @@ use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{IssueDraft, IssueTracker, RemoteIssue, Result, TrackerError, map_status};
+use super::{CommitRef, IssueDraft, IssueTracker, RemoteIssue, Result, TrackerError, map_status};
 use crate::config::{TrackerConfig, TrackerFilter};
 use crate::task::TaskStatus;
 
@@ -734,6 +734,9 @@ impl IssueTracker for AzdoTracker {
             ops.push(json!({"op": "add", "path": "/fields/System.Tags",
                             "value": draft.tags.join("; ")}));
         }
+        if let Some(area) = draft.area_path.as_deref().filter(|a| !a.is_empty()) {
+            ops.push(json!({"op": "add", "path": "/fields/System.AreaPath", "value": area}));
+        }
         if let Some(who) = draft.assignee.as_deref().filter(|w| !w.is_empty()) {
             ops.push(json!({"op": "add", "path": "/fields/System.AssignedTo", "value": who}));
         }
@@ -844,6 +847,46 @@ impl IssueTracker for AzdoTracker {
         self.patch_item(id, vec![op], None).await.map(|_| ())
     }
 
+    async fn link_commit(&self, id: &str, commit: &CommitRef) -> Result<()> {
+        check_id(id)?;
+        let Some(remote) = commit.origin_url.as_deref().and_then(parse_azdo_remote) else {
+            return Ok(());
+        };
+        let org = self
+            .config
+            .as_ref()
+            .and_then(|c| c.extra_str("organization"))
+            .filter(|o| !o.trim().is_empty());
+        if org.is_some_and(|o| !o.eq_ignore_ascii_case(&remote.org)) {
+            return Ok(());
+        }
+        if commit.sha.is_empty() || !commit.sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(TrackerError::Other(anyhow!("invalid commit sha")));
+        }
+        let url = format!(
+            "{}/{}/_apis/git/repositories/{}?api-version={API_VERSION}",
+            self.base_url,
+            url_encode(&remote.project),
+            url_encode(&remote.repo)
+        );
+        let repo = self
+            .call_json(self.request("GET", url, None), "git repository")
+            .await?;
+        let field = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+        let (Some(repo_id), Some(project_id)) = (field(&repo["id"]), field(&repo["project"]["id"]))
+        else {
+            return Err(TrackerError::Other(anyhow!(
+                "azdo git repository: response lacks `id` / `project.id`"
+            )));
+        };
+        let op = json!({"op": "add", "path": "/relations/-", "value": {
+            "rel": "ArtifactLink",
+            "url": format!("vstfs:///Git/Commit/{project_id}%2F{repo_id}%2F{}", commit.sha),
+            "attributes": {"name": "Fixed in Commit"},
+        }});
+        self.patch_item(id, vec![op], None).await.map(|_| ())
+    }
+
     async fn process_template(&self) -> Result<Option<String>> {
         self.project_process_template().await
     }
@@ -852,6 +895,103 @@ impl IssueTracker for AzdoTracker {
         let url = format!("{}/_apis/connectionData?api-version={API_VERSION}-preview.1", self.base_url);
         let request = self.request("GET", url, None);
         self.call_json(request, "connectionData").await.map(|_| ())
+    }
+}
+
+/// An Azure Repos remote, decomposed.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct AzdoRemote {
+    pub org: String,
+    pub project: String,
+    pub repo: String,
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = (bytes[i] == b'%' && i + 2 < bytes.len())
+            .then(|| std::str::from_utf8(&bytes[i + 1..i + 3]).ok())
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(b) => {
+                out.push(b);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse an `origin` URL if (and only if) it is an Azure Repos remote:
+/// `https://[user@]dev.azure.com/ORG/PROJECT/_git/REPO`,
+/// `https://ORG.visualstudio.com/[DefaultCollection/]PROJECT/_git/REPO`, or the
+/// SSH forms `git@ssh.dev.azure.com:v3/ORG/PROJECT/REPO`.
+pub(super) fn parse_azdo_remote(url: &str) -> Option<AzdoRemote> {
+    let url = url.trim();
+    let (host, path) = if let Some(rest) = url.strip_prefix("git@") {
+        rest.split_once(':')?
+    } else {
+        let rest = url.split_once("://")?.1;
+        let rest = rest.split_once('@').filter(|(u, _)| !u.contains('/')).map_or(rest, |(_, r)| r);
+        rest.split_once('/')?
+    };
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let segments: Vec<String> = path
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(percent_decode)
+        .collect();
+    let seg = |i: usize| segments.get(i).cloned();
+    let remote = if host == "ssh.dev.azure.com" || host == "vs-ssh.visualstudio.com" {
+        match segments.as_slice() {
+            [v, org, project, repo] if v == "v3" => AzdoRemote {
+                org: org.clone(),
+                project: project.clone(),
+                repo: repo.clone(),
+            },
+            _ => return None,
+        }
+    } else if host == "dev.azure.com" {
+        let org = seg(0)?;
+        git_tail(&segments[1..], org)?
+    } else if let Some(org) = host.strip_suffix(".visualstudio.com") {
+        let rest = match segments.first() {
+            Some(c) if c.eq_ignore_ascii_case("DefaultCollection") => &segments[1..],
+            _ => &segments[..],
+        };
+        git_tail(rest, org.to_owned())?
+    } else {
+        return None;
+    };
+    [&remote.org, &remote.project, &remote.repo]
+        .iter()
+        .all(|p| !p.is_empty())
+        .then_some(remote)
+}
+
+/// `[PROJECT, "_git", REPO]` or `["_git", REPO]` (project named like the repo).
+fn git_tail(rest: &[String], org: String) -> Option<AzdoRemote> {
+    match rest {
+        [project, g, repo] if g == "_git" => Some(AzdoRemote {
+            org,
+            project: project.clone(),
+            repo: repo.clone(),
+        }),
+        [g, repo] if g == "_git" => Some(AzdoRemote {
+            org,
+            project: repo.clone(),
+            repo: repo.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -1732,6 +1872,66 @@ mod tests {
         assert!(err.to_string().contains("no config"), "{err}");
     }
 
+    #[test]
+    fn azdo_remotes_parse_and_others_do_not() {
+        let want = |org: &str, project: &str, repo: &str| {
+            Some(AzdoRemote { org: org.into(), project: project.into(), repo: repo.into() })
+        };
+        for url in [
+            "https://dev.azure.com/acme/My%20Proj/_git/web",
+            "https://tok@dev.azure.com/acme/My%20Proj/_git/web",
+            "https://acme.visualstudio.com/My%20Proj/_git/web",
+            "https://acme.visualstudio.com/DefaultCollection/My%20Proj/_git/web",
+            "git@ssh.dev.azure.com:v3/acme/My%20Proj/web",
+            "ssh://git@ssh.dev.azure.com/v3/acme/My%20Proj/web",
+        ] {
+            assert_eq!(parse_azdo_remote(url), want("acme", "My Proj", "web"), "{url}");
+        }
+        assert_eq!(parse_azdo_remote("https://dev.azure.com/acme/_git/solo.git"), want("acme", "solo", "solo"));
+        for url in [
+            "https://github.com/acme/web.git",
+            "git@github.com:acme/web.git",
+            "https://dev.azure.com/acme/proj",
+            "https://evil.example/dev.azure.com/acme/p/_git/r",
+            "/local/path",
+            "",
+        ] {
+            assert_eq!(parse_azdo_remote(url), None, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn link_commit_adds_artifact_link_relation() {
+        let (base, seen) = fake_server(vec![
+            (200, vec![], r#"{"id":"REPO-ID","project":{"id":"PROJ-ID"}}"#.to_owned()),
+            (200, vec![], item_json(1)),
+        ]);
+        let commit = CommitRef {
+            sha: "abc123".to_owned(),
+            origin_url: Some("https://dev.azure.com/acme/My%20Project/_git/web".to_owned()),
+        };
+        tracker(&base).link_commit("101", &commit).await.unwrap();
+        let requests = seen.lock().unwrap();
+        assert!(requests[0].starts_with(
+            "GET /My%20Project/_apis/git/repositories/web?api-version="
+        ), "{}", requests[0]);
+        assert!(requests[1].starts_with("PATCH /My%20Project/_apis/wit/workitems/101?"), "{}", requests[1]);
+        let body = body_of(&requests[1]);
+        assert_eq!(body[0]["path"], "/relations/-");
+        assert_eq!(body[0]["value"]["rel"], "ArtifactLink");
+        assert_eq!(body[0]["value"]["url"], "vstfs:///Git/Commit/PROJ-ID%2FREPO-ID%2Fabc123");
+    }
+
+    #[tokio::test]
+    async fn link_commit_skips_silently_without_an_azure_repos_origin() {
+        // No server: any request would fail the connection.
+        let t = tracker("http://127.0.0.1:1");
+        for origin in [None, Some("https://github.com/acme/web.git")] {
+            let commit = CommitRef { sha: "abc123".to_owned(), origin_url: origin.map(str::to_owned) };
+            t.link_commit("101", &commit).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn comment_posts_markdown() {
         let (base, seen) = fake_server(vec![(200, vec![], "{}".to_owned())]);
@@ -1801,6 +2001,7 @@ mod tests {
             tags: vec![],
             assignee: None,
             work_item_type: None,
+            area_path: None,
         };
         agile_tracker(&base).create(&draft).await.unwrap();
         let ops = body_of(&seen.lock().unwrap()[0]);
@@ -1836,6 +2037,7 @@ mod tests {
             tags: vec!["varda".to_owned(), "a".to_owned()],
             assignee: Some("me".to_owned()),
             work_item_type: None,
+            area_path: Some("My Project\\Team".to_owned()),
         };
         let created = t.create(&draft).await.unwrap();
         assert_eq!(created.id, "101");
@@ -1850,7 +2052,9 @@ mod tests {
         assert_eq!(ops[0]["value"], "T");
         assert_eq!(ops[1]["value"], "<p>x &lt; y</p>");
         assert_eq!(ops[2]["value"], "varda; a");
-        assert_eq!(ops[3]["path"], "/fields/System.AssignedTo");
+        assert_eq!(ops[3]["path"], "/fields/System.AreaPath");
+        assert_eq!(ops[3]["value"], "My Project\\Team");
+        assert_eq!(ops[4]["path"], "/fields/System.AssignedTo");
     }
 
     #[tokio::test]

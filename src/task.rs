@@ -316,6 +316,13 @@ pub fn load_task(path: impl AsRef<Path>) -> Result<TaskDocument> {
     Ok(task)
 }
 
+/// Read a home task file as it is on disk, WITHOUT the repo-definition body
+/// overlay. For callers that must see what a half-finished write left in the
+/// home file itself.
+pub fn load_task_raw(path: impl AsRef<Path>) -> Result<TaskDocument> {
+    parse_task_raw(path.as_ref())
+}
+
 /// Read and parse a task file with NO repo-definition overlay. Used internally
 /// wherever overlaying could recurse into the same lookup (scanning a repo
 /// DEFINITION store) or is simply irrelevant (id-only scans).

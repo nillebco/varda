@@ -5,6 +5,8 @@
 //! pull never duplicates. Refreshes never touch a `running` task.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 
@@ -185,6 +187,90 @@ fn apply_issue(
     issue: &RemoteIssue,
     dry_run: bool,
 ) -> Result<(PullAction, Vec<PathBuf>)> {
+    apply_issue_with(config, tracker, issue, dry_run, task::write_task_and_definition_body)
+}
+
+/// The home task name an imported item gets. The tracker name keeps two
+/// trackers that return the same title and native id for one project from
+/// colliding on the task filename.
+fn import_task_name(tracker: &TrackerConfig, issue: &RemoteIssue) -> String {
+    format!("{} {}-{}", issue.title, tracker.name, issue.id)
+}
+
+/// Local-only options for a task created by `task add --tracker`. They go into
+/// the repo DEFINITION too (via `create_task_with_egress`), because
+/// `sync_definition_fields_from_repo` re-copies those fields on every dispatch.
+#[derive(Debug, Clone, Default)]
+pub struct LocalTaskOptions {
+    pub assignee: Option<String>,
+    pub sandbox: Option<String>,
+    pub egress: Vec<String>,
+}
+
+/// Create the home task for a new remote item, with `external` set.
+///
+/// `create_task` and the write that records `external` are two steps, so a
+/// failure (or crash) between them leaves a task that carries no `external`.
+/// The filename is derived from title + tracker + remote id, so the next
+/// pull finds that orphan at the same path and ADOPTS it instead of failing on
+/// "already exists" or importing a duplicate. A file that already carries a
+/// *different* `external` is never adopted.
+fn import_new_issue(
+    config: &Config,
+    tracker: &TrackerConfig,
+    issue: &RemoteIssue,
+    status: TaskStatus,
+    local: &LocalTaskOptions,
+    write: impl FnOnce(&task::TaskDocument) -> Result<Vec<PathBuf>>,
+) -> Result<Vec<PathBuf>> {
+    let project = Path::new(&tracker.project_path);
+    let name = import_task_name(tracker, issue);
+    let orphan = task::task_file_path(config, project, &name)?;
+    let path = if orphan.exists() {
+        // Read the home file WITHOUT the definition overlay: a crash after the
+        // definition write leaves the remote body there, while the home file
+        // (written last) is still the pristine `create_task` seed.
+        let existing = task::load_task_raw(&orphan)?;
+        // Only a pristine `create_task` leftover (no `external`, untouched body).
+        if existing.frontmatter.external.is_some()
+            || existing.body.trim() != format!("# {name}")
+        {
+            bail!("task {} already exists", orphan.display());
+        }
+        orphan
+    } else {
+        task::create_task_with_egress(
+            config,
+            &name,
+            project,
+            local.assignee.as_deref(),
+            None,
+            local.sandbox.as_deref(),
+            &local.egress,
+        )?
+    };
+    let mut doc = task::load_task(&path)?;
+    doc.frontmatter.status = status;
+    doc.frontmatter.external = Some(ExternalRef {
+        backend: tracker.name.clone(),
+        id: issue.id.clone(),
+        url: issue.url.clone(),
+        rev: Some(issue.rev),
+        synced_status: None,
+        remote_state: Some(issue.remote_state.clone()),
+        sync_error: None,
+    });
+    doc.body = task_body(issue);
+    write(&doc)
+}
+
+fn apply_issue_with(
+    config: &Config,
+    tracker: &TrackerConfig,
+    issue: &RemoteIssue,
+    dry_run: bool,
+    write_new: impl FnOnce(&task::TaskDocument) -> Result<Vec<PathBuf>>,
+) -> Result<(PullAction, Vec<PathBuf>)> {
     match task::find_task_by_external(config, &tracker.name, &issue.id)? {
         None => {
             if is_done(tracker, issue) {
@@ -197,24 +283,7 @@ fn apply_issue(
             if dry_run {
                 return Ok((PullAction::Created, Vec::new()));
             }
-            let project = Path::new(&tracker.project_path);
-            // The tracker name keeps two trackers that return the same title and
-            // native id for one project from colliding on the task filename.
-            let name = format!("{} {}-{}", issue.title, tracker.name, issue.id);
-            let path = task::create_task(config, &name, project, None, None, None)?;
-            let mut doc = task::load_task(&path)?;
-            doc.frontmatter.status = status;
-            doc.frontmatter.external = Some(ExternalRef {
-                backend: tracker.name.clone(),
-                id: issue.id.clone(),
-                url: issue.url.clone(),
-                rev: Some(issue.rev),
-                synced_status: None,
-                remote_state: Some(issue.remote_state.clone()),
-                sync_error: None,
-            });
-            doc.body = task_body(issue);
-            let paths = task::write_task_and_definition_body(&doc)?;
+            let paths = import_new_issue(config, tracker, issue, status, &LocalTaskOptions::default(), write_new)?;
             Ok((PullAction::Created, paths))
         }
         Some(path) => {
@@ -343,13 +412,75 @@ pub async fn pull_command(config: &Config, only: Option<&str>, dry_run: bool) ->
             None => bail!("no trackers configured"),
         }
     }
+    pull_selected(config, selected, dry_run, None).await
+}
+
+/// Upper bound for one background / `run --pull` pull of a single tracker.
+pub const PULL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Smallest `orchestrate --pull-every` interval.
+pub const MIN_PULL_EVERY_SECS: u64 = 60;
+
+/// Builds a tracker backend (may run a credential command: blocking).
+type BuildFn =
+    dyn Fn(&TrackerConfig, Option<Duration>) -> Result<Box<dyn IssueTracker>> + Send + Sync;
+/// Commits one repo group of task files (blocking).
+/// The deadline is shared by repo discovery and the commit of the whole step.
+type CommitFn = dyn Fn(&[&Path], Option<Instant>) -> Result<()> + Send + Sync;
+/// Finds a path's git root (blocking), bounded by the same shared deadline.
+type RootFn = fn(&Path, Option<Instant>) -> Result<PathBuf>;
+
+/// Pull every tracker in `selected`, best-effort across trackers, then one
+/// control-plane commit of what was written.
+async fn pull_selected(
+    config: &Config,
+    selected: Vec<&TrackerConfig>,
+    dry_run: bool,
+    bound: Option<Duration>,
+) -> Result<()> {
+    let build: Arc<BuildFn> = Arc::new(super::build_tracker_within);
+    let commit: Arc<CommitFn> = Arc::new(commit_pulled);
+    pull_selected_with(config, selected, dry_run, bound, build, crate::git::repo_root_for_path_until, commit)
+        .await
+}
+
+fn commit_pulled(refs: &[&Path], deadline: Option<Instant>) -> Result<()> {
+    crate::git::commit_task_files_until(refs, "Pull tracker work items", deadline)
+}
+
+/// Upper bound for the control-plane `git commit` after a pull.
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn pull_selected_with(
+    config: &Config,
+    selected: Vec<&TrackerConfig>,
+    dry_run: bool,
+    bound: Option<Duration>,
+    build: Arc<BuildFn>,
+    root_for: RootFn,
+    commit: Arc<CommitFn>,
+) -> Result<()> {
     let mut failed = 0usize;
     let mut commit_failures = 0usize;
     let mut written: Vec<PathBuf> = Vec::new();
     for t in selected {
-        let result = match super::build_tracker(t, config) {
-            Ok(backend) => pull_tracker(config, t, backend.as_ref(), dry_run).await,
-            Err(e) => Err(e),
+        // The bound applies per tracker, so a stalled tracker cannot discard
+        // what the others already wrote: everything completed is committed below.
+        // Credential resolution may run a command: build off the executor
+        // thread, with the same bound.
+        let for_build = t.clone();
+        let build = build.clone();
+        let one = async {
+            let backend = tokio::task::spawn_blocking(move || build(&for_build, bound))
+                .await
+                .map_err(|e| anyhow::anyhow!("building tracker failed: {e}"))??;
+            pull_tracker(config, t, backend.as_ref(), dry_run).await
+        };
+        let result = match bound {
+            Some(b) => match tokio::time::timeout(b, one).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("timed out after {}s", b.as_secs())),
+            },
+            None => one.await,
         };
         match result {
             Ok(outcome) => {
@@ -375,11 +506,18 @@ pub async fn pull_command(config: &Config, only: Option<&str>, dry_run: bool) ->
         }
     }
     if !dry_run && config.git.auto_commit && !written.is_empty() {
-        let report = commit_in_groups(
-            &written,
-            crate::git::repo_root_for_path,
-            |refs| crate::git::commit_task_files(refs, "Pull tracker work items"),
-        );
+        // git runs blocking (and bounded by `commit`'s own deadline), off the
+        // executor thread.
+        let report = tokio::task::spawn_blocking(move || {
+            let deadline = Some(Instant::now() + COMMIT_TIMEOUT);
+            commit_in_groups(
+                &written,
+                |p| root_for(p, deadline),
+                |refs| commit(refs, deadline),
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("commit step failed: {e}"))?;
         if report.committed > 0 {
             println!("committed {} task file(s)", report.committed);
         }
@@ -401,6 +539,159 @@ pub async fn pull_command(config: &Config, only: Option<&str>, dry_run: bool) ->
         bail!("{failed} tracker(s) failed");
     }
     Ok(())
+}
+
+/// `varda run --pull`: pull every configured tracker before running ready
+/// tasks. Best-effort and bounded: a failing or slow tracker is reported and the
+/// run proceeds with what is already on the board. No trackers ⇒ a no-op.
+pub async fn pull_before_run(config: &Config, bound: Duration) {
+    if config.trackers.is_empty() {
+        eprintln!("--pull: no trackers configured; nothing to pull");
+        return;
+    }
+    let selected: Vec<&TrackerConfig> = config.trackers.iter().collect();
+    // The bound is applied per tracker inside `pull_selected`.
+    if let Err(e) = pull_selected(config, selected, false, Some(bound)).await {
+        eprintln!("--pull: {e:#} (continuing with the existing board)");
+    }
+}
+
+/// Canonicalize `p`; when it does not exist (yet), canonicalize its deepest
+/// existing ancestor and re-append the remaining components, so symlinked
+/// prefixes (macOS `/var` -> `/private/var`) resolve the same on both sides.
+fn resolved_path(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cur = p;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            rest.push(name);
+        }
+        if let Ok(mut base) = parent.canonicalize() {
+            base.extend(rest.iter().rev());
+            return base;
+        }
+        cur = parent;
+    }
+    p.to_path_buf()
+}
+
+fn resolved(path: &str) -> PathBuf {
+    resolved_path(Path::new(path))
+}
+
+/// Names of the trackers whose `project_path` the `workspace` covers: the same
+/// directory, or one inside the other (the workspace defaults to the repo root,
+/// but may also be a parent holding several projects).
+pub fn trackers_covered_by(config: &Config, workspace: &Path) -> Vec<String> {
+    let workspace = resolved_path(workspace);
+    config
+        .trackers
+        .iter()
+        .filter(|t| {
+            let project = resolved(&t.project_path);
+            project.starts_with(&workspace) || workspace.starts_with(&project)
+        })
+        .map(|t| t.name.clone())
+        .collect()
+}
+
+/// Validate `--pull-every`.
+pub fn check_pull_every(secs: u64) -> Result<Duration> {
+    if secs < MIN_PULL_EVERY_SECS {
+        bail!("--pull-every must be at least {MIN_PULL_EVERY_SECS} seconds (got {secs})");
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+/// Host-side background loop for `varda orchestrate --pull-every`: pull the
+/// named trackers now and then every `every`, each pull bounded by `bound`.
+/// Runs until aborted; never returns an error (failures are logged).
+pub async fn pull_loop(config: Config, names: Vec<String>, every: Duration, bound: Duration) {
+    let mut ticker = tokio::time::interval(every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        pull_names_once(&config, &names, bound).await;
+    }
+}
+
+async fn pull_names_once(config: &Config, names: &[String], bound: Duration) {
+    let selected: Vec<&TrackerConfig> = config
+        .trackers
+        .iter()
+        .filter(|t| names.contains(&t.name))
+        .collect();
+    if let Err(e) = pull_selected(config, selected, false, Some(bound)).await {
+        eprintln!("orchestrate pull: {e:#}");
+    }
+}
+
+/// `varda task add --tracker NAME`: create the work item first (carrying the
+/// pickup tag), then the home task with `external` set. Refuses an
+/// unacknowledged tracker BEFORE anything is created remotely.
+pub async fn add_tracker_task(
+    config: &Config,
+    tracker_name: &str,
+    title: &str,
+    description: Option<&str>,
+    local: &LocalTaskOptions,
+    bound: Duration,
+) -> Result<PathBuf> {
+    let tracker = config
+        .trackers
+        .iter()
+        .find(|t| t.name == tracker_name)
+        .with_context(|| format!("no tracker named '{tracker_name}' is configured"))?;
+    check_acknowledged(config, tracker)?;
+    let for_build = tracker.clone();
+    let backend = tokio::task::spawn_blocking(move || {
+        super::build_tracker_within(&for_build, Some(bound))
+    })
+    .await
+    .context("building tracker failed")??;
+    add_tracker_task_via(config, tracker, backend.as_ref(), title, description, local, bound).await
+}
+
+async fn add_tracker_task_via(
+    config: &Config,
+    tracker: &TrackerConfig,
+    backend: &dyn IssueTracker,
+    title: &str,
+    description: Option<&str>,
+    local: &LocalTaskOptions,
+    bound: Duration,
+) -> Result<PathBuf> {
+    let draft = super::IssueDraft {
+        title: title.to_owned(),
+        body_markdown: description.unwrap_or_default().to_owned(),
+        // The pickup tag makes the item visible to later pulls too.
+        tags: tracker.filter.tags.clone(),
+        // Keep the item inside an area-filtered pull.
+        area_path: tracker.filter.area_path.clone(),
+        ..super::IssueDraft::default()
+    };
+    let issue = tokio::time::timeout(bound, backend.create(&draft))
+        .await
+        .map_err(|_| anyhow::anyhow!("creating the work item timed out after {}s", bound.as_secs()))?
+        .map_err(|e| anyhow::anyhow!("tracker '{}': {e}", tracker.name))?;
+    // From here the work item exists: say so if the local half fails, and a
+    // later `tracker pull` imports it (it carries the pickup tag).
+    let status = match status_from_remote(tracker, &issue.remote_state, &issue.tags) {
+        Some(s @ (TaskStatus::Backlog | TaskStatus::Ready)) => s,
+        _ => TaskStatus::Backlog,
+    };
+    import_new_issue(config, tracker, &issue, status, local, task::write_task_and_definition_body)
+        .map(|paths| paths.into_iter().next().expect("home task path"))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "created work item {} ({}) but the local task could not be written: {e:#}; `varda tracker pull` will import it",
+                issue.id,
+                issue.url
+            )
+        })
 }
 
 #[cfg(test)]
@@ -648,8 +939,11 @@ mod tests {
         fake.insert("New", "alpha", &[]);
         fake.insert("New", "beta", &[]);
         // Squat on beta's filename so creating it fails after alpha succeeded.
-        task::create_task(&config, "beta azdo-test-2", Path::new(&t.project_path), None, None, None)
+        let squat = task::create_task(&config, "beta azdo-test-2", Path::new(&t.project_path), None, None, None)
             .unwrap();
+        let mut squatter = task::load_task(&squat).unwrap();
+        squatter.body = "# hand-written\n\nmine\n".to_owned();
+        task::write_task(&squatter).unwrap();
         let outcome = pull_tracker(&config, &t, &fake, false).await.unwrap();
         assert_eq!(outcome.items.len(), 1);
         assert_eq!(outcome.items[0].action, PullAction::Created);
@@ -728,6 +1022,318 @@ mod tests {
         let items = pull_tracker(&config, &t, &fake, false).await.unwrap().items;
         assert_eq!(items[0].action, PullAction::Updated);
         assert!(std::fs::read_to_string(&home).unwrap().contains("rev: 2"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_external_write_leaves_orphan_that_next_pull_adopts() {
+        let (root, config, t) = setup("orphan");
+        let fake = FakeTracker::new(t.clone());
+        let a = fake.insert("New", "alpha", &["varda:ready"]);
+        let issue = fake.get(&a.id).await.unwrap();
+
+        // The write that records `external` fails after `create_task` succeeded.
+        let err = apply_issue_with(&config, &t, &issue, false, |_| bail!("disk full")).unwrap_err();
+        assert!(format!("{err:#}").contains("disk full"), "{err:#}");
+        assert_eq!(count_tasks(&root), 1);
+        assert!(task::find_task_by_external(&config, &t.name, &a.id).unwrap().is_none());
+
+        // The next pull adopts the orphan: no duplicate, `external` now set.
+        let items = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        assert!(items.errors.is_empty(), "{:?}", items.errors);
+        assert_eq!(items.items[0].action, PullAction::Created);
+        assert_eq!(count_tasks(&root), 1);
+        let path = task::find_task_by_external(&config, &t.name, &a.id).unwrap().unwrap();
+        let doc = task::load_task(&path).unwrap();
+        assert_eq!(doc.frontmatter.status, TaskStatus::Ready);
+        assert_eq!(doc.frontmatter.external.unwrap().rev, Some(1));
+
+        let again = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        assert_eq!(again.items[0].action, PullAction::Unchanged);
+        assert_eq!(count_tasks(&root), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn crash_after_definition_write_is_adopted_by_next_pull() {
+        let (root, config, t) = setup("defcrash");
+        make_varda_dir(&root);
+        let fake = FakeTracker::new(t.clone());
+        let a = fake.insert("New", "alpha", &["varda:ready"]);
+        let issue = fake.get(&a.id).await.unwrap();
+        let store = root.join("proj/.varda/tasks");
+        let err = apply_issue_with(&config, &t, &issue, false, |doc| {
+            // The definition write lands, then the home write never happens.
+            let def = std::fs::read_dir(&store).unwrap().next().unwrap().unwrap().path();
+            let text = std::fs::read_to_string(&def).unwrap();
+            let end = text[4..].find("---\n").unwrap() + 8;
+            std::fs::write(&def, format!("{}\n{}", &text[..end], doc.body)).unwrap();
+            bail!("crash")
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("crash"), "{err:#}");
+        assert_eq!(count_tasks(&root), 1);
+
+        let out = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.items[0].action, PullAction::Created);
+        assert_eq!(count_tasks(&root), 1);
+        let path = task::find_task_by_external(&config, &t.name, &a.id).unwrap().unwrap();
+        assert!(task::load_task(&path).unwrap().body.contains("fake.example"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn slow_credential_command_is_bounded_in_pull() {
+        let (root, mut config, mut t) = setup("slowcred");
+        t.credential = CredentialConfig {
+            command: Some("sleep 30".to_owned()),
+            ..CredentialConfig::default()
+        };
+        config.trackers = vec![t.clone()];
+        let started = std::time::Instant::now();
+        let res = pull_selected(&config, vec![&t], false, Some(Duration::from_secs(1))).await;
+        assert!(res.is_err());
+        assert!(started.elapsed() < Duration::from_secs(15), "{:?}", started.elapsed());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn add_keeps_egress_and_sandbox_through_definition_sync() {
+        let (root, config, t) = setup("addegress");
+        make_varda_dir(&root);
+        let fake = FakeTracker::new(t.clone());
+        let local = LocalTaskOptions {
+            assignee: Some("claude".to_owned()),
+            sandbox: Some("worker".to_owned()),
+            egress: vec!["example.com".to_owned()],
+        };
+        let path = add_tracker_task_via(&config, &t, &fake, "x", None, &local, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut doc = task::load_task(&path).unwrap();
+        task::sync_definition_fields_from_repo(&mut doc).unwrap();
+        assert_eq!(doc.frontmatter.bounds.egress, vec!["example.com"]);
+        assert_eq!(doc.frontmatter.sandbox.as_deref(), Some("worker"));
+        assert_eq!(doc.frontmatter.assignee.as_deref(), Some("claude"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn boxed_build(
+        f: impl Fn(&TrackerConfig, Option<Duration>) -> Result<Box<dyn IssueTracker>> + Send + Sync + 'static,
+    ) -> Arc<BuildFn> {
+        Arc::new(f)
+    }
+
+    fn boxed_commit(f: impl Fn(&[&Path]) -> Result<()> + Send + Sync + 'static) -> Arc<CommitFn> {
+        Arc::new(move |refs, _deadline| f(refs))
+    }
+
+    /// Delegates to a fake, optionally stalling `query` and recording drafts.
+    struct Probe {
+        inner: FakeTracker,
+        stall: bool,
+        drafts: std::sync::Mutex<Vec<super::super::IssueDraft>>,
+    }
+
+    #[async_trait::async_trait]
+    impl IssueTracker for Probe {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        async fn query(
+            &self,
+            filter: &crate::config::TrackerFilter,
+        ) -> super::super::Result<Vec<RemoteIssue>> {
+            if self.stall {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            self.inner.query(filter).await
+        }
+        async fn get(&self, id: &str) -> super::super::Result<RemoteIssue> {
+            self.inner.get(id).await
+        }
+        async fn create(&self, draft: &super::super::IssueDraft) -> super::super::Result<RemoteIssue> {
+            self.drafts.lock().unwrap().push(draft.clone());
+            self.inner.create(draft).await
+        }
+        async fn transition(
+            &self,
+            id: &str,
+            to: TaskStatus,
+            expected_rev: Option<u64>,
+        ) -> super::super::Result<RemoteIssue> {
+            self.inner.transition(id, to, expected_rev).await
+        }
+        async fn comment(&self, id: &str, markdown: &str) -> super::super::Result<()> {
+            self.inner.comment(id, markdown).await
+        }
+        async fn assign(&self, id: &str, who: Option<&str>) -> super::super::Result<()> {
+            self.inner.assign(id, who).await
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_tracker_does_not_discard_other_trackers_paths() {
+        let (root, mut config, a) = setup("stall");
+        let mut b = a.clone();
+        b.name = "azdo-stall".to_owned();
+        config.trackers = vec![a.clone(), b.clone()];
+        config.git.auto_commit = true;
+        let good = Probe { inner: FakeTracker::new(a.clone()), stall: false, drafts: Default::default() };
+        good.inner.insert("New", "alpha", &[]);
+        let slow = Probe { inner: FakeTracker::new(b.clone()), stall: true, drafts: Default::default() };
+        let (good, slow) = (Arc::new(good), Arc::new(slow));
+        struct Shared(Arc<Probe>);
+        #[async_trait::async_trait]
+        impl IssueTracker for Shared {
+            fn name(&self) -> &str { self.0.name() }
+            async fn query(&self, f: &crate::config::TrackerFilter) -> super::super::Result<Vec<RemoteIssue>> { self.0.query(f).await }
+            async fn get(&self, id: &str) -> super::super::Result<RemoteIssue> { self.0.get(id).await }
+            async fn create(&self, d: &super::super::IssueDraft) -> super::super::Result<RemoteIssue> { self.0.create(d).await }
+            async fn transition(&self, id: &str, to: TaskStatus, r: Option<u64>) -> super::super::Result<RemoteIssue> { self.0.transition(id, to, r).await }
+            async fn comment(&self, id: &str, m: &str) -> super::super::Result<()> { self.0.comment(id, m).await }
+            async fn assign(&self, id: &str, w: Option<&str>) -> super::super::Result<()> { self.0.assign(id, w).await }
+        }
+        let build: Arc<BuildFn> = {
+            let (good, slow) = (good.clone(), slow.clone());
+            boxed_build(move |t, _| {
+                let p = if t.name == "azdo-stall" { slow.clone() } else { good.clone() };
+                Ok(Box::new(Shared(p)) as Box<dyn IssueTracker>)
+            })
+        };
+        let committed: Arc<std::sync::Mutex<Vec<PathBuf>>> = Default::default();
+        let commit: Arc<CommitFn> = {
+            let committed = committed.clone();
+            boxed_commit(move |refs| {
+                committed.lock().unwrap().extend(refs.iter().map(|p| p.to_path_buf()));
+                Ok(())
+            })
+        };
+        let selected: Vec<&TrackerConfig> = config.trackers.iter().collect();
+        let started = std::time::Instant::now();
+        let res = pull_selected_with(&config, selected, false, Some(Duration::from_secs(1)), build, |_, _| Ok(PathBuf::from("/repo")), commit).await;
+        assert!(res.is_err(), "the stalled tracker must be reported as failed");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        let done = committed.lock().unwrap().clone();
+        assert!(!done.is_empty(), "completed tracker's paths must still be committed");
+        assert!(done.iter().all(|p| p.exists()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stalled_discovery_puts_paths_on_the_uncommitted_list() {
+        let paths = vec![PathBuf::from("/a/x.md"), PathBuf::from("/b/y.md")];
+        let report = commit_in_groups(
+            &paths,
+            |p| {
+                if p.starts_with("/a") {
+                    Err(anyhow::anyhow!("git timed out and was stopped"))
+                } else {
+                    Ok(PathBuf::from("/b"))
+                }
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(report.uncommitted, vec![PathBuf::from("/a/x.md")]);
+        assert_eq!(report.committed, 1);
+        assert_eq!(report.errors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_carries_filter_area_path_into_the_draft() {
+        let (root, config, mut t) = setup("area");
+        t.filter.area_path = Some("Proj\\Team".to_owned());
+        let probe = Probe { inner: FakeTracker::new(t.clone()), stall: false, drafts: Default::default() };
+        add_tracker_task_via(&config, &t, &probe, "x", None, &LocalTaskOptions::default(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(probe.drafts.lock().unwrap()[0].area_path.as_deref(), Some("Proj\\Team"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn add_applies_every_filter_tag_on_create() {
+        let (root, config, mut t) = setup("twotags");
+        t.filter.tags = vec!["varda".to_owned(), "team".to_owned()];
+        let fake = FakeTracker::new(t.clone());
+        add_tracker_task_via(&config, &t, &fake, "x", None, &LocalTaskOptions::default(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(fake.get("1").await.unwrap().tags, vec!["varda", "team"]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn add_creates_remote_item_with_pickup_tag_then_linked_local_task() {
+        let (root, config, mut t) = setup("add");
+        t.filter.tags = vec!["varda".to_owned()];
+        let fake = FakeTracker::new(t.clone());
+        let path = add_tracker_task_via(&config, &t, &fake, "write docs", Some("details"), &LocalTaskOptions::default(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let remote = fake.get("1").await.unwrap();
+        assert_eq!(remote.title, "write docs");
+        assert_eq!(remote.body_markdown, "details");
+        assert_eq!(remote.tags, vec!["varda"]);
+        let doc = task::load_task(&path).unwrap();
+        let ext = doc.frontmatter.external.unwrap();
+        assert_eq!((ext.backend.as_str(), ext.id.as_str()), ("azdo-test", "1"));
+        assert_eq!(doc.frontmatter.status, TaskStatus::Backlog);
+        assert_eq!(doc.frontmatter.project.as_deref(), Some(t.project_path.as_str()));
+        // The next pull recognises it: no duplicate.
+        let again = pull_tracker(&config, &t, &fake, false).await.unwrap();
+        assert_eq!(again.items[0].action, PullAction::Unchanged);
+        assert_eq!(count_tasks(&root), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn add_refuses_unknown_or_unacknowledged_tracker_before_creating_anything() {
+        let (root, mut config, _) = setup("addack");
+        let err = add_tracker_task(&config, "nope", "x", None, &LocalTaskOptions::default(), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no tracker named"), "{err:#}");
+        config.trackers[0].acknowledged = None;
+        let err = add_tracker_task(&config, "azdo-test", "x", None, &LocalTaskOptions::default(), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not been acknowledged"), "{err:#}");
+        assert_eq!(count_tasks(&root), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn pull_before_run_without_trackers_is_a_noop_and_with_trackers_imports() {
+        let (root, mut config, t) = setup("runpull");
+        let mut empty = config.clone();
+        empty.trackers.clear();
+        pull_before_run(&empty, Duration::from_secs(5)).await;
+        assert_eq!(count_tasks(&root), 0);
+
+        // An unbuildable tracker (credential env unset) is reported, not fatal.
+        config.trackers = vec![t];
+        pull_before_run(&config, Duration::from_secs(5)).await;
+        assert_eq!(count_tasks(&root), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn pull_every_has_a_floor_and_workspace_selects_covered_trackers() {
+        assert!(check_pull_every(59).is_err());
+        assert_eq!(check_pull_every(60).unwrap(), Duration::from_secs(60));
+
+        let (root, mut config, t) = setup("cover");
+        let mut other = t.clone();
+        other.name = "elsewhere".to_owned();
+        other.project_path = "/definitely/not/here".to_owned();
+        config.trackers = vec![t.clone(), other];
+        let project = PathBuf::from(&t.project_path);
+        assert_eq!(trackers_covered_by(&config, &project), vec!["azdo-test"]);
+        assert_eq!(trackers_covered_by(&config, &root), vec!["azdo-test"]);
+        assert_eq!(trackers_covered_by(&config, &project.join("sub")), vec!["azdo-test"]);
+        assert!(trackers_covered_by(&config, Path::new("/tmp/unrelated-ws")).is_empty());
         std::fs::remove_dir_all(root).ok();
     }
 
