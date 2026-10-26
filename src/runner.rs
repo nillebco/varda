@@ -768,7 +768,7 @@ pub async fn run_task(
     };
 
     task.set_status(status);
-    write_task(&task)?;
+    persist_settled_task(&mut task)?;
     crate::tracker::push::push_and_save(config, &mut task).await;
 
     Ok(RunOutcome {
@@ -924,7 +924,7 @@ pub async fn resume_interactive_task(
     };
 
     task.set_status(status);
-    write_task(&task)?;
+    persist_settled_task(&mut task)?;
     crate::tracker::push::push_and_save(config, &mut task).await;
 
     Ok(RunOutcome {
@@ -934,6 +934,23 @@ pub async fn resume_interactive_task(
         blocked_commands,
         files_touched,
     })
+}
+
+/// Persist the end-of-run status, recap and session metadata under the per-task
+/// lock, keeping the file's current tracker-owned `external` block and body
+/// (a concurrent `varda sync` may have advanced them during the run), then
+/// refresh `task.external` so the following tracker push starts from it.
+fn persist_settled_task(task: &mut TaskDocument) -> Result<()> {
+    let settled = task.frontmatter.clone();
+    let mut external = None;
+    crate::task::update_task_locked(&task.path, |fresh| {
+        external = fresh.frontmatter.external.clone();
+        fresh.frontmatter = settled;
+        fresh.frontmatter.external = external.clone();
+        Ok(true)
+    })?;
+    task.frontmatter.external = external;
+    Ok(())
 }
 
 /// Stable, human-readable task override evidence kept beside every resumed
