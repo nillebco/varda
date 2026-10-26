@@ -370,10 +370,127 @@ fn git_path_until(
     Ok(if rel.is_absolute() { rel } else { repo.join(rel) })
 }
 
+/// A Job Object holding a spawned git and every process it starts, so a timeout
+/// can kill hooks and filters too (Windows has no process groups to signal).
+/// No kill-on-close: a background `git gc --auto` left by a command that
+/// finished in time must survive the handle closing.
+#[cfg(windows)]
+struct ProcessTreeJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl ProcessTreeJob {
+    /// Spawn `cmd` suspended, put it in a fresh job, then resume it, so not even
+    /// its first descendant can start outside the job. Failing to establish
+    /// the job degrades (with a warning) to killing git alone on timeout;
+    /// failing to resume kills the suspended child and errors.
+    fn spawn(cmd: &mut Command) -> Result<(std::process::Child, Option<Self>)> {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+        let mut child = cmd.spawn()?;
+        let job = match Self::assign(&child) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot put git in a job object ({e}); a timeout will not stop its hooks"
+                );
+                None
+            }
+        };
+        if let Err(e) = resume_process(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow::Error::from(e).context("failed to resume suspended git"));
+        }
+        Ok((child, job))
+    }
+
+    fn assign(child: &std::process::Child) -> std::io::Result<Self> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        // SAFETY: plain Win32 calls on a handle we own and the live child's handle.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let job = Self(job);
+            if AssignProcessToJobObject(job.0, child.as_raw_handle()) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(job)
+        }
+    }
+
+    fn terminate(&self) {
+        // SAFETY: `self.0` is a job handle we own until drop.
+        let ok = unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) };
+        if ok == 0 {
+            eprintln!(
+                "warning: failed to terminate git's job object ({}); its hooks may outlive the timeout",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Resume every thread of a process created suspended (only its main thread,
+/// in practice). Errors if none was resumed.
+#[cfg(windows)]
+fn resume_process(pid: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    // SAFETY: plain Win32 calls; every handle opened here is closed here.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut resumed = 0;
+        let mut failure = None;
+        let mut more = Thread32First(snapshot, &mut entry) != 0;
+        while more {
+            if entry.th32OwnerProcessID == pid {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if thread.is_null() || ResumeThread(thread) == u32::MAX {
+                    failure = Some(std::io::Error::last_os_error());
+                } else {
+                    resumed += 1;
+                }
+                if !thread.is_null() {
+                    CloseHandle(thread);
+                }
+            }
+            more = Thread32Next(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        match (resumed, failure) {
+            (0, Some(e)) => Err(e),
+            (0, None) => Err(std::io::Error::other(format!("no thread of process {pid} found to resume"))),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTreeJob {
+    fn drop(&mut self) {
+        // SAFETY: closing the handle we own, once.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 /// Run `cmd` to completion; with a `deadline`, poll it and, when the deadline
 /// passes, SIGTERM its process group (so git can drop `index.lock` and hooks
-/// die), wait a short grace period, then SIGKILL. Pipe readers are abandoned,
-/// not joined, on timeout: a grandchild may still hold the pipe.
+/// die), wait a short grace period, then SIGKILL (Windows: terminate its Job
+/// Object). Pipe readers are abandoned, not joined, on timeout: a grandchild
+/// may still hold the pipe.
 fn run_bounded(
     mut cmd: Command,
     deadline: Option<std::time::Instant>,
@@ -387,11 +504,13 @@ fn run_bounded(
     }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    let mut child = cmd
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(not(windows))]
+    let mut child = cmd.spawn()?;
+    #[cfg(windows)]
+    let (mut child, job) = ProcessTreeJob::spawn(&mut cmd)?;
     fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::sync::mpsc::Receiver<Vec<u8>> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -415,9 +534,13 @@ fn run_bounded(
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGTERM);
             }
-            let grace_end = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while std::time::Instant::now() < grace_end {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            // Nothing was signalled on Windows, so there is nothing to wait for.
+            #[cfg(unix)]
+            {
+                let grace_end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < grace_end {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
             }
             // Always escalate on the GROUP: a descendant may ignore SIGTERM even
             // though the leader exited.
@@ -425,6 +548,10 @@ fn run_bounded(
             // SAFETY: plain kill(2) on the child's own process group (ESRCH ignored).
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            if let Some(job) = &job {
+                job.terminate();
             }
             let _ = child.kill();
             let _ = child.wait();
@@ -1485,6 +1612,60 @@ mod tests {
         commit_task_files_within(&[file.as_path()], "msg", Some(std::time::Duration::from_secs(20)))
             .expect("a later commit must succeed");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Windows: a process started by the child outlives it unless the whole Job
+    /// Object is terminated.
+    #[cfg(windows)]
+    #[test]
+    fn run_bounded_kills_the_process_tree_on_windows() {
+        let dir = std::env::temp_dir().join(format!("varda-job-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        // The path travels in the environment, never interpolated into the
+        // script (`-Command` joins trailing args into the script text).
+        let mut cmd = Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$p = Start-Process -PassThru -WindowStyle Hidden -FilePath ping \
+             -ArgumentList '-n','120','127.0.0.1'; \
+             Set-Content -LiteralPath $env:VARDA_TEST_PIDFILE -Value $p.Id; \
+             Start-Sleep -Seconds 120",
+        ])
+        .env("VARDA_TEST_PIDFILE", &pidfile);
+        let started = std::time::Instant::now();
+        // PowerShell is slow to start; leave it time to record the pid.
+        let deadline = started + std::time::Duration::from_secs(15);
+        let err = run_bounded(cmd, Some(deadline)).expect_err("must time out");
+        assert!(err.is::<GitTimedOut>());
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .expect("descendant never wrote its pid before the deadline (machine contention?)");
+        // CSV rows: "Image Name","PID",... — match the PID column exactly.
+        let alive = || {
+            let out = Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+                .output()
+                .expect("tasklist runs");
+            assert!(
+                out.status.success(),
+                "tasklist failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|row| row.split(',').nth(1) == Some(&format!("\"{pid}\"")))
+        };
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while alive() {
+            assert!(std::time::Instant::now() < end, "descendant {pid} survived");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(unix)]
