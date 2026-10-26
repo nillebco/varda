@@ -32,7 +32,10 @@ Setup prints each step as it runs:
 
 `--yes` skips the prompts (the acknowledgement is still recorded); `--force` replaces an existing tracker of the same name; `--name` overrides the default name `azdo-<project>`; `--work-item-type` (default `Task`) sets the type used when Varda creates items.
 
-Then tag a work item `varda`. Under the default Agile `status_map` a pulled `New` item becomes `backlog`, and `varda run` only runs `ready` tasks, so also add the `varda:ready` tag to the item (GitHub and Jira behave the same when `ready` shares a remote state with `backlog`; tag the issue `varda:ready` there too). Then:
+Then tag a work item `varda`. `varda run` only runs `ready` tasks, and readiness is decided when the item is **first imported**: the item must be in the `ready` state of your `status_map` and, where `ready` shares that state with `backlog` (Agile's `New`, and GitHub/Jira equivalents), also carry the `varda:ready` tag. So apply `varda` and `varda:ready` **before** the first `varda tracker pull`. Under Scrum, `ready` maps to `Approved`, so a `New` item cannot become ready by tagging; move it to `Approved` first.
+
+Pulling an item that is already imported never promotes it: an existing `backlog` task only gets its body, URL and remote state refreshed (only a remote close is propagated, as `done`). Adding `varda:ready` afterwards therefore has no effect on the local task; promote it with `varda task set-status ready <task>`.
+
 
 ```sh
 varda tracker list            # configured trackers + auth check
@@ -150,7 +153,7 @@ varda orchestrate --pull-every SECS    # pull in the background while the reside
 
 Varda never overwrites a human change. Before each push it re-reads the item; if the remote state differs from the one Varda last saw (or the item is closed), the push is **refused** and `external.sync_error` explains why. Azure DevOps additionally sends a `test /rev` operation, so an edit landing between the read and the write fails with a conflict; Varda re-reads and retries once. Jira and GitHub have no atomic compare-and-set, so there the check is read-then-write and a narrow race remains. Re-run `varda tracker pull` to accept the human's change.
 
-A push failure never fails a run: the error is stored in `external.sync_error`, shown by `varda task show`, and retried by `varda tracker sync`. Every outbound request has a timeout, and a whole push is bounded at 60 s. The runner awaits the push, so a slow tracker can delay a run by up to that bound.
+A push failure never fails a run: the error is stored in `external.sync_error`, shown by `varda task show`, and retried by `varda tracker sync`. Every outbound request has a timeout, and each push is bounded at 60 s. The runner awaits every push, so a run that pushes several times can be delayed by up to 60 s per push.
 
 ## Data disclaimer
 
