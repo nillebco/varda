@@ -196,6 +196,7 @@ These are the main config knobs that shape execution. The shipped default config
 | Terraform Cloud recipe | `from_secret = "tfc-token"; env = "TF_TOKEN_app_terraform_io"` exposes only the Terraform Cloud token value. |
 | Azure DevOps recipe | `from_secret = "azdo-pat"; env = "AZURE_DEVOPS_EXT_PAT"` exposes only the PAT value. |
 | Azure CLI recipe | `from_secret = "azure-client-id"; env = "AZURE_CLIENT_ID"` plus client secret and tenant secret env entries supports service-principal auth without `~/.azure`. |
+| Issue tracker | `[[trackers]] name = "azdo-acme"; kind = "azdo"; project_path = "…"; credential = { from_env = "AZDO_PAT" }` pulls work items as tasks; central config only (a repo `.varda` may not declare one). Written by `varda tracker setup`; full reference in [trackers.md](trackers.md). |
 | Orchestration defaults | `[orchestration] enabled = true; max_depth = 2; max_fanout = 4; global_child_budget = 16; deny_sandboxes = ["local"]` gates sandboxed subtask spawning. |
 | Route orchestration override | `[routes.orchestration] enabled = false` disables spawning for that matched route. |
 | Repo-local tasks and config | `.varda/tasks/<id>-<slug>.md` stores committed task definitions; `.varda/config.toml` can carry repo workflow rules while runtime state remains in `$VARDA_HOME`. |

@@ -1,16 +1,20 @@
 # Varda
 
-**Write a task in markdown. Varda routes it to the right agent, runs it in a sandbox, and commits the result.**
+**Point Varda at your issue tracker. It routes each item to the right agent, runs it in a sandbox, and reports the result back.**
 
-Varda is a small Rust CLI that turns a folder of markdown files into an agent work queue. Each task carries its own project path; Varda matches that path to a route, checks the agent is allowed there, runs it under whatever isolation you configured, captures a recap, and commits everything to a git-tracked control plane.
+Varda is a small Rust CLI. It pulls work items from Azure DevOps, GitHub Issues or Jira, matches each item's project path to a route, checks the agent is allowed there, runs it under whatever isolation you configured, posts the recap and commit back to the item, and commits everything to a git-tracked control plane.
 
-One operations folder tracks work across every project you own — and Varda can run itself, spawning sandboxed workers that merge their branches back.
+No tracker? A folder of markdown files works too — each task is a file carrying its own project path, zero setup. One operations folder tracks work across every project you own, and Varda can run itself, spawning sandboxed workers that merge their branches back.
 
 ```sh
-varda task add "Fix the flaky auth test" --exec
+varda tracker setup azdo --org acme --project Platform --repo ~/dev/acme/platform   # guided, once
+varda tracker pull && varda run                                                    # items tagged `varda` → agents → recap on the item
+varda task add "Fix the flaky auth test" --exec                                    # or, with no tracker: a local markdown task
 ```
 
-## Quickstart
+→ [Issue trackers](docs/trackers.md) (Azure DevOps, GitHub, Jira)
+
+## Quickstart (local markdown tasks)
 
 ```sh
 brew tap nillebco/tap && brew install varda   # or, from a checkout: make install (→ ~/.local/bin)
@@ -136,6 +140,7 @@ binaries, publishes a GitHub Release, and pushes the formula to `nillebco/homebr
 
 | | |
 |---|---|
+| [Issue trackers](docs/trackers.md) | Azure DevOps / GitHub / Jira: setup, `status_map`, lifecycle, conflicts |
 | [Tasks](docs/tasks.md) | creating, running, inspecting, resuming |
 | [Configuration](docs/configuration.md) | routes, agents, `config.toml` reference |
 | [Sandboxing](docs/sandboxing.md) | providers, credentials, isolation invariants |
