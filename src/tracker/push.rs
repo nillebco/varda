@@ -141,15 +141,24 @@ fn ownership_check(
 ) -> Check {
     let remote_done =
         status_from_remote(tracker, &remote.remote_state, &remote.tags) == Some(TaskStatus::Done);
-    if remote_done {
-        return if status == TaskStatus::Done {
-            Check::AlreadyDone
-        } else {
-            Check::Refuse(format!(
-                "remote item is closed ('{}'); Varda will not reopen it (re-run `varda tracker pull`)",
-                remote.remote_state
-            ))
-        };
+    // Closed is detected independently of the Done mapping: GitHub's
+    // `closed:not_planned` maps to no status by default, yet must not be reopened.
+    // The `closed:<reason>` encoding is GitHub's own; other backends' state names
+    // (e.g. an AzDO custom `Closed: awaiting verification`) go by the map alone.
+    let state = remote.remote_state.to_ascii_lowercase();
+    let github_closed = tracker.kind == crate::config::TrackerKind::Github
+        && (state == "closed" || state.starts_with("closed:"));
+    let remote_closed = remote_done || github_closed;
+    if remote_done && status == TaskStatus::Done {
+        return Check::AlreadyDone;
+    }
+    // Moving a task to done on an item closed for another reason is not a reopen
+    // and falls through to the baseline check.
+    if remote_closed && status != TaskStatus::Done {
+        return Check::Refuse(format!(
+            "remote item is closed ('{}'); Varda will not reopen it (re-run `varda tracker pull`)",
+            remote.remote_state
+        ));
     }
     // Baseline: the state recorded at import / last sync; older tasks fall back
     // to what the last pushed status maps to.
@@ -784,6 +793,58 @@ mod tests {
         assert!(ext(&doc).sync_error.as_deref().unwrap().starts_with("conflict:"));
         assert_eq!(fake.get(&item.id).await.unwrap().remote_state, "Closed");
         assert!(fake.comments().is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn closed_without_done_mapping_is_not_reopened_after_pull() {
+        let (root, config, mut t) = setup("closed-np");
+        // GitHub's default map: `done` is `closed:completed`, so `closed:not_planned`
+        // maps to no status (the AzDO map's bare `Closed` would accept it as Done).
+        t.kind = TrackerKind::Github;
+        t.status_map = status_map_from(super::super::GITHUB_STATUS_MAP);
+        let fake = FakeTracker::new(t.clone());
+        let item = fake.insert("open", "alpha", &["varda:ready"]);
+        let mut doc = imported(&config, &t, &fake).await;
+        // Closed for a reason that maps to no status (GitHub `closed:not_planned`),
+        // then recorded as the baseline the way a pull does.
+        fake.set_state(&item.id, "closed:not_planned");
+        assert_eq!(status_from_remote(&t, "closed:not_planned", &[]), None);
+        let remote = fake.get(&item.id).await.unwrap();
+        {
+            let e = doc.frontmatter.external.as_mut().unwrap();
+            e.remote_state = Some(remote.remote_state.clone());
+            e.rev = Some(remote.rev);
+        }
+
+        doc.frontmatter.status = TaskStatus::Running;
+        push_via(&t, &fake, &mut doc).await;
+        assert!(ext(&doc).sync_error.as_deref().unwrap().starts_with("conflict:"));
+        assert_eq!(fake.get(&item.id).await.unwrap().remote_state, "closed:not_planned");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The GitHub-only `closed:<reason>` rule must not refuse a legitimate push
+    /// on another backend whose custom state merely starts with "Closed:".
+    #[tokio::test]
+    async fn non_github_state_named_closed_colon_is_not_treated_as_closed() {
+        let (root, config, mut t) = setup("closed-azdo");
+        t.status_map.insert("review".to_owned(), "Closed: awaiting verification".to_owned());
+        let fake = FakeTracker::new(t.clone());
+        let item = fake.insert("New", "alpha", &["varda:ready"]);
+        let mut doc = imported(&config, &t, &fake).await;
+        fake.set_state(&item.id, "Closed: awaiting verification");
+        let remote = fake.get(&item.id).await.unwrap();
+        {
+            let e = doc.frontmatter.external.as_mut().unwrap();
+            e.remote_state = Some(remote.remote_state.clone());
+            e.rev = Some(remote.rev);
+        }
+        let ext_ref = doc.frontmatter.external.clone().unwrap();
+        assert!(!matches!(
+            ownership_check(&t, &ext_ref, &remote, TaskStatus::Running),
+            Check::Refuse(_)
+        ));
         std::fs::remove_dir_all(root).ok();
     }
 
