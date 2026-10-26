@@ -8,7 +8,9 @@ No tracker? A folder of markdown files works too — each task is a file carryin
 
 ```sh
 varda tracker setup azdo --org acme --project Platform --repo ~/dev/acme/platform   # guided, once
-varda tracker pull && varda run                                                    # items tagged `varda` → agents → recap on the item
+varda tracker pull                                                                 # items tagged `varda` are imported as `backlog` tasks
+# add the `varda:ready` tag to an item — `varda run` only runs `ready` tasks
+varda run                                                                          # ready items → agents → recap on the item
 varda task add "Fix the flaky auth test" --exec                                    # or, with no tracker: a local markdown task
 ```
 
