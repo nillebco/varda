@@ -335,29 +335,55 @@ pub async fn push_transition(config: &Config, doc: &mut TaskDocument) {
 /// The runner's single hook per status settle.
 pub async fn push_and_save(config: &Config, doc: &mut TaskDocument) {
     // Never fails a run; a save failure is already printed.
-    let _ = push_and_save_within(config, doc, PUSH_TIMEOUT).await;
+    let _ = push_and_save_within(config, &mut *doc, PUSH_TIMEOUT).await;
 }
 
-/// Returns `false` if the bookkeeping changed but could not be saved.
-async fn push_and_save_within(config: &Config, doc: &mut TaskDocument, bound: Duration) -> bool {
+/// What happened to a task's tracker bookkeeping after a push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveOutcome {
+    /// Nothing changed, or the change was persisted.
+    Saved,
+    /// Another writer changed the tracker bookkeeping while we awaited; its
+    /// version is kept and ours dropped (a later sync retries). Not an error.
+    Conflict,
+    /// The bookkeeping changed but could not be saved.
+    Failed,
+}
+
+async fn push_and_save_within(config: &Config, doc: &mut TaskDocument, bound: Duration) -> SaveOutcome {
     let before = doc.frontmatter.external.clone();
     push_transition_within(config, doc, bound).await;
-    save_if_changed(doc, &before)
+    merge_external_if_changed(doc, &before)
 }
 
-/// Persist the task if its tracker bookkeeping differs from `before`.
-/// Returns `false` if it changed but could not be saved.
-fn save_if_changed(doc: &TaskDocument, before: &Option<ExternalRef>) -> bool {
-    if doc.frontmatter.external != *before
-        && let Err(e) = task::write_task(doc)
-    {
-        eprintln!(
-            "tracker sync: could not save task {}: {e:#}",
-            doc.path.display()
-        );
-        return false;
+/// Persist the tracker-owned `external` block of a doc held across network
+/// awaits. The file may have moved on meanwhile (a runner settling to Review
+/// writes status, recap and session metadata), so under the per-task lock the
+/// file is re-read and ONLY `external` is replaced -- and only if the on-disk
+/// `external` is still `before`; otherwise another writer won and its value is
+/// kept ([`SaveOutcome::Conflict`]).
+fn merge_external_if_changed(doc: &TaskDocument, before: &Option<ExternalRef>) -> SaveOutcome {
+    if doc.frontmatter.external == *before {
+        return SaveOutcome::Saved;
     }
-    true
+    let result = task::update_task_locked(&doc.path, |fresh| {
+        if fresh.frontmatter.external != *before {
+            return Ok(false);
+        }
+        fresh.frontmatter.external = doc.frontmatter.external.clone();
+        Ok(true)
+    });
+    match result {
+        Ok(true) => SaveOutcome::Saved,
+        Ok(false) => SaveOutcome::Conflict,
+        Err(e) => {
+            eprintln!(
+                "tracker sync: could not save task {}: {e:#}",
+                doc.path.display()
+            );
+            SaveOutcome::Failed
+        }
+    }
 }
 
 fn needs_sync(doc: &TaskDocument) -> bool {
@@ -384,12 +410,32 @@ fn collect_task_paths(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Retry every task whose `synced_status` differs from `status` or that carries
 /// a `sync_error`. Returns the number of tasks still failing.
 pub async fn sync_tasks(config: &Config, only: Option<&str>, bound: Duration) -> usize {
+    sync_tasks_with(config, only, move |mut doc| {
+        Box::pin(async move {
+            push_transition_within(config, &mut doc, bound).await;
+            doc
+        })
+    })
+    .await
+}
+
+/// The per-task push takes the document by value and hands it back, so the
+/// future only borrows what outlives the whole sync (`'c`), never the doc.
+type PushFuture<'c> = std::pin::Pin<Box<dyn std::future::Future<Output = TaskDocument> + Send + 'c>>;
+
+/// [`sync_tasks`] with the per-task push injected (tests substitute a fake
+/// tracker, and a hook that edits the task file mid-push).
+async fn sync_tasks_with<'c>(
+    config: &'c Config,
+    only: Option<&str>,
+    push: impl Fn(TaskDocument) -> PushFuture<'c>,
+) -> usize {
     let mut paths = Vec::new();
     collect_task_paths(&Path::new(&config.defaults.operations_dir).join("tasks"), &mut paths);
     paths.sort();
     let mut failing = 0;
     for path in paths {
-        let Ok(mut doc) = task::load_task(&path) else {
+        let Ok(doc) = task::load_task(&path) else {
             continue;
         };
         let backend = match doc.frontmatter.external.as_ref() {
@@ -399,7 +445,9 @@ pub async fn sync_tasks(config: &Config, only: Option<&str>, bound: Duration) ->
         if !needs_sync(&doc) {
             continue;
         }
-        let saved = push_and_save_within(config, &mut doc, bound).await;
+        let before = doc.frontmatter.external.clone();
+        let doc = push(doc).await;
+        let saved = merge_external_if_changed(&doc, &before);
         if report_outcome(&backend, &doc, saved) {
             failing += 1;
         }
@@ -408,11 +456,18 @@ pub async fn sync_tasks(config: &Config, only: Option<&str>, bound: Duration) ->
 }
 
 /// Print the per-task sync result; returns `true` if the task counts as failing.
-fn report_outcome(backend: &str, doc: &TaskDocument, saved: bool) -> bool {
+fn report_outcome(backend: &str, doc: &TaskDocument, saved: SaveOutcome) -> bool {
     let ext = doc.frontmatter.external.as_ref().expect("external");
-    if !saved {
-        println!("{backend}: {} pushed but the task file could not be saved", ext.id);
-        return true;
+    match saved {
+        SaveOutcome::Failed => {
+            println!("{backend}: {} pushed but the task file could not be saved", ext.id);
+            return true;
+        }
+        SaveOutcome::Conflict => {
+            println!("{backend}: {} skipped, the task changed during the sync", ext.id);
+            return false;
+        }
+        SaveOutcome::Saved => {}
     }
     match &ext.sync_error {
         None => {
@@ -921,6 +976,90 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// A runner settles the task to Review while sync is awaiting the tracker:
+    /// sync must keep the runner's status, recap, session metadata and body,
+    /// adding only its bookkeeping.
+    #[tokio::test]
+    async fn sync_does_not_overwrite_a_concurrent_update_to_the_task_file() {
+        let (root, config, t) = setup("staleSave");
+        let fake = FakeTracker::new(t.clone());
+        fake.insert("New", "alpha", &[]);
+        let mut doc = imported(&config, &t, &fake).await;
+        let path = doc.path.clone();
+        doc.frontmatter.status = TaskStatus::Running;
+        task::write_task(&doc).unwrap();
+        let (tr, fk) = (&t, &fake);
+        let failing = sync_tasks_with(&config, None, {
+            let path = path.clone();
+            move |doc| {
+            let path = path.clone();
+            Box::pin(async move {
+                let mut doc = doc;
+                push_via(tr, fk, &mut doc).await;
+                // The runner finishes during the push.
+                task::update_task_locked(&path, |runner| {
+                    runner.frontmatter.status = TaskStatus::Review;
+                    runner.frontmatter.recaps.push("recap-1.md".to_owned());
+                    runner.frontmatter.agent_session_ids.push("sid-1".to_owned());
+                    runner.body.push_str("\nRUNNER RECAP\n");
+                    Ok(true)
+                })
+                .unwrap();
+                doc
+            })
+            }
+        })
+        .await;
+        assert_eq!(failing, 0);
+        let saved = task::load_task_raw(&path).unwrap();
+        assert_eq!(saved.frontmatter.status, TaskStatus::Review);
+        assert_eq!(saved.frontmatter.recaps, vec!["recap-1.md".to_owned()]);
+        assert_eq!(saved.frontmatter.agent_session_ids, vec!["sid-1".to_owned()]);
+        assert!(saved.body.contains("RUNNER RECAP"));
+        assert_eq!(ext(&saved).synced_status, Some(TaskStatus::Running));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Another writer advanced the tracker bookkeeping (rev, synced_status)
+    /// during the push: its version survives and sync reports a skip.
+    #[tokio::test]
+    async fn sync_keeps_newer_bookkeeping_written_during_the_push() {
+        let (root, config, t) = setup("staleExternal");
+        let fake = FakeTracker::new(t.clone());
+        fake.insert("New", "alpha", &[]);
+        let mut doc = imported(&config, &t, &fake).await;
+        let path = doc.path.clone();
+        doc.frontmatter.status = TaskStatus::Running;
+        task::write_task(&doc).unwrap();
+        let (tr, fk) = (&t, &fake);
+        let failing = sync_tasks_with(&config, None, {
+            let path = path.clone();
+            move |doc| {
+            let path = path.clone();
+            Box::pin(async move {
+                let mut doc = doc;
+                push_via(tr, fk, &mut doc).await;
+                task::update_task_locked(&path, |runner| {
+                    runner.frontmatter.status = TaskStatus::Review;
+                    let e = runner.frontmatter.external.as_mut().unwrap();
+                    e.rev = Some(999);
+                    e.synced_status = Some(TaskStatus::Review);
+                    Ok(true)
+                })
+                .unwrap();
+                doc
+            })
+            }
+        })
+        .await;
+        assert_eq!(failing, 0, "a conflict is a skip, not an error");
+        let saved = task::load_task_raw(&path).unwrap();
+        assert_eq!(saved.frontmatter.status, TaskStatus::Review);
+        assert_eq!(ext(&saved).rev, Some(999));
+        assert_eq!(ext(&saved).synced_status, Some(TaskStatus::Review));
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn save_failure_is_reported_and_counted_by_sync() {
@@ -949,7 +1088,7 @@ mod tests {
         let saved = push_and_save_within(&cfg, &mut doc, Duration::from_secs(1)).await;
         perms.set_mode(0o755);
         std::fs::set_permissions(&dir, perms).unwrap();
-        assert!(!saved);
+        assert_eq!(saved, SaveOutcome::Failed);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -978,12 +1117,12 @@ mod tests {
         doc.frontmatter.status = TaskStatus::Running;
         push_via(&t, &fake, &mut doc).await;
         let push_ok = ext(&doc).sync_error.is_none();
-        let saved = save_if_changed(&doc, &before);
+        let saved = merge_external_if_changed(&doc, &before);
         let failing = report_outcome(&t.name, &doc, saved);
         perms.set_mode(0o755);
         std::fs::set_permissions(&dir, perms).unwrap();
         assert!(push_ok);
-        assert!(!saved);
+        assert_eq!(saved, SaveOutcome::Failed);
         assert!(failing);
         std::fs::remove_dir_all(root).ok();
     }

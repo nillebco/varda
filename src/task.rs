@@ -565,6 +565,84 @@ pub fn write_task(task: &TaskDocument) -> Result<()> {
     write_task_text(&task.path, &content)
 }
 
+/// How long [`update_task_locked`] waits for another writer before giving up.
+const TASK_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read-modify-write a task file under an exclusive per-task advisory lock
+/// (`File::lock` on the sidecar `<task>.md.lock`). The file is re-loaded RAW (no
+/// definition overlay, so only home state is written back) after the lock is
+/// taken, `f` edits it, and the result is persisted atomically if `f` returns
+/// `true`. Returns whether anything was written.
+///
+/// Errors if the lock is not obtained within 10s, or if the task file is gone
+/// once the lock is held. Only writers that take this lock are serialized:
+/// a deletion that does not (e.g. `varda task rm`) racing the final rename can
+/// still leave the file recreated.
+pub fn update_task_locked(
+    path: impl AsRef<Path>,
+    f: impl FnOnce(&mut TaskDocument) -> Result<bool>,
+) -> Result<bool> {
+    update_task_locked_within(path.as_ref(), TASK_LOCK_TIMEOUT, f)
+}
+
+fn update_task_locked_within(
+    path: &Path,
+    timeout: std::time::Duration,
+    f: impl FnOnce(&mut TaskDocument) -> Result<bool>,
+) -> Result<bool> {
+    if !path.exists() {
+        bail!("task {} no longer exists; not updating it", path.display());
+    }
+    let _lock = TaskLock::acquire(path, timeout)?;
+    if !path.exists() {
+        bail!("task {} was removed; not recreating it", path.display());
+    }
+    let mut doc = parse_task_raw(path)?;
+    if f(&mut doc)? {
+        write_task(&doc)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Held for the duration of a locked update; the lock drops with the file.
+struct TaskLock {
+    _file: fs::File,
+}
+
+impl TaskLock {
+    fn acquire(path: &Path, timeout: std::time::Duration) -> Result<Self> {
+        let mut lock_name = path.as_os_str().to_owned();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open task lock {}", lock_path.display()))?;
+        // `File::try_lock` is `flock(LOCK_EX|LOCK_NB)` on unix and
+        // `LockFileEx` on Windows, so every shipped platform serializes here.
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to lock {}", lock_path.display()));
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("timed out waiting for task lock {}", lock_path.display());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 /// Atomically (tmp file + rename, preserving existing permissions) replace the
 /// task file at `path` with already-rendered `content`.
 fn write_task_text(path: &Path, content: &str) -> Result<()> {
@@ -2080,6 +2158,100 @@ Body.
             },
             body: body.to_owned(),
         }
+    }
+
+    fn locked_test_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "varda-lock-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1-locked.md");
+        write_task(&sample_task_document(path.clone(), "# Task\n")).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_task_locked_keeps_concurrent_updates_to_different_fields() {
+        let path = locked_test_path("threads");
+        let rounds = 25;
+        let a = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 0..rounds {
+                    update_task_locked(&path, |d| {
+                        d.frontmatter.recaps.push(format!("r{i}"));
+                        Ok(true)
+                    })
+                    .unwrap();
+                }
+            })
+        };
+        let b = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 0..rounds {
+                    update_task_locked(&path, |d| {
+                        d.frontmatter.agent_session_ids.push(format!("s{i}"));
+                        Ok(true)
+                    })
+                    .unwrap();
+                }
+            })
+        };
+        a.join().unwrap();
+        b.join().unwrap();
+        let doc = load_task_raw(&path).unwrap();
+        assert_eq!(doc.frontmatter.recaps.len(), rounds);
+        assert_eq!(doc.frontmatter.agent_session_ids.len(), rounds);
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn update_task_locked_does_not_resurrect_a_deleted_task() {
+        let path = locked_test_path("deleted");
+        fs::remove_file(&path).unwrap();
+        let result = update_task_locked(&path, |_| Ok(true));
+        assert!(result.is_err());
+        assert!(!path.exists());
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn update_task_locked_returns_false_without_writing_when_unchanged() {
+        let path = locked_test_path("noop");
+        assert!(!update_task_locked(&path, |_| Ok(false)).unwrap());
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_task_locked_times_out_instead_of_hanging() {
+        let path = locked_test_path("timeout");
+        let _held = TaskLock::acquire(&path, std::time::Duration::from_secs(1)).unwrap();
+        let start = std::time::Instant::now();
+        let result =
+            update_task_locked_within(&path, std::time::Duration::from_millis(200), |_| Ok(true));
+        assert!(result.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn lock_sidecars_are_not_listed_as_tasks() {
+        let path = locked_test_path("scan");
+        update_task_locked(&path, |_| Ok(false)).unwrap();
+        assert!(path.with_extension("md.lock").exists());
+        let dir = path.parent().unwrap();
+        let tasks = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+            .count();
+        assert_eq!(tasks, 1);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(unix)]
