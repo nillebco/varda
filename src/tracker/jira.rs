@@ -228,6 +228,13 @@ impl JiraTracker {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned(),
+            // Terminal statuses ("Done", "Won't Do", "Cancelled", ...) share
+            // the `done` category whatever they are named.
+            closed: fields
+                .get("status")
+                .and_then(|s| s.pointer("/statusCategory/key"))
+                .and_then(Value::as_str)
+                .is_some_and(|k| k.eq_ignore_ascii_case("done")),
             assignee,
             tags,
             fields: fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<BTreeMap<_, _>>(),
@@ -878,6 +885,21 @@ mod tests {
         let err = tracker(&base).query(&TrackerFilter::default()).await.unwrap_err();
         assert!(format!("{err:#}").contains("more than"), "{err:#}");
         assert_eq!(seen.lock().unwrap().len(), MAX_PAGES);
+    }
+
+    #[test]
+    fn done_category_is_closed_whatever_the_status_name() {
+        let t = tracker("http://127.0.0.1:9");
+        let issue = |name: &str, category: &str| {
+            json!({"key": "VAR-1", "fields": {"updated": "2026-10-01T09:00:00.000+0000",
+                "status": {"name": name, "statusCategory": {"key": category}}}})
+        };
+        let wont_do = t.map_issue(&issue("Won't Do", "done")).unwrap();
+        assert_eq!(wont_do.remote_state, "Won't Do");
+        assert!(wont_do.closed);
+        assert!(!t.map_issue(&issue("In Progress", "indeterminate")).unwrap().closed);
+        let bare = json!({"key": "VAR-1", "fields": {"updated": "2026-10-01T09:00:00.000+0000", "status": {"name": "Done"}}});
+        assert!(!t.map_issue(&bare).unwrap().closed, "no category, no claim");
     }
 
     #[test]

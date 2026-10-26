@@ -141,14 +141,10 @@ fn ownership_check(
 ) -> Check {
     let remote_done =
         status_from_remote(tracker, &remote.remote_state, &remote.tags) == Some(TaskStatus::Done);
-    // Closed is detected independently of the Done mapping: GitHub's
-    // `closed:not_planned` maps to no status by default, yet must not be reopened.
-    // The `closed:<reason>` encoding is GitHub's own; other backends' state names
-    // (e.g. an AzDO custom `Closed: awaiting verification`) go by the map alone.
-    let state = remote.remote_state.to_ascii_lowercase();
-    let github_closed = tracker.kind == crate::config::TrackerKind::Github
-        && (state == "closed" || state.starts_with("closed:"));
-    let remote_closed = remote_done || github_closed;
+    // Closed is detected independently of the Done mapping: a terminal state the
+    // map doesn't cover (GitHub `closed:not_planned`, AzDO `Removed`, a Jira
+    // "Won't Do") must not be reopened. The backend reports it in `closed`.
+    let remote_closed = remote_done || remote.closed;
     if remote_done && status == TaskStatus::Done {
         return Check::AlreadyDone;
     }
@@ -204,10 +200,13 @@ async fn push_via_tracked(
     let status = doc.frontmatter.status;
     let mut attempt = 0;
     let moved: Result<Moved, String> = loop {
-        let remote = match backend.get(&ext.id).await {
+        let mut remote = match backend.get(&ext.id).await {
             Ok(remote) => remote,
             Err(e) => break Err(e.to_string()),
         };
+        if let Err(e) = backend.resolve_closed(&mut remote).await {
+            break Err(e.to_string());
+        }
         match ownership_check(tracker, &ext, &remote, status) {
             Check::AlreadyDone => break Ok(Moved::AlreadyDone),
             Check::Refuse(why) => break Err(format!("conflict: {why}")),
@@ -846,6 +845,37 @@ mod tests {
             Check::Refuse(_)
         ));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A terminal state the map doesn't cover is not reopened (the fake reports
+    /// AzDO `Removed` closed; a Jira done-category status via `set_closed_state`).
+    #[tokio::test]
+    async fn unmapped_terminal_state_is_not_reopened() {
+        for (kind, closed_state) in [(TrackerKind::Azdo, "Removed"), (TrackerKind::Jira, "Won't Do")] {
+            let (root, config, mut t) = setup(&format!("unmapped-{kind:?}"));
+            t.kind = kind;
+            let fake = FakeTracker::new(t.clone());
+            let item = fake.insert("New", "alpha", &["varda:ready"]);
+            let mut doc = imported(&config, &t, &fake).await;
+            match kind {
+                TrackerKind::Jira => fake.set_closed_state(&item.id, closed_state),
+                _ => fake.set_state(&item.id, closed_state),
+            }
+            assert_eq!(status_from_remote(&t, closed_state, &[]), None);
+            let remote = fake.get(&item.id).await.unwrap();
+            {
+                let e = doc.frontmatter.external.as_mut().unwrap();
+                e.remote_state = Some(remote.remote_state.clone());
+                e.rev = Some(remote.rev);
+            }
+
+            doc.frontmatter.status = TaskStatus::Running;
+            push_via(&t, &fake, &mut doc).await;
+            let err = ext(&doc).sync_error.clone().unwrap_or_default();
+            assert!(err.starts_with("conflict:") && err.contains("closed"), "{kind:?}: {err}");
+            assert_eq!(fake.get(&item.id).await.unwrap().remote_state, closed_state);
+            std::fs::remove_dir_all(root).ok();
+        }
     }
 
     #[tokio::test]

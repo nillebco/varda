@@ -252,6 +252,7 @@ impl GithubTracker {
             rev,
             title: text("title").to_owned(),
             body_markdown: text("body").to_owned(),
+            closed: super::github_state_is_closed(&remote_state),
             remote_state,
             assignee,
             tags,
@@ -773,8 +774,10 @@ mod tests {
         assert_eq!(a.tags, vec!["varda", "backend", "varda:ready"]);
         assert_eq!(a.fields["updated_at"], json!("2026-10-01T09:00:00Z"));
 
+        assert!(!a.closed);
         let b = &issues[1];
         assert_eq!(b.remote_state, "closed:completed");
+        assert!(b.closed);
         assert_eq!(b.body_markdown, "");
         assert_eq!(b.assignee, None);
     }

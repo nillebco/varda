@@ -6,10 +6,10 @@
 //! The PAT is resolved on the host by [`super::build_tracker`], sent as
 //! `Authorization: Basic base64(":" + pat)`, and scrubbed from every error.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
@@ -372,6 +372,9 @@ pub struct AzdoTracker {
     /// Central tracker entry (status map, default work-item type); `None` for
     /// trackers built with [`AzdoTracker::new`] alone, which cannot transition.
     config: Option<TrackerConfig>,
+    /// Per work-item type: lowercased state name → state category
+    /// (`Proposed`, `InProgress`, `Resolved`, `Completed`, `Removed`).
+    state_categories: Mutex<HashMap<String, HashMap<String, String>>>,
 }
 
 impl AzdoTracker {
@@ -420,6 +423,7 @@ impl AzdoTracker {
             pat,
             transport,
             config: None,
+            state_categories: Mutex::new(HashMap::new()),
         }
     }
 
@@ -568,6 +572,19 @@ impl AzdoTracker {
     /// State names of a work-item type, for `doctor`/`setup` validation of a
     /// `status_map`.
     pub async fn work_item_states(&self, work_item_type: &str) -> Result<Vec<String>> {
+        Ok(self
+            .work_item_state_list(work_item_type)
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    /// `(name, category)` of each state of a work-item type.
+    async fn work_item_state_list(
+        &self,
+        work_item_type: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
         let url = self.api(
             &format!("workitemtypes/{}/states", url_encode(work_item_type)),
             "",
@@ -584,7 +601,11 @@ impl AzdoTracker {
             .ok_or_else(|| anyhow!("azdo workitemtypes states: missing `value` array"))?;
         Ok(states
             .iter()
-            .filter_map(|s| s.get("name").and_then(Value::as_str).map(str::to_owned))
+            .filter_map(|s| {
+                let name = s.get("name").and_then(Value::as_str)?;
+                let category = s.get("category").and_then(Value::as_str);
+                Some((name.to_owned(), category.map(str::to_owned)))
+            })
             .collect())
     }
 
@@ -658,6 +679,9 @@ impl AzdoTracker {
             title: text("System.Title").to_owned(),
             body_markdown: body,
             remote_state: text("System.State").to_owned(),
+            // A state's name says nothing about its category (an inherited
+            // process can add a custom Completed state): see `resolve_closed`.
+            closed: false,
             assignee,
             tags,
             fields: fields
@@ -702,6 +726,49 @@ impl IssueTracker for AzdoTracker {
         let request = self.request("GET", self.api(&format!("workitems/{id}"), &fields), None);
         let value = self.call_json(request, &format!("work item {id}")).await?;
         Ok(self.map_item(&value)?)
+    }
+
+    /// Closed ⇔ the state's category is `Completed` or `Removed`, read from the
+    /// item's work-item type (cached per type). An unknown type or state is an
+    /// error, so a push never proceeds on a guess.
+    async fn resolve_closed(&self, issue: &mut RemoteIssue) -> Result<()> {
+        let work_item_type = issue
+            .fields
+            .get("System.WorkItemType")
+            .and_then(Value::as_str)
+            .filter(|t| !t.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!("work item {}: no `System.WorkItemType` to read state categories from", issue.id)
+            })?
+            .to_owned();
+        let cached = self.state_categories.lock().unwrap().get(&work_item_type).cloned();
+        let categories = match cached {
+            Some(categories) => categories,
+            None => {
+                let fetched: HashMap<String, String> = self
+                    .work_item_state_list(&work_item_type)
+                    .await?
+                    .into_iter()
+                    .filter_map(|(name, category)| Some((name.to_ascii_lowercase(), category?)))
+                    .collect();
+                self.state_categories
+                    .lock()
+                    .unwrap()
+                    .insert(work_item_type.clone(), fetched.clone());
+                fetched
+            }
+        };
+        let category = categories
+            .get(&issue.remote_state.to_ascii_lowercase())
+            .ok_or_else(|| {
+                anyhow!(
+                    "work item {}: state '{}' has no category on type '{work_item_type}'",
+                    issue.id,
+                    issue.remote_state
+                )
+            })?;
+        issue.closed = category == "Completed" || category == "Removed";
+        Ok(())
     }
 
     async fn valid_states(&self) -> Result<Option<Vec<String>>> {
@@ -1623,6 +1690,37 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(err.to_string().contains("timed out") || err.to_string().contains("read failed"), "{err}");
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn resolve_closed_reads_the_state_category_not_the_name() {
+        // A custom Completed state (`Shipped`) and a custom non-terminal `Done`.
+        let body = r#"{"count":5,"value":[
+            {"name":"New","category":"Proposed"},
+            {"name":"Done","category":"InProgress"},
+            {"name":"Shipped","category":"Completed"},
+            {"name":"Removed","category":"Removed"},
+            {"name":"Odd"}]}"#;
+        let (base, seen) = fake_server(vec![(200, vec![], body.to_owned())]);
+        let t = tracker(&base);
+        let item = |state: &str| {
+            json!({"id": 7, "rev": 1, "fields": {"System.State": state, "System.WorkItemType": "User Story"}})
+        };
+        for (state, closed) in [("Shipped", true), ("Removed", true), ("Done", false), ("new", false)] {
+            let mut issue = t.map_item(&item(state)).unwrap();
+            assert!(!issue.closed, "unresolved until asked");
+            t.resolve_closed(&mut issue).await.unwrap();
+            assert_eq!(issue.closed, closed, "{state}");
+        }
+        // Cached per type: one metadata call for all four.
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(seen.lock().unwrap()[0]
+            .starts_with("GET /My%20Project/_apis/wit/workitemtypes/User%20Story/states?api-version=7.1 "));
+        // No category, or no type: refuse to guess.
+        let mut odd = t.map_item(&item("Odd")).unwrap();
+        assert!(t.resolve_closed(&mut odd).await.is_err());
+        let mut untyped = t.map_item(&json!({"id": 8, "rev": 1, "fields": {"System.State": "New"}})).unwrap();
+        assert!(t.resolve_closed(&mut untyped).await.is_err());
     }
 
     #[tokio::test]

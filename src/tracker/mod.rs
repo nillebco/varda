@@ -33,9 +33,20 @@ pub struct RemoteIssue {
     pub title: String,
     pub body_markdown: String,
     pub remote_state: String,
+    /// The backend itself reports the item as terminal (GitHub `closed`, Jira
+    /// status category `done`), independently of how `status_map` maps
+    /// `remote_state`. Azure DevOps fills it only in
+    /// [`IssueTracker::resolve_closed`].
+    pub closed: bool,
     pub assignee: Option<String>,
     pub tags: Vec<String>,
     pub fields: BTreeMap<String, serde_json::Value>,
+}
+
+/// GitHub: any `closed` / `closed:<reason>` state.
+pub fn github_state_is_closed(state: &str) -> bool {
+    let state = state.to_ascii_lowercase();
+    state == "closed" || state.starts_with("closed:")
 }
 
 /// What `create` needs to open a new work item.
@@ -115,6 +126,11 @@ pub trait IssueTracker: Send + Sync {
     /// Candidate work items matching `filter`, for import.
     async fn query(&self, filter: &TrackerFilter) -> Result<Vec<RemoteIssue>>;
     async fn get(&self, id: &str) -> Result<RemoteIssue>;
+    /// Settle `issue.closed` where the item alone doesn't tell (Azure DevOps:
+    /// the state's category). Push calls it before deciding to transition.
+    async fn resolve_closed(&self, _issue: &mut RemoteIssue) -> Result<()> {
+        Ok(())
+    }
     async fn create(&self, draft: &IssueDraft) -> Result<RemoteIssue>;
     /// Move the item to the state mapped for `to`. With `expected_rev`, fails
     /// with [`TrackerError::Conflict`] if the item changed in between.
@@ -419,6 +435,7 @@ pub mod fake {
                 title: title.to_owned(),
                 body_markdown: String::new(),
                 remote_state: state.to_owned(),
+                closed: self.backend_closed(state),
                 assignee: None,
                 tags: tags.iter().map(|t| (*t).to_owned()).collect(),
                 fields: BTreeMap::new(),
@@ -438,9 +455,34 @@ pub mod fake {
         /// Simulate a human moving the item to `state` (bumps the rev).
         pub fn set_state(&self, id: &str, state: &str) {
             let mut s = self.state.lock().unwrap();
+            let closed = self.backend_closed(state);
             if let Some(issue) = s.issues.get_mut(id) {
                 issue.remote_state = state.to_owned();
+                issue.closed = closed;
                 issue.rev += 1;
+            }
+        }
+
+        /// Simulate a human moving the item to a terminal `state` whose
+        /// closedness only the backend knows (e.g. a Jira done-category status).
+        pub fn set_closed_state(&self, id: &str, state: &str) {
+            self.set_state(id, state);
+            if let Some(issue) = self.state.lock().unwrap().issues.get_mut(id) {
+                issue.closed = true;
+            }
+        }
+
+        /// The name-based closed rule of the configured backend; Jira's comes
+        /// from the status category, which only [`Self::set_closed_state`] sets.
+        fn backend_closed(&self, state: &str) -> bool {
+            match self.config.kind {
+                TrackerKind::Github => github_state_is_closed(state),
+                // The built-in Completed/Removed states; the real backend asks
+                // the work-item type for the state's category.
+                TrackerKind::Azdo => ["Closed", "Done", "Removed"]
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(state)),
+                TrackerKind::Jira => false,
             }
         }
 
@@ -509,6 +551,7 @@ pub mod fake {
             expected_rev: Option<u64>,
         ) -> Result<RemoteIssue> {
             let mapped = map_status(&self.config, to);
+            let closed = mapped.state.as_deref().map(|st| self.backend_closed(st));
             let mut s = self.state.lock().unwrap();
             let forced = std::mem::take(&mut s.conflict_next);
             let issue = s
@@ -527,6 +570,7 @@ pub mod fake {
             }
             if let Some(state) = mapped.state {
                 issue.remote_state = state;
+                issue.closed = closed.unwrap_or(false);
             }
             // Helper tags match case-insensitively, like `status_from_remote`.
             issue.tags.retain(|t| {

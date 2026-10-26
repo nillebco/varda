@@ -151,7 +151,7 @@ varda orchestrate --pull-every SECS    # pull in the background while the reside
 
 ## Conflicts
 
-Varda never overwrites a human change. Before each push it re-reads the item; if the remote state differs from the one Varda last saw (or the item is closed), the push is **refused** and `external.sync_error` explains why. Azure DevOps additionally sends a `test /rev` operation, so an edit landing between the read and the write fails with a conflict; Varda re-reads and retries once. Jira and GitHub have no atomic compare-and-set, so there the check is read-then-write and a narrow race remains. Re-run `varda tracker pull` to accept the human's change.
+Varda never overwrites a human change. Before each push it re-reads the item; if the remote state differs from the one Varda last saw (or the item is closed — including terminal states the `status_map` doesn't cover: GitHub "not planned", Azure DevOps `Removed`, any Jira status in the *Done* category such as "Won't Do"), the push is **refused** and `external.sync_error` explains why. Azure DevOps additionally sends a `test /rev` operation, so an edit landing between the read and the write fails with a conflict; Varda re-reads and retries once. Jira and GitHub have no atomic compare-and-set, so there the check is read-then-write and a narrow race remains. Re-run `varda tracker pull` to accept the human's change.
 
 A push failure never fails a run: the error is stored in `external.sync_error`, shown by `varda task show`, and retried by `varda tracker sync`. Every outbound request has a timeout, and each push is bounded at 60 s. The runner awaits every push, so a run that pushes several times can be delayed by up to 60 s per push.
 
