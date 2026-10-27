@@ -1094,12 +1094,31 @@ fn append_session_log(path: &Path, content: &str) -> Result<()> {
 /// pass (M13a §7 skip). Set on bare interactive shells (e.g. the `shell` agent
 /// behind `vmsbsh`/`vdocksh`), which have no Varda recap to produce, so spending an
 /// agent invocation on "interpreting" them is wasted, needs auth, and produces
-/// pointless output.
+/// pointless output. Also inferred for an agent whose interactive command is a
+/// bare shell with no arguments and no `interpreter_agent`: the default would
+/// interpret the session with that same shell, which runs the recap prompt as
+/// shell commands and fails the task (#633).
 fn agent_skips_recap(config: &Config, agent_name: &str) -> bool {
-    config
-        .agents
-        .get(agent_name)
-        .is_some_and(|agent| agent.skip_recap)
+    config.agents.get(agent_name).is_some_and(|agent| {
+        agent.skip_recap || (agent.interpreter_agent.is_none() && is_bare_shell(agent))
+    })
+}
+
+fn is_bare_shell(agent: &crate::config::AgentConfig) -> bool {
+    // The interactive launch uses `interactive_command` + `interactive_args`
+    // when set, else falls back to `command` + `args`.
+    let (command, args) = match agent.interactive_command.as_deref() {
+        Some(command) => (command, agent.interactive_args.as_deref().unwrap_or_default()),
+        None => (agent.command.as_str(), agent.args.as_slice()),
+    };
+    let program = Path::new(command)
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or(command);
+    let shell = ["sh", "bash", "zsh", "dash", "ash", "fish", "pwsh", "powershell", "cmd"]
+        .iter()
+        .any(|s| program.eq_ignore_ascii_case(s));
+    shell && args.is_empty()
 }
 
 /// Minimal, non-LLM-produced recap used in place of the interpreter pass when
@@ -2243,6 +2262,67 @@ Help interactively.
             !recap.contains("SHOULD_NOT_BE_USED"),
             "the interpretation pass must not fall back to the driving client's response"
         );
+    }
+
+    #[test]
+    fn bare_shell_agent_skips_recap_unless_an_interpreter_is_named() {
+        let mut config = test_config("/tmp/varda-bare-shell".to_owned());
+        let base = config.agents.get("codex").cloned().expect("codex agent");
+        let shell = AgentConfig {
+            command: "sh".to_owned(),
+            interactive_command: Some("/bin/sh".to_owned()),
+            interactive_args: None,
+            interpreter_agent: None,
+            skip_recap: false,
+            ..base.clone()
+        };
+        config.agents.insert("dev-shell".to_owned(), shell.clone());
+        // `sh -c 'claude …'` drives a real agent: interpret as usual.
+        config.agents.insert(
+            "wrapped".to_owned(),
+            AgentConfig {
+                interactive_args: Some(vec!["-c".to_owned(), "claude".to_owned()]),
+                ..shell.clone()
+            },
+        );
+        config.agents.insert(
+            "interpreted-shell".to_owned(),
+            AgentConfig {
+                interpreter_agent: Some("codex".to_owned()),
+                ..shell
+            },
+        );
+        // No interactive command: the fallback `command` + `args` wrapper.
+        config.agents.insert(
+            "fallback-wrapped".to_owned(),
+            AgentConfig {
+                command: "sh".to_owned(),
+                args: vec!["-c".to_owned(), "claude".to_owned()],
+                interactive_command: None,
+                interactive_args: None,
+                interpreter_agent: None,
+                skip_recap: false,
+                ..base.clone()
+            },
+        );
+        config.agents.insert(
+            "fallback-bare".to_owned(),
+            AgentConfig {
+                command: "bash".to_owned(),
+                args: Vec::new(),
+                interactive_command: None,
+                interactive_args: None,
+                interpreter_agent: None,
+                skip_recap: false,
+                ..base.clone()
+            },
+        );
+        assert!(!agent_skips_recap(&config, "fallback-wrapped"));
+        assert!(agent_skips_recap(&config, "fallback-bare"));
+        assert!(agent_skips_recap(&config, "dev-shell"));
+        assert!(!agent_skips_recap(&config, "wrapped"));
+        assert!(!agent_skips_recap(&config, "interpreted-shell"));
+        assert!(!agent_skips_recap(&config, "codex"));
     }
 
     #[tokio::test]
