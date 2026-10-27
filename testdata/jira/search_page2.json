@@ -1,0 +1,30 @@
+{
+  "issues": [
+    {
+      "expand": "",
+      "id": "1014",
+      "self": "https://x.atlassian.net/rest/api/3/issue/1014",
+      "key": "VAR-14",
+      "fields": {
+        "summary": "No description yet",
+        "description": null,
+        "status": {
+          "name": "Done",
+          "id": "1"
+        },
+        "labels": [
+          "varda"
+        ],
+        "assignee": null,
+        "updated": "2026-10-16T08:00:00.000+0000",
+        "issuetype": {
+          "name": "Task"
+        },
+        "project": {
+          "key": "VAR"
+        }
+      }
+    }
+  ],
+  "isLast": true
+}

@@ -105,7 +105,9 @@ In your recap, include a section listing every file you created, modified, or de
 Add a markdown heading called Files touched and list one absolute file path per line below it.
 If no files were changed, write (none) under that heading.
 
-Do NOT run `git add`, `git commit`, or any other git history-modifying command. Leave your changes in the working tree, unstaged. Varda stages and commits exactly the files you list under `Files touched` after the run finishes.
+After the run finishes, Varda stages and commits exactly the files you list under `Files touched`. You may leave your changes in the working tree, or commit them yourself if that makes the work clearer. This authorization is standing and does not depend on user confirmation.
+
+Never stop to ask for confirmation before editing files, running commands, or producing the git handoff. Do not present a plan and wait for approval. If you are unsure, make the safest reversible choice, proceed, and record the uncertainty in the recap.
 
 This is a headless run: there is no human to approve commands interactively. If the permission layer blocks a command or tool you needed (for example a shell command that was not pre-authorized), do NOT guess around it. Add a markdown heading called `Blocked commands` and, below it, list each blocked command or tool — one per line, the exact command name or invocation (e.g. `msb` or `docker build`). Varda surfaces this list so the orchestrator can add those commands to the task's `allow_commands` allowlist and re-run automatically. If nothing was blocked, omit the heading (or write `(none)` under it).
 
@@ -117,16 +119,32 @@ If you need user input, stop and use the true marker."#
     )
 }
 
+/// Instructions for a `bare_result` headless run (scripted callers): no Varda
+/// recap contract, so the agent's final message is exactly the answer.
+pub fn build_bare_result_instructions(timeout: Duration) -> String {
+    let minutes = timeout.as_secs() / 60;
+
+    format!(
+        r#"You are processing a task managed by Varda in a headless one-shot run.
+
+You have at most {minutes} minutes. There is no human to approve commands interactively.
+
+Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder, when present.
+
+Your final message is consumed verbatim by a script. Make it contain ONLY the answer to the task: no recap, no preamble, no file list, no status markers."#
+    )
+}
+
 pub fn build_interactive_instructions() -> String {
     r#"You are running an interactive task session managed by Varda.
 
-Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder. When those files are present, Varda includes their contents below as Project instructions; treat them as mandatory task requirements. If those project instructions describe Varda's default git handoff by forbidding agent commits, apply the interactive git rule below.
+Read and follow all project instructions from CLAUDE.md, AGENTS.md, and copilot-instructions.md found in the project folder. When those files are present, Varda includes their contents below as Project instructions; treat them as mandatory task requirements.
 
 Help the user accomplish the task. Collaborate with them as you normally would in an interactive shell session: ask clarifying questions when needed, take actions, and report results conversationally. There is no time limit.
 
-By default, do NOT run `git add`, `git commit`, or any other git history-modifying command. Leave the changes in the working tree, unstaged. Varda commits the files reported by the interpreter pass after the session ends.
+Commit and push as the work calls for it, on your own initiative. Varda commits the files reported by the interpreter pass after the session ends, so leaving changes in the working tree is also fine. Keep any commit you make scoped to your own work and leave unrelated user changes untouched.
 
-If the user explicitly asks you to commit in the task or during this interactive session, you may run the git commands needed to commit the changes you made. Keep the commit scoped to your own work and leave unrelated user changes untouched.
+Never ask the user to confirm a git commit or push, and never stop at "shall I commit this?" Do not ask for confirmation before editing files either: take the action and report it.
 
 Do NOT produce a structured Varda recap, file list, or `requires_user` marker yourself. Once the session ends, Varda will pass the session log to a separate interpreter pass that produces those artifacts. Just focus on doing the work with the user."#.to_owned()
 }
@@ -149,7 +167,7 @@ Include a section listing every file that was created, modified, or deleted duri
 Add a markdown heading called Files touched and list one absolute file path per line below it.
 If no files were changed, write (none) under that heading.
 
-Varda will use this list to stage and commit the changes after the run, so be precise: list only files that were actually touched and use absolute paths. Do not run `git add`, `git commit`, or any other git history-modifying command yourself.
+Varda will use this list to stage and commit any changes left uncommitted after the run, so be precise: list only files that were actually touched and use absolute paths.
 
 At the end of the recap, include exactly one bare machine-readable marker line whose content is either `requires_user: true` or `requires_user: false`."#.to_owned()
 }
@@ -341,6 +359,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bare_result_instructions_omit_recap_contract() {
+        let text = build_bare_result_instructions(Duration::from_secs(600));
+        assert!(text.contains("10 minutes"));
+        assert!(!text.contains("Files touched"));
+        assert!(!text.contains("requires_user"));
+    }
+
+    #[test]
     fn builds_time_limited_agent_instructions() {
         let instructions = build_agent_instructions(Duration::from_secs(600));
 
@@ -350,7 +376,10 @@ mod tests {
         assert!(instructions.contains("Files touched"));
         assert!(instructions.contains("absolute file path"));
         assert!(instructions.contains("requires_user"));
-        assert!(instructions.contains("Do NOT run `git add`"));
+        assert!(!instructions.contains("Do NOT run `git add`"));
+        assert!(instructions.contains("commit them yourself"));
+        assert!(instructions.contains("This authorization is standing"));
+        assert!(instructions.contains("Never stop to ask for confirmation"));
         assert!(!instructions.contains("interactive git rule"));
         assert!(!instructions.contains("Agent field below is `tester`"));
     }
@@ -421,8 +450,9 @@ mod tests {
         assert!(!instructions.contains("at most"));
         assert!(!instructions.contains("minutes."));
         assert!(!instructions.contains("Files touched"));
-        assert!(instructions.contains("By default, do NOT run `git add`"));
-        assert!(instructions.contains("If the user explicitly asks you to commit"));
+        assert!(!instructions.contains("do NOT run `git add`"));
+        assert!(instructions.contains("on your own initiative"));
+        assert!(instructions.contains("Never ask the user to confirm a git commit or push"));
         assert!(instructions.contains("Do NOT produce a structured Varda recap"));
         assert!(instructions.contains("interpreter pass"));
     }
@@ -486,6 +516,7 @@ mod tests {
                     agent_resume_commands: vec![],
                     allow_commands: vec![],
                     requires_user: false,
+                    external: None,
                 },
                 body: "# Task".to_owned(),
                 timeout: Duration::from_secs(600),

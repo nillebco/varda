@@ -135,6 +135,7 @@ mod tests {
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let notification = notify_user_interaction(

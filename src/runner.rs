@@ -614,6 +614,7 @@ pub async fn run_task(
         .agent_session_logs
         .push(session_log_path.display().to_string());
     write_task(&task)?;
+    crate::tracker::push::push_and_save(config, &mut task).await;
 
     write_session_log(
         &session_log_path,
@@ -767,7 +768,8 @@ pub async fn run_task(
     };
 
     task.set_status(status);
-    write_task(&task)?;
+    persist_settled_task(&mut task)?;
+    crate::tracker::push::push_and_save(config, &mut task).await;
 
     Ok(RunOutcome {
         status,
@@ -812,6 +814,7 @@ pub async fn resume_interactive_task(
         .agent_session_logs
         .push(session_log_path.display().to_string());
     write_task(&task)?;
+    crate::tracker::push::push_and_save(config, &mut task).await;
 
     write_session_log(
         &session_log_path,
@@ -921,7 +924,8 @@ pub async fn resume_interactive_task(
     };
 
     task.set_status(status);
-    write_task(&task)?;
+    persist_settled_task(&mut task)?;
+    crate::tracker::push::push_and_save(config, &mut task).await;
 
     Ok(RunOutcome {
         status,
@@ -930,6 +934,23 @@ pub async fn resume_interactive_task(
         blocked_commands,
         files_touched,
     })
+}
+
+/// Persist the end-of-run status, recap and session metadata under the per-task
+/// lock, keeping the file's current tracker-owned `external` block and body
+/// (a concurrent `varda sync` may have advanced them during the run), then
+/// refresh `task.external` so the following tracker push starts from it.
+fn persist_settled_task(task: &mut TaskDocument) -> Result<()> {
+    let settled = task.frontmatter.clone();
+    let mut external = None;
+    crate::task::update_task_locked(&task.path, |fresh| {
+        external = fresh.frontmatter.external.clone();
+        fresh.frontmatter = settled;
+        fresh.frontmatter.external = external.clone();
+        Ok(true)
+    })?;
+    task.frontmatter.external = external;
+    Ok(())
 }
 
 /// Stable, human-readable task override evidence kept beside every resumed
@@ -2928,6 +2949,7 @@ Help interactively.
             allow_commands: vec![],
             bounds: crate::task::TaskBounds::default(),
             requires_user: false,
+            external: None,
         }
     }
 
@@ -2980,6 +3002,7 @@ Help interactively.
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 

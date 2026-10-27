@@ -66,39 +66,147 @@ pub const INTEGRATE_SUBTASKS_TOOL: &str = "integrate_subtasks";
 /// launcher and the broker observe the same map. A subtask absent from the map
 /// ran WITHOUT isolation (non-git mother → shared-mount degrade), so it has no
 /// branch to integrate and `integrate_subtasks` skips it.
+///
+/// A registry built with [`WorkerRegistry::persistent`] also stores each entry
+/// as its own JSON file in a directory (#1239), so a RELAUNCHED resident can
+/// still integrate the workers a previous root run spawned but never merged.
+/// One file per entry, written via a unique temp file + rename, means two
+/// residents never overwrite each other's registrations.
+///
+/// Ownership bounds teardown: [`drain`](Self::drain) yields only checkouts THIS
+/// instance recorded, or adopted by looking them up via [`get`](Self::get)
+/// (which only `integrate_subtasks` does, after awaiting the worker). Entries
+/// merely loaded from disk — possibly a concurrent resident's live workers —
+/// are never torn down by this run. An entry's file is deleted only via
+/// [`forget`](Self::forget), after its clone has actually been removed.
 #[derive(Debug, Clone, Default)]
-pub struct WorkerRegistry(Arc<Mutex<BTreeMap<SubtaskId, WorkerCheckout>>>);
+pub struct WorkerRegistry {
+    entries: Arc<Mutex<BTreeMap<SubtaskId, WorkerCheckout>>>,
+    owned: Arc<Mutex<BTreeSet<SubtaskId>>>,
+    store_dir: Option<PathBuf>,
+}
 
 impl WorkerRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// A registry backed by one file per entry in `store_dir`. Unreadable
+    /// entries and entries whose clone no longer exists are skipped on load.
+    pub fn persistent(store_dir: PathBuf) -> Self {
+        let mut entries = BTreeMap::new();
+        if let Ok(dir) = std::fs::read_dir(&store_dir) {
+            for entry in dir.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+                else {
+                    continue;
+                };
+                match std::fs::read(&path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|bytes| Ok(serde_json::from_slice::<WorkerCheckout>(&bytes)?))
+                {
+                    Ok(checkout) if checkout.path.exists() => {
+                        entries.insert(id, checkout);
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!(
+                        "warning: ignoring unreadable worker registry entry {}: {error:#}",
+                        path.display()
+                    ),
+                }
+            }
+        }
+        Self {
+            entries: Arc::new(Mutex::new(entries)),
+            owned: Arc::default(),
+            store_dir: Some(store_dir),
+        }
+    }
+
+    fn entry_file(&self, id: &str) -> Option<PathBuf> {
+        let safe: String = id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        self.store_dir.as_ref().map(|dir| dir.join(format!("{safe}.json")))
+    }
+
+    fn persist_entry(&self, id: &str, checkout: &WorkerCheckout) {
+        let Some(file) = self.entry_file(id) else {
+            return;
+        };
+        let write = || -> anyhow::Result<()> {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = file.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+            std::fs::write(&tmp, serde_json::to_vec_pretty(checkout)?)?;
+            std::fs::rename(&tmp, &file)?;
+            Ok(())
+        };
+        if let Err(error) = write() {
+            eprintln!(
+                "warning: failed to persist worker registry entry {}: {error:#}",
+                file.display()
+            );
+        }
+    }
+
     /// Record the isolated checkout the launcher created for `id`.
     pub fn record(&self, id: SubtaskId, checkout: WorkerCheckout) {
-        self.0
+        self.persist_entry(&id, &checkout);
+        self.owned
+            .lock()
+            .expect("worker registry mutex poisoned")
+            .insert(id.clone());
+        self.entries
             .lock()
             .expect("worker registry mutex poisoned")
             .insert(id, checkout);
     }
 
     /// The checkout recorded for `id`, if the worker got an isolated worktree.
+    /// Looking an entry up adopts it into this run's ownership, so a relaunched
+    /// resident that integrates a previous run's worker also tears it down.
     pub fn get(&self, id: &str) -> Option<WorkerCheckout> {
-        self.0
+        let found = self
+            .entries
             .lock()
             .expect("worker registry mutex poisoned")
             .get(id)
-            .cloned()
+            .cloned();
+        if found.is_some() {
+            self.owned
+                .lock()
+                .expect("worker registry mutex poisoned")
+                .insert(id.to_owned());
+        }
+        found
     }
 
-    /// Remove and return every checkout owned by this root run.
-    ///
-    /// Draining makes teardown idempotent and prevents a later cleanup pass from
-    /// touching paths that may have been reused after this run ended.
-    pub fn drain(&self) -> Vec<WorkerCheckout> {
-        std::mem::take(&mut *self.0.lock().expect("worker registry mutex poisoned"))
-            .into_values()
+    /// Remove and return every checkout OWNED by this root run, keyed by id.
+    /// Their on-disk entries are untouched: teardown calls
+    /// [`forget`](Self::forget) once a clone is really gone and
+    /// [`record`](Self::record)s back the ones it keeps, so a crash mid-teardown
+    /// loses no recovery information.
+    pub fn drain(&self) -> Vec<(SubtaskId, WorkerCheckout)> {
+        let owned = std::mem::take(&mut *self.owned.lock().expect("worker registry mutex poisoned"));
+        let mut entries = self.entries.lock().expect("worker registry mutex poisoned");
+        owned
+            .into_iter()
+            .filter_map(|id| entries.remove(&id).map(|checkout| (id, checkout)))
             .collect()
+    }
+
+    /// Delete `id`'s on-disk entry (after its clone has been removed).
+    pub fn forget(&self, id: &str) {
+        if let Some(file) = self.entry_file(id) {
+            let _ = std::fs::remove_file(file);
+        }
     }
 }
 

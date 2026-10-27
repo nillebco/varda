@@ -1,0 +1,31 @@
+{
+  "count": 2,
+  "value": [
+    {
+      "id": 101,
+      "rev": 7,
+      "fields": {
+        "System.Title": "Add retry to the importer",
+        "System.State": "New",
+        "System.WorkItemType": "User Story",
+        "System.Tags": "varda; backend; varda:ready",
+        "System.Rev": 7,
+        "System.AssignedTo": {"displayName": "Ada Lovelace", "uniqueName": "ada@acme.example"},
+        "System.Description": "<div><p>The importer <b>must</b> retry on <em>429</em>.</p><ul><li>Honour <code>Retry-After</code></li><li>See <a href=\"https://example.com/spec\">the spec</a></li></ul><ol><li>first</li><li>second</li></ol><table><tr><th>Code</th><th>Action</th></tr><tr><td>429</td><td>retry</td></tr><tr><td>500</td><td>fail</td></tr></table><p>Diagram: <img src=\"https://dev.azure.com/acme/_apis/wit/attachments/abc\" alt=\"flow\"></p></div>",
+        "Microsoft.VSTS.Common.AcceptanceCriteria": "<ul><li>Gives up after 2 retries</li></ul>"
+      },
+      "url": "https://dev.azure.com/acme/_apis/wit/workItems/101"
+    },
+    {
+      "id": 102,
+      "rev": 2,
+      "fields": {
+        "System.Title": "Bare item",
+        "System.State": "Active",
+        "System.WorkItemType": "Task",
+        "System.Rev": 2
+      },
+      "url": "https://dev.azure.com/acme/_apis/wit/workItems/102"
+    }
+  ]
+}

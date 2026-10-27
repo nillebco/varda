@@ -72,6 +72,15 @@ pub struct CapabilitySummary {
     /// `dns-pin`) changes no `egress_hosts` entry, so without this it would be a
     /// silent downgrade — exactly what Decision 3 exists to prevent.
     pub egress_modes: BTreeMap<String, EgressMode>,
+    /// Tracker names introduced (`[[trackers]]`).
+    pub trackers: BTreeSet<String>,
+    /// `(tracker_name, destination)` — where a tracker syncs work items to/from
+    /// (`kind`, `project_path`, and every kind-specific `extra` setting such as
+    /// the azdo organization). A changed destination is a NEW tuple, so it
+    /// diffs as an addition. Tracker credential sources land in
+    /// `host_env_reads` / `secrets_bound` / `host_commands` under the label
+    /// `tracker:<name>`.
+    pub tracker_destinations: BTreeSet<(String, String)>,
 }
 
 fn mount_is_rw_outside_project(raw: &str) -> Option<PathBuf> {
@@ -174,6 +183,34 @@ impl CapabilitySummary {
             }
         }
 
+        for tracker in &config.trackers {
+            summary.trackers.insert(tracker.name.clone());
+            // `{:?}` escapes quotes/backslashes in every string, so distinct
+            // (project_path, extra) configurations can never render identically
+            // (plain `k=v` concatenation let a value smuggle in a fake `key=`).
+            let extras: Vec<(&String, &String)> = tracker.extra.iter().collect();
+            let destination = format!(
+                "kind={:?} project_path={:?} extra={:?}",
+                tracker.kind, tracker.project_path, extras
+            );
+            summary
+                .tracker_destinations
+                .insert((tracker.name.clone(), destination));
+            let label = format!("tracker:{}", tracker.name);
+            match tracker.credential.source() {
+                Ok(CredentialSource::Env(env_name)) => {
+                    summary.host_env_reads.insert((label, env_name.to_owned()));
+                }
+                Ok(CredentialSource::Secret(secret_name)) => {
+                    summary.secrets_bound.insert((label, secret_name.to_owned()));
+                }
+                Ok(CredentialSource::Command(cmd)) => {
+                    summary.host_commands.insert((label, cmd.to_owned()));
+                }
+                Err(_) => {}
+            }
+        }
+
         summary
     }
 }
@@ -255,6 +292,21 @@ pub fn diff_capabilities(
         changes.push(CapabilityChange {
             critical: false,
             sentence: format!("introduces sandbox '{name}'"),
+        });
+    }
+    for name in new.trackers.difference(&old.trackers) {
+        changes.push(CapabilityChange {
+            critical: false,
+            sentence: format!("introduces tracker '{name}'"),
+        });
+    }
+    for (name, destination) in new
+        .tracker_destinations
+        .difference(&old.tracker_destinations)
+    {
+        changes.push(CapabilityChange {
+            critical: false,
+            sentence: format!("tracker '{name}' syncs with {destination}"),
         });
     }
     for glob in new.route_globs.difference(&old.route_globs) {
@@ -662,6 +714,9 @@ mod tests {
             "image",
             "build",
             "image_from",
+            // Which docker-compatible CLI runs the box (docker | podman); the
+            // mounts/egress/env it is handed are classified separately.
+            "engine",
             "egress_proxy_image",
             "memory",
             "cpus",
@@ -867,6 +922,64 @@ mod tests {
         expect_any("introduces agent 'worker'"); // agents
         expect_any("introduces sandbox 'escape'"); // sandboxes
         expect_any("**/*.rs"); // route glob
+    }
+
+    fn tracker_from_toml(body: &str) -> crate::config::TrackerConfig {
+        toml::from_str(&format!("name = \"t\"\n{body}")).expect("tracker toml")
+    }
+
+    fn tracker_summary(body: &str) -> CapabilitySummary {
+        let mut config = base_config();
+        config.trackers.push(tracker_from_toml(body));
+        CapabilitySummary::from_config(&config)
+    }
+
+    #[test]
+    fn tracker_destination_fingerprint_has_no_concatenation_collision() {
+        let a = tracker_summary(
+            "kind = \"azdo\"\nproject_path = \"/r organization=evil\"\n\
+             organization = \"good\"\ncredential = { from_env = \"TOK\" }\n",
+        );
+        let b = tracker_summary(
+            "kind = \"azdo\"\nproject_path = \"/r\"\n\
+             organization = \"evil organization=good\"\ncredential = { from_env = \"TOK\" }\n",
+        );
+        assert_ne!(a.tracker_destinations, b.tracker_destinations);
+        assert!(!diff_capabilities(&a, &b).is_empty());
+        assert!(!diff_capabilities(&b, &a).is_empty());
+    }
+
+    #[test]
+    fn every_tracker_field_changes_the_summary() {
+        let base = "kind = \"azdo\"\nproject_path = \"/r\"\norganization = \"o\"\n";
+        let cred = "credential = { from_env = \"TOK\" }\n";
+        let old = tracker_summary(&format!("{base}{cred}"));
+        let variants = [
+            ("kind", "kind = \"github\"\nproject_path = \"/r\"\norganization = \"o\"\ncredential = { from_env = \"TOK\" }\n"),
+            ("project_path", "kind = \"azdo\"\nproject_path = \"/x\"\norganization = \"o\"\ncredential = { from_env = \"TOK\" }\n"),
+            ("extra value", "kind = \"azdo\"\nproject_path = \"/r\"\norganization = \"p\"\ncredential = { from_env = \"TOK\" }\n"),
+            ("extra key", "kind = \"azdo\"\nproject_path = \"/r\"\norganization = \"o\"\nproject = \"q\"\ncredential = { from_env = \"TOK\" }\n"),
+            ("env source", "kind = \"azdo\"\nproject_path = \"/r\"\norganization = \"o\"\ncredential = { from_env = \"OTHER\" }\n"),
+            ("secret source", "kind = \"azdo\"\nproject_path = \"/r\"\norganization = \"o\"\ncredential = { from_fnox = \"s/pat\" }\n"),
+            ("command source", "kind = \"azdo\"\nproject_path = \"/r\"\norganization = \"o\"\ncredential = { command = \"mint\" }\n"),
+        ];
+        for (label, body) in variants {
+            let new = tracker_summary(body);
+            assert!(
+                !diff_capabilities(&old, &new).is_empty(),
+                "tracker {label} change must alter the capability summary"
+            );
+        }
+        // Each credential variant lands in its own set.
+        assert!(tracker_summary(&format!("{base}credential = {{ from_env = \"E\" }}\n"))
+            .host_env_reads
+            .contains(&("tracker:t".to_owned(), "E".to_owned())));
+        assert!(tracker_summary(&format!("{base}credential = {{ from_fnox = \"S\" }}\n"))
+            .secrets_bound
+            .contains(&("tracker:t".to_owned(), "S".to_owned())));
+        assert!(tracker_summary(&format!("{base}credential = {{ command = \"C\" }}\n"))
+            .host_commands
+            .contains(&("tracker:t".to_owned(), "C".to_owned())));
     }
 
     #[test]

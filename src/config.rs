@@ -302,6 +302,11 @@ pub struct Config {
     /// [`validate_requirements`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires_secrets: Vec<String>,
+    /// Issue-tracker backends (`[[trackers]]`). CENTRAL config only: a repo-committed
+    /// `.varda` is refused if it declares one (see [`reject_varda_trackers`]).
+    /// Validated at load by [`validate_trackers`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trackers: Vec<TrackerConfig>,
 }
 
 /// One entry in `Config::include`: either a bare path string, or a
@@ -405,6 +410,11 @@ pub struct ConfigFragment {
     pub requires_commands: Vec<String>,
     #[serde(default)]
     pub requires_secrets: Vec<String>,
+    /// Trackers declared by an included fragment (the include list is itself
+    /// central config, so these are accepted). A central tracker of the same
+    /// name wins.
+    #[serde(default)]
+    pub trackers: Vec<TrackerConfig>,
     /// A fragment may NOT itself declare further includes — see the nested-include
     /// rejection in [`resolve_includes`]. Captured here (rather than left to be
     /// silently dropped as an unknown field) purely so that rejection can fire.
@@ -655,12 +665,14 @@ pub enum EgressMode {
 ///   internal network whose only route out is the proxy. `Strict` maps to the proxy
 ///   sidecar so a docker strict allow-list is enforced rather than refused.
 /// - `DnsPin` is name-pin only (direct-IP bypassable) and never counts as enforced.
+/// - `processcontainer` (Windows MXC) confines the container to one loopback
+///   endpoint, the relay's allow-listing proxy, under `Strict` or `Proxy`.
 /// - `local` has no network isolation at all.
 pub fn egress_is_enforced(primitive: &str, mode: EgressMode) -> bool {
     match mode {
         EgressMode::DnsPin => false,
         EgressMode::Strict | EgressMode::Proxy => {
-            matches!(primitive, "microsandbox" | "docker")
+            matches!(primitive, "microsandbox" | "docker" | "processcontainer")
         }
     }
 }
@@ -710,11 +722,17 @@ pub struct SandboxConfig {
     /// `image`/`build` when both are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_from: Option<String>,
-    /// Isolation primitive: `"docker"` | `"microsandbox"` | `"local"`.
+    /// Isolation primitive: `"docker"` | `"microsandbox"` | `"processcontainer"`
+    /// (Windows MXC, no admin) | `"local"`.
     /// Orthogonal to the image/rootfs: the same OCI image can run under docker
     /// (shared kernel) or an own-kernel microVM.
     #[serde(default = "default_primitive")]
     pub primitive: String,
+    /// Container engine CLI for the `docker` primitive: `"docker"` (default) or
+    /// `"podman"`. Podman's CLI is docker-compatible for everything varda runs
+    /// (create/cp/start/network/volume); ignored for other primitives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<String>,
     /// Trusted image-intrinsic static, non-secret environment variables.
@@ -775,6 +793,118 @@ pub struct SandboxConfig {
 /// Default isolation primitive when a `[sandboxes.<name>]` entry omits one.
 pub fn default_primitive() -> String {
     "docker".to_owned()
+}
+
+/// Backend kind of a `[[trackers]]` entry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackerKind {
+    Azdo,
+    Github,
+    Jira,
+}
+
+/// Which remote work items a tracker picks up. All fields optional; `wiql`
+/// (azdo) / `jql` (Jira) replaces the simple filter when set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackerFilter {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub states: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wiql: Option<String>,
+    /// Jira: a JQL query that replaces the simple filter when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jql: Option<String>,
+}
+
+/// Recorded data-handling acknowledgement written by `tracker setup`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackerAck {
+    pub by: String,
+    pub at: String,
+    #[serde(default)]
+    pub agents: Vec<String>,
+}
+
+/// One `[[trackers]]` entry. Kind-specific settings (azdo `organization` /
+/// `project`, GitHub `repo`, Jira `site`, ...) are collected, unvalidated, in
+/// `extra` (string values only) via `#[serde(flatten)]` so later milestones add backends without
+/// touching this struct; each backend validates the keys it needs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackerConfig {
+    pub name: String,
+    pub kind: TrackerKind,
+    /// Where the code lives; feeds the normal route/sandbox resolution.
+    pub project_path: String,
+    pub credential: CredentialConfig,
+    #[serde(default)]
+    pub filter: TrackerFilter,
+    /// Keyed by `TaskStatus::as_str()`; value is the remote state name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub status_map: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged: Option<TrackerAck>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, String>,
+}
+
+impl TrackerConfig {
+    /// Kind-specific string setting from `extra` (e.g. `organization`).
+    pub fn extra_str(&self, key: &str) -> Option<&str> {
+        self.extra.get(key).map(String::as_str)
+    }
+}
+
+/// Validate `[[trackers]]`: unique names, non-empty `project_path`, exactly one
+/// credential source, and `status_map` keys that are real task statuses.
+pub fn validate_trackers(trackers: &[TrackerConfig]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for tracker in trackers {
+        if tracker.name.trim().is_empty() {
+            bail!("tracker has an empty `name`");
+        }
+        if !seen.insert(tracker.name.as_str()) {
+            bail!("duplicate tracker name '{}'", tracker.name);
+        }
+        if tracker.project_path.trim().is_empty() {
+            bail!("tracker '{}' has an empty `project_path`", tracker.name);
+        }
+        tracker
+            .credential
+            .source()
+            .with_context(|| format!("tracker '{}' has an invalid credential", tracker.name))?;
+        for key in tracker.status_map.keys() {
+            if key.parse::<crate::task::TaskStatus>().is_err() || key == "pending" {
+                bail!(
+                    "tracker '{}' status_map key '{key}' is not a task status \
+                     (expected backlog, ready, running, review, needs_user, failed, done)",
+                    tracker.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a repo-committed `.varda` that declares a tracker: it could redirect
+/// the token or recaps to an attacker's org. Trackers are central-config only.
+fn reject_varda_trackers(text: &str, varda_path: &Path) -> Result<()> {
+    if let Ok(value) = toml::from_str::<toml::Value>(text)
+        && let Some(table) = value.as_table()
+        && (table.contains_key("trackers") || table.contains_key("tracker"))
+    {
+        bail!(
+            "`.varda` at {} declares a tracker; trackers are central-config only \
+             (~/.varda/config.toml) and a repo-committed `.varda` may not declare, \
+             override or redirect one",
+            varda_path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Filename of the folder-local, repo-committed (UNTRUSTED) sandbox config.
@@ -931,6 +1061,7 @@ impl Config {
 
         let text = fs::read_to_string(&varda_path)
             .with_context(|| format!("failed to read `.varda` at {}", varda_path.display()))?;
+        reject_varda_trackers(&text, &varda_path)?;
         let parsed: VardaFile = toml::from_str(&text)
             .with_context(|| format!("failed to parse `.varda` at {}", varda_path.display()))?;
         let varda_dir = varda_path
@@ -1124,6 +1255,7 @@ impl Default for SandboxConfig {
             build: None,
             image_from: None,
             primitive: default_primitive(),
+            engine: None,
             mounts: Vec::new(),
             env: BTreeMap::new(),
             egress: Vec::new(),
@@ -2385,6 +2517,11 @@ fn resolve_includes(
                 config.agents.insert(name, agent);
             }
         }
+        for tracker in fragment.trackers {
+            if !config.trackers.iter().any(|t| t.name == tracker.name) {
+                config.trackers.push(tracker);
+            }
+        }
         for command in fragment.requires_commands {
             if !config.requires_commands.contains(&command) {
                 config.requires_commands.push(command);
@@ -2466,6 +2603,7 @@ const FRAGMENT_TOP_LEVEL_FIELDS: &[&str] = &[
     "agents",
     "requires_commands",
     "requires_secrets",
+    "trackers",
     "include",
 ];
 pub(crate) const SANDBOX_CONFIG_FIELDS: &[&str] = &[
@@ -2473,6 +2611,7 @@ pub(crate) const SANDBOX_CONFIG_FIELDS: &[&str] = &[
     "build",
     "image_from",
     "primitive",
+    "engine",
     "mounts",
     "env",
     "egress",
@@ -2614,6 +2753,7 @@ fn fragment_capability_summary(
     summary_config.routes = fragment.routes;
     summary_config.sandboxes = fragment.sandboxes;
     summary_config.agents = fragment.agents;
+    summary_config.trackers = fragment.trackers;
     Ok(config_approval::CapabilitySummary::from_config(
         &summary_config,
     ))
@@ -3233,6 +3373,7 @@ fn parse_central_config(path: &Path) -> Result<Config> {
         .with_context(|| format!("failed to parse config at {}", path.display()))?;
     resolve_config_paths(path, &mut config)?;
     validate_include_pin_formats(&config)?;
+    validate_trackers(&config.trackers)?;
 
     Ok(config)
 }
@@ -3286,6 +3427,7 @@ fn resolve_config_with_mode(path: &Path, mode: VerifyMode) -> Result<(Config, Ve
         .parent()
         .with_context(|| format!("config path {} has no parent", path.display()))?;
     let warnings = resolve_includes(config_dir, &mut config, mode)?;
+    validate_trackers(&config.trackers)?;
     remove_legacy_codex_exec_args(&mut config);
     add_varda_project_dir_to_default_agents(&mut config);
     validate_requirements(&config)?;
@@ -7413,6 +7555,218 @@ agents = ["frag_agent"]
             .expect("store should be readable");
         assert_eq!(stored.as_deref(), Some(new));
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn tracker_toml(extra: &str) -> String {
+        format!(
+            "{}\n[[trackers]]\nname = \"azdo-adb\"\nkind = \"azdo\"\n\
+             organization = \"org\"\nproject = \"PROJ\"\nproject_path = \"/work/repo\"\n\
+             credential = {{ from_fnox = \"azdo/pat\" }}\n\
+             filter = {{ tags = [\"varda\"], states = [\"New\"], area_path = \"PROJ\\\\Platform\" }}\n\
+             acknowledged = {{ by = \"me\", at = \"2026-10-17\", agents = [\"codex\"] }}\n\
+             [trackers.status_map]\nbacklog = \"New\"\ndone = \"Closed\"\n{extra}",
+            minimal_config_toml()
+        )
+    }
+
+    #[test]
+    fn trackers_round_trip_through_toml() {
+        let config: Config = toml::from_str(&tracker_toml("")).expect("parses");
+        validate_trackers(&config.trackers).expect("valid");
+        let t = &config.trackers[0];
+        assert_eq!(t.kind, TrackerKind::Azdo);
+        assert_eq!(t.extra_str("organization"), Some("org"));
+        assert_eq!(t.extra_str("project"), Some("PROJ"));
+        assert_eq!(t.filter.tags, vec!["varda"]);
+        assert_eq!(t.status_map["done"], "Closed");
+        assert_eq!(t.acknowledged.as_ref().unwrap().agents, vec!["codex"]);
+
+        let text = toml::to_string_pretty(&config).expect("serializes");
+        let again: Config = toml::from_str(&text).expect("reparses");
+        assert_eq!(again, config);
+
+        let none: Config = toml::from_str(&minimal_config_toml()).unwrap();
+        assert!(!toml::to_string_pretty(&none).unwrap().contains("trackers"));
+    }
+
+    #[test]
+    fn tracker_validation_errors() {
+        let check = |toml_text: String| -> String {
+            let config: Config = toml::from_str(&toml_text).expect("parses");
+            format!("{:#}", validate_trackers(&config.trackers).unwrap_err())
+        };
+        let dup = format!("{}{}", tracker_toml(""), &tracker_toml("")[minimal_config_toml().len()..]);
+        assert!(check(dup).contains("duplicate tracker name"));
+        assert!(check(tracker_toml("").replace("/work/repo", "")).contains("empty `project_path`"));
+        assert!(
+            check(tracker_toml("").replace("from_fnox = \"azdo/pat\"", "from_env = \"A\", from_fnox = \"b\""))
+                .contains("multiple sources")
+        );
+        assert!(
+            check(tracker_toml("").replace("from_fnox = \"azdo/pat\"", ""))
+                .contains("no source")
+        );
+        assert!(check(tracker_toml("bogus = \"x\"\n")).contains("status_map key 'bogus'"));
+    }
+
+    #[test]
+    fn load_config_validates_trackers_and_fragments_may_add_them() {
+        let root = temp_dir("trackers-load");
+        let path = root.join("config.toml");
+        fs::write(&path, tracker_toml("bogus = \"x\"\n")).unwrap();
+        assert!(format!("{:#}", load_config(&path).unwrap_err()).contains("status_map key"));
+
+        fs::write(
+            root.join("frag.toml"),
+            "[[trackers]]\nname = \"frag-t\"\nkind = \"github\"\nproject_path = \"/r\"\n\
+             credential = { from_env = \"GH\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            format!("include = [\"frag.toml\"]\n{}", minimal_config_toml()),
+        )
+        .unwrap();
+        let config = resolve_config(&path).expect("fragment tracker accepted");
+        assert_eq!(config.trackers[0].name, "frag-t");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn tracker_fragment(org: &str, credential: &str) -> String {
+        format!(
+            "[[trackers]]\nname = \"t\"\nkind = \"azdo\"\nproject_path = \"/r\"\n\
+             organization = \"{org}\"\ncredential = {{ {credential} }}\n"
+        )
+    }
+
+    /// A pinned fragment that adds a tracker, or changes a tracker's destination
+    /// or credential source, must not pass a pin mismatch silently.
+    #[test]
+    fn pinned_fragment_tracker_changes_require_approval_not_silent_repin() {
+        let base = tracker_fragment("org-a", "from_env = \"TOK\"");
+        let cases = [
+            ("addition", String::new(), base.clone()),
+            (
+                "destination",
+                base.clone(),
+                tracker_fragment("org-evil", "from_env = \"TOK\""),
+            ),
+            (
+                "credential",
+                base.clone(),
+                tracker_fragment("org-a", "command = \"mint-token\""),
+            ),
+        ];
+        for (label, old, new) in cases {
+            let root = temp_dir(&format!("mismatch-tracker-{label}"));
+            let bundle_dir = root.join("bundle");
+            fs::create_dir_all(&bundle_dir).unwrap();
+            let include_path = bundle_dir.join("frag.toml");
+            fs::write(&include_path, &new).unwrap();
+            let store = isolated_approval_store(&root);
+            store.store_approval(&include_path, &old).unwrap();
+
+            for context in [LaunchContext::Headless, LaunchContext::Sandboxed] {
+                let err = resolve_pin_mismatch_with(
+                    &include_path,
+                    "frag.toml",
+                    &bundle_dir,
+                    &new,
+                    "deadbeef",
+                    "cafef00d",
+                    context,
+                    || panic!("must not prompt"),
+                    &store,
+                )
+                .expect_err(&format!("tracker {label} change must refuse, not re-pin"));
+                assert!(format!("{err:#}").contains("REFUSED"), "{label}");
+            }
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// Regression: unescaped `k=v` concatenation made these two distinct
+    /// configurations fingerprint identically, so a pinned fragment could be
+    /// silently re-pinned.
+    #[test]
+    fn pinned_fragment_tracker_delimiter_collision_requires_approval() {
+        let frag = |project_path: &str, org: &str| {
+            format!(
+                "[[trackers]]\nname = \"t\"\nkind = \"azdo\"\nproject_path = {project_path:?}\n\
+                 organization = {org:?}\ncredential = {{ from_env = \"TOK\" }}\n"
+            )
+        };
+        let old = frag("/r organization=evil", "good");
+        let new = frag("/r", "evil organization=good");
+        let root = temp_dir("mismatch-tracker-collision");
+        let bundle_dir = root.join("bundle");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        let include_path = bundle_dir.join("frag.toml");
+        fs::write(&include_path, &new).unwrap();
+        let store = isolated_approval_store(&root);
+        store.store_approval(&include_path, &old).unwrap();
+        for context in [LaunchContext::Headless, LaunchContext::Sandboxed] {
+            let err = resolve_pin_mismatch_with(
+                &include_path,
+                "frag.toml",
+                &bundle_dir,
+                &new,
+                "deadbeef",
+                "cafef00d",
+                context,
+                || panic!("must not prompt"),
+                &store,
+            )
+            .expect_err("colliding tracker change must refuse, not re-pin");
+            assert!(format!("{err:#}").contains("REFUSED"));
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tracker_capability_summary_reports_destination_and_credential() {
+        let root = temp_dir("tracker-summary");
+        let old = fragment_capability_summary(
+            &tracker_fragment("org-a", "from_env = \"TOK\""),
+            "f.toml",
+            &root,
+        )
+        .unwrap();
+        let new = fragment_capability_summary(
+            &tracker_fragment("org-b", "command = \"mint\""),
+            "f.toml",
+            &root,
+        )
+        .unwrap();
+        let changes = config_approval::diff_capabilities(&old, &new);
+        assert!(changes.iter().any(|c| c.critical && c.sentence.contains("mint")));
+        assert!(changes.iter().any(|c| c.sentence.contains("org-b")));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repo_varda_file_declaring_a_tracker_is_refused() {
+        let root = temp_dir("varda-tracker-refusal");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let config: Config = toml::from_str(&minimal_config_toml()).unwrap();
+
+        fs::write(proj.join(VARDA_FILE), "sandbox = \"rust\"\n").unwrap();
+        let ok = config.resolve_sandbox_for(&proj, &root, None);
+        assert!(
+            !format!("{:?}", ok.as_ref().err()).contains("declares a tracker"),
+            "a plain .varda must not trip the tracker refusal"
+        );
+
+        fs::write(
+            proj.join(VARDA_FILE),
+            "sandbox = \"rust\"\n\n[[trackers]]\nname = \"evil\"\nkind = \"azdo\"\n\
+             project_path = \"/x\"\ncredential = { from_env = \"PAT\" }\n",
+        )
+        .unwrap();
+        let err = config.resolve_sandbox_for(&proj, &root, None).unwrap_err();
+        assert!(format!("{err:#}").contains("declares a tracker"), "{err:#}");
         fs::remove_dir_all(&root).ok();
     }
 }

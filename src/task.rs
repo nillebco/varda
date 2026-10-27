@@ -101,6 +101,34 @@ pub struct TaskFrontmatter {
     pub bounds: TaskBounds,
     #[serde(default)]
     pub requires_user: bool,
+    /// Link to the issue-tracker work item this task mirrors. Absent ⇒ a plain
+    /// local task, behaviour unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalRef>,
+}
+
+/// Tracker-side handle of a task (`[[trackers]]` entry `backend`, native `id`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalRef {
+    /// Name of the `[[trackers]]` entry.
+    pub backend: String,
+    /// Tracker-native id (a string: GH `owner/repo#12`, Jira `ABC-12`).
+    pub id: String,
+    pub url: String,
+    /// Last revision seen (optimistic concurrency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<u64>,
+    /// Last status successfully pushed to the tracker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_status: Option<TaskStatus>,
+    /// Remote state last seen at import / pull refresh / successful push: the
+    /// baseline a push compares the live state against. A difference means a
+    /// human changed the item, so Varda refuses to overwrite it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_state: Option<String>,
+    /// Last push failure, retried on the next sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_error: Option<String>,
 }
 
 impl TaskFrontmatter {
@@ -132,6 +160,13 @@ impl TaskFrontmatter {
         fm.agent_session_ids.clear();
         fm.agent_session_logs.clear();
         fm.agent_resume_commands.clear();
+        // Keep backend/id/url; rev and sync bookkeeping are host-only.
+        if let Some(external) = fm.external.as_mut() {
+            external.rev = None;
+            external.synced_status = None;
+            external.remote_state = None;
+            external.sync_error = None;
+        }
         fm
     }
 }
@@ -156,6 +191,11 @@ pub struct TaskBounds {
     /// Override `defaults.max_tool_calls` (tool-call budget) for this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_calls: Option<u64>,
+    /// Headless one-shot mode for scripted callers (`--print-result`): the agent
+    /// prompt omits Varda's recap boilerplate (Files touched / requires_user
+    /// marker / ...) so the agent's final message is just the answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bare_result: bool,
 }
 
 /// Default status for a task whose frontmatter omits `status` — namely a
@@ -274,6 +314,13 @@ pub fn load_task(path: impl AsRef<Path>) -> Result<TaskDocument> {
     let mut task = parse_task_raw(path.as_ref())?;
     overlay_repo_definition_body(&mut task)?;
     Ok(task)
+}
+
+/// Read a home task file as it is on disk, WITHOUT the repo-definition body
+/// overlay. For callers that must see what a half-finished write left in the
+/// home file itself.
+pub fn load_task_raw(path: impl AsRef<Path>) -> Result<TaskDocument> {
+    parse_task_raw(path.as_ref())
 }
 
 /// Read and parse a task file with NO repo-definition overlay. Used internally
@@ -515,11 +562,94 @@ pub fn render_task_document(task: &TaskDocument) -> Result<String> {
 
 pub fn write_task(task: &TaskDocument) -> Result<()> {
     let content = render_task_document(task)?;
+    write_task_text(&task.path, &content)
+}
 
-    let parent = task.path.parent().unwrap_or_else(|| Path::new("."));
+/// How long [`update_task_locked`] waits for another writer before giving up.
+const TASK_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read-modify-write a task file under an exclusive per-task advisory lock
+/// (`File::lock` on the sidecar `<task>.md.lock`). The file is re-loaded RAW (no
+/// definition overlay, so only home state is written back) after the lock is
+/// taken, `f` edits it, and the result is persisted atomically if `f` returns
+/// `true`. Returns whether anything was written.
+///
+/// Errors if the lock is not obtained within 10s, or if the task file is gone
+/// once the lock is held. Only writers that take this lock are serialized:
+/// a deletion that does not (e.g. `varda task rm`) racing the final rename can
+/// still leave the file recreated.
+pub fn update_task_locked(
+    path: impl AsRef<Path>,
+    f: impl FnOnce(&mut TaskDocument) -> Result<bool>,
+) -> Result<bool> {
+    update_task_locked_within(path.as_ref(), TASK_LOCK_TIMEOUT, f)
+}
+
+fn update_task_locked_within(
+    path: &Path,
+    timeout: std::time::Duration,
+    f: impl FnOnce(&mut TaskDocument) -> Result<bool>,
+) -> Result<bool> {
+    if !path.exists() {
+        bail!("task {} no longer exists; not updating it", path.display());
+    }
+    let _lock = TaskLock::acquire(path, timeout)?;
+    if !path.exists() {
+        bail!("task {} was removed; not recreating it", path.display());
+    }
+    let mut doc = parse_task_raw(path)?;
+    if f(&mut doc)? {
+        write_task(&doc)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Held for the duration of a locked update; the lock drops with the file.
+struct TaskLock {
+    _file: fs::File,
+}
+
+impl TaskLock {
+    fn acquire(path: &Path, timeout: std::time::Duration) -> Result<Self> {
+        let mut lock_name = path.as_os_str().to_owned();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open task lock {}", lock_path.display()))?;
+        // `File::try_lock` is `flock(LOCK_EX|LOCK_NB)` on unix and
+        // `LockFileEx` on Windows, so every shipped platform serializes here.
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to lock {}", lock_path.display()));
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("timed out waiting for task lock {}", lock_path.display());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// Atomically (tmp file + rename, preserving existing permissions) replace the
+/// task file at `path` with already-rendered `content`.
+fn write_task_text(path: &Path, content: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp_path = parent.join(format!(
         ".{}.tmp-{}-{}",
-        task.path
+        path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("task"),
@@ -531,20 +661,20 @@ pub fn write_task(task: &TaskDocument) -> Result<()> {
         fs::write(&tmp_path, content)
             .with_context(|| format!("failed to write task tmp file at {}", tmp_path.display()))?;
 
-        if let Ok(metadata) = fs::metadata(&task.path) {
+        if let Ok(metadata) = fs::metadata(&path) {
             fs::set_permissions(&tmp_path, metadata.permissions()).with_context(|| {
                 format!(
                     "failed to apply permissions from {} to tmp file {}",
-                    task.path.display(),
+                    path.display(),
                     tmp_path.display()
                 )
             })?;
         }
 
-        fs::rename(&tmp_path, &task.path).with_context(|| {
+        fs::rename(&tmp_path, &path).with_context(|| {
             format!(
                 "failed to atomically replace task at {} (tmp file: {})",
-                task.path.display(),
+                path.display(),
                 tmp_path.display()
             )
         })?;
@@ -807,6 +937,7 @@ pub fn create_task_with_egress(
             agent_resume_commands: vec![],
             allow_commands: vec![],
             requires_user: false,
+            external: None,
         },
         body: if let Some(desc) = description {
             format!("# {taskname}\n\n{desc}\n")
@@ -828,6 +959,92 @@ pub fn create_task_with_egress(
     }
 
     Ok(path)
+}
+
+/// Write `task` to its home STATE file AND, when the project carries a live
+/// repo DEFINITION for the same id, replace that definition's body with
+/// `task.body` (frontmatter untouched). [`load_task`] overlays the definition
+/// body onto the home task, so a body written only to the home file would be
+/// invisible on the next read. Returns every path written (home file first).
+pub fn write_task_and_definition_body(task: &TaskDocument) -> Result<Vec<PathBuf>> {
+    write_task_and_definition_body_with(task, render_task_document)
+}
+
+fn write_task_and_definition_body_with(
+    task: &TaskDocument,
+    render: impl FnOnce(&TaskDocument) -> Result<String>,
+) -> Result<Vec<PathBuf>> {
+    // Compute BOTH texts (home document and definition) BEFORE writing anything,
+    // then write the DEFINITION first and the home file last: the home file
+    // carries the external `rev`, which must only advance once the body update
+    // succeeded. A render failure therefore leaves every file untouched.
+    let home_text = render(task)?;
+    let mut definition_update = None;
+    if let Some((store, id)) = definition_store_for(task)
+        && let Some(definition) = find_definition_document(&store, id)?
+    {
+        let content = fs::read_to_string(&definition.path).with_context(|| {
+            format!("failed to read task definition {}", definition.path.display())
+        })?;
+        let head_end = frontmatter_block_end(&content).with_context(|| {
+            format!(
+                "definition {} has missing or unterminated frontmatter",
+                definition.path.display()
+            )
+        })?;
+        let head = &content[..head_end];
+        let updated = if head.ends_with('\n') {
+            let eol = if head.ends_with("\r\n") { "\r\n" } else { "\n" };
+            format!("{head}{eol}{}", task.body.trim_start())
+        } else {
+            // Closing fence at EOF has no terminator: infer the newline style
+            // from the first frontmatter line, and supply the fence terminator
+            // plus the blank-line separator ourselves.
+            let first_line = content.split('\n').next().unwrap_or("");
+            let eol = if first_line.ends_with('\r') { "\r\n" } else { "\n" };
+            format!("{head}{eol}{eol}{}", task.body.trim_start())
+        };
+        definition_update = Some((definition.path, updated));
+    }
+    let mut written = vec![task.path.clone()];
+    if let Some((path, updated)) = definition_update {
+        fs::write(&path, updated)
+            .with_context(|| format!("failed to write task definition {}", path.display()))?;
+        written.push(path);
+    }
+    write_task_text(&task.path, &home_text)?;
+    Ok(written)
+}
+
+/// Byte offset just past the closing `---` fence line (including its line
+/// terminator, if any) of the frontmatter block in `content`. Fences are
+/// recognised the same way as in [`rewrite_legacy_pending_status`]: the first
+/// line must be `---` and the first later `---` line closes the block, with
+/// CRLF endings and a closing fence at EOF accepted. `None` when there is no
+/// complete block.
+fn frontmatter_block_end(content: &str) -> Option<usize> {
+    let mut start = 0usize;
+    let mut first = true;
+    while start <= content.len() {
+        let (line_end, next) = match content[start..].find('\n') {
+            Some(i) => (start + i, start + i + 1),
+            None => (content.len(), content.len() + 1),
+        };
+        let is_fence = content[start..line_end].trim() == "---";
+        if first {
+            if !is_fence {
+                return None;
+            }
+            first = false;
+        } else if is_fence {
+            return Some(next.min(content.len()));
+        }
+        if next > content.len() {
+            return None;
+        }
+        start = next;
+    }
+    None
 }
 
 pub fn list_tasks(config: &Config, project_path: &Path) -> Result<Vec<TaskSummary>> {
@@ -891,6 +1108,14 @@ pub fn resolve_task_reference(config: &Config, task_ref: &Path) -> Result<PathBu
     let Some(task_ref) = task_ref.to_str() else {
         bail!("task reference is not valid UTF-8: {}", task_ref.display());
     };
+    // `<tracker>:<id>` (e.g. `azdo-adb:12345`): only when the prefix names a
+    // configured tracker, so other colon-bearing strings keep their old errors.
+    if let Some((backend, external_id)) = task_ref.split_once(':')
+        && config.trackers.iter().any(|t| t.name == backend)
+    {
+        return find_task_by_external(config, backend, external_id)?
+            .with_context(|| format!("no task found for tracker reference '{task_ref}'"));
+    }
     let id = task_ref.parse::<u64>().with_context(|| {
         format!("task reference '{task_ref}' is neither an existing path nor a numeric id")
     })?;
@@ -1213,6 +1438,66 @@ pub fn find_task_by_id(config: &Config, id: u64) -> Result<Option<PathBuf>> {
         Some(TaskIndexEntry::Duplicate) => bail!("multiple tasks found with id {id}"),
         None => Ok(None),
     }
+}
+
+/// Resolve a tracker-native id to its home task file via `external.{backend,id}`.
+/// The persistent id→path index is keyed by the local `u64` id only, so this is a
+/// full recursive scan of the task store (cost ∝ number of task files); it is
+/// meant for `varda task run <tracker>:<id>` and pull/import, not hot loops.
+/// Two tasks claiming the same external id is an error, never a silent pick.
+pub fn find_task_by_external(
+    config: &Config,
+    backend: &str,
+    id: &str,
+) -> Result<Option<PathBuf>> {
+    let task_dir = Path::new(&config.defaults.operations_dir).join("tasks");
+    if !task_dir.exists() {
+        return Ok(None);
+    }
+    let mut matches = Vec::new();
+    collect_external_matches(&task_dir, backend, id, &mut matches)?;
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => bail!("multiple tasks found for external id {backend}:{id}"),
+    }
+}
+
+fn collect_external_matches(
+    dir: &Path,
+    backend: &str,
+    id: &str,
+    matches: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("failed to read task directory {}", dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read task directory {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if file_type.is_dir() {
+            collect_external_matches(&path, backend, id, matches)?;
+            continue;
+        }
+        if path.extension().is_none_or(|extension| extension != "md") {
+            continue;
+        }
+        let Ok(task) = load_task(&path) else {
+            continue;
+        };
+        if task
+            .frontmatter
+            .external
+            .as_ref()
+            .is_some_and(|e| e.backend == backend && e.id == id)
+        {
+            matches.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// One id's resolution as discovered by a full-tree scan: either it maps to
@@ -1786,6 +2071,7 @@ Body.
                 agent_resume_commands: vec![],
                 allow_commands: vec![],
                 requires_user: false,
+                external: None,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
         };
@@ -1833,6 +2119,7 @@ Body.
                 agent_resume_commands: vec![],
                 allow_commands: vec![],
                 requires_user: false,
+                external: None,
             },
             body: "# Task\n\nDo the work.\n".to_owned(),
         };
@@ -1867,9 +2154,104 @@ Body.
                 agent_resume_commands: vec![],
                 allow_commands: vec![],
                 requires_user: false,
+                external: None,
             },
             body: body.to_owned(),
         }
+    }
+
+    fn locked_test_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "varda-lock-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1-locked.md");
+        write_task(&sample_task_document(path.clone(), "# Task\n")).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_task_locked_keeps_concurrent_updates_to_different_fields() {
+        let path = locked_test_path("threads");
+        let rounds = 25;
+        let a = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 0..rounds {
+                    update_task_locked(&path, |d| {
+                        d.frontmatter.recaps.push(format!("r{i}"));
+                        Ok(true)
+                    })
+                    .unwrap();
+                }
+            })
+        };
+        let b = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 0..rounds {
+                    update_task_locked(&path, |d| {
+                        d.frontmatter.agent_session_ids.push(format!("s{i}"));
+                        Ok(true)
+                    })
+                    .unwrap();
+                }
+            })
+        };
+        a.join().unwrap();
+        b.join().unwrap();
+        let doc = load_task_raw(&path).unwrap();
+        assert_eq!(doc.frontmatter.recaps.len(), rounds);
+        assert_eq!(doc.frontmatter.agent_session_ids.len(), rounds);
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn update_task_locked_does_not_resurrect_a_deleted_task() {
+        let path = locked_test_path("deleted");
+        fs::remove_file(&path).unwrap();
+        let result = update_task_locked(&path, |_| Ok(true));
+        assert!(result.is_err());
+        assert!(!path.exists());
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn update_task_locked_returns_false_without_writing_when_unchanged() {
+        let path = locked_test_path("noop");
+        assert!(!update_task_locked(&path, |_| Ok(false)).unwrap());
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_task_locked_times_out_instead_of_hanging() {
+        let path = locked_test_path("timeout");
+        let _held = TaskLock::acquire(&path, std::time::Duration::from_secs(1)).unwrap();
+        let start = std::time::Instant::now();
+        let result =
+            update_task_locked_within(&path, std::time::Duration::from_millis(200), |_| Ok(true));
+        assert!(result.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn lock_sidecars_are_not_listed_as_tasks() {
+        let path = locked_test_path("scan");
+        update_task_locked(&path, |_| Ok(false)).unwrap();
+        assert!(path.with_extension("md.lock").exists());
+        let dir = path.parent().unwrap();
+        let tasks = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+            .count();
+        assert_eq!(tasks, 1);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(unix)]
@@ -2075,6 +2457,7 @@ Body.
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let project_path = Path::new("/work/project");
@@ -2135,6 +2518,7 @@ requires_user: false
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let path = create_task(&config, "Next Task", Path::new("/work/project"), None, None, None)
@@ -2173,6 +2557,7 @@ requires_user: false
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let first = create_task(&config, "Project Task", &first_project, None, None, None)
@@ -2204,6 +2589,7 @@ requires_user: false
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
@@ -2714,6 +3100,7 @@ requires_user: false
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let tasks = list_tasks(&config, &project_path).expect("tasks should list");
@@ -2763,6 +3150,7 @@ requires_user: false
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let resolved =
@@ -3261,5 +3649,211 @@ requires_user: false
         assert!(!reread.frontmatter.requires_user);
 
         fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    const EXTERNAL_TASK: &str = r#"---
+id: 9
+status: ready
+external:
+  backend: azdo-test
+  id: "12345"
+  url: https://dev.azure.com/o/p/_workitems/edit/12345
+  rev: 7
+  synced_status: review
+  sync_error: boom
+---
+
+# Ext
+"#;
+
+    #[test]
+    fn external_frontmatter_round_trips_and_is_skipped_when_absent() {
+        let task = parse_task(Path::new("t/ext.md"), EXTERNAL_TASK).expect("parse");
+        let ext = task.frontmatter.external.clone().expect("external");
+        assert_eq!(ext.id, "12345");
+        assert_eq!(ext.rev, Some(7));
+        assert_eq!(ext.synced_status, Some(TaskStatus::Review));
+        let yaml = serde_yaml::to_string(&task.frontmatter).expect("serialize");
+        let back: TaskFrontmatter = serde_yaml::from_str(&yaml).expect("reparse");
+        assert_eq!(back.external, Some(ext));
+
+        let plain = parse_task(Path::new("t/p.md"), "---\nid: 1\nstatus: ready\n---\n\n# P\n")
+            .expect("parse");
+        assert!(plain.frontmatter.external.is_none());
+        let yaml = serde_yaml::to_string(&plain.frontmatter).expect("serialize");
+        assert!(!yaml.contains("external"), "yaml: {yaml}");
+    }
+
+    /// Documents current behaviour: `external.id` must be a quoted string; an
+    /// unquoted YAML number is rejected by the real frontmatter path.
+    #[test]
+    fn unquoted_numeric_external_id_is_rejected_quoted_is_accepted() {
+        let unquoted = EXTERNAL_TASK.replace("id: \"12345\"", "id: 12345");
+        assert_ne!(unquoted, EXTERNAL_TASK);
+        assert!(parse_task(Path::new("t/ext.md"), &unquoted).is_err());
+        assert!(parse_task(Path::new("t/ext.md"), EXTERNAL_TASK).is_ok());
+    }
+
+    #[test]
+    fn sanitized_for_prompt_keeps_external_identity_drops_sync_bookkeeping() {
+        let task = parse_task(Path::new("t/ext.md"), EXTERNAL_TASK).expect("parse");
+        let ext = task.frontmatter.sanitized_for_prompt().external.expect("kept");
+        assert_eq!(ext.backend, "azdo-test");
+        assert_eq!(ext.id, "12345");
+        assert!(ext.url.contains("12345"));
+        assert_eq!(ext.rev, None);
+        assert_eq!(ext.synced_status, None);
+        assert_eq!(ext.sync_error, None);
+    }
+
+    #[test]
+    fn resolves_tracker_colon_id_reference_via_external_id() {
+        let root = std::env::temp_dir().join(format!("varda-task-ext-{}", std::process::id()));
+        let task_dir = root.join("operations/tasks/proj");
+        fs::create_dir_all(&task_dir).expect("dir");
+        let path = task_dir.join("9-ext.md");
+        fs::write(&path, EXTERNAL_TASK).expect("write");
+        fs::write(
+            task_dir.join("10-other.md"),
+            EXTERNAL_TASK.replace("id: 9", "id: 10").replace("12345", "999"),
+        )
+        .expect("write");
+
+        let mut config = test_config(&root.join("operations"));
+        config.trackers.push(crate::config::TrackerConfig {
+            name: "azdo-test".to_owned(),
+            kind: crate::config::TrackerKind::Azdo,
+            project_path: "/p".to_owned(),
+            credential: crate::config::CredentialConfig {
+                from_env: Some("PAT".to_owned()),
+                ..Default::default()
+            },
+            filter: Default::default(),
+            status_map: Default::default(),
+            acknowledged: None,
+            extra: Default::default(),
+        });
+
+        let resolved = resolve_task_reference(&config, Path::new("azdo-test:12345")).expect("resolve");
+        assert_eq!(resolved, path);
+        assert_eq!(
+            find_task_by_external(&config, "azdo-test", "nope").expect("scan"),
+            None
+        );
+        let err = resolve_task_reference(&config, Path::new("azdo-test:nope")).unwrap_err();
+        assert!(format!("{err:#}").contains("no task found for tracker reference"));
+        // An unconfigured prefix keeps the old numeric-id error.
+        let err = resolve_task_reference(&config, Path::new("other:12345")).unwrap_err();
+        assert!(format!("{err:#}").contains("neither an existing path nor a numeric id"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn frontmatter_block_end_handles_crlf_eof_and_body_rules() {
+        let lf = "---\nid: 1\n---\n\nbody\n---\nmore\n";
+        assert_eq!(&lf[..frontmatter_block_end(lf).unwrap()], "---\nid: 1\n---\n");
+        let crlf = "---\r\nid: 1\r\n---\r\n\r\nbody\r\n---\r\n";
+        assert_eq!(&crlf[..frontmatter_block_end(crlf).unwrap()], "---\r\nid: 1\r\n---\r\n");
+        let eof = "---\nid: 1\n---";
+        assert_eq!(frontmatter_block_end(eof), Some(eof.len()));
+        assert_eq!(frontmatter_block_end("---\nid: 1\n"), None);
+        assert_eq!(frontmatter_block_end("id: 1\n---\n"), None);
+        let mixed = "---\nid: 1\r\n---\n\nx\n---\n";
+        assert_eq!(&mixed[..frontmatter_block_end(mixed).unwrap()], "---\nid: 1\r\n---\n");
+    }
+
+    fn definition_body_fixture(name: &str, def_text: &str) -> (PathBuf, TaskDocument, PathBuf) {
+        let root = std::env::temp_dir().join(format!("varda-defbody-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = root.join("proj/.varda/tasks");
+        fs::create_dir_all(&store).unwrap();
+        let def = store.join("5-x.md");
+        fs::write(&def, def_text).unwrap();
+        let home = root.join("home/5-x.md");
+        fs::create_dir_all(home.parent().unwrap()).unwrap();
+        let doc = TaskDocument {
+            path: home,
+            frontmatter: TaskFrontmatter {
+                bounds: TaskBounds::default(),
+                id: Some(5),
+                status: TaskStatus::Backlog,
+                project: Some(root.join("proj").display().to_string()),
+                mother_project: None,
+                assignee: None,
+                sandbox: None,
+                recap: None,
+                recaps: vec![],
+                plan: None,
+                agent_session_id: None,
+                agent_session_log: None,
+                agent_session_ids: vec![],
+                agent_session_logs: vec![],
+                agent_resume_commands: vec![],
+                allow_commands: vec![],
+                requires_user: false,
+                external: None,
+            },
+            body: "# New\n\nnew body\n".to_owned(),
+        };
+        (root, doc, def)
+    }
+
+    #[test]
+    fn definition_body_replaced_with_crlf_eof_and_hr_in_old_body() {
+        let cases = [
+            ("crlf", "---\r\nid: 5\r\n---\r\n\r\nold\r\n", "---\r\nid: 5\r\n---\r\n"),
+            ("eof", "---\nid: 5\n---", "---\nid: 5\n---\n"),
+            ("crlf-eof", "---\r\nid: 5\r\n---", "---\r\nid: 5\r\n---\r\n\r\n"),
+            ("hr", "---\nid: 5\n---\n\nold\n\n---\n\nrule\n", "---\nid: 5\n---\n"),
+        ];
+        for (name, text, head) in cases {
+            let (root, doc, def) = definition_body_fixture(name, text);
+            let written = write_task_and_definition_body(&doc).unwrap();
+            assert_eq!(written, vec![doc.path.clone(), def.clone()], "{name}");
+            let out = fs::read_to_string(&def).unwrap();
+            assert!(out.starts_with(head), "{name}: {out:?}");
+            assert!(out.ends_with("new body\n"), "{name}: {out:?}");
+            assert!(!out.contains("old") && !out.contains("rule"), "{name}: {out:?}");
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn definition_eof_fence_exact_output_follows_newline_style() {
+        for (name, text, want) in [
+            ("exact-lf", "---\nid: 5\n---", "---\nid: 5\n---\n\n# New\n\nnew body\n"),
+            (
+                "exact-crlf",
+                "---\r\nid: 5\r\n---",
+                "---\r\nid: 5\r\n---\r\n\r\n# New\n\nnew body\n",
+            ),
+        ] {
+            let (root, doc, def) = definition_body_fixture(name, text);
+            write_task_and_definition_body(&doc).unwrap();
+            assert_eq!(fs::read_to_string(&def).unwrap(), want, "{name}");
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn render_failure_writes_neither_definition_nor_home_file() {
+        let (root, doc, def) = definition_body_fixture("render-fail", "---\nid: 5\n---\n\nold\n");
+        let err = write_task_and_definition_body_with(&doc, |_| anyhow::bail!("render boom"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("render boom"), "{err:#}");
+        assert!(!doc.path.exists());
+        assert_eq!(fs::read_to_string(&def).unwrap(), "---\nid: 5\n---\n\nold\n");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn definition_failure_leaves_home_file_unwritten() {
+        let (root, doc, def) = definition_body_fixture("fail", "---\nid: 5\n");
+        let err = write_task_and_definition_body(&doc).unwrap_err();
+        assert!(format!("{err:#}").contains("frontmatter"), "{err:#}");
+        assert!(!doc.path.exists());
+        assert_eq!(fs::read_to_string(&def).unwrap(), "---\nid: 5\n");
+        fs::remove_dir_all(root).ok();
     }
 }

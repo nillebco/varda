@@ -1,9 +1,21 @@
+/// `println!` to stdout, or to stderr when stdout is reserved for `--print-result`.
+macro_rules! say {
+    ($to_stderr:expr, $($arg:tt)*) => {
+        if $to_stderr {
+            eprintln!($($arg)*)
+        } else {
+            println!($($arg)*)
+        }
+    };
+}
+
 mod acp;
 mod agent;
 mod capability;
 mod config;
 mod config_approval;
 mod doctor;
+mod host_doctor;
 mod git;
 mod mcp_transport;
 mod notify;
@@ -12,6 +24,7 @@ mod routing;
 mod runner;
 mod sandbox;
 mod task;
+mod tracker;
 mod verify;
 
 use std::fs;
@@ -57,9 +70,16 @@ enum Command {
         /// Skip the confirmation prompt and run immediately.
         #[arg(long)]
         yes: bool,
+        /// Pull every configured issue tracker (`tracker pull`) before running.
+        /// Best-effort: a failing tracker is reported and the run continues.
+        #[arg(long)]
+        pull: bool,
     },
     /// Create a reviewable execution plan for ready tasks.
     Plan,
+    /// Check which isolation backends (docker, podman, microsandbox,
+    /// processcontainer) work on this host, and whether every configured sandbox can run.
+    Doctor,
     /// Manage Varda configuration.
     Config {
         #[command(subcommand)]
@@ -80,6 +100,11 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    /// Issue-tracker integration: list trackers, pull work items as tasks.
+    Tracker {
+        #[command(subcommand)]
+        command: TrackerCommand,
+    },
     /// Launch the self-hosting orchestrator: run the RESIDENT as a sandboxed
     /// interactive agent with the spawn broker wired, so Varda can drive its own
     /// dev loop. The loop logic lives in the workspace's `.varda/WORKFLOW.md`; this
@@ -97,6 +122,31 @@ enum Command {
         /// `$HOME`/`~/dev`.
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Pull the issue trackers whose project_path the workspace covers every
+        /// SECS seconds (minimum 60) while the resident runs. Host-side only; the
+        /// broker surface is unchanged.
+        #[arg(long, value_name = "SECS")]
+        pull_every: Option<u64>,
+    },
+    /// Internal: run a `processcontainer` relay request (Windows MXC). Written
+    /// by the provider's `wrap()`; not meant to be typed by hand.
+    #[command(name = "sandbox-exec", hide = true)]
+    SandboxExec {
+        /// Relay request file.
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Internal: inside a `processcontainer`, run the agent under a
+    /// pseudo-console fed by stdin/stdout (MXC cannot attach one itself).
+    #[command(name = "pty-host", hide = true)]
+    PtyHost {
+        #[arg(long)]
+        rows: u16,
+        #[arg(long)]
+        cols: u16,
+        /// Agent command line, passed verbatim to CreateProcessW.
+        #[arg(long)]
+        command_line: String,
     },
 }
 
@@ -144,6 +194,11 @@ enum TaskCommand {
         /// Set the task status to ready after creation (skips backlog).
         #[arg(long)]
         ready: bool,
+        /// Create the work item in this issue tracker first (tagged for pickup),
+        /// then the local task linked to it. The task lands in the tracker's
+        /// project_path; refuses an unacknowledged tracker.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["project", "reuse"])]
+        tracker: Option<String>,
         /// Resume-or-create: if a task with this name already exists for the project,
         /// resume it instead of erroring. Continues the previously captured agent
         /// session when one is available (falling back to fresh, with a message, if
@@ -152,6 +207,15 @@ enum TaskCommand {
         /// repeated launches reuse one task per (project, name) rather than colliding.
         #[arg(long)]
         reuse: bool,
+        /// Scripted-caller mode (only meaningful with --exec): print ONLY the agent's final
+        /// answer on stdout (all Varda chatter goes to stderr), omit Varda's recap
+        /// boilerplate from the agent prompt, and exit non-zero if the agent run fails.
+        #[arg(long, conflicts_with_all = ["background", "interactive"])]
+        print_result: bool,
+        /// Like --print-result, but write the agent's final answer to this file instead of
+        /// stdout (chatter stays on stdout).
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["background", "interactive"])]
+        result_file: Option<PathBuf>,
     },
     /// List markdown tasks for a project.
     List {
@@ -176,6 +240,15 @@ enum TaskCommand {
         /// written to the session log and the recap is printed after the run).
         #[arg(long)]
         quiet: bool,
+        /// Scripted-caller mode (only meaningful with --exec): print ONLY the agent's final
+        /// answer on stdout (all Varda chatter goes to stderr), omit Varda's recap
+        /// boilerplate from the agent prompt, and exit non-zero if the agent run fails.
+        #[arg(long, conflicts_with_all = ["background", "interactive"])]
+        print_result: bool,
+        /// Like --print-result, but write the agent's final answer to this file instead of
+        /// stdout (chatter stays on stdout).
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["background", "interactive"])]
+        result_file: Option<PathBuf>,
     },
     /// Generate an agent-driven plan for a task and open it in $EDITOR.
     Plan {
@@ -356,6 +429,145 @@ enum ProjectCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum TrackerCommand {
+    /// List configured trackers with an authentication check for each.
+    List,
+    /// Import tracker work items as tasks (idempotent).
+    Pull {
+        /// Only pull this tracker.
+        #[arg(long, value_name = "NAME")]
+        tracker: Option<String>,
+        /// Print what would happen and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Guided setup for a tracker, ending with the data-disclaimer acknowledgement.
+    Setup {
+        #[command(subcommand)]
+        backend: TrackerSetupBackend,
+    },
+    /// Retry pushing task status to trackers for tasks that are out of sync.
+    Sync {
+        /// Only sync this tracker.
+        #[arg(long, value_name = "NAME")]
+        tracker: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TrackerSetupBackend {
+    /// Azure DevOps: check the credential, map the process states, preview the
+    /// pickup, acknowledge the data disclaimer, then append the `[[trackers]]` block.
+    Azdo {
+        #[arg(long)]
+        org: String,
+        #[arg(long)]
+        project: String,
+        /// Local repository the work items are worked on in.
+        #[arg(long)]
+        repo: PathBuf,
+        /// Tracker name (default: azdo-<project>).
+        #[arg(long)]
+        name: Option<String>,
+        /// Pickup tag: only work items carrying it are imported.
+        #[arg(long, default_value = "varda")]
+        tag: String,
+        /// PAT stored under this fnox key.
+        #[arg(long, value_name = "KEY", conflicts_with_all = ["credential_env", "credential_command"])]
+        credential_fnox: Option<String>,
+        /// PAT in this host environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "credential_command")]
+        credential_env: Option<String>,
+        /// Host command printing the token (e.g. an `az account get-access-token` call).
+        #[arg(long, value_name = "CMD")]
+        credential_command: Option<String>,
+        #[arg(long, default_value = "Task")]
+        work_item_type: String,
+        /// Skip the prompts (the acknowledgement is still recorded).
+        #[arg(long)]
+        yes: bool,
+        /// Replace an existing tracker of the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// GitHub Issues: check the token, offer to create the pickup/helper labels,
+    /// preview the pickup, acknowledge the data disclaimer, then append the
+    /// `[[trackers]]` block.
+    Github {
+        /// GitHub repository holding the issues, as `owner/name`.
+        #[arg(long, value_name = "OWNER/NAME")]
+        repo: String,
+        /// Local repository the issues are worked on in.
+        #[arg(long, value_name = "PATH")]
+        project_path: PathBuf,
+        /// REST API root for GitHub Enterprise (default https://api.github.com).
+        #[arg(long, value_name = "URL")]
+        api_base: Option<String>,
+        /// Tracker name (default: github-<owner>-<name>).
+        #[arg(long)]
+        name: Option<String>,
+        /// Pickup label: only issues carrying it are imported.
+        #[arg(long, default_value = "varda")]
+        label: String,
+        /// Token stored under this fnox key.
+        #[arg(long, value_name = "KEY", conflicts_with_all = ["credential_env", "credential_command"])]
+        credential_fnox: Option<String>,
+        /// Token in this host environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "credential_command")]
+        credential_env: Option<String>,
+        /// Host command printing the token (e.g. `gh auth token`).
+        #[arg(long, value_name = "CMD")]
+        credential_command: Option<String>,
+        /// Skip the prompts and create missing labels (the acknowledgement is still recorded).
+        #[arg(long)]
+        yes: bool,
+        /// Replace an existing tracker of the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Jira Cloud: prove the API token, map the project's workflow statuses, preview
+    /// the pickup, acknowledge the data disclaimer, then append the `[[trackers]]` block.
+    Jira {
+        /// Site URL, e.g. https://acme.atlassian.net
+        #[arg(long)]
+        site: String,
+        /// Jira project key, e.g. VAR
+        #[arg(long)]
+        project_key: String,
+        /// Atlassian account email (Basic-auth user for the API token).
+        #[arg(long)]
+        email: String,
+        /// Local repository the issues are worked on in.
+        #[arg(long)]
+        repo: PathBuf,
+        /// Tracker name (default: jira-<project key>).
+        #[arg(long)]
+        name: Option<String>,
+        /// Pickup label: only issues carrying it are imported.
+        #[arg(long, default_value = "varda")]
+        label: String,
+        /// API token stored under this fnox key.
+        #[arg(long, value_name = "KEY", conflicts_with_all = ["credential_env", "credential_command"])]
+        credential_fnox: Option<String>,
+        /// API token in this host environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "credential_command")]
+        credential_env: Option<String>,
+        /// Host command printing the token.
+        #[arg(long, value_name = "CMD")]
+        credential_command: Option<String>,
+        /// Issue type used when Varda creates issues.
+        #[arg(long, default_value = "Task")]
+        issue_type: String,
+        /// Skip the prompts (the acknowledgement is still recorded).
+        #[arg(long)]
+        yes: bool,
+        /// Replace an existing tracker of the same name.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SkillCommand {
     /// Install the Varda skill into the user-level Claude Code skills directory.
     Install {
@@ -385,11 +597,23 @@ async fn run_cli() -> Result<()> {
                 result.config_path, result.operations_dir
             );
         }
-        Command::Run { task, plan, yes } => {
+        Command::Run {
+            task,
+            plan,
+            yes,
+            pull,
+        } => {
+            if pull {
+                let config = config::resolve_config(&config::config_file()?)?;
+                tracker::sync::pull_before_run(&config, tracker::sync::PULL_TIMEOUT).await;
+            }
             run_command(task.as_deref(), plan.as_deref(), yes).await?;
         }
         Command::Plan => {
             plan_command()?;
+        }
+        Command::Doctor => {
+            host_doctor::doctor_host_command().await?;
         }
         Command::Config { command } => match command {
             ConfigCommand::Edit => {
@@ -429,9 +653,19 @@ async fn run_cli() -> Result<()> {
                 interactive,
                 quiet,
                 ready,
+                tracker,
                 reuse,
+                print_result,
+                result_file,
             } => {
                 use std::io::IsTerminal as _;
+                let result_output = ResultOutput {
+                    print: print_result,
+                    file: result_file,
+                };
+                if result_output.requested() && !exec {
+                    anyhow::bail!("--print-result/--result-file require --exec");
+                }
                 let (taskname, description) = if let Some(file_path) = file {
                     let stem = file_path
                         .file_stem()
@@ -471,7 +705,21 @@ async fn run_cli() -> Result<()> {
                 };
                 let config_path = config::config_file()?;
                 let config = config::resolve_config(&config_path)?;
-                let project_path = task::resolve_project_path(project.as_deref())?;
+                let tracked_project = match tracker.as_deref() {
+                    Some(name) => Some(
+                        config
+                            .trackers
+                            .iter()
+                            .find(|t| t.name == name)
+                            .map(|t| PathBuf::from(&t.project_path))
+                            .with_context(|| format!("no tracker named '{name}' is configured"))?,
+                    ),
+                    None => None,
+                };
+                let project_path = match tracked_project {
+                    Some(path) => path,
+                    None => task::resolve_project_path(project.as_deref())?,
+                };
                 validate_egress_override(&egress)?;
                 // --reuse (with --exec): if this (project, name) task already exists,
                 // resume it instead of erroring on the collision. Lets the shell aliases
@@ -552,24 +800,44 @@ async fn run_cli() -> Result<()> {
                     }
                     assignee
                 };
-                let task_path = task::create_task_with_egress(
-                    &config,
-                    &taskname,
-                    &project_path,
-                    assignee.as_deref(),
-                    description.as_deref(),
-                    sandbox.as_deref(),
-                    &egress,
-                )?;
+                let task_path = if let Some(tracker_name) = tracker.as_deref() {
+                    tracker::sync::add_tracker_task(
+                        &config,
+                        tracker_name,
+                        &taskname,
+                        description.as_deref(),
+                        &tracker::sync::LocalTaskOptions {
+                            assignee: assignee.clone(),
+                            sandbox: sandbox.clone(),
+                            egress: egress.clone(),
+                        },
+                        tracker::push::PUSH_TIMEOUT,
+                    )
+                    .await?
+                } else {
+                    task::create_task_with_egress(
+                        &config,
+                        &taskname,
+                        &project_path,
+                        assignee.as_deref(),
+                        description.as_deref(),
+                        sandbox.as_deref(),
+                        &egress,
+                    )?
+                };
                 let mut task_doc = task::load_task(&task_path)?;
                 if ready || exec {
                     task_doc.set_status(task::TaskStatus::Ready);
                     task::write_task(&task_doc)?;
                 }
                 if let Some(task_id) = task_doc.frontmatter.id {
-                    println!("created task #{task_id} {}", task_path.display());
+                    say!(
+                        result_output.print,
+                        "created task #{task_id} {}",
+                        task_path.display()
+                    );
                 } else {
-                    println!("created task {}", task_path.display());
+                    say!(result_output.print, "created task {}", task_path.display());
                 }
                 if exec {
                     if edit {
@@ -578,7 +846,8 @@ async fn run_cli() -> Result<()> {
                     if background {
                         spawn_task_in_background(&task_path)?;
                     } else {
-                        run_task_command(&task_path, interactive, quiet).await?;
+                        run_task_command_with(&task_path, interactive, quiet, &result_output)
+                            .await?;
                     }
                 } else if edit {
                     open_editor(&task_path)?;
@@ -599,11 +868,17 @@ async fn run_cli() -> Result<()> {
                 background,
                 interactive,
                 quiet,
+                print_result,
+                result_file,
             } => {
+                let result_output = ResultOutput {
+                    print: print_result,
+                    file: result_file,
+                };
                 if background {
                     spawn_task_in_background(&task)?;
                 } else {
-                    run_task_command(&task, interactive, quiet).await?;
+                    run_task_command_with(&task, interactive, quiet, &result_output).await?;
                 }
             }
             TaskCommand::Plan { task } => {
@@ -738,6 +1013,206 @@ async fn run_cli() -> Result<()> {
                 }
             }
         },
+        Command::Tracker {
+            command:
+                TrackerCommand::Setup {
+                    backend:
+                        TrackerSetupBackend::Azdo {
+                            org,
+                            project,
+                            repo,
+                            name,
+                            tag,
+                            credential_fnox,
+                            credential_env,
+                            credential_command,
+                            work_item_type,
+                            yes,
+                            force,
+                        },
+                },
+        } => {
+            let config_path = config::config_file()?;
+            let config = config::load_config(&config_path)?;
+            let credential = (credential_fnox.is_some()
+                || credential_env.is_some()
+                || credential_command.is_some())
+            .then(|| config::CredentialConfig {
+                from_fnox: credential_fnox,
+                from_env: credential_env,
+                command: credential_command,
+                ..config::CredentialConfig::default()
+            });
+            let opts = tracker::setup::SetupOptions {
+                org,
+                project,
+                repo,
+                name,
+                tag,
+                credential,
+                work_item_type,
+                yes,
+                force,
+                by: tracker::setup::acknowledging_user(),
+                at: tracker::setup::now_rfc3339(),
+            };
+            let build = |t: &config::TrackerConfig| {
+                tracker::build_tracker_within(t, Some(std::time::Duration::from_secs(30)))
+            };
+            match tracker::setup::run_setup(
+                &config,
+                &config_path,
+                &opts,
+                &mut tracker::setup::StdioIo,
+                &build,
+            )
+            .await?
+            {
+                tracker::setup::SetupOutcome::Written { doctor_failures: 0 } => {}
+                tracker::setup::SetupOutcome::Written { doctor_failures } => {
+                    anyhow::bail!("tracker written, but {doctor_failures} doctor check(s) failed")
+                }
+                tracker::setup::SetupOutcome::Declined => {}
+            }
+        }
+        Command::Tracker {
+            command:
+                TrackerCommand::Setup {
+                    backend:
+                        TrackerSetupBackend::Github {
+                            repo,
+                            project_path,
+                            api_base,
+                            name,
+                            label,
+                            credential_fnox,
+                            credential_env,
+                            credential_command,
+                            yes,
+                            force,
+                        },
+                },
+        } => {
+            let config_path = config::config_file()?;
+            let config = config::load_config(&config_path)?;
+            let credential = (credential_fnox.is_some()
+                || credential_env.is_some()
+                || credential_command.is_some())
+            .then(|| config::CredentialConfig {
+                from_fnox: credential_fnox,
+                from_env: credential_env,
+                command: credential_command,
+                ..config::CredentialConfig::default()
+            });
+            let opts = tracker::setup::GithubSetupOptions {
+                github_repo: repo,
+                api_base,
+                project_path,
+                name,
+                label,
+                credential,
+                yes,
+                force,
+                by: tracker::setup::acknowledging_user(),
+                at: tracker::setup::now_rfc3339(),
+            };
+            let build = |t: &config::TrackerConfig| {
+                tracker::build_tracker_within(t, Some(std::time::Duration::from_secs(30)))
+            };
+            match tracker::setup::run_setup_github(
+                &config,
+                &config_path,
+                &opts,
+                &mut tracker::setup::StdioIo,
+                &build,
+            )
+            .await?
+            {
+                tracker::setup::SetupOutcome::Written { doctor_failures: 0 } => {}
+                tracker::setup::SetupOutcome::Written { doctor_failures } => {
+                    anyhow::bail!("tracker written, but {doctor_failures} doctor check(s) failed")
+                }
+                tracker::setup::SetupOutcome::Declined => {}
+            }
+        }
+        Command::Tracker {
+            command:
+                TrackerCommand::Setup {
+                    backend:
+                        TrackerSetupBackend::Jira {
+                            site,
+                            project_key,
+                            email,
+                            repo,
+                            name,
+                            label,
+                            credential_fnox,
+                            credential_env,
+                            credential_command,
+                            issue_type,
+                            yes,
+                            force,
+                        },
+                },
+        } => {
+            let config_path = config::config_file()?;
+            let config = config::load_config(&config_path)?;
+            let credential = (credential_fnox.is_some()
+                || credential_env.is_some()
+                || credential_command.is_some())
+            .then(|| config::CredentialConfig {
+                from_fnox: credential_fnox,
+                from_env: credential_env,
+                command: credential_command,
+                ..config::CredentialConfig::default()
+            });
+            let opts = tracker::setup::JiraSetupOptions {
+                site,
+                project_key,
+                email,
+                repo,
+                name,
+                label,
+                credential,
+                issue_type,
+                yes,
+                force,
+                by: tracker::setup::acknowledging_user(),
+                at: tracker::setup::now_rfc3339(),
+            };
+            let build = |t: &config::TrackerConfig| {
+                tracker::build_tracker_within(t, Some(std::time::Duration::from_secs(30)))
+            };
+            match tracker::setup::run_setup_jira(
+                &config,
+                &config_path,
+                &opts,
+                &mut tracker::setup::StdioIo,
+                &build,
+            )
+            .await?
+            {
+                tracker::setup::SetupOutcome::Written { doctor_failures: 0 } => {}
+                tracker::setup::SetupOutcome::Written { doctor_failures } => {
+                    anyhow::bail!("tracker written, but {doctor_failures} doctor check(s) failed")
+                }
+                tracker::setup::SetupOutcome::Declined => {}
+            }
+        }
+        Command::Tracker { command } => {
+            let config_path = config::config_file()?;
+            let config = config::load_config(&config_path)?;
+            match command {
+                TrackerCommand::List => tracker::sync::list_command(&config).await?,
+                TrackerCommand::Pull { tracker, dry_run } => {
+                    tracker::sync::pull_command(&config, tracker.as_deref(), dry_run).await?
+                }
+                TrackerCommand::Sync { tracker } => {
+                    tracker::push::sync_command(&config, tracker.as_deref()).await?
+                }
+                TrackerCommand::Setup { .. } => unreachable!("handled above"),
+            }
+        }
         Command::Skill { command } => match command {
             SkillCommand::Install { source, link } => {
                 skill_install_command(source.as_deref(), link)?;
@@ -746,8 +1221,24 @@ async fn run_cli() -> Result<()> {
         Command::Orchestrate {
             interactive,
             workspace,
+            pull_every,
         } => {
-            orchestrate_command(interactive, workspace.as_deref()).await?;
+            orchestrate_command(interactive, workspace.as_deref(), pull_every).await?;
+        }
+        Command::SandboxExec { request } => {
+            let code = sandbox::processcontainer::run_relay(&request).await?;
+            std::process::exit(code);
+        }
+        Command::PtyHost {
+            rows,
+            cols,
+            command_line,
+        } => {
+            let code = tokio::task::spawn_blocking(move || {
+                sandbox::pty_host::run(rows, cols, &command_line)
+            })
+            .await??;
+            std::process::exit(code);
         }
     }
 
@@ -1216,6 +1707,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
             agent_resume_commands: vec![],
             allow_commands: vec![],
             requires_user: false,
+            external: None,
         },
         body: format!(
             "# Transform Execution Plan To JSON\n\nReturn only JSON using schema `varda.execution_plan.v1`.\n\nThe JSON shape is:\n\n```json\n{{\"schema\":\"varda.execution_plan.v1\",\"source_plan\":\"{}\",\"tasks\":[{{\"path\":\"/absolute/or/resolvable/task.md\",\"id\":1,\"title\":\"Task title\",\"agent\":\"codex\",\"project\":\"/project\",\"stage\":\"Stage 1\",\"parallel_group\":\"group-1\"}}]}}\n```\n\nInclude every task that should be executed from this plan. Omit optional fields when unknown.\n\nPlan markdown:\n\n{}",
@@ -1380,10 +1872,13 @@ async fn run_task_paths_in_parallel(
                 if config.git.auto_commit {
                     if may_commit_files && let Some(project) = report.project.as_deref() {
                         commit_agent_files_for_task(
+                            &config,
                             &report.task_path,
                             project,
                             &report.outcome.files_touched,
-                        );
+                            false,
+                        )
+                        .await;
                     }
                     git::commit_task_update(
                         &report.task_path,
@@ -1658,12 +2153,40 @@ async fn finish_spawned_subtasks(
         // paths this launcher registered and makes repeated teardown harmless.
         // Only reclaimed on a SUCCESSFUL root run — on failure the checkouts are
         // left in place for a human to inspect/recover un-integrated work.
-        for checkout in worker_registry.drain() {
-            if let Err(error) = git::remove_worker_worktree(mother, &checkout, true) {
-                eprintln!(
-                    "warning: failed to remove worker checkout '{}' after root run: {error:#}",
-                    checkout.path.display()
-                );
+        //
+        // "Successful" includes a resident that settled at `needs_user` before
+        // integrating its workers, so a checkout is removed only when it is
+        // provably integrated (clean and its HEAD contained in the mother's
+        // target); anything else is kept and re-recorded so a relaunched resident
+        // can still integrate it (#1239 — this used to delete un-merged work).
+        for (id, checkout) in worker_registry.drain() {
+            match git::worker_checkout_is_integrated(mother, &checkout) {
+                Ok(true) => match git::remove_worker_worktree(mother, &checkout, true) {
+                    Ok(()) => worker_registry.forget(&id),
+                    Err(error) => {
+                        eprintln!(
+                            "warning: failed to remove worker checkout '{}' after root run: {error:#}",
+                            checkout.path.display()
+                        );
+                        worker_registry.record(id, checkout);
+                    }
+                },
+                Ok(false) => {
+                    eprintln!(
+                        "keeping un-integrated worker checkout for subtask {id}: {} (branch {})",
+                        checkout.path.display(),
+                        checkout.branch
+                    );
+                    worker_registry.record(id, checkout);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: keeping worker checkout for subtask {id} at '{}': could not \
+                         prove it is integrated: {error:#}",
+                        checkout.path.display()
+                    );
+                    worker_registry.record(id, checkout);
+                }
             }
         }
     } else {
@@ -1984,8 +2507,15 @@ impl<C: AgentClient> AgentClient for OrchestratedAgentClient<C> {
         // Shared worker registry: the launcher records each isolated worktree it
         // creates, and the broker's `integrate_subtasks` tool harvests them back
         // for the host-side merge. One instance threaded through both halves so
-        // they observe the same map.
-        let worker_registry = orchestration::WorkerRegistry::new();
+        // they observe the same map. Persisted under `<varda_home>/worktrees/` so
+        // a relaunched resident still sees a prior run's un-integrated workers
+        // (#1239).
+        let worker_registry = match config::varda_home() {
+            Ok(home) => {
+                orchestration::WorkerRegistry::persistent(home.join("worktrees").join("registry"))
+            }
+            Err(_) => orchestration::WorkerRegistry::new(),
+        };
         let launcher = VardaSubtaskLauncher {
             config: self.config.clone(),
             project_path: self.project_path.clone(),
@@ -2412,6 +2942,16 @@ fn resolve_credential_value(
     source: &config::CredentialSource<'_>,
     optional: bool,
 ) -> Result<Option<String>> {
+    resolve_credential_value_within(source, optional, None)
+}
+
+/// [`resolve_credential_value`] with an optional deadline for host credential
+/// commands: past it the child is killed and the resolution fails.
+fn resolve_credential_value_within(
+    source: &config::CredentialSource<'_>,
+    optional: bool,
+    timeout: Option<std::time::Duration>,
+) -> Result<Option<String>> {
     match source {
         config::CredentialSource::Env(name) => match std::env::var(name) {
             Ok(value) if !value.is_empty() => Ok(Some(value)),
@@ -2424,7 +2964,7 @@ fn resolve_credential_value(
             }
         },
         config::CredentialSource::Secret(name) => {
-            let value = run_host_credential_command("fnox", &["get", name]).with_context(|| {
+            let value = run_host_credential_command("fnox", &["get", name], timeout).with_context(|| {
                 format!("failed to resolve secret '{name}' from the host secret store (`fnox get {name}`)")
             })?;
             if value.is_empty() {
@@ -2439,7 +2979,7 @@ fn resolve_credential_value(
             Ok(Some(value))
         }
         config::CredentialSource::Command(cmd) => {
-            let value = run_host_credential_command("sh", &["-c", cmd])
+            let value = run_host_credential_command("sh", &["-c", cmd], timeout)
                 .with_context(|| format!("credential command failed on the host: {cmd}"))?;
             if value.is_empty() {
                 if optional {
@@ -2496,7 +3036,7 @@ fn resolve_env_secrets(
             );
         }
         let resolved =
-            run_host_credential_command("fnox", &["get", &secret]).with_context(|| {
+            run_host_credential_command("fnox", &["get", &secret], None).with_context(|| {
                 format!(
                     "failed to resolve env '{key}' from the host secret store (`fnox get {secret}`)"
                 )
@@ -2514,11 +3054,71 @@ fn resolve_env_secrets(
 /// Run a host-side credential minting command and return its stdout with the
 /// trailing newline trimmed. Never logs stdout (it is a secret); errors surface
 /// only the command and its stderr.
-fn run_host_credential_command(program: &str, args: &[&str]) -> Result<String> {
-    let output = std::process::Command::new(program)
+fn run_host_credential_command(
+    program: &str,
+    args: &[&str],
+    timeout: Option<std::time::Duration>,
+) -> Result<String> {
+    let Some(timeout) = timeout else {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to spawn host credential command `{program}`"))?;
+        return credential_command_output(program, args, output);
+    };
+    // Bounded: poll the child, drain its pipes on helper threads (so a chatty
+    // child cannot block on a full pipe) and kill it at the deadline. The readers
+    // are abandoned, not joined, on timeout: a grandchild may still hold the pipe.
+    let mut child = std::process::Command::new(program)
         .args(args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| format!("failed to spawn host credential command `{program}`"))?;
+    fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("waiting on host credential command")? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "`{program} {}` timed out after {}s and was killed",
+                args.join(" "),
+                timeout.as_secs_f32()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let grace = std::time::Duration::from_secs(2);
+    let output = std::process::Output {
+        status,
+        stdout: stdout.recv_timeout(grace).unwrap_or_default(),
+        stderr: stderr.recv_timeout(grace).unwrap_or_default(),
+    };
+    credential_command_output(program, args, output)
+}
+
+fn credential_command_output(
+    program: &str,
+    args: &[&str],
+    output: std::process::Output,
+) -> Result<String> {
     if !output.status.success() {
         anyhow::bail!(
             "`{program} {}` exited with {}: {}",
@@ -2737,6 +3337,12 @@ fn render_show_task_output(task_path: &Path, task_document: &task::TaskDocument)
     out.push_str(&task_content);
     if !task_content.ends_with('\n') {
         out.push('\n');
+    }
+    if let Some(external) = &task_document.frontmatter.external {
+        out.push_str(&format!("\nTracker: {} {}\n", external.backend, external.url));
+        if let Some(error) = &external.sync_error {
+            out.push_str(&format!("Tracker sync error: {error}\n"));
+        }
     }
     out.push_str("\n---\n\n");
 
@@ -4552,7 +5158,12 @@ fn default_orchestrate_workspace(
         .unwrap_or_else(|| varda_home.join("orchestrate").join("workspace"))
 }
 
-async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Result<()> {
+async fn orchestrate_command(
+    interactive: bool,
+    workspace: Option<&Path>,
+    pull_every: Option<u64>,
+) -> Result<()> {
+    let pull_every = pull_every.map(tracker::sync::check_pull_every).transpose()?;
     let config_path = config::config_file()?;
     let config = config::resolve_config(&config_path)?;
 
@@ -4610,10 +5221,67 @@ async fn orchestrate_command(interactive: bool, workspace: Option<&Path>) -> Res
     // wraps the session in the 461d interactive broker so `run_subtask` is served
     // for the whole session. `--interactive` attaches the TTY (M13b); headless runs
     // the resident autonomously until it terminates or signals needs_user.
-    run_task_command(&task_path, interactive, false).await
+    let puller = pull_every.and_then(|every| {
+        let names = tracker::sync::trackers_covered_by(&config, &workspace);
+        if names.is_empty() {
+            println!("orchestrate: --pull-every ignored: no tracker covers this workspace");
+            return None;
+        }
+        println!(
+            "orchestrate: pulling tracker(s) {} every {}s (host-side)",
+            names.join(", "),
+            every.as_secs()
+        );
+        Some(tokio::spawn(tracker::sync::pull_loop(
+            config.clone(),
+            names,
+            every,
+            tracker::sync::PULL_TIMEOUT,
+        )))
+    });
+    let result = run_task_command(&task_path, interactive, false).await;
+    if let Some(handle) = puller {
+        handle.abort();
+    }
+    result
+}
+
+/// Where a scripted caller wants the agent's final answer (`--print-result` /
+/// `--result-file`). Default (neither set) leaves the run output unchanged.
+#[derive(Debug, Default, Clone)]
+struct ResultOutput {
+    /// Print only the agent's answer on stdout; all Varda chatter goes to stderr.
+    print: bool,
+    /// Write the agent's answer to this file.
+    file: Option<PathBuf>,
+}
+
+impl ResultOutput {
+    fn requested(&self) -> bool {
+        self.print || self.file.is_some()
+    }
+}
+
+/// Strips the `---\ntask: …\n---\n\n` header `write_recap` prepends, leaving the
+/// agent's own final message.
+fn recap_body(recap_file: &str) -> &str {
+    recap_file
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map_or(recap_file, |(_, body)| body.trim_start_matches('\n'))
 }
 
 async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> Result<()> {
+    run_task_command_with(task_path, interactive, quiet, &ResultOutput::default()).await
+}
+
+async fn run_task_command_with(
+    task_path: &Path,
+    interactive: bool,
+    quiet: bool,
+    result_output: &ResultOutput,
+) -> Result<()> {
+    let to_stderr = result_output.print;
     let config_path = config::config_file()?;
     let config = config::resolve_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_path)?;
@@ -4622,21 +5290,32 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     // from the repo-local DEFINITION before route/agent resolution reads them
     // below (#1024) and persist to the operations copy.
     task::sync_definition_fields_from_repo(&mut task_document)?;
+    if result_output.requested() {
+        task_document.frontmatter.bounds.bare_result = true;
+    }
     task::write_task(&task_document)?;
     let id_str = task_document
         .frontmatter
         .id
         .map(|id| format!(" #{id}"))
         .unwrap_or_default();
-    println!("Running task{}: {}", id_str, task_document.title());
-    println!();
-    print!("{}", task_document.body.trim());
-    println!();
-    println!();
-    println!("---");
-    println!();
+    say!(
+        to_stderr,
+        "Running task{}: {}",
+        id_str,
+        task_document.title()
+    );
+    say!(to_stderr,);
+    say!(to_stderr, "{}", task_document.body.trim());
+    say!(to_stderr,);
+    say!(to_stderr, "---");
+    say!(to_stderr,);
     let route = routing::match_route_for_task(&config, &task_document, false)?;
-    println!("estimated_prompt_tokens: {}", route.estimated_prompt_tokens);
+    say!(
+        to_stderr,
+        "estimated_prompt_tokens: {}",
+        route.estimated_prompt_tokens
+    );
     let agent_config = config
         .agents
         .get(&route.agent)
@@ -4696,7 +5375,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
             &task_path,
             &format!("Snapshot task {} before run", task_path.display()),
         )?;
-        println!("committed task snapshot");
+        say!(to_stderr, "committed task snapshot");
     }
     // Pre-run dirty-set snapshot of the project repo (#816): taken before the
     // agent runs so the post-run completeness check can tell "the run changed
@@ -4722,7 +5401,7 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     } else {
         Some(Vec::new())
     };
-    let stream = !quiet && !interactive;
+    let stream = !quiet && !interactive && !result_output.requested();
     let mut outcome = runner::run_task(
         &config,
         &display_name,
@@ -4735,7 +5414,8 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
         stream,
     )
     .await?;
-    println!(
+    say!(
+        to_stderr,
         "processed task={} agent={} glob={} status={:?} recap={}",
         task_path.display(),
         display_name,
@@ -4745,12 +5425,27 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     );
 
     if !outcome.blocked_commands.is_empty() {
-        println!();
-        println!("blocked_commands: {}", outcome.blocked_commands.join(", "));
-        println!(
+        say!(to_stderr,);
+        say!(
+            to_stderr,
+            "blocked_commands: {}",
+            outcome.blocked_commands.join(", ")
+        );
+        say!(
+            to_stderr,
             "hint: add these to the task's `allow_commands` frontmatter and re-run to authorize them headlessly"
         );
     }
+
+    // Capture the agent's own final message now: the verification gate below
+    // appends sections to the recap file.
+    let agent_answer = if result_output.requested() {
+        let recap_file = fs::read_to_string(&outcome.recap_path)
+            .with_context(|| format!("failed to read recap at {}", outcome.recap_path.display()))?;
+        Some(recap_body(&recap_file).trim().to_owned())
+    } else {
+        None
+    };
 
     let mut may_commit_files = true;
     if config.git.auto_commit && let Some(project) = task_document.frontmatter.project.clone() {
@@ -4769,18 +5464,16 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
 
     let recap_content = fs::read_to_string(&outcome.recap_path)
         .with_context(|| format!("failed to read recap at {}", outcome.recap_path.display()))?;
-    println!();
-    println!("---");
-    println!();
-    print!("{recap_content}");
-    if !recap_content.ends_with('\n') {
-        println!();
-    }
+    say!(to_stderr,);
+    say!(to_stderr, "---");
+    say!(to_stderr,);
+    say!(to_stderr, "{}", recap_content.trim_end_matches('\n'));
 
     let notification = if outcome.status == task::TaskStatus::NeedsUser {
         let notification =
             notify::notify_user_interaction(&config, &task_path, &outcome.recap_path)?;
-        println!(
+        say!(
+            to_stderr,
             "user interaction required; notification={}",
             notification.display()
         );
@@ -4790,7 +5483,14 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
     };
     if config.git.auto_commit {
         if may_commit_files && let Some(project) = task_document.frontmatter.project.as_deref() {
-            commit_agent_files_for_task(&task_path, project, &outcome.files_touched);
+            commit_agent_files_for_task(
+                &config,
+                &task_path,
+                project,
+                &outcome.files_touched,
+                to_stderr,
+            )
+            .await;
         }
         git::commit_task_update(
             &task_path,
@@ -4798,13 +5498,36 @@ async fn run_task_command(task_path: &Path, interactive: bool, quiet: bool) -> R
             &outcome.session_log_path,
             notification.as_deref(),
         )?;
-        println!("committed task update");
+        say!(to_stderr, "committed task update");
+    }
+
+    if let Some(answer) = agent_answer {
+        if outcome.status == task::TaskStatus::Failed {
+            anyhow::bail!(
+                "agent run failed for task {}; see recap {}",
+                task_path.display(),
+                outcome.recap_path.display()
+            );
+        }
+        if let Some(path) = &result_output.file {
+            fs::write(path, format!("{answer}\n"))
+                .with_context(|| format!("failed to write result to {}", path.display()))?;
+        }
+        if result_output.print {
+            println!("{answer}");
+        }
     }
 
     Ok(())
 }
 
-fn commit_agent_files_for_task(task_path: &Path, project: &str, files_touched: &[PathBuf]) {
+async fn commit_agent_files_for_task(
+    config: &config::Config,
+    task_path: &Path,
+    project: &str,
+    files_touched: &[PathBuf],
+    to_stderr: bool,
+) {
     if files_touched.is_empty() {
         return;
     }
@@ -4814,17 +5537,35 @@ fn commit_agent_files_for_task(task_path: &Path, project: &str, files_touched: &
         .and_then(|s| s.to_str())
         .unwrap_or("task");
     let message = format!("Apply task {id} agent changes");
-    if let Err(error) = git::commit_agent_files(project_path, files_touched, &message) {
-        eprintln!(
+    match git::commit_agent_files(project_path, files_touched, &message) {
+        Err(error) => eprintln!(
             "warning: failed to commit agent files for task {}: {error:#}",
             task_path.display()
-        );
-    } else {
-        println!(
-            "committed {} agent file(s) in {}",
-            files_touched.len(),
-            project_path.display()
-        );
+        ),
+        Ok(sha) => {
+            say!(
+                to_stderr,
+                "committed {} agent file(s) in {}",
+                files_touched.len(),
+                project_path.display()
+            );
+            // A tracker-linked task gets the commit hash (and branch / artifact
+            // link) as a follow-up comment; a plain task skips this entirely.
+            if let Some(sha) = sha {
+                let report = tracker::push::CommitReport {
+                    shas: vec![sha],
+                    branch: git::current_branch(project_path).ok().flatten(),
+                    origin_url: git::origin_url(project_path),
+                };
+                tracker::push::push_commit_links(
+                    config,
+                    task_path,
+                    &report,
+                    tracker::push::PUSH_TIMEOUT,
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -5661,6 +6402,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recap_body_strips_write_recap_header() {
+        let file = "---\ntask: /t/x.md\n---\n\nhi there\n";
+        assert_eq!(recap_body(file), "hi there\n");
+        assert_eq!(recap_body("no header"), "no header");
+    }
+
+    #[test]
+    fn result_output_requested_only_when_a_flag_is_set() {
+        assert!(!ResultOutput::default().requested());
+        assert!(
+            ResultOutput {
+                print: true,
+                file: None
+            }
+            .requested()
+        );
+        assert!(
+            ResultOutput {
+                print: false,
+                file: Some(PathBuf::from("/tmp/r"))
+            }
+            .requested()
+        );
+    }
+
+    #[test]
     fn egress_auto_resume_does_not_suppress_needs_user_editor_offer() {
         assert_eq!(resume_prompt_policy(true, true), (true, false));
         assert_eq!(resume_prompt_policy(true, false), (true, true));
@@ -5753,6 +6520,7 @@ mod tests {
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
@@ -6562,6 +7330,7 @@ planner_agent: codex
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
@@ -7437,6 +8206,142 @@ deny_sandboxes = ["local"]
         let _ = fs::remove_dir_all(root);
     }
 
+    // #1239: a resident that settles `needs_user` before integrating counts as a
+    // successful root run; teardown must still keep every un-integrated worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_root_run_keeps_unintegrated_worker_checkouts() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-root-worker-keep-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        seed_git_repo(&mother);
+
+        // Uncommitted output (a new, untracked file) — the #1227 loss scenario.
+        let dirty = git::create_worker_worktree(&mother, "dirty", &root.join("dirty"))
+            .expect("dirty worker checkout should be created");
+        fs::write(dirty.path.join("new_module.rs"), "pub fn f() {}\n").unwrap();
+
+        // Committed on its wip branch but never merged into the mother.
+        let unmerged = git::create_worker_worktree(&mother, "unmerged", &root.join("unmerged"))
+            .expect("unmerged worker checkout should be created");
+        fs::write(unmerged.path.join("feature.txt"), "work\n").unwrap();
+        for args in [
+            vec!["add", "feature.txt"],
+            vec!["commit", "-q", "-m", "worker change"],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&unmerged.path)
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed in worker clone");
+        }
+
+        // No-op worker: clean and still at its base — safe to reclaim.
+        let noop = git::create_worker_worktree(&mother, "noop", &root.join("noop"))
+            .expect("noop worker checkout should be created");
+
+        let registry = orchestration::WorkerRegistry::new();
+        registry.record("dirty".to_owned(), dirty.clone());
+        registry.record("unmerged".to_owned(), unmerged.clone());
+        registry.record("noop".to_owned(), noop.clone());
+
+        finish_spawned_subtasks(
+            &orchestration::SharedSpawnState::new(),
+            &registry,
+            &mother,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(dirty.path.exists(), "uncommitted worker output must survive teardown");
+        assert!(unmerged.path.exists(), "unmerged worker branch must survive teardown");
+        assert!(!noop.path.exists(), "a no-op worker clone is reclaimed");
+        assert!(registry.get("dirty").is_some(), "kept checkout stays registered");
+        assert!(registry.get("unmerged").is_some(), "kept checkout stays registered");
+        assert!(registry.get("noop").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persistent_worker_registry_survives_a_new_instance() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-worker-registry-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        seed_git_repo(&mother);
+        let checkout = git::create_worker_worktree(&mother, "persisted", &root.join("w"))
+            .expect("worker checkout should be created");
+        let store = root.join("registry");
+
+        orchestration::WorkerRegistry::persistent(store.clone())
+            .record("1227".to_owned(), checkout.clone());
+
+        let reloaded = orchestration::WorkerRegistry::persistent(store.clone());
+        let found = reloaded.get("1227").expect("entry survives a relaunch");
+        assert_eq!(found.path, checkout.path);
+        assert_eq!(found.branch, checkout.branch);
+
+        // Entries whose clone vanished are dropped on load.
+        fs::remove_dir_all(&checkout.path).unwrap();
+        assert!(orchestration::WorkerRegistry::persistent(store).get("1227").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // A registry instance never tears down an entry it only LOADED from disk
+    // (possibly a concurrent resident's live worker), even one that looks
+    // reclaimable; and the kept entry's file survives teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_ignores_entries_another_run_owns() {
+        let root = std::env::temp_dir().join(format!(
+            "varda-worker-registry-owner-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let mother = root.join("repo");
+        seed_git_repo(&mother);
+        let store = root.join("registry");
+        let foreign = git::create_worker_worktree(&mother, "foreign", &root.join("foreign"))
+            .expect("worker checkout should be created");
+        let other_run = orchestration::WorkerRegistry::persistent(store.clone());
+        other_run.record("other".to_owned(), foreign.clone());
+
+        let this_run = orchestration::WorkerRegistry::persistent(store.clone());
+        finish_spawned_subtasks(
+            &orchestration::SharedSpawnState::new(),
+            &this_run,
+            &mother,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(foreign.path.exists(), "another run's clean worker must not be reclaimed");
+        assert!(store.join("other.json").exists(), "its registry entry must survive");
+
+        // The owning run reclaims it and drops the entry file.
+        finish_spawned_subtasks(
+            &orchestration::SharedSpawnState::new(),
+            &other_run,
+            &mother,
+            true,
+            true,
+        )
+        .await;
+        assert!(!foreign.path.exists());
+        assert!(!store.join("other.json").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// Test double for `OrchestratedAgentClient`'s inner agent: it never spawns a
     /// real subprocess. It records what the broker wiring handed it (the injected
     /// `orchestration_socket_path`, whether the request was interactive) and probes
@@ -7532,6 +8437,7 @@ deny_sandboxes = ["local"]
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
@@ -8147,6 +9053,7 @@ deny_sandboxes = ["local"]
                 agent_resume_commands: vec![],
                 allow_commands: vec![],
                 requires_user: false,
+                external: None,
             },
             body: "# Task\n".to_owned(),
         }
@@ -8192,6 +9099,7 @@ deny_sandboxes = ["local"]
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         let sessions = task_sessions(&config, &task_path).expect("sessions should be found");
@@ -8244,6 +9152,7 @@ Do it.
             include: Vec::new(),
             requires_commands: Vec::new(),
             requires_secrets: Vec::new(),
+            trackers: Vec::new(),
         };
 
         record_background_launch_failure(&config, &task_path, "agent binary was not found")

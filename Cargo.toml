@@ -1,6 +1,6 @@
 [package]
 name = "varda"
-version = "0.3.1"
+version = "0.4.2"
 edition = "2024"
 description = "Routes markdown tasks to AI agents (Claude, Codex, Copilot) and tracks their lifecycle"
 license = "MIT"
@@ -18,11 +18,20 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 tokio = { version = "1.48", features = ["sync", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
 toml = "0.9"
+# HTTPS client for issue-tracker backends (rustls + webpki roots; no gzip/json/native-tls).
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 uuid = { version = "1.19", features = ["v4"] }
 sha2 = "0.11.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `processcontainer` primitive (Windows MXC). Pinned to MXC main for
+# microsoft/mxc#1490 (identity-less loopback proxy on PSEC 1.0 hosts); move to
+# crates.io `mxc-sdk = "1.0.1"` once it is published.
+[target.'cfg(windows)'.dependencies]
+mxc-sdk = { git = "https://github.com/microsoft/mxc", rev = "fda29ac6", default-features = false }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 # The profile that 'dist' will build with
 [profile.dist]
