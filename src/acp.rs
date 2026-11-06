@@ -246,7 +246,10 @@ impl AcpSubprocessClient {
             // it through the guest shell keeps the invocation inside the selected
             // sandbox; treating it as a fresh agent command silently starts a new
             // session and makes auto-resume illusory.
-            ("sh".to_owned(), vec!["-c".to_owned(), resume.to_owned()])
+            (
+                "sh".to_owned(),
+                vec!["-c".to_owned(), expand_varda_project(resume)],
+            )
         } else {
             (fresh_command, args)
         };
@@ -1324,7 +1327,7 @@ impl AcpSubprocessClient {
             request.frontmatter.project.as_deref().unwrap_or(""),
         );
         Some(
-            template
+            expand_varda_project(template)
                 .replace("{external_session_id}", &session_id)
                 .replace("{project}", &project),
         )
@@ -1836,11 +1839,16 @@ fn expand_arg(arg: &str, request: &AgentRunRequest, project: &str) -> String {
         .replace("{task}", &request.task_path)
 }
 
+/// Commands recorded before `build_resume_command` expanded them still carry
+/// the config-injected `{varda_project}`/`{varda_home}` placeholders; expand them
+/// here so the sandbox drop pass can match the host paths and the agent never
+/// sees a literal `--add-dir {varda_project}`.
 fn resume_args_for_command(command: &str, resume_command: &str) -> Vec<String> {
+    let resume_command = expand_varda_project(resume_command);
     if command == "sh" || command.ends_with("/sh") {
-        vec!["-c".to_owned(), resume_command.to_owned()]
+        vec!["-c".to_owned(), resume_command]
     } else {
-        vec![resume_command.to_owned()]
+        vec![resume_command]
     }
 }
 
@@ -2203,6 +2211,29 @@ mod tests {
         assert_eq!(
             spec.args[1],
             "copilot -p \"$(cat $VARDA_PROMPT_FILE)\" --allow-all-tools"
+        );
+    }
+
+    /// A resume command recorded with the config-injected placeholders still
+    /// unexpanded (as every copilot/claude/codex resume was before the fix)
+    /// must reach the guest with them expanded, so the drop pass strips them
+    /// instead of copilot exiting on a literal `--add-dir {varda_project}`.
+    #[test]
+    fn stored_resume_command_placeholders_are_expanded_then_dropped_in_sandbox() {
+        let stored = "exec copilot --resume='abc' --add-dir '/proj' --allow-all-tools \
+                      --add-dir {varda_project} --add-dir {varda_home}";
+        let mut spec = CommandSpec {
+            program: "sh".to_owned(),
+            args: resume_args_for_command("sh", stored),
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        assert!(!spec.args[1].contains("{varda_"));
+        let dropped = drop_unreachable_varda_add_dirs(&mut spec, &[PathBuf::from("/proj")]);
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(
+            spec.args[1],
+            "exec copilot --resume='abc' --add-dir '/proj' --allow-all-tools"
         );
     }
 
