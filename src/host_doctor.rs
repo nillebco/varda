@@ -77,6 +77,8 @@ pub fn sandbox_verdicts(
 
 pub async fn doctor_host_command() -> Result<()> {
     let mut backends = BTreeMap::new();
+    println!("host: {}", host_os());
+    println!();
     println!("isolation backends on this host:");
     for backend in BACKENDS {
         let availability = probe_backend(backend).await;
@@ -203,6 +205,87 @@ async fn probe_microsandbox() -> Availability {
         Ok(version) => Availability::Available(version),
         Err(reason) => Availability::Unavailable(reason),
     }
+}
+
+/// One-line host OS description. On Windows this is the exact build (incl. the
+/// cumulative-update revision), since processcontainer support — PSEC 1.0 and the
+/// identity-less loopback proxy — tracks the OS build, not the edition.
+fn host_os() -> String {
+    let arch = std::env::consts::ARCH;
+    #[cfg(windows)]
+    {
+        match windows_build() {
+            Some(build) => format!("windows {build}, {arch}"),
+            None => format!("windows (build unreadable), {arch}"),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        format!("{}, {arch}", std::env::consts::OS)
+    }
+}
+
+/// `10.0.<CurrentBuild>.<UBR> (<DisplayVersion>)` from the registry, e.g.
+/// `10.0.26100.4652 (24H2)`. `GetVersionEx` lies without a manifest; the
+/// registry does not.
+#[cfg(windows)]
+fn windows_build() -> Option<String> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
+    };
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let key = wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+    let read_sz = |name: &str| -> Option<String> {
+        let name = wide(name);
+        let mut buf = [0u16; 128];
+        let mut size = std::mem::size_of_val(&buf) as u32;
+        // SAFETY: buffer and size describe a valid, writable region; strings are NUL-terminated.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..len]))
+    };
+    let read_dword = |name: &str| -> Option<u32> {
+        let name = wide(name);
+        let mut value = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        // SAFETY: value and size describe a valid, writable u32.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        (status == 0).then_some(value)
+    };
+    let build = read_sz("CurrentBuild")?;
+    let mut out = format!("10.0.{build}");
+    if let Some(ubr) = read_dword("UBR") {
+        out.push_str(&format!(".{ubr}"));
+    }
+    if let Some(display) = read_sz("DisplayVersion") {
+        out.push_str(&format!(" ({display})"));
+    }
+    Some(out)
 }
 
 #[cfg(windows)]
