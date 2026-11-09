@@ -301,7 +301,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -664,7 +664,8 @@ dependencies = [
 [[package]]
 name = "mxc-sdk"
 version = "1.0.1"
-source = "git+https://github.com/microsoft/mxc?rev=fda29ac6#fda29ac63bc306b7f97f3b86b4b63d44f7f40cf2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c9e2d05b3953fdb34c44e4de8d8f2b447f4444534cb95294b72fb297a468f61"
 dependencies = [
  "anyhow",
  "base64",
@@ -866,7 +867,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1117,7 +1118,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1479,7 +1480,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
