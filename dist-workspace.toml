@@ -17,3 +17,8 @@ tap = "nillebco/homebrew-tap"
 publish-jobs = ["homebrew"]
 # Whether to install an updater program
 install-updater = false
+
+# GitHub retired the macos-14 image dist defaults to for Apple Silicon (v0.5.0 run cancelled:
+# "macos-14-arm64-us-default is not supported").
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
