@@ -2,6 +2,9 @@
 
 Sandbox providers, credentials, per-folder overrides, and the isolation invariants.
 
+What each primitive actually blocks (files, egress, env, desktop, resources), with what is
+verified and what is not: [isolation.md](./isolation.md).
+
 ## Sandbox providers
 
 Varda can run an agent inside an isolated sandbox instead of directly on your machine:

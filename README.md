@@ -153,6 +153,7 @@ binaries, publishes a GitHub Release, and pushes the formula to `nillebco/homebr
 | [Tasks](docs/tasks.md) | creating, running, inspecting, resuming |
 | [Configuration](docs/configuration.md) | routes, agents, `config.toml` reference |
 | [Sandboxing](docs/sandboxing.md) | providers, credentials, isolation invariants |
+| [Isolation](docs/isolation.md) | what each primitive actually blocks, verified vs not |
 | [Orchestration](docs/orchestration.md) | sub-task spawning, the resident, roles |
 | [The agent contract](docs/agent-contract.md) | what the agent is told, execution bounds |
 | [Git behavior](docs/git.md) | what gets committed, verification gate |
