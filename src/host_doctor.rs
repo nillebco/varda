@@ -77,6 +77,8 @@ pub fn sandbox_verdicts(
 
 pub async fn doctor_host_command() -> Result<()> {
     let mut backends = BTreeMap::new();
+    println!("host: {}", host_os());
+    println!();
     println!("isolation backends on this host:");
     for backend in BACKENDS {
         let availability = probe_backend(backend).await;
@@ -205,6 +207,127 @@ async fn probe_microsandbox() -> Availability {
     }
 }
 
+/// One-line host OS description. On Windows this is the exact build (incl. the
+/// cumulative-update revision), since processcontainer support — PSEC 1.0 and the
+/// identity-less loopback proxy — tracks the OS build, not the edition.
+fn host_os() -> String {
+    let arch = std::env::consts::ARCH;
+    #[cfg(windows)]
+    {
+        match windows_build() {
+            Some(build) => format!("windows {}, {arch}", build.render()),
+            None => format!("windows (build unreadable), {arch}"),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        format!("{}, {arch}", std::env::consts::OS)
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsBuild {
+    build: u32,
+    /// Cumulative-update revision (`UBR`), the part after the build number.
+    ubr: Option<u32>,
+    /// Marketing version, e.g. `24H2`.
+    display: Option<String>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl WindowsBuild {
+    /// `10.0.26100.4652 (24H2)`.
+    fn render(&self) -> String {
+        let mut out = format!("10.0.{}", self.build);
+        if let Some(ubr) = self.ubr {
+            out.push_str(&format!(".{ubr}"));
+        }
+        if let Some(display) = &self.display {
+            out.push_str(&format!(" ({display})"));
+        }
+        out
+    }
+
+    /// Why processcontainer can't run agent CLIs on this build, if it can't.
+    /// From 26100.9711 / 26200.9711 (October 2026 CU) path resolution works
+    /// inside a BaseContainer (microsoft/mxc#1464); before that git, Node's
+    /// `realpath.native` and Rust's `canonicalize` fail with "access denied".
+    fn processcontainer_shortfall(&self) -> Option<String> {
+        const MIN_UBR: u32 = 9711;
+        let too_old = match self.build {
+            b if b < 26100 => true,
+            26100 | 26200 => self.ubr.is_some_and(|ubr| ubr < MIN_UBR),
+            _ => false,
+        };
+        too_old.then(|| {
+            format!(
+                "Windows build {} is older than 26100.{MIN_UBR} / 26200.{MIN_UBR}: \
+                 agent CLIs fail with \"access denied\" in the container (microsoft/mxc#1464)",
+                self.render()
+            )
+        })
+    }
+}
+
+/// CurrentBuild, UBR and DisplayVersion from the registry. `GetVersionEx`
+/// lies without a manifest; the registry does not.
+#[cfg(windows)]
+fn windows_build() -> Option<WindowsBuild> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
+    };
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let key = wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+    let read_sz = |name: &str| -> Option<String> {
+        let name = wide(name);
+        let mut buf = [0u16; 128];
+        let mut size = std::mem::size_of_val(&buf) as u32;
+        // SAFETY: buffer and size describe a valid, writable region; strings are NUL-terminated.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..len]))
+    };
+    let read_dword = |name: &str| -> Option<u32> {
+        let name = wide(name);
+        let mut value = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        // SAFETY: value and size describe a valid, writable u32.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        (status == 0).then_some(value)
+    };
+    Some(WindowsBuild {
+        build: read_sz("CurrentBuild")?.trim().parse().ok()?,
+        ubr: read_dword("UBR"),
+        display: read_sz("DisplayVersion"),
+    })
+}
+
 #[cfg(windows)]
 async fn probe_processcontainer() -> Availability {
     let probe = tokio::task::spawn_blocking(|| mxc_sdk::v1::probe(None)).await;
@@ -214,7 +337,15 @@ async fn probe_processcontainer() -> Availability {
         Ok(Ok(output)) => output,
     };
     match serde_json::to_value(&output) {
-        Ok(value) => processcontainer_verdict(&value),
+        Ok(value) => match processcontainer_verdict(&value) {
+            Availability::Available(detail) => {
+                match windows_build().and_then(|b| b.processcontainer_shortfall()) {
+                    Some(shortfall) => Availability::Unavailable(shortfall),
+                    None => Availability::Available(detail),
+                }
+            }
+            unavailable => unavailable,
+        },
         Err(error) => Availability::Unavailable(format!("unreadable MXC probe: {error}")),
     }
 }
@@ -314,6 +445,27 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown primitive")
         );
+    }
+
+    #[test]
+    fn windows_build_gates_processcontainer() {
+        let build = |build, ubr| WindowsBuild {
+            build,
+            ubr: Some(ubr),
+            display: None,
+        };
+        assert!(build(26100, 9711).processcontainer_shortfall().is_none());
+        assert!(build(26200, 9800).processcontainer_shortfall().is_none());
+        assert!(build(26300, 1).processcontainer_shortfall().is_none());
+        assert!(build(26100, 4652).processcontainer_shortfall().is_some());
+        assert!(build(26200, 9710).processcontainer_shortfall().is_some());
+        assert!(build(22631, 9999).processcontainer_shortfall().is_some());
+        let named = WindowsBuild {
+            build: 26100,
+            ubr: Some(4652),
+            display: Some("24H2".to_owned()),
+        };
+        assert_eq!(named.render(), "10.0.26100.4652 (24H2)");
     }
 
     #[test]

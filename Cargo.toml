@@ -30,7 +30,7 @@ libc = "0.2"
 # microsoft/mxc#1490 (identity-less loopback proxy on PSEC 1.0 hosts).
 [target.'cfg(windows)'.dependencies]
 mxc-sdk = { version = "1.0.1", default-features = false }
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Threading"] }
 
 # The profile that 'dist' will build with
 [profile.dist]
