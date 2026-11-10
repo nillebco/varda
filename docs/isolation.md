@@ -21,7 +21,7 @@ those settings actually guarantee.
 | Egress, empty list | open | `--network none` | `--net-default deny` | MXC `egress: deny`, no proxy |
 | Egress, with a list | open | proxy sidecar on an `--internal` network (`proxy`/`strict`), or DNS pins (`dns-pin`) | in-guest net rules per host | one loopback proxy in the varda relay |
 | Host env inherited | yes | no | no | no (`inheritDefaultEnv: false`) |
-| Desktop / UI | full | none (no display) | none | **open**: `ui.disable: false` |
+| Desktop / UI | full | none (no display) | none | **partly open**: clipboard and other windows blocked; screen capture and `SendInput` open (`ui.disable: false`) |
 | CPU / memory caps | no | opt-in `memory`/`cpus` | opt-in `memory`/`cpus` | none set |
 
 ## Shared rules (every non-`local` primitive)
@@ -127,10 +127,25 @@ supported.
 
 **Not limited.**
 - **Desktop.** `ui.disable: false`, because Node and PowerShell fail Win32k initialisation
-  (0xC0000142) without UI access. The job-object UI limits are therefore off and the agent shares
-  your interactive desktop. Clipboard, other windows, screen capture and synthetic input are
-  presumed reachable until measured: run a clipboard/UI probe (a host baseline, then the same probe
-  inside the container) on the target host and record the result here.
+  (0xC0000142) without UI access, so the job-object UI limits are off and the agent runs on your
+  interactive desktop. Measured on a Windows 365 Cloud PC (2026-11-10) with a
+  clipboard/UI probe run first on the host as a baseline, then in the container:
+
+  | Capability | Container |
+  |---|---|
+  | read the clipboard | blocked (verified) |
+  | write the clipboard | blocked (verified) |
+  | see other windows' titles | blocked (verified) |
+  | rename another process's window | blocked (verified) |
+  | capture the screen | **open** (verified: real pixels) |
+  | synthetic keyboard input (`SendInput`) | **accepted** (verified); delivery to another window unverified |
+
+  The restricted token cuts the clipboard and cross-process window access. It does not stop a
+  screen capture: anything visible on the desktop, in any application, is readable by the agent.
+  `SendInput` reports success even when Windows drops the events, so whether keystrokes reach
+  the focused window (a terminal, for instance) is still open; until it is measured, treat it
+  as reachable. Until varda can run the container on a separate desktop, keep sensitive windows
+  closed or minimised while a session runs.
 - **Resources.** No CPU, memory or process caps are set, and `timeout: 0` (MXC supports job-object
   caps; spike #1170 confirmed they work without admin).
 - **Same kernel and session.** A Windows privilege escalation from the restricted token reaches
