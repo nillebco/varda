@@ -21,7 +21,7 @@ those settings actually guarantee.
 | Egress, empty list | open | `--network none` | `--net-default deny` | MXC `egress: deny`, no proxy |
 | Egress, with a list | open | proxy sidecar on an `--internal` network (`proxy`/`strict`), or DNS pins (`dns-pin`) | in-guest net rules per host | one loopback proxy in the varda relay |
 | Host env inherited | yes | no | no | no (`inheritDefaultEnv: false`) |
-| Desktop / UI | full | none (no display) | none | **partly open**: clipboard and other windows blocked; screen capture and `SendInput` open (`ui.disable: false`) |
+| Desktop / UI | full | none (no display) | none | **screen capture open**; clipboard, other windows and keystroke delivery blocked (`ui.disable: false`) |
 | CPU / memory caps | no | opt-in `memory`/`cpus` | opt-in `memory`/`cpus` | none set |
 
 ## Shared rules (every non-`local` primitive)
@@ -138,14 +138,15 @@ supported.
   | see other windows' titles | blocked (verified) |
   | rename another process's window | blocked (verified) |
   | capture the screen | **open** (verified: real pixels) |
-  | synthetic keyboard input (`SendInput`) | **accepted** (verified); delivery to another window unverified |
+  | synthetic keystrokes reaching another window | blocked (verified: `SendInput` accepts the events, none arrive) |
 
-  The restricted token cuts the clipboard and cross-process window access. It does not stop a
-  screen capture: anything visible on the desktop, in any application, is readable by the agent.
-  `SendInput` reports success even when Windows drops the events, so whether keystrokes reach
-  the focused window (a terminal, for instance) is still open; until it is measured, treat it
-  as reachable. Until varda can run the container on a separate desktop, keep sensitive windows
-  closed or minimised while a session runs.
+  The restricted token cuts the clipboard and cross-process window access, and Windows drops the
+  container's synthetic input before it reaches a normal-integrity window (the probe types into a
+  focused, topmost window of the user's; the host baseline receives the text, the container's does
+  not), so the agent cannot type into your terminal. It does not stop a screen capture: anything
+  visible on the desktop, in any application, is readable by the agent. Until varda can run the
+  container on a separate desktop, keep sensitive windows closed or minimised while a session runs.
+  Probe: a host-baseline-then-container clipboard/UI script (`ui-probe.ps1` with its driver).
 - **Resources.** No CPU, memory or process caps are set, and `timeout: 0` (MXC supports job-object
   caps; spike #1170 confirmed they work without admin).
 - **Same kernel and session.** A Windows privilege escalation from the restricted token reaches
