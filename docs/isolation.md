@@ -137,7 +137,7 @@ supported.
   | write the clipboard | blocked (verified) |
   | see other windows' titles | blocked (verified) |
   | rename another process's window | blocked (verified) |
-  | capture the screen | **open** (verified: real pixels) |
+  | capture the screen | **open** (verified: the capture contains a marker window the driver paints on the user's desktop) |
   | synthetic keystrokes reaching another window | blocked (verified: `SendInput` accepts the events, none arrive) |
 
   The restricted token cuts the clipboard and cross-process window access, and Windows drops the
