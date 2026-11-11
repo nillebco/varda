@@ -159,10 +159,30 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Best-effort symlink resolution for prefix matching; falls back to the path as
-/// written when it does not yet exist on the host.
+/// Best-effort symlink resolution for prefix matching. A path that does not
+/// exist yet is resolved through its deepest existing ancestor, with the missing
+/// tail re-appended: otherwise `~/.azure/missing.json` stays as written while an
+/// existing `~/.azure` behind a symlink canonicalises elsewhere, and the two no
+/// longer share a prefix. Falls back to the path as written when no ancestor
+/// resolves (or the missing tail contains `..`).
 fn resolve_symlinks(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    let mut missing = Vec::new();
+    let mut current = path;
+    while let Some(parent) = current.parent() {
+        let Some(name) = current.file_name() else {
+            break;
+        };
+        missing.push(name);
+        if let Ok(mut resolved) = std::fs::canonicalize(parent) {
+            resolved.extend(missing.iter().rev());
+            return resolved;
+        }
+        current = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Control-plane paths (relative to `$HOME`) that may never be mounted into ANY
@@ -4346,6 +4366,37 @@ mod tests {
     /// `~/.terraform.d` — both in our documented cloud recipes — is REFUSED. Proven
     /// two ways: the denylist predicate rejects the resolved source, AND a docker
     /// `wrap()` carrying such a mount fails (the real rejection path a launch takes).
+    /// A path that does not exist yet still resolves through its existing,
+    /// symlinked ancestors, so it is compared in the same (canonical) spelling as
+    /// an existing denylisted dir.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_symlinks_resolves_missing_leaf_through_symlinked_ancestor() {
+        let base = std::env::temp_dir().join(format!(
+            "varda-resolve-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+
+        assert_eq!(
+            resolve_symlinks(&base.join("link").join("missing").join("tokens.json")),
+            real.join("missing").join("tokens.json")
+        );
+        assert_eq!(resolve_symlinks(&base.join("link")), real);
+        // A `..` in the missing tail is not re-appended: left as written.
+        let dotdot = base.join("link").join("missing").join("..").join("x");
+        assert_eq!(resolve_symlinks(&dotdot), dotdot);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn m11ext_credential_denylist_rejects_azure_and_terraform() {
         let home = std::env::var("HOME").expect("HOME set in tests");
