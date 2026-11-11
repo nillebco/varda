@@ -4015,6 +4015,11 @@ mod tests {
     /// box (the stub provider's `prepare` would otherwise panic).
     #[tokio::test]
     async fn sandboxed_interactive_requires_a_tty() {
+        // `cargo test` from an interactive shell inherits the terminal on stdin,
+        // so the guard rightly lets the launch through; nothing to assert then.
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            return;
+        }
         let config = interactive_shell_config();
         let client =
             AcpSubprocessClient::with_sandbox("sh", &config, Arc::new(FakeSandboxProvider));
@@ -4075,6 +4080,11 @@ mod tests {
     /// prepares the box — same guard as a fresh sandboxed interactive launch.
     #[tokio::test]
     async fn interactive_resume_sandboxed_requires_a_tty() {
+        // `cargo test` from an interactive shell inherits the terminal on stdin,
+        // so the guard rightly lets the launch through; nothing to assert then.
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            return;
+        }
         let config = interactive_shell_config();
         let client = AcpSubprocessClient::with_sandbox(
             "sh",
