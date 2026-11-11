@@ -179,6 +179,11 @@ pub struct TaskBounds {
     /// launch. Stored with other per-task launch overrides so resumes preserve it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<String>,
+    /// Operator-supplied read-only host mounts (`--mount DIR:ro[:path]`), each
+    /// re-validated against the resolved sandbox's `task_mounts` roots at every
+    /// launch. Stored here, like `egress`, so resumes keep the same mounts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<String>,
     /// Override `defaults.idle_timeout_seconds` for this task (seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<u64>,
@@ -872,25 +877,25 @@ pub fn create_task(
     description: Option<&str>,
     sandbox: Option<&str>,
 ) -> Result<PathBuf> {
-    create_task_with_egress(
+    create_task_with_bounds(
         config,
         taskname,
         project_path,
         assignee,
         description,
         sandbox,
-        &[],
+        TaskBounds::default(),
     )
 }
 
-pub fn create_task_with_egress(
+pub fn create_task_with_bounds(
     config: &Config,
     taskname: &str,
     project_path: &Path,
     assignee: Option<&str>,
     description: Option<&str>,
     sandbox: Option<&str>,
-    egress: &[String],
+    bounds: TaskBounds,
 ) -> Result<PathBuf> {
     let task_root = Path::new(&config.defaults.operations_dir).join("tasks");
     let task_dir = task_root.join(project_task_folder(project_path)?);
@@ -917,10 +922,7 @@ pub fn create_task_with_egress(
     let task = TaskDocument {
         path: path.clone(),
         frontmatter: TaskFrontmatter {
-            bounds: crate::task::TaskBounds {
-                egress: egress.to_vec(),
-                ..Default::default()
-            },
+            bounds,
             id: Some(id),
             status: TaskStatus::Backlog,
             project: Some(project_path.display().to_string()),

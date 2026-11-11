@@ -45,6 +45,9 @@ pub struct CapabilitySummary {
     /// whose source resolves outside a plain project-relative path (an absolute
     /// path or a `~`-rooted one).
     pub rw_mounts_outside_project: BTreeSet<(String, String)>,
+    /// `(sandbox_name, root)` — `task_mounts` roots a task may pick read-only
+    /// `--mount` directories from.
+    pub task_mount_roots: BTreeSet<(String, String)>,
     /// `(agent_or_route_label, secret_name)` — `${fnox:...}` bindings reachable
     /// from a static env map or a `[[agents.X.credentials]]` entry (`from_secret`
     /// / `from_fnox`, resolved via [`crate::config::AgentConfig::effective_credentials`]).
@@ -119,6 +122,11 @@ impl CapabilitySummary {
                         .rw_mounts_outside_project
                         .insert((name.clone(), source.display().to_string()));
                 }
+            }
+            for root in &sandbox.task_mounts {
+                summary
+                    .task_mount_roots
+                    .insert((name.clone(), root.clone()));
             }
             for value in sandbox.env.values() {
                 if let Some(secret) = fnox_env_ref(value) {
@@ -262,6 +270,12 @@ pub fn diff_capabilities(
         changes.push(CapabilityChange {
             critical: false,
             sentence: format!("'{label}' can now write to {source}"),
+        });
+    }
+    for (name, root) in new.task_mount_roots.difference(&old.task_mount_roots) {
+        changes.push(CapabilityChange {
+            critical: false,
+            sentence: format!("tasks in '{name}' can now mount (read-only) anything under {root}"),
         });
     }
     for (label, secret) in new.secrets_bound.difference(&old.secrets_bound) {
@@ -707,8 +721,14 @@ mod tests {
         // the highest-severity capability a credential can request) — is checked
         // independently for each struct instead of one classification incidentally
         // "covering" the other's same-named, differently-meaning field.
-        const SANDBOX_CAPABILITY_BEARING: &[&str] =
-            &["primitive", "mounts", "env", "egress", "egress_mode"];
+        const SANDBOX_CAPABILITY_BEARING: &[&str] = &[
+            "primitive",
+            "mounts",
+            "task_mounts",
+            "env",
+            "egress",
+            "egress_mode",
+        ];
         const SANDBOX_NOT_CAPABILITY_BEARING: &[&str] = &[
             // image identity/build/resources, not a capability grant.
             "image",
@@ -861,6 +881,7 @@ mod tests {
             SandboxConfig {
                 primitive: "local".to_owned(),
                 mounts: vec!["/home/user/.aws:rw".to_owned()],
+                task_mounts: vec!["/opt/toolstore".to_owned()],
                 egress: vec!["evil.example.com".to_owned()],
                 egress_mode: crate::config::EgressMode::DnsPin,
                 ..SandboxConfig::default()
@@ -914,6 +935,7 @@ mod tests {
         };
         expect_any("UNSANDBOXED"); // primitive = "local"
         expect_any("/home/user/.aws"); // mounts (rw, outside project)
+        expect_any("/opt/toolstore"); // task_mounts
         expect_any("evil.example.com"); // egress
         expect_any("sandbox-secret"); // sandbox env ${fnox:...}
         expect_any("agent-secret"); // credentials.from_secret

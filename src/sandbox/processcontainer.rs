@@ -97,7 +97,7 @@ fn parse_host_mount(raw: &str) -> Result<HostMount> {
 /// paths (`\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share` → `\\srv\share`).
 /// `cmd.exe` treats a verbatim cwd as an unsupported UNC path and falls back
 /// to `C:\Windows`, and MXC path policies are written in the plain form.
-fn strip_verbatim(text: &str) -> String {
+pub(super) fn strip_verbatim(text: &str) -> String {
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         return format!(r"\\{rest}");
     }
@@ -1106,5 +1106,26 @@ mod tests {
         assert!(ProcessContainerProvider::from_config("pc", &config, remapped).is_err());
         let ok = vec![(MountOrigin::Sandbox, r"C:\a:ro".to_owned())];
         assert!(ProcessContainerProvider::from_config("pc", &config, ok).is_ok());
+    }
+
+    #[test]
+    fn task_origin_mount_is_a_read_only_host_path() {
+        let config = SandboxConfig {
+            primitive: "processcontainer".to_owned(),
+            ..SandboxConfig::default()
+        };
+        let task = super::super::TaskMount {
+            source: PathBuf::from(r"C:\toolchains\store\terraform\1.9.8"),
+            on_path: true,
+        };
+        let mounts = vec![(MountOrigin::Task, task.mount())];
+        let provider = ProcessContainerProvider::from_config("pc", &config, mounts).unwrap();
+        assert_eq!(
+            provider.mounts,
+            vec![HostMount {
+                path: PathBuf::from(r"C:\toolchains\store\terraform\1.9.8"),
+                writable: false
+            }]
+        );
     }
 }

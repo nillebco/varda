@@ -176,6 +176,12 @@ enum TaskCommand {
         /// this task's launches. Wildcards, URLs, and paths are rejected.
         #[arg(long, value_delimiter = ',', value_name = "HOSTS")]
         egress: Vec<String>,
+        /// Mount a host directory read-only, at the same path, for this task's
+        /// launches (repeatable). Must be `DIR:ro`; `DIR:ro:path` also prepends it
+        /// to the sandbox PATH. DIR must resolve under one of the sandbox's
+        /// `task_mounts` roots.
+        #[arg(long = "mount", value_name = "DIR:ro[:path]")]
+        mounts: Vec<String>,
         /// Treat the task name as a complete one-line task and run it immediately.
         #[arg(long)]
         exec: bool,
@@ -647,6 +653,7 @@ async fn run_cli() -> Result<()> {
                 agent,
                 sandbox,
                 egress,
+                mounts,
                 exec,
                 edit,
                 background,
@@ -738,8 +745,19 @@ async fn run_cli() -> Result<()> {
                 if reuse && exec {
                     let existing = task::task_file_path(&config, &project_path, &taskname)?;
                     if existing.exists() {
-                        let confirmed_resume = !egress.is_empty();
+                        let confirmed_resume = !egress.is_empty() || !mounts.is_empty();
                         let mut existing_task = task::load_task(&existing)?;
+                        let mounts = resolve_task_mount_specs(
+                            &config,
+                            &project_path,
+                            existing_task.frontmatter.sandbox.as_deref(),
+                            &mounts,
+                        )?;
+                        for mount in mounts {
+                            if !existing_task.frontmatter.bounds.mounts.contains(&mount) {
+                                existing_task.frontmatter.bounds.mounts.push(mount);
+                            }
+                        }
                         for host in &egress {
                             if !existing_task
                                 .frontmatter
@@ -764,7 +782,7 @@ async fn run_cli() -> Result<()> {
                                 existing.display()
                             );
                         }
-                        // An explicit egress relaunch is a one-command operation: skip
+                        // An explicit egress/mount relaunch is a one-command operation: skip
                         // only the captured-session confirmation. A needs-user task's
                         // editor offer remains independent and is never bypassed here.
                         return resume_task_command(
@@ -788,6 +806,10 @@ async fn run_cli() -> Result<()> {
                         );
                     }
                 }
+                // Refuse a bad `--mount` before anything is created, and store it
+                // canonical so a resume mounts exactly what was validated here.
+                let mounts =
+                    resolve_task_mount_specs(&config, &project_path, sandbox.as_deref(), &mounts)?;
                 let assignee = if let Some(ref agent_name) = agent {
                     routing::match_route(&config, &project_path, Some(agent_name))?;
                     Some(agent_name.clone())
@@ -810,19 +832,24 @@ async fn run_cli() -> Result<()> {
                             assignee: assignee.clone(),
                             sandbox: sandbox.clone(),
                             egress: egress.clone(),
+                            mounts: mounts.clone(),
                         },
                         tracker::push::PUSH_TIMEOUT,
                     )
                     .await?
                 } else {
-                    task::create_task_with_egress(
+                    task::create_task_with_bounds(
                         &config,
                         &taskname,
                         &project_path,
                         assignee.as_deref(),
                         description.as_deref(),
                         sandbox.as_deref(),
-                        &egress,
+                        task::TaskBounds {
+                            egress: egress.clone(),
+                            mounts,
+                            ..Default::default()
+                        },
                     )?
                 };
                 let mut task_doc = task::load_task(&task_path)?;
@@ -1682,6 +1709,7 @@ async fn transform_plan_to_json(config: &config::Config, plan_path: &Path) -> Re
         None,
         None,
         None,
+        &[],
         &[],
     )?;
     let timeout = std::time::Duration::from_secs(config.defaults.timeout_seconds);
@@ -2632,6 +2660,7 @@ fn build_client(
     policy_path: Option<&Path>,
     pinned_sandbox: Option<&str>,
     egress_override: &[String],
+    task_mounts: &[String],
 ) -> Result<acp::AcpSubprocessClient> {
     // M11 — resolve the three identity/auth channels (curated identity files,
     // SSH-agent + git identity, scoped auth token) once and inject them into
@@ -2659,6 +2688,11 @@ fn build_client(
             let mut resolved =
                 config.resolve_sandbox_for(policy_path, &routing_root, pinned_sandbox)?;
             apply_egress_override(&mut resolved.config, egress_override)?;
+            // Re-validated at every launch (not only at `task add`): the sandbox's
+            // roots may have changed, or a link under a root been re-pointed.
+            let task_mounts =
+                sandbox::resolve_task_mounts(&resolved.name, &resolved.config, task_mounts)?;
+            apply_task_mount_path(&mut resolved, &task_mounts)?;
             enforce_varda_env_credential_floor(agent_config, &resolved)?;
             if let Some(varda_file) = &resolved.varda_file {
                 eprintln!(
@@ -2667,16 +2701,30 @@ fn build_client(
                     varda_file.display()
                 );
             }
-            let mounts = sandbox::merge_mount_origins(
+            let mut mounts = sandbox::merge_mount_origins(
                 &resolved.config.mounts,
                 &resolved.route_mounts,
                 &resolved.varda_mounts,
+            );
+            if !task_mounts.is_empty() {
+                let specs: Vec<String> = task_mounts.iter().map(sandbox::TaskMount::spec).collect();
+                eprintln!("sandbox: per-task read-only mounts: {}", specs.join(", "));
+            }
+            mounts.extend(
+                task_mounts
+                    .iter()
+                    .map(|mount| (sandbox::MountOrigin::Task, mount.mount())),
             );
             untrusted_env_keys = resolved.varda_env_keys.clone();
             static_env = resolved.env;
             sandbox::provider_from_config(&resolved.name, &resolved.config, mounts, &identity)?
         }
         None => {
+            if !task_mounts.is_empty() {
+                anyhow::bail!(
+                    "--mount needs a task with a project: its roots come from the project's resolved sandbox"
+                );
+            }
             // No project context ⇒ no `resolve_sandbox_for` call to compute
             // `varda_env_keys`, but the sandbox/route env still needs the same
             // fragment-sourced (`.untrusted`) origin gating so a fnox binding
@@ -2727,6 +2775,70 @@ fn build_client(
         provider,
         static_env,
     ))
+}
+
+/// Prepend the `--mount DIR:ro:path` directories to the sandbox PATH, in mount
+/// order. processcontainer composes its PATH from the sandbox `env.PATH` plus the
+/// program and system dirs, so the dirs go there. docker/microsandbox pass the
+/// static env verbatim and a PATH there REPLACES the image's own, so `:path` is
+/// only honoured when the sandbox already declares a PATH to prepend to.
+fn apply_task_mount_path(
+    resolved: &mut config::ResolvedSandbox,
+    mounts: &[sandbox::TaskMount],
+) -> Result<()> {
+    let dirs: Vec<String> = mounts
+        .iter()
+        .filter(|mount| mount.on_path)
+        .map(|mount| mount.source.display().to_string())
+        .collect();
+    if dirs.is_empty() {
+        return Ok(());
+    }
+    let (env, separator) = if resolved.config.primitive == "processcontainer" {
+        (&mut resolved.config.env, ";")
+    } else {
+        if !resolved
+            .env
+            .get("PATH")
+            .is_some_and(|path| !path.is_empty())
+        {
+            anyhow::bail!(
+                "--mount ...:ro:path needs `env.PATH` on sandbox '{}' (primitive '{}'): a PATH in \
+                 the box env replaces the image's own, so Varda only prepends to a declared one",
+                resolved.name,
+                resolved.config.primitive
+            );
+        }
+        (&mut resolved.env, ":")
+    };
+    let mut path = dirs.join(separator);
+    if let Some(existing) = env.get("PATH").filter(|existing| !existing.is_empty()) {
+        path.push_str(separator);
+        path.push_str(existing);
+    }
+    env.insert("PATH".to_owned(), path);
+    Ok(())
+}
+
+/// Validate `--mount` specs against the sandbox the task at `project_path` would
+/// launch in, returning them in their stored, canonical `DIR:ro[:path]` form.
+fn resolve_task_mount_specs(
+    config: &config::Config,
+    project_path: &Path,
+    pinned_sandbox: Option<&str>,
+    mounts: &[String],
+) -> Result<Vec<String>> {
+    if mounts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let routing_root = routing_root_for(project_path);
+    let resolved = config.resolve_sandbox_for(project_path, &routing_root, pinned_sandbox)?;
+    Ok(
+        sandbox::resolve_task_mounts(&resolved.name, &resolved.config, mounts)?
+            .iter()
+            .map(sandbox::TaskMount::spec)
+            .collect(),
+    )
 }
 
 fn validate_egress_override(hosts: &[String]) -> Result<()> {
@@ -3201,6 +3313,7 @@ async fn run_task_path_for_parallel(
             .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
         &task_document.frontmatter.bounds.egress,
+        &task_document.frontmatter.bounds.mounts,
     )?;
     // POLICY reads (orchestration policy + sandbox-primitive/transport selection)
     // key on the MOTHER repo root via `policy_project`; MOUNT/cwd (the socket dir,
@@ -5337,6 +5450,7 @@ async fn run_task_command_with(
             .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
         &task_document.frontmatter.bounds.egress,
+        &task_document.frontmatter.bounds.mounts,
     )?;
     // Wire the nested-orchestration broker onto the interactive resident: when
     // orchestration is enabled for this project, wrap the session in
@@ -5771,6 +5885,7 @@ async fn plan_task_command(task_path: &Path) -> Result<()> {
             .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
         &task_document.frontmatter.bounds.egress,
+        &task_document.frontmatter.bounds.mounts,
     )?;
     let outcome = runner::plan_task(
         &config,
@@ -5896,6 +6011,7 @@ async fn run_captured_resume_command(
             .map(Path::new),
         task_document.frontmatter.sandbox.as_deref(),
         &task_document.frontmatter.bounds.egress,
+        &task_document.frontmatter.bounds.mounts,
     )?;
     if config.git.auto_commit {
         git::commit_task_file(
@@ -6559,6 +6675,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         )
         .map(|_| ())
         .expect_err(
@@ -6595,6 +6712,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
         )
         .map(|_| ())
@@ -6644,6 +6762,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         )
         .expect(
             "central-config sandbox/route env must not be affected by the untrusted-fragment refusal",
@@ -6671,6 +6790,7 @@ mod tests {
             None,
             None,
             &["example.com".to_owned()],
+            &[],
         )
         .map(|_| ())
         .expect_err("local provider must see and reject the egress override");
@@ -8719,6 +8839,65 @@ deny_sandboxes = ["local"]
         task.frontmatter.agent_resume_commands = vec!["".to_owned(), "  ".to_owned()];
 
         assert_eq!(latest_agent_resume_command(&task), None);
+    }
+
+    #[test]
+    fn task_mount_path_prepends_per_primitive() {
+        let mounts = vec![
+            sandbox::TaskMount {
+                source: PathBuf::from("/store/tf"),
+                on_path: true,
+            },
+            sandbox::TaskMount {
+                source: PathBuf::from("/store/data"),
+                on_path: false,
+            },
+            sandbox::TaskMount {
+                source: PathBuf::from("/store/dotnet"),
+                on_path: true,
+            },
+        ];
+        let resolved = |primitive: &str, env: &[(&str, &str)]| {
+            let env: std::collections::BTreeMap<String, String> = env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            config::ResolvedSandbox {
+                name: "dev".to_owned(),
+                config: config::SandboxConfig {
+                    primitive: primitive.to_owned(),
+                    env: env.clone(),
+                    ..Default::default()
+                },
+                route_mounts: Vec::new(),
+                varda_mounts: Vec::new(),
+                env,
+                varda_env_keys: Vec::new(),
+                varda_file: None,
+            }
+        };
+
+        // processcontainer: sandbox env PATH, `;`-joined, created when absent.
+        let mut pc = resolved("processcontainer", &[]);
+        apply_task_mount_path(&mut pc, &mounts).unwrap();
+        assert_eq!(pc.config.env["PATH"], "/store/tf;/store/dotnet");
+        let mut pc = resolved("processcontainer", &[("PATH", r"C:\tools")]);
+        apply_task_mount_path(&mut pc, &mounts).unwrap();
+        assert_eq!(pc.config.env["PATH"], r"/store/tf;/store/dotnet;C:\tools");
+
+        // docker: only prepends to a declared PATH (one in the box env replaces
+        // the image's own).
+        let mut docker = resolved("docker", &[]);
+        let err = apply_task_mount_path(&mut docker, &mounts).unwrap_err();
+        assert!(err.to_string().contains("env.PATH"), "{err}");
+        let mut docker = resolved("docker", &[("PATH", "/usr/bin:/bin")]);
+        apply_task_mount_path(&mut docker, &mounts).unwrap();
+        assert_eq!(docker.env["PATH"], "/store/tf:/store/dotnet:/usr/bin:/bin");
+
+        // No `:path` mount ⇒ env untouched, even without a PATH.
+        let mut untouched = resolved("docker", &[]);
+        apply_task_mount_path(&mut untouched, &mounts[1..2]).unwrap();
+        assert!(!untouched.env.contains_key("PATH"));
     }
 
     #[test]

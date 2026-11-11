@@ -27,6 +27,7 @@ egress = ["api.example.com"]  # optional egress allow-list (default-deny)
 # egress_mode = "strict"      # docker: strict/proxy = forward-proxy sidecar; "dns-pin" = legacy
 # egress_proxy_image = "vimagick/tinyproxy"  # override the forward-proxy image (proxy mode)
 mounts = ["/opt/cache"]       # optional extra read-only host mounts
+# task_mounts = ["/opt/toolstore"]  # roots `task add --mount DIR:ro` may pick from (empty = refused)
 env = { TOOLCHAIN_HOME = "/opt/toolchain" }  # image-intrinsic static env
 # memory = "4g"                # optional memory ceiling, docker `--memory` grammar
 # cpus = "2"                   # optional CPU ceiling, docker `--cpus` grammar

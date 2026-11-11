@@ -43,6 +43,10 @@ pub enum MountOrigin {
     /// at run time by [`crate::config::Config::resolve_sandbox_for`] and merged in
     /// via [`merge_mount_origins`].
     Varda,
+    /// Per-task read-only mount (`varda task add --mount DIR:ro`). Operator-
+    /// supplied, but only ever a canonical path under one of the sandbox's
+    /// trusted `task_mounts` roots — see [`resolve_task_mounts`].
+    Task,
 }
 
 /// Fixed in-guest path for the current policy project's task definitions and
@@ -488,6 +492,160 @@ pub fn parse_mount(raw: &str) -> Result<MountSpec> {
         }
         _ => bail!("invalid mount '{raw}': malformed (empty or too many ':'-separated segments)"),
     }
+}
+
+/// A per-task read-only mount (`varda task add --mount DIR:ro[:path]`). The
+/// directory is seen at the same path inside the sandbox (no remapping, so the
+/// same spec works for processcontainer, which cannot remap).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskMount {
+    /// Host directory. Canonical (symlinks/junctions resolved) once returned by
+    /// [`resolve_task_mounts`].
+    pub source: PathBuf,
+    /// `:path` suffix: prepend `source` to the sandbox PATH.
+    pub on_path: bool,
+}
+
+impl TaskMount {
+    /// The stored form, `DIR:ro` or `DIR:ro:path` (what `TaskBounds.mounts` keeps).
+    pub fn spec(&self) -> String {
+        let suffix = if self.on_path { ":path" } else { "" };
+        format!("{}:ro{suffix}", self.source.display())
+    }
+
+    /// The mount grammar every provider parses: `DIR:ro`.
+    pub fn mount(&self) -> String {
+        format!("{}:ro", self.source.display())
+    }
+}
+
+/// Parse `DIR:ro` or `DIR:ro:path`. A Windows drive letter's colon is not a
+/// separator. Writable (`:rw`/`:w`), mode-less and `source:target` forms are
+/// refused: a task may only add read-only views of host directories.
+pub fn parse_task_mount(raw: &str) -> Result<TaskMount> {
+    let trimmed = raw.trim();
+    let (body, on_path) = match trimmed.strip_suffix(":path") {
+        Some(body) => (body, true),
+        None => (trimmed, false),
+    };
+    let Some(source) = body.strip_suffix(":ro") else {
+        bail!(
+            "invalid --mount '{raw}': per-task mounts are read-only — write DIR:ro \
+             (or DIR:ro:path to also prepend DIR to the sandbox PATH)"
+        );
+    };
+    let after_drive = match source.as_bytes() {
+        [letter, b':', ..] if letter.is_ascii_alphabetic() => &source[2..],
+        _ => source,
+    };
+    if source.is_empty() || after_drive.contains(':') {
+        bail!(
+            "invalid --mount '{raw}': DIR is mounted at the same path inside the sandbox; \
+             `source:target` remapping is not supported"
+        );
+    }
+    Ok(TaskMount {
+        source: PathBuf::from(source),
+        on_path,
+    })
+}
+
+/// Expand a leading `~` from `$HOME` (or `%USERPROFILE%`).
+fn expand_home(raw: &str) -> PathBuf {
+    let home = || {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+    };
+    if raw == "~" {
+        return home().unwrap_or_else(|| PathBuf::from(raw));
+    }
+    match raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        Some(rest) => home().map_or_else(|| PathBuf::from(raw), |h| h.join(rest)),
+        None => PathBuf::from(raw),
+    }
+}
+
+/// Canonicalise (resolving symlinks/junctions) and drop Windows' `\\?\` prefix.
+fn canonical_host_dir(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    Ok(PathBuf::from(processcontainer::strip_verbatim(
+        &canonical.display().to_string(),
+    )))
+}
+
+/// Validate per-task `--mount` specs against sandbox `name`'s `config`, returning
+/// them canonicalised. Each must be `DIR:ro[:path]`, name an existing directory,
+/// pass the control-plane/credential denylist, and — after symlinks/junctions are
+/// resolved — sit under one of the sandbox's `task_mounts` roots. A sandbox with
+/// no roots (or primitive `local`, which has no mount boundary) refuses every
+/// `--mount`. Called when the task is added AND at every launch, so a link that
+/// is re-pointed after `task add` is still caught.
+pub fn resolve_task_mounts(
+    name: &str,
+    config: &SandboxConfig,
+    raw: &[String],
+) -> Result<Vec<TaskMount>> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if config.primitive == "local" {
+        bail!(
+            "--mount refused: sandbox '{name}' uses primitive 'local', which has no mount \
+             boundary (the agent already sees the whole host)"
+        );
+    }
+    if config.task_mounts.is_empty() {
+        bail!(
+            "--mount refused: sandbox '{name}' declares no `task_mounts` roots; add \
+             `task_mounts = [\"<dir>\"]` to `[sandboxes.{name}]` to allow per-task mounts"
+        );
+    }
+    let roots = config
+        .task_mounts
+        .iter()
+        .map(|root| {
+            let expanded = expand_home(root);
+            if !expanded.is_absolute() {
+                bail!("sandbox '{name}': task_mounts root '{root}' must be an absolute path");
+            }
+            // A missing root allows nothing; it is not an error until used.
+            Ok(canonical_host_dir(&expanded).ok())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    raw.iter()
+        .map(|spec| {
+            let parsed = parse_task_mount(spec)?;
+            let source = expand_home(&parsed.source.to_string_lossy());
+            let canonical = canonical_host_dir(&source).with_context(|| {
+                format!("--mount '{spec}': cannot resolve {}", source.display())
+            })?;
+            if !canonical.is_dir() {
+                bail!(
+                    "--mount '{spec}': {} is not a directory",
+                    canonical.display()
+                );
+            }
+            check_credential_denylist(&canonical)
+                .with_context(|| format!("--mount '{spec}' refused"))?;
+            if !roots
+                .iter()
+                .flatten()
+                .any(|root| canonical.starts_with(root))
+            {
+                bail!(
+                    "--mount '{spec}' refused: {} is not under any `task_mounts` root of sandbox \
+                     '{name}' ({})",
+                    canonical.display(),
+                    config.task_mounts.join(", ")
+                );
+            }
+            Ok(TaskMount {
+                source: canonical,
+                on_path: parsed.on_path,
+            })
+        })
+        .collect()
 }
 
 /// Refuse to launch a checkout whose `.git` file points somewhere the guest
@@ -7744,5 +7902,173 @@ mod tests {
         assert!(!session.target_is_within_store(&relative));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_task_mount_accepts_read_only_same_path_only() {
+        let unix = parse_task_mount("/opt/store/tf:ro").unwrap();
+        assert_eq!(unix.source, PathBuf::from("/opt/store/tf"));
+        assert!(!unix.on_path);
+        let with_path = parse_task_mount("/opt/store/tf:ro:path").unwrap();
+        assert!(with_path.on_path);
+        assert_eq!(with_path.spec(), "/opt/store/tf:ro:path");
+        assert_eq!(with_path.mount(), "/opt/store/tf:ro");
+        let windows = parse_task_mount(r"C:\toolchains\store\tf:ro").unwrap();
+        assert_eq!(windows.source, PathBuf::from(r"C:\toolchains\store\tf"));
+
+        for refused in [
+            "/opt/store/tf",
+            "/opt/store/tf:rw",
+            "/opt/store/tf:w",
+            "/opt/store/tf:rw:path",
+            "/opt/store/tf:path",
+            "/opt/store/tf:/guest:ro",
+            r"C:\a:D:\b:ro",
+            ":ro",
+        ] {
+            assert!(
+                parse_task_mount(refused).is_err(),
+                "{refused} must be refused"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_task_mounts_enforces_roots_and_resolves_links() {
+        let nonce = format!(
+            "varda-task-mounts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(nonce);
+        let store = base.join("store");
+        let terraform = store.join("terraform").join("1.9.8");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&terraform).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(store.join("file"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, store.join("escape")).unwrap();
+        let canonical_terraform = std::fs::canonicalize(&terraform).unwrap();
+
+        let mut config = SandboxConfig {
+            primitive: "docker".to_owned(),
+            ..SandboxConfig::default()
+        };
+        fn spec(path: &Path) -> Vec<String> {
+            vec![format!("{}:ro", path.display())]
+        }
+
+        // No roots declared ⇒ every --mount refused.
+        let err = resolve_task_mounts("dev", &config, &spec(&terraform)).unwrap_err();
+        assert!(err.to_string().contains("task_mounts"), "{err:#}");
+        // No --mount ⇒ nothing to check, even without roots.
+        assert!(resolve_task_mounts("dev", &config, &[]).unwrap().is_empty());
+
+        config.task_mounts = vec![store.display().to_string()];
+        let ok = resolve_task_mounts(
+            "dev",
+            &config,
+            &[format!("{}:ro:path", terraform.display())],
+        )
+        .unwrap();
+        assert_eq!(
+            ok,
+            vec![TaskMount {
+                source: canonical_terraform.clone(),
+                on_path: true
+            }]
+        );
+
+        // Outside every root.
+        let err = resolve_task_mounts("dev", &config, &spec(&outside)).unwrap_err();
+        assert!(err.to_string().contains("not under"), "{err:#}");
+        // A link under the root that points outside it.
+        let err = resolve_task_mounts("dev", &config, &spec(&store.join("escape"))).unwrap_err();
+        assert!(err.to_string().contains("not under"), "{err:#}");
+        // `..` climbing out of the root.
+        let climbing = store.join("..").join("outside");
+        assert!(resolve_task_mounts("dev", &config, &spec(&climbing)).is_err());
+        // Writable, a file, a missing path.
+        assert!(
+            resolve_task_mounts("dev", &config, &[format!("{}:rw", terraform.display())]).is_err()
+        );
+        assert!(resolve_task_mounts("dev", &config, &spec(&store.join("file"))).is_err());
+        assert!(resolve_task_mounts("dev", &config, &spec(&store.join("missing"))).is_err());
+
+        // `local` has no mount boundary to add to.
+        config.primitive = "local".to_owned();
+        assert!(resolve_task_mounts("dev", &config, &spec(&terraform)).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn task_origin_mount_appears_read_only_in_docker_argv() {
+        let task = TaskMount {
+            source: PathBuf::from("/opt/store/terraform/1.9.8"),
+            on_path: false,
+        };
+        let session = DockerSession::for_test(
+            "img",
+            "/srv/app",
+            vec![(MountOrigin::Task, task.mount())],
+            vec![],
+            "/var/varda/sessions/s1",
+        );
+        let wrapped = session
+            .wrap(
+                CommandSpec {
+                    program: "sh".to_owned(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                },
+                LaunchMode::Batch,
+            )
+            .unwrap();
+        let values = mount_values(&wrapped);
+        assert!(
+            values.contains(&"/opt/store/terraform/1.9.8:/opt/store/terraform/1.9.8:ro".to_owned()),
+            "task mount missing from argv: {values:?}"
+        );
+    }
+
+    #[test]
+    fn task_origin_mount_appears_read_only_in_microsandbox_argv() {
+        let task = TaskMount {
+            source: PathBuf::from("/opt/store/terraform/1.9.8"),
+            on_path: false,
+        };
+        let session = MicrosandboxSession {
+            image: "varda-agents:latest".to_owned(),
+            project_root: PathBuf::from("/ws"),
+            mounts: vec![(MountOrigin::Task, task.mount())],
+            egress: vec![],
+            session_store: PathBuf::from("/host/store"),
+            sandbox: "varda-sbx-task".to_owned(),
+            home: "/home/agent".to_owned(),
+            memory: None,
+            cpus: None,
+            tmpfs: Vec::new(),
+            identity: SandboxIdentity::default(),
+            staged_files: std::sync::Mutex::new(Vec::new()),
+        };
+        let spec = CommandSpec {
+            program: "claude".to_owned(),
+            args: vec![],
+            env: BTreeMap::new(),
+            cwd: None,
+        };
+        let wrapped = session.wrap(spec, LaunchMode::Batch).unwrap();
+        assert!(
+            wrapped.args.windows(2).any(|w| w[0] == "--mount-dir"
+                && w[1] == "/opt/store/terraform/1.9.8:/opt/store/terraform/1.9.8:ro"),
+            "task mount missing from argv: {:?}",
+            wrapped.args
+        );
     }
 }

@@ -149,6 +149,48 @@ The resumed run log records the task's exact `egress_override`. An empty value
 is recorded as `(sandbox default)`, since the configured sandbox allow-list is
 resolved separately at launch time.
 
+### Per-task read-only mounts (`--mount`)
+
+Several projects can share one sandbox and still each see only the tools they
+need. The sandbox declares the roots a task may pick from, and each task names
+the directories it wants:
+
+```toml
+[sandboxes.dev]
+primitive   = "processcontainer"
+mounts      = ['C:\toolchains\base:ro']
+task_mounts = ['C:\toolchains\store']   # empty or absent ⇒ --mount is refused
+```
+
+```sh
+varda task add --sandbox dev \
+  --mount 'C:\toolchains\store\terraform\1.9.8:ro:path' \
+  --mount 'C:\toolchains\store\dotnet-sdk\10.0.100:ro' \
+  --exec "plan the infra change"
+```
+
+Rules:
+
+- `DIR:ro` only. `:rw`, `:w` or no mode is refused. The directory appears at
+  the same path inside the sandbox; `source:target` remapping is refused.
+- `DIR` is canonicalised (symlinks and junctions resolved) and must sit under
+  one of the sandbox's `task_mounts` roots. A link under a root that points
+  outside it is refused. The control-plane (`~/.varda`), docker-socket and
+  credential-directory denylists still apply. Primitive `local` refuses
+  `--mount`, because it has no mount boundary.
+- `DIR:ro:path` also prepends `DIR` to the sandbox PATH. processcontainer adds
+  it to the sandbox `env.PATH`, which it always composes with the system
+  directories. docker and microsandbox pass the box env verbatim, and a PATH
+  there replaces the image's own, so `:path` requires the sandbox (or route) to
+  declare `env.PATH`. Varda prepends to that value.
+- The canonical specs are stored in the task frontmatter (`mounts:`). Resumes
+  and `--reuse` (which adds new mounts to the stored ones) use the same mounts.
+  They are checked again at every launch, so a root removed from the config or
+  a link re-pointed after `task add` refuses the run.
+- `task_mounts` may only be set in the central config. An inline `.varda`
+  `[sandbox]` that declares it is refused, and config approval reports a
+  bundle that adds a root.
+
 `taskname` and `description` are two separate positional arguments, so quote any multi-word values:
 
 ```sh

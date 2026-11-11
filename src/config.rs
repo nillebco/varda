@@ -735,6 +735,13 @@ pub struct SandboxConfig {
     pub engine: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<String>,
+    /// Host directories a task may pick extra READ-ONLY mounts from
+    /// (`varda task add --mount DIR:ro`). Each `--mount` must canonicalise
+    /// (symlinks/junctions resolved) to a path under one of these roots; empty ⇒
+    /// `--mount` is refused. Trusted central config only: an inline `.varda`
+    /// sandbox may not declare it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_mounts: Vec<String>,
     /// Trusted image-intrinsic static, non-secret environment variables.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
@@ -1090,6 +1097,13 @@ impl Config {
             }
             VardaSandbox::Inline(config) => {
                 self.enforce_varda_primitive_floor(&config.primitive, &varda_path)?;
+                if !config.task_mounts.is_empty() {
+                    bail!(
+                        "`.varda` at {} declares `task_mounts`, which only the central config may \
+                         grant (it widens what a task may mount from the host)",
+                        varda_path.display()
+                    );
+                }
                 self.enforce_egress_ceiling(&config.egress, &varda_path)?;
                 self.enforce_varda_env_floor(&config.env, &route_env, &varda_path)?;
                 let varda_mounts = self.harden_inline_varda_mounts(
@@ -1257,6 +1271,7 @@ impl Default for SandboxConfig {
             primitive: default_primitive(),
             engine: None,
             mounts: Vec::new(),
+            task_mounts: Vec::new(),
             env: BTreeMap::new(),
             egress: Vec::new(),
             egress_mode: EgressMode::Strict,
@@ -2613,6 +2628,7 @@ pub(crate) const SANDBOX_CONFIG_FIELDS: &[&str] = &[
     "primitive",
     "engine",
     "mounts",
+    "task_mounts",
     "env",
     "egress",
     "egress_mode",
@@ -4598,6 +4614,23 @@ mod m6b_tests {
         // Forced :ro (writable not allowed by default) and source made absolute.
         assert!(r.varda_mounts[0].ends_with(":/ctx:ro"));
         assert!(r.varda_mounts[0].starts_with(proj.join("ctx").to_str().unwrap()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inline_varda_may_not_grant_task_mounts() {
+        let root = tmp("inline-task-mounts");
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let config = base_config();
+        fs::write(
+            proj.join(VARDA_FILE),
+            "[sandbox]\nimage = \"x:1\"\ntask_mounts = [\"/\"]\n",
+        )
+        .unwrap();
+
+        let err = config.resolve_sandbox_for(&proj, &root, None).unwrap_err();
+        assert!(err.to_string().contains("task_mounts"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
 

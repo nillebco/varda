@@ -198,13 +198,15 @@ fn import_task_name(tracker: &TrackerConfig, issue: &RemoteIssue) -> String {
 }
 
 /// Local-only options for a task created by `task add --tracker`. They go into
-/// the repo DEFINITION too (via `create_task_with_egress`), because
+/// the repo DEFINITION too (via `create_task_with_bounds`), because
 /// `sync_definition_fields_from_repo` re-copies those fields on every dispatch.
 #[derive(Debug, Clone, Default)]
 pub struct LocalTaskOptions {
     pub assignee: Option<String>,
     pub sandbox: Option<String>,
     pub egress: Vec<String>,
+    /// Already-validated `--mount` specs (see `sandbox::resolve_task_mounts`).
+    pub mounts: Vec<String>,
 }
 
 /// Create the home task for a new remote item, with `external` set.
@@ -239,14 +241,18 @@ fn import_new_issue(
         }
         orphan
     } else {
-        task::create_task_with_egress(
+        task::create_task_with_bounds(
             config,
             &name,
             project,
             local.assignee.as_deref(),
             None,
             local.sandbox.as_deref(),
-            &local.egress,
+            task::TaskBounds {
+                egress: local.egress.clone(),
+                mounts: local.mounts.clone(),
+                ..Default::default()
+            },
         )?
     };
     let mut doc = task::load_task(&path)?;
@@ -1107,6 +1113,7 @@ mod tests {
             assignee: Some("claude".to_owned()),
             sandbox: Some("worker".to_owned()),
             egress: vec!["example.com".to_owned()],
+            mounts: vec!["/opt/store/terraform:ro".to_owned()],
         };
         let path = add_tracker_task_via(&config, &t, &fake, "x", None, &local, Duration::from_secs(5))
             .await
@@ -1114,6 +1121,10 @@ mod tests {
         let mut doc = task::load_task(&path).unwrap();
         task::sync_definition_fields_from_repo(&mut doc).unwrap();
         assert_eq!(doc.frontmatter.bounds.egress, vec!["example.com"]);
+        assert_eq!(
+            doc.frontmatter.bounds.mounts,
+            vec!["/opt/store/terraform:ro"]
+        );
         assert_eq!(doc.frontmatter.sandbox.as_deref(), Some("worker"));
         assert_eq!(doc.frontmatter.assignee.as_deref(), Some("claude"));
         std::fs::remove_dir_all(root).ok();
