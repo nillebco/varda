@@ -1152,7 +1152,7 @@ impl Config {
             .unwrap_or_else(|| self.orchestration.clone())
     }
 
-    fn sandbox_config_by_name(&self, name: &str) -> SandboxConfig {
+    pub fn sandbox_config_by_name(&self, name: &str) -> SandboxConfig {
         if name == DEFAULT_SANDBOX_PROVIDER {
             return SandboxConfig {
                 primitive: DEFAULT_SANDBOX_PROVIDER.to_owned(),

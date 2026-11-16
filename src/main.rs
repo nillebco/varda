@@ -325,6 +325,15 @@ enum TaskCommand {
         /// Markdown task file or task id to update.
         task: PathBuf,
     },
+    /// Pin a task to another configured sandbox (or `local`). Takes effect at its next
+    /// run or resume; the agent's saved session moves with the task, so `varda task
+    /// resume` continues the same conversation in the new sandbox.
+    SetSandbox {
+        /// Configured sandbox name, or `local`.
+        sandbox: String,
+        /// Markdown task file or task id to update.
+        task: PathBuf,
+    },
     /// Print the resolved file path for a task ID or path.
     Resolve {
         /// Markdown task file or task id to resolve.
@@ -964,6 +973,9 @@ async fn run_cli() -> Result<()> {
                     false,
                     true,
                 )?;
+            }
+            TaskCommand::SetSandbox { sandbox, task } => {
+                set_sandbox_command(&task, &sandbox)?;
             }
             TaskCommand::Resolve { task } => {
                 let config_path = config::config_file()?;
@@ -6052,6 +6064,43 @@ async fn run_captured_resume_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn set_sandbox_command(task_ref: &Path, sandbox: &str) -> Result<()> {
+    let config_path = config::config_file()?;
+    let config = config::load_config(&config_path)?;
+    let task_path = task::resolve_task_reference(&config, task_ref)?;
+    let mut doc = task::load_task(&task_path)?;
+    let previous = repin_task_sandbox(&config, &mut doc.frontmatter, sandbox)?;
+    task::write_task(&doc)?;
+    println!(
+        "{}: sandbox {} -> {sandbox}",
+        task_path.display(),
+        previous.as_deref().unwrap_or("(route default)")
+    );
+    Ok(())
+}
+
+/// Point `fm` at sandbox `name`, returning the previous pin. Refused while the task runs
+/// (its box is live), for an unknown name, and when the task's `--mount`s would not be
+/// allowed there: the launch would refuse them anyway, later and less clearly.
+fn repin_task_sandbox(
+    config: &config::Config,
+    fm: &mut task::TaskFrontmatter,
+    name: &str,
+) -> Result<Option<String>> {
+    if fm.status == task::TaskStatus::Running {
+        anyhow::bail!("the task is running: end its session before moving it to another sandbox");
+    }
+    if name != config::DEFAULT_SANDBOX_PROVIDER && !config.sandboxes.contains_key(name) {
+        anyhow::bail!(
+            "sandbox '{name}' is not configured; add a `[sandboxes.{name}]` entry or use `local`"
+        );
+    }
+    if !fm.bounds.mounts.is_empty() {
+        sandbox::resolve_task_mounts(name, &config.sandbox_config_by_name(name), &fm.bounds.mounts)?;
+    }
+    Ok(fm.sandbox.replace(name.to_owned()))
+}
+
 fn update_tasks_command(
     task_ref: Option<&Path>,
     set_status: Option<&str>,
@@ -6615,6 +6664,42 @@ mod tests {
         assert!(msg.contains("EXFIL"), "error must name the key: {msg}");
         // The sentinel is left in place; no value was resolved.
         assert_eq!(env.get("EXFIL").unwrap(), "${fnox:aws-prod-key}");
+    }
+
+    fn task_frontmatter(yaml: &str) -> task::TaskFrontmatter {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("varda-repin-{}-{n}.md", std::process::id()));
+        std::fs::write(&path, format!("---\n{yaml}---\n\n# t\n")).unwrap();
+        let fm = task::load_task(&path).unwrap().frontmatter;
+        let _ = std::fs::remove_file(&path);
+        fm
+    }
+
+    #[test]
+    fn repin_task_sandbox_moves_an_idle_task_and_returns_the_old_pin() {
+        let config = config_with_sandbox("adb-infra", config::SandboxConfig::default());
+        let mut fm = task_frontmatter("id: 7\nstatus: review\nsandbox: adb-dev\n");
+        let previous = repin_task_sandbox(&config, &mut fm, "adb-infra").unwrap();
+        assert_eq!(previous.as_deref(), Some("adb-dev"));
+        assert_eq!(fm.sandbox.as_deref(), Some("adb-infra"));
+        assert!(repin_task_sandbox(&config, &mut fm, "local").is_ok());
+    }
+
+    #[test]
+    fn repin_task_sandbox_refuses_unknown_names_and_running_tasks() {
+        let config = config_with_sandbox("adb-infra", config::SandboxConfig::default());
+        let mut fm = task_frontmatter("id: 7\nstatus: review\nsandbox: adb-dev\n");
+        let err = repin_task_sandbox(&config, &mut fm, "adb-infr")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not configured"), "{err}");
+        let mut running = task_frontmatter("id: 8\nstatus: running\nsandbox: adb-dev\n");
+        let err = repin_task_sandbox(&config, &mut running, "adb-infra")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("running"), "{err}");
+        assert_eq!(running.sandbox.as_deref(), Some("adb-dev"));
     }
 
     fn config_with_sandbox(name: &str, sandbox: config::SandboxConfig) -> config::Config {
