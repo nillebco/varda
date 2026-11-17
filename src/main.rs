@@ -6066,7 +6066,7 @@ async fn run_captured_resume_command(
 #[allow(clippy::too_many_arguments)]
 fn set_sandbox_command(task_ref: &Path, sandbox: &str) -> Result<()> {
     let config_path = config::config_file()?;
-    let config = config::load_config(&config_path)?;
+    let config = config::resolve_config(&config_path)?;
     let task_path = task::resolve_task_reference(&config, task_ref)?;
     let mut doc = task::load_task(&task_path)?;
     let previous = repin_task_sandbox(&config, &mut doc.frontmatter, sandbox)?;
