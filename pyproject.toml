@@ -1,0 +1,23 @@
+# PyPI distribution of the varda binary (maturin `bin` bindings: no Python code, the wheel
+# carries varda / varda.exe as a script). `varda` is taken on PyPI, hence nillebco-varda.
+# Lets package proxies with a PyPI upstream (Azure Artifacts, Artifactory) serve varda where
+# GitHub release assets are blocked. Built and published by .github/workflows/pypi.yml.
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "nillebco-varda"
+description = "Routes markdown tasks to AI agents (Claude, Codex, Copilot) and tracks their lifecycle"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/nillebco/varda"
+Source = "https://github.com/nillebco/varda"
+
+[tool.maturin]
+bindings = "bin"
+profile = "dist"

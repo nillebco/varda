@@ -1,0 +1,63 @@
+# Publishes varda to PyPI as nillebco-varda (see pyproject.toml): one platform wheel per
+# dist target, so PyPI-proxying feeds can serve varda where GitHub release assets are
+# blocked. Separate from release.yml, which `dist generate` owns.
+#
+# Same tag trigger as release.yml. workflow_dispatch republishes an existing tag.
+# Publishing uses PyPI trusted publishing: project nillebco-varda, workflow pypi.yml,
+# environment pypi.
+name: PyPI
+
+on:
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish (e.g. v0.6.0)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { runner: macos-15, target: aarch64-apple-darwin }
+          - { runner: macos-15, target: x86_64-apple-darwin }
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-22.04, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --profile dist --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+
+  publish:
+    needs: wheels
+    runs-on: ubuntu-22.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
