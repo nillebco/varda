@@ -23,6 +23,8 @@ varda task add "Fix the flaky auth test" --exec                                 
 brew tap nillebco/tap && brew install varda   # or, from a checkout: make install (→ ~/.local/bin)
 # Windows (PowerShell, per-user, no admin; needs Git for Windows):
 #   irm https://github.com/nillebco/varda/releases/latest/download/varda-installer.ps1 | iex
+# Any platform, from PyPI (or a feed proxying it, where GitHub downloads are blocked):
+#   uv tool install nillebco-varda
 varda init            # creates the control plane at ~/.varda
 ```
 
