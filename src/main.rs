@@ -751,57 +751,52 @@ async fn run_cli() -> Result<()> {
                 // start fresh instead. Either way `resume_task_command` still falls
                 // back to fresh (and says so) when there is nothing to resume or the
                 // resume attempt fails.
-                if reuse && exec {
-                    let existing = task::task_file_path(&config, &project_path, &taskname)?;
-                    if existing.exists() {
-                        let confirmed_resume = !egress.is_empty() || !mounts.is_empty();
-                        let mut existing_task = task::load_task(&existing)?;
-                        let mounts = resolve_task_mount_specs(
-                            &config,
-                            &project_path,
-                            existing_task.frontmatter.sandbox.as_deref(),
-                            &mounts,
-                        )?;
-                        for mount in mounts {
-                            if !existing_task.frontmatter.bounds.mounts.contains(&mount) {
-                                existing_task.frontmatter.bounds.mounts.push(mount);
-                            }
+                if reuse
+                    && exec
+                    && let Some(existing) = task::find_task_file(&config, &project_path, &taskname)?
+                {
+                    let confirmed_resume = !egress.is_empty() || !mounts.is_empty();
+                    let mut existing_task = task::load_task(&existing)?;
+                    let mounts = resolve_task_mount_specs(
+                        &config,
+                        &project_path,
+                        existing_task.frontmatter.sandbox.as_deref(),
+                        &mounts,
+                    )?;
+                    for mount in mounts {
+                        if !existing_task.frontmatter.bounds.mounts.contains(&mount) {
+                            existing_task.frontmatter.bounds.mounts.push(mount);
                         }
-                        for host in &egress {
-                            if !existing_task
-                                .frontmatter
-                                .bounds
-                                .egress
-                                .iter()
-                                .any(|saved| saved.eq_ignore_ascii_case(host))
-                            {
-                                existing_task.frontmatter.bounds.egress.push(host.clone());
-                            }
-                        }
-                        task::write_task(&existing_task)?;
-                        let fresh = existing_task.frontmatter.status == task::TaskStatus::Done;
-                        if fresh {
-                            println!(
-                                "task {} already exists and is done — starting a fresh session",
-                                existing.display()
-                            );
-                        } else {
-                            println!(
-                                "task {} already exists — continuing the previous session",
-                                existing.display()
-                            );
-                        }
-                        // An explicit egress/mount relaunch is a one-command operation: skip
-                        // only the captured-session confirmation. A needs-user task's
-                        // editor offer remains independent and is never bypassed here.
-                        return resume_task_command(
-                            &existing,
-                            fresh,
-                            interactive,
-                            confirmed_resume,
-                        )
-                        .await;
                     }
+                    for host in &egress {
+                        if !existing_task
+                            .frontmatter
+                            .bounds
+                            .egress
+                            .iter()
+                            .any(|saved| saved.eq_ignore_ascii_case(host))
+                        {
+                            existing_task.frontmatter.bounds.egress.push(host.clone());
+                        }
+                    }
+                    task::write_task(&existing_task)?;
+                    let fresh = existing_task.frontmatter.status == task::TaskStatus::Done;
+                    if fresh {
+                        println!(
+                            "task {} already exists and is done — starting a fresh session",
+                            existing.display()
+                        );
+                    } else {
+                        println!(
+                            "task {} already exists — continuing the previous session",
+                            existing.display()
+                        );
+                    }
+                    // An explicit egress/mount relaunch is a one-command operation: skip
+                    // only the captured-session confirmation. A needs-user task's
+                    // editor offer remains independent and is never bypassed here.
+                    return resume_task_command(&existing, fresh, interactive, confirmed_resume)
+                        .await;
                 }
                 // Validate the pinned sandbox up front so `--sandbox typo` fails at
                 // creation time rather than only at run time. `local` is always valid.
@@ -2365,13 +2360,18 @@ impl VardaTaskControlPlane {
     }
 }
 
-/// The task-file basename minus its extension, used as the caller-facing
-/// `slug` for a task (the home store names STATE files `<slug>.md`, with no
-/// id prefix — unlike the repo-local `<id>-<slug>.md` DEFINITION naming).
-fn task_slug(path: &Path) -> String {
-    path.file_stem()
+/// The task-file basename minus its extension and `<id>-` prefix, used as the
+/// caller-facing `slug` for a task. Home STATE files are named `<id>-<slug>.md`
+/// (like the repo-local DEFINITION); legacy ones are plain `<slug>.md`.
+fn task_slug(path: &Path, id: u64) -> String {
+    let stem = path
+        .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    match stem.strip_prefix(&format!("{id}-")) {
+        Some(slug) => slug.to_owned(),
+        None => stem,
+    }
 }
 
 impl orchestration::TaskControlPlane for VardaTaskControlPlane {
@@ -2389,7 +2389,7 @@ impl orchestration::TaskControlPlane for VardaTaskControlPlane {
             .filter(|t| status.is_none_or(|status| t.status == status))
             .map(|t| orchestration::TaskListEntry {
                 id: t.id.expect("filtered to Some above"),
-                slug: task_slug(&t.path),
+                slug: task_slug(&t.path, t.id.expect("filtered to Some above")),
                 status: t.status.as_str().to_owned(),
                 title: t.title,
                 assignee: t.assignee,
@@ -2402,7 +2402,7 @@ impl orchestration::TaskControlPlane for VardaTaskControlPlane {
         let doc = task::load_task(&summary.path).ok()?;
         Some(orchestration::TaskDetail {
             id,
-            slug: task_slug(&summary.path),
+            slug: task_slug(&summary.path, id),
             status: doc.frontmatter.status.as_str().to_owned(),
             title: doc.title(),
             assignee: doc.frontmatter.assignee.clone(),
@@ -2446,7 +2446,7 @@ impl orchestration::TaskControlPlane for VardaTaskControlPlane {
             .ok_or_else(|| "created task has no id".to_owned())?;
         Ok(orchestration::CreatedTask {
             id,
-            slug: task_slug(&task_path),
+            slug: task_slug(&task_path, id),
         })
     }
 }

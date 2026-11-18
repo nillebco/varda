@@ -208,8 +208,16 @@ $VARDA_HOME/operations/tasks/<project-folder>/
 For the example above, the file is:
 
 ```text
-$VARDA_HOME/operations/tasks/some-project-path/summarize-this-project.md
+$VARDA_HOME/operations/tasks/some-project-path/<id>-summarize-this-project.md
 ```
+
+File names are `<id>-<slug>.md`, matching the repo-local store. The slug is the
+title lowercased, with common accented Latin letters transliterated (`é` → `e`,
+`ß` → `ss`) and every other run of non-alphanumerics collapsed to `-`. Slugs
+longer than 64 characters are cut at a word boundary and suffixed with a short
+hash of the full slug, so long titles stay distinct. A title with nothing
+transliterable (e.g. only CJK or emoji) gets a stable `task-<hash>` slug. Task
+files created by older versions (`<slug>.md`, no id prefix) are still found.
 
 ## Repo-local task store (`.varda/`)
 

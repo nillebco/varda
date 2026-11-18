@@ -858,15 +858,72 @@ fn write_definition(store: &Path, slug: &str, task: &TaskDocument) -> Result<Pat
     Ok(path)
 }
 
-/// Compute the home-store STATE file path for a `(project, taskname)` pair WITHOUT
-/// creating anything. Uses the same folder + name slugging as [`create_task`], so an
-/// existence check here matches exactly what `create_task` would refuse to overwrite.
+/// Find the home-store STATE file for a `(project, taskname)` pair WITHOUT
+/// creating anything. Uses the same folder + name slugging as [`create_task`], so
+/// a hit here is exactly what `create_task` would refuse to duplicate. Matches
+/// both the current `<id>-<slug>.md` naming and legacy un-prefixed `<slug>.md`
+/// files (including their pre-cap, pre-transliteration slugs).
 /// Used by `task add --reuse` to decide resume-vs-create.
-pub fn task_file_path(config: &Config, project_path: &Path, taskname: &str) -> Result<PathBuf> {
+pub fn find_task_file(
+    config: &Config,
+    project_path: &Path,
+    taskname: &str,
+) -> Result<Option<PathBuf>> {
     let task_root = Path::new(&config.defaults.operations_dir).join("tasks");
     let task_dir = task_root.join(project_task_folder(project_path)?);
-    let slug = slugify_task_name(taskname)?;
-    Ok(task_dir.join(format!("{slug}.md")))
+    let mut slugs = vec![slugify_task_name(taskname)?];
+    if let Some(legacy) = legacy_task_slug(taskname)
+        && !slugs.contains(&legacy)
+    {
+        slugs.push(legacy);
+    }
+    find_task_file_by_slugs(&task_dir, &slugs)
+}
+
+fn find_task_file_by_slugs(task_dir: &Path, slugs: &[String]) -> Result<Option<PathBuf>> {
+    for slug in slugs {
+        let legacy = task_dir.join(format!("{slug}.md"));
+        if legacy.is_file() {
+            return Ok(Some(legacy));
+        }
+    }
+    let Ok(entries) = fs::read_dir(task_dir) else {
+        return Ok(None);
+    };
+    let mut matches: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "md")
+                && path.is_file()
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.split_once('-'))
+                    .is_some_and(|(id, rest)| {
+                        slugs.iter().any(|slug| slug == rest)
+                            // The prefix must be the task's own id: a legacy
+                            // `2024-roadmap.md` is not task 2024's `roadmap`.
+                            && id.parse::<u64>().is_ok_and(|id| {
+                                load_task_raw(path).is_ok_and(|t| t.frontmatter.id == Some(id))
+                            })
+                    })
+        })
+        .collect();
+    matches.sort();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => bail!(
+            "multiple task files match the same name in {}: {}",
+            task_dir.display(),
+            matches
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 pub fn create_task(
@@ -911,13 +968,12 @@ pub fn create_task_with_bounds(
     }
     let id = max_id.unwrap_or(0) + 1;
 
-    let slug = slugify_task_name(taskname)?;
-    let filename = format!("{slug}.md");
-    let path = task_dir.join(filename);
-
-    if path.exists() {
-        bail!("task {} already exists", path.display());
+    if let Some(existing) = find_task_file(config, project_path, taskname)? {
+        bail!("task {} already exists", existing.display());
     }
+    let slug = slugify_task_name(taskname)?;
+    let path = task_dir.join(format!("{id}-{slug}.md"));
+
 
     let task = TaskDocument {
         path: path.clone(),
@@ -1877,10 +1933,65 @@ fn parse_task(path: &Path, content: &str) -> Result<TaskDocument> {
     })
 }
 
+/// Longest slug a task file name carries (excluding the `<id>-` prefix and
+/// `.md`). Longer names are cut at a word boundary and suffixed with a short
+/// hash of the full slug, so distinct long names (e.g. tracker imports that end
+/// in `<tracker>-<id>`) still map to distinct, deterministic slugs.
+const MAX_TASK_SLUG_LEN: usize = 64;
+const SLUG_HASH_LEN: usize = 8;
+
 fn slugify_task_name(taskname: &str) -> Result<String> {
     let mut slug = String::new();
     let mut last_was_dash = false;
 
+    let mut buffer = [0u8; 4];
+    for character in taskname.chars() {
+        let ascii = transliterate(character).unwrap_or_else(|| character.encode_utf8(&mut buffer));
+        for character in ascii.chars().flat_map(char::to_lowercase) {
+            if character.is_ascii_alphanumeric() {
+                slug.push(character);
+                last_was_dash = false;
+            } else if !last_was_dash {
+                slug.push('-');
+                last_was_dash = true;
+            }
+        }
+    }
+
+    let slug = slug.trim_matches('-').to_owned();
+
+    if slug.is_empty() {
+        // Nothing transliterable (e.g. CJK, emoji): fall back to a stable hash of
+        // the name so the same title always maps to the same file.
+        if taskname.trim().is_empty() {
+            bail!("task name must not be empty");
+        }
+        return Ok(format!("task-{}", short_hash(taskname.trim())));
+    }
+
+    if slug.len() <= MAX_TASK_SLUG_LEN {
+        return Ok(slug);
+    }
+
+    let budget = MAX_TASK_SLUG_LEN - SLUG_HASH_LEN - 1;
+    let head = &slug[..budget];
+    // Cut at the last word boundary unless that would drop most of the budget.
+    let head = match head.rfind('-') {
+        Some(cut) if cut >= budget / 2 => &head[..cut],
+        _ => head,
+    };
+    Ok(format!(
+        "{}-{}",
+        head.trim_end_matches('-'),
+        short_hash(&slug)
+    ))
+}
+
+/// The pre-cap, pre-transliteration slug older varda versions used for home
+/// STATE file names, so lookups still find tasks created before the change.
+fn legacy_task_slug(taskname: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
     for character in taskname.chars().flat_map(char::to_lowercase) {
         if character.is_ascii_alphanumeric() {
             slug.push(character);
@@ -1890,14 +2001,71 @@ fn slugify_task_name(taskname: &str) -> Result<String> {
             last_was_dash = true;
         }
     }
-
     let slug = slug.trim_matches('-').to_owned();
+    (!slug.is_empty()).then_some(slug)
+}
 
-    if slug.is_empty() {
-        bail!("task name must contain at least one ASCII letter or digit");
-    }
+fn short_hash(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    digest
+        .iter()
+        .take(SLUG_HASH_LEN / 2)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
-    Ok(slug)
+/// ASCII rendering of common Latin letters with diacritics and ligatures.
+/// Characters with no entry pass through and are treated as separators.
+fn transliterate(character: char) -> Option<&'static str> {
+    Some(match character {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
+        'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'Ā' | 'Ă' | 'Ą' => "A",
+        'æ' => "ae",
+        'Æ' => "AE",
+        'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => "c",
+        'Ç' | 'Ć' | 'Ĉ' | 'Ċ' | 'Č' => "C",
+        'ď' | 'đ' | 'ð' => "d",
+        'Ď' | 'Đ' | 'Ð' => "D",
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => "e",
+        'È' | 'É' | 'Ê' | 'Ë' | 'Ē' | 'Ĕ' | 'Ė' | 'Ę' | 'Ě' => "E",
+        'ĝ' | 'ğ' | 'ġ' | 'ģ' => "g",
+        'Ĝ' | 'Ğ' | 'Ġ' | 'Ģ' => "G",
+        'ĥ' | 'ħ' => "h",
+        'Ĥ' | 'Ħ' => "H",
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => "i",
+        'Ì' | 'Í' | 'Î' | 'Ï' | 'Ĩ' | 'Ī' | 'Ĭ' | 'Į' | 'İ' => "I",
+        'ĵ' => "j",
+        'Ĵ' => "J",
+        'ķ' => "k",
+        'Ķ' => "K",
+        'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => "l",
+        'Ĺ' | 'Ļ' | 'Ľ' | 'Ŀ' | 'Ł' => "L",
+        'ñ' | 'ń' | 'ņ' | 'ň' => "n",
+        'Ñ' | 'Ń' | 'Ņ' | 'Ň' => "N",
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => "o",
+        'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' | 'Ō' | 'Ŏ' | 'Ő' => "O",
+        'œ' => "oe",
+        'Œ' => "OE",
+        'ŕ' | 'ŗ' | 'ř' => "r",
+        'Ŕ' | 'Ŗ' | 'Ř' => "R",
+        'ś' | 'ŝ' | 'ş' | 'š' | 'ș' => "s",
+        'Ś' | 'Ŝ' | 'Ş' | 'Š' | 'Ș' => "S",
+        'ß' => "ss",
+        'ţ' | 'ť' | 'ŧ' | 'ț' => "t",
+        'Ţ' | 'Ť' | 'Ŧ' | 'Ț' => "T",
+        'þ' => "th",
+        'Þ' => "TH",
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => "u",
+        'Ù' | 'Ú' | 'Û' | 'Ü' | 'Ũ' | 'Ū' | 'Ŭ' | 'Ů' | 'Ű' | 'Ų' => "U",
+        'ŵ' => "w",
+        'Ŵ' => "W",
+        'ý' | 'ÿ' | 'ŷ' => "y",
+        'Ý' | 'Ÿ' | 'Ŷ' => "Y",
+        'ź' | 'ż' | 'ž' => "z",
+        'Ź' | 'Ż' | 'Ž' => "Z",
+        _ => return None,
+    })
 }
 
 fn project_task_folder(project_path: &Path) -> Result<String> {
@@ -2568,7 +2736,15 @@ requires_user: false
             .expect("second task should be created");
 
         assert_ne!(first.parent(), second.parent());
-        assert_eq!(first.file_name(), second.file_name());
+        // Ids are global, so the same title gets a distinct `<id>-` prefix.
+        assert_eq!(
+            first.file_name().and_then(|n| n.to_str()),
+            Some("1-project-task.md")
+        );
+        assert_eq!(
+            second.file_name().and_then(|n| n.to_str()),
+            Some("2-project-task.md")
+        );
         assert!(first.starts_with(operations_dir.join("tasks")));
         assert!(second.starts_with(operations_dir.join("tasks")));
         fs::remove_dir_all(root).expect("test directory should be removable");
@@ -3040,6 +3216,93 @@ requires_user: false
             slugify_task_name("Write README Please").expect("name should slugify"),
             "write-readme-please"
         );
+    }
+
+    #[test]
+    fn slugify_transliterates_latin_diacritics() {
+        assert_eq!(
+            slugify_task_name("Réparer l'échéancier — Straße").expect("name should slugify"),
+            "reparer-l-echeancier-strasse"
+        );
+    }
+
+    #[test]
+    fn slugify_falls_back_to_stable_hash_for_untransliterable_names() {
+        let slug = slugify_task_name("修复登录").expect("name should slugify");
+        assert!(slug.starts_with("task-") && slug.len() == "task-".len() + SLUG_HASH_LEN);
+        assert_eq!(slug, slugify_task_name("修复登录").expect("stable"));
+        assert_ne!(slug, slugify_task_name("修复注册").expect("distinct"));
+        assert!(slugify_task_name("  ").is_err());
+    }
+
+    #[test]
+    fn slugify_caps_long_names_at_word_boundary_with_distinct_hash() {
+        let base =
+            "sync assignee sandbox route from repo local task definition into the operations copy";
+        let a = slugify_task_name(&format!("{base} azdo-1")).expect("long name should slugify");
+        let b = slugify_task_name(&format!("{base} azdo-2")).expect("long name should slugify");
+        assert!(a.len() <= MAX_TASK_SLUG_LEN, "{a} too long");
+        assert_ne!(a, b, "truncated names must stay distinct");
+        let (head, hash) = a.rsplit_once('-').expect("hash suffix");
+        assert_eq!(hash.len(), SLUG_HASH_LEN);
+        assert!(
+            base.replace(' ', "-").starts_with(head),
+            "cut at a word boundary: {head}"
+        );
+        assert!(!head.ends_with('-'));
+    }
+
+    #[test]
+    fn create_task_prefixes_home_file_with_id_and_finds_legacy_names() {
+        let root = std::env::temp_dir().join(format!("varda-task-names-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let project_path = root.join("project");
+        fs::create_dir_all(&project_path).expect("project should be created");
+        let config = test_config(&root.join("operations"));
+
+        let path = create_task(&config, "Write README", &project_path, None, None, None)
+            .expect("task should be created");
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("file name");
+        assert_eq!(name, "1-write-readme.md");
+        assert_eq!(
+            find_task_file(&config, &project_path, "Write README").expect("lookup"),
+            Some(path.clone())
+        );
+        let duplicate = create_task(&config, "write readme", &project_path, None, None, None)
+            .expect_err("same slug must be refused");
+        assert!(
+            duplicate.to_string().contains("already exists"),
+            "{duplicate:#}"
+        );
+
+        // A legacy un-prefixed, uncapped file is still found by name.
+        let long = "a very long legacy task title that predates the slug length cap entirely";
+        let legacy = path.parent().expect("task dir").join(format!(
+            "{}.md",
+            legacy_task_slug(long).expect("legacy slug")
+        ));
+        fs::write(&legacy, "---\nid: 2\nstatus: backlog\n---\n\n# legacy\n")
+            .expect("legacy file should be written");
+        assert_eq!(
+            find_task_file(&config, &project_path, long).expect("lookup"),
+            Some(legacy)
+        );
+
+        // A legacy name that merely starts with digits is not an `<id>-` prefix.
+        fs::write(
+            path.parent().expect("task dir").join("2024-roadmap.md"),
+            "---\nid: 3\nstatus: backlog\n---\n\n# 2024 roadmap\n",
+        )
+        .expect("legacy file should be written");
+        assert_eq!(
+            find_task_file(&config, &project_path, "roadmap").expect("lookup"),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
