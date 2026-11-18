@@ -227,8 +227,7 @@ fn import_new_issue(
 ) -> Result<Vec<PathBuf>> {
     let project = Path::new(&tracker.project_path);
     let name = import_task_name(tracker, issue);
-    let orphan = task::task_file_path(config, project, &name)?;
-    let path = if orphan.exists() {
+    let path = if let Some(orphan) = task::find_task_file(config, project, &name)? {
         // Read the home file WITHOUT the definition overlay: a crash after the
         // definition write leaves the remote body there, while the home file
         // (written last) is still the pristine `create_task` seed.
