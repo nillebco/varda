@@ -880,10 +880,22 @@ pub fn find_task_file(
     find_task_file_by_slugs(&task_dir, &slugs)
 }
 
+/// Whether `path` is named `<id>-<slug>.md` with `<id>` equal to the task's own
+/// frontmatter id (as opposed to a legacy slug that merely starts with digits).
+fn has_own_id_prefix(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.split_once('-'))
+        .and_then(|(id, _)| id.parse::<u64>().ok())
+        .is_some_and(|id| load_task_raw(path).is_ok_and(|t| t.frontmatter.id == Some(id)))
+}
+
 fn find_task_file_by_slugs(task_dir: &Path, slugs: &[String]) -> Result<Option<PathBuf>> {
     for slug in slugs {
         let legacy = task_dir.join(format!("{slug}.md"));
-        if legacy.is_file() {
+        // A slug like `1-roadmap-2` can name task 1's `<id>-<slug>.md` file
+        // rather than a legacy one; only accept genuinely un-prefixed files.
+        if legacy.is_file() && !has_own_id_prefix(&legacy) {
             return Ok(Some(legacy));
         }
     }
@@ -900,14 +912,10 @@ fn find_task_file_by_slugs(task_dir: &Path, slugs: &[String]) -> Result<Option<P
                     .file_stem()
                     .and_then(|stem| stem.to_str())
                     .and_then(|stem| stem.split_once('-'))
-                    .is_some_and(|(id, rest)| {
-                        slugs.iter().any(|slug| slug == rest)
-                            // The prefix must be the task's own id: a legacy
-                            // `2024-roadmap.md` is not task 2024's `roadmap`.
-                            && id.parse::<u64>().is_ok_and(|id| {
-                                load_task_raw(path).is_ok_and(|t| t.frontmatter.id == Some(id))
-                            })
-                    })
+                    .is_some_and(|(_, rest)| slugs.iter().any(|slug| slug == rest))
+                // The prefix must be the task's own id: a legacy
+                // `2024-roadmap.md` is not task 2024's `roadmap`.
+                && has_own_id_prefix(path)
         })
         .collect();
     matches.sort();
@@ -3299,6 +3307,12 @@ requires_user: false
         .expect("legacy file should be written");
         assert_eq!(
             find_task_file(&config, &project_path, "roadmap").expect("lookup"),
+            None
+        );
+
+        // ...and a digit-led title is not task 1's id-prefixed file.
+        assert_eq!(
+            find_task_file(&config, &project_path, "1 write readme").expect("lookup"),
             None
         );
 
